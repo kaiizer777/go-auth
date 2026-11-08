@@ -58,7 +58,8 @@ go get github.com/kaiizer777/go-auth
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for details on code style, linting, and architectural boundaries.
+Please review [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidelines, code style, and architectural boundaries.
+All contributors are expected to uphold the [Code of Conduct](CODE_OF_CONDUCT.md).
 
 ---
 

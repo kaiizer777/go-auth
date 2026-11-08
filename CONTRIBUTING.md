@@ -38,3 +38,8 @@ Thank you for contributing to `go-auth`!
    - Write clear, concise commit messages.
    - Open a PR against `main` explaining the changes and linking relevant issues.
    - PRs must adhere to the architectural rule mentioned above.
+
+## Code of Conduct
+
+All contributors and participants are expected to adhere to our [Code of Conduct](CODE_OF_CONDUCT.md).
+
