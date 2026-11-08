@@ -4,8 +4,6 @@
 [![Go Report Card](https://goreportcard.com/badge/github.com/kaiizer777/go-auth)](https://goreportcard.com/report/github.com/kaiizer777/go-auth)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-go-auth — a composable, honest-about-its-limits authentication library for Go, inspired by Better Auth.
-
 > [!WARNING]
 > **Status: Early development — not yet usable in production.**
 > APIs and interfaces are undergoing initial design and scaffolding.
