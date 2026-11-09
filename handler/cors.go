@@ -7,23 +7,29 @@ import (
 	"github.com/kaiizer777/go-auth/config"
 )
 
-// CORS returns middleware that applies CORS headers and preflight handling.
+// CORS returns HTTP middleware that applies Cross-Origin Resource Sharing (CORS) headers
+// and handles preflight OPTIONS requests according to the provided configuration.
 func CORS(cfg config.Config) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Add("Vary", "Origin")
+
 			origin := r.Header.Get("Origin")
-			if isAllowedOrigin(origin, cfg.AllowedOrigins) {
-				w.Header().Set("Access-Control-Allow-Origin", origin)
+			allowOrigin, allowCredentials := checkOrigin(origin, cfg.AllowedOrigins)
+			if allowOrigin != "" {
+				w.Header().Set("Access-Control-Allow-Origin", allowOrigin)
 				if len(cfg.AllowedMethods) > 0 {
 					w.Header().Set("Access-Control-Allow-Methods", strings.Join(cfg.AllowedMethods, ", "))
 				}
 				if len(cfg.AllowedHeaders) > 0 {
 					w.Header().Set("Access-Control-Allow-Headers", strings.Join(cfg.AllowedHeaders, ", "))
 				}
-				w.Header().Set("Access-Control-Allow-Credentials", "true")
+				if allowCredentials {
+					w.Header().Set("Access-Control-Allow-Credentials", "true")
+				}
 			}
 
-			if r.Method == http.MethodOptions {
+			if r.Method == http.MethodOptions && r.Header.Get("Access-Control-Request-Method") != "" {
 				w.Header().Set("Access-Control-Max-Age", "86400")
 				w.WriteHeader(http.StatusNoContent)
 				return
@@ -34,14 +40,24 @@ func CORS(cfg config.Config) func(http.Handler) http.Handler {
 	}
 }
 
-func isAllowedOrigin(origin string, allowed []string) bool {
+func checkOrigin(origin string, allowed []string) (allowedOrigin string, allowCredentials bool) {
 	if origin == "" {
-		return false
+		return "", false
 	}
 	for _, o := range allowed {
-		if o == "*" || o == origin {
-			return true
+		if o == origin && o != "*" {
+			return origin, true
 		}
 	}
-	return false
+	for _, o := range allowed {
+		if o == "*" {
+			return "*", false
+		}
+	}
+	return "", false
+}
+
+func isAllowedOrigin(origin string, allowed []string) bool {
+	allowOrigin, _ := checkOrigin(origin, allowed)
+	return allowOrigin != ""
 }

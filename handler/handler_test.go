@@ -59,6 +59,7 @@ func TestNewHandler_WrapsCORSMiddleware(t *testing.T) {
 	// Test OPTIONS preflight short-circuit
 	optReq := httptest.NewRequest(http.MethodOptions, "/health", nil)
 	optReq.Header.Set("Origin", "https://dashboard.example.com")
+	optReq.Header.Set("Access-Control-Request-Method", "GET")
 	optRec := httptest.NewRecorder()
 
 	h.ServeHTTP(optRec, optReq)
