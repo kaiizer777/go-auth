@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 
@@ -49,6 +50,9 @@ func TestNew_InvalidConfig(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error with invalid config, got nil")
 	}
+	if !strings.Contains(err.Error(), "goauth: invalid configuration") {
+		t.Fatalf("expected error containing 'goauth: invalid configuration', got: %v", err)
+	}
 	if auth != nil {
 		t.Fatalf("expected nil Auth on error, got %+v", auth)
 	}
@@ -79,7 +83,7 @@ func TestAuth_Close_WithDB(t *testing.T) {
 	}
 
 	auth := &Auth{
-		DB: gormDB,
+		db: gormDB,
 	}
 
 	if err := auth.Close(); err != nil {

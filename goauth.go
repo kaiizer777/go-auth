@@ -17,10 +17,9 @@ import (
 
 // Auth is the main entry point for the authentication library.
 type Auth struct {
-	// DB is the underlying GORM database handle.
-	DB *gorm.DB
-	// Config contains the validated runtime configuration.
-	Config config.Config
+	db  *gorm.DB
+	cfg config.Config
+
 	// Handler is the root HTTP handler with mounted routes and middleware.
 	Handler http.Handler
 }
@@ -39,18 +38,18 @@ func New(cfg config.Config) (*Auth, error) {
 
 	h := handler.New(database, cfg)
 	return &Auth{
-		DB:      database,
-		Config:  cfg,
+		db:      database,
+		cfg:     cfg,
 		Handler: h,
 	}, nil
 }
 
 // Close terminates the underlying database connection pool.
 func (a *Auth) Close() error {
-	if a.DB == nil {
+	if a.db == nil {
 		return nil
 	}
-	sqlDB, err := a.DB.DB()
+	sqlDB, err := a.db.DB()
 	if err != nil {
 		return err
 	}
