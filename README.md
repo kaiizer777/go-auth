@@ -1,4 +1,4 @@
-# go-auth
+# **Go-Auth** — A composable, modular authentication library for Go.
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/kaiizer777/go-auth.svg)](https://pkg.go.dev/github.com/kaiizer777/go-auth)
 [![Go Report Card](https://goreportcard.com/badge/github.com/kaiizer777/go-auth)](https://goreportcard.com/report/github.com/kaiizer777/go-auth)
