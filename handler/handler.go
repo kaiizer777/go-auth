@@ -26,6 +26,7 @@ func New(db *gorm.DB, cfg config.Config) http.Handler {
 	return CORS(cfg)(h.mux)
 }
 
+// registerRoutes configures default and endpoint routes on the internal multiplexer.
 func (h *Handler) registerRoutes() {
 	// Base routes mounted in Phase 1; additional auth routes mount in subsequent phases.
 	h.mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {

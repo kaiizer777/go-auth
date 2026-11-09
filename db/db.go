@@ -71,6 +71,8 @@ func Connect(cfg config.Config) (*gorm.DB, error) {
 	return db, nil
 }
 
+// runMigrations executes database migrations using either embedded migration files
+// or a custom filesystem directory.
 func runMigrations(databaseURL, migrationsPath string) error {
 	db, err := sql.Open("pgx", databaseURL)
 	if err != nil {
@@ -122,6 +124,7 @@ func runMigrations(databaseURL, migrationsPath string) error {
 	return nil
 }
 
+// isDefaultMigrationsPath reports whether the provided path represents the default embedded migrations directory.
 func isDefaultMigrationsPath(p string) bool {
 	clean := filepath.ToSlash(filepath.Clean(p))
 	return p == "" || clean == "db/migrations"

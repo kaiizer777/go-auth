@@ -40,6 +40,8 @@ func CORS(cfg config.Config) func(http.Handler) http.Handler {
 	}
 }
 
+// checkOrigin evaluates the incoming origin against the configured allowlist.
+// It returns the origin to reflect and whether credentials should be permitted.
 func checkOrigin(origin string, allowed []string) (allowedOrigin string, allowCredentials bool) {
 	if origin == "" {
 		return "", false
@@ -57,6 +59,7 @@ func checkOrigin(origin string, allowed []string) (allowedOrigin string, allowCr
 	return "", false
 }
 
+// isAllowedOrigin reports whether the provided origin is allowed by the configured allowlist.
 func isAllowedOrigin(origin string, allowed []string) bool {
 	allowOrigin, _ := checkOrigin(origin, allowed)
 	return allowOrigin != ""

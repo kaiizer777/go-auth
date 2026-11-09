@@ -7,18 +7,25 @@ import (
 
 // Config holds all database, CORS, and connection pool settings.
 type Config struct {
-	DatabaseURL    string
+	// DatabaseURL is the PostgreSQL connection string.
+	DatabaseURL string
+	// MigrationsPath is the path to database migration files or empty for embedded defaults.
 	MigrationsPath string
 
-	// CORS
+	// AllowedOrigins specifies trusted origins for CORS headers.
 	AllowedOrigins []string
+	// AllowedMethods specifies HTTP methods permitted during CORS preflight.
 	AllowedMethods []string
+	// AllowedHeaders specifies HTTP headers permitted during CORS preflight.
 	AllowedHeaders []string
 
-	// DB pool
-	MaxOpenConns    int
-	MaxIdleConns    int
+	// MaxOpenConns sets the maximum number of open connections to the database.
+	MaxOpenConns int
+	// MaxIdleConns sets the maximum number of connections in the idle pool.
+	MaxIdleConns int
+	// ConnMaxLifetime sets the maximum amount of time a connection may be reused.
 	ConnMaxLifetime time.Duration
+	// ConnMaxIdleTime sets the maximum amount of time a connection may remain idle.
 	ConnMaxIdleTime time.Duration
 }
 
