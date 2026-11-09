@@ -36,16 +36,18 @@ func TestDefaultConfig(t *testing.T) {
 
 func TestConfigValidate(t *testing.T) {
 	tests := []struct {
-		name    string
-		mutate  func(*Config)
-		wantErr bool
+		name               string
+		mutate             func(*Config)
+		wantErr            bool
+		wantMigrationsPath string
 	}{
 		{
 			name: "valid configuration",
 			mutate: func(c *Config) {
 				c.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
 			},
-			wantErr: false,
+			wantErr:            false,
+			wantMigrationsPath: "db/migrations",
 		},
 		{
 			name: "missing database URL",
@@ -80,12 +82,48 @@ func TestConfigValidate(t *testing.T) {
 			wantErr: true,
 		},
 		{
+			name: "negative conn max lifetime",
+			mutate: func(c *Config) {
+				c.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+				c.ConnMaxLifetime = -time.Second
+			},
+			wantErr: true,
+		},
+		{
+			name: "negative conn max idle time",
+			mutate: func(c *Config) {
+				c.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+				c.ConnMaxIdleTime = -time.Second
+			},
+			wantErr: true,
+		},
+		{
+			name: "zero durations permitted as no-limit",
+			mutate: func(c *Config) {
+				c.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+				c.ConnMaxLifetime = 0
+				c.ConnMaxIdleTime = 0
+			},
+			wantErr:            false,
+			wantMigrationsPath: "db/migrations",
+		},
+		{
 			name: "empty migrations path falls back to default",
 			mutate: func(c *Config) {
 				c.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
 				c.MigrationsPath = ""
 			},
-			wantErr: false,
+			wantErr:            false,
+			wantMigrationsPath: "db/migrations",
+		},
+		{
+			name: "custom migrations path preserved",
+			mutate: func(c *Config) {
+				c.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+				c.MigrationsPath = "custom/migrations"
+			},
+			wantErr:            false,
+			wantMigrationsPath: "custom/migrations",
 		},
 	}
 
@@ -97,11 +135,8 @@ func TestConfigValidate(t *testing.T) {
 			if (err != nil) != tt.wantErr {
 				t.Fatalf("Validate() err = %v, wantErr = %v", err, tt.wantErr)
 			}
-			if !tt.wantErr && cfg.MigrationsPath == "" {
-				t.Errorf("expected default migrations path, got empty")
-			}
-			if tt.name == "empty migrations path falls back to default" && cfg.MigrationsPath != "db/migrations" {
-				t.Errorf("got migrations path %q, want %q", cfg.MigrationsPath, "db/migrations")
+			if !tt.wantErr && tt.wantMigrationsPath != "" && cfg.MigrationsPath != tt.wantMigrationsPath {
+				t.Errorf("got migrations path %q, want %q", cfg.MigrationsPath, tt.wantMigrationsPath)
 			}
 		})
 	}

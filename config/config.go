@@ -60,5 +60,11 @@ func (c *Config) Validate() error {
 	if c.MaxOpenConns > 0 && c.MaxIdleConns > c.MaxOpenConns {
 		return errors.New("max idle conns cannot exceed max open conns")
 	}
+	if c.ConnMaxLifetime < 0 {
+		return errors.New("conn max lifetime cannot be negative")
+	}
+	if c.ConnMaxIdleTime < 0 {
+		return errors.New("conn max idle time cannot be negative")
+	}
 	return nil
 }
