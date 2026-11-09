@@ -69,7 +69,9 @@ func runMigrations(databaseURL, migrationsPath string) error {
 	if err != nil {
 		return fmt.Errorf("open: %w", err)
 	}
-	defer db.Close()
+	defer func() {
+		_ = db.Close()
+	}()
 
 	// validate connection before passing to migrate
 	if err := db.Ping(); err != nil {
