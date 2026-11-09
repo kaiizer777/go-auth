@@ -226,6 +226,7 @@ func TestSentinels(t *testing.T) {
 	sentinels := []*Error{
 		ErrDatabaseURLRequired,
 		ErrBaseURLRequired,
+		ErrBaseURLInvalid,
 		ErrMaxOpenConnsNegative,
 		ErrMaxIdleConnsNegative,
 		ErrMaxIdleExceedsOpen,

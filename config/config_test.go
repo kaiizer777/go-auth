@@ -54,6 +54,7 @@ func TestConfigValidate(t *testing.T) {
 		name               string
 		mutate             func(*Config)
 		wantErr            error
+		notWantErr         error
 		wantMigrationsPath string
 	}{
 		{
@@ -78,7 +79,8 @@ func TestConfigValidate(t *testing.T) {
 				c.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
 				c.BaseURL = ""
 			},
-			wantErr: errors.ErrBaseURLRequired,
+			wantErr:    errors.ErrBaseURLRequired,
+			notWantErr: errors.ErrBaseURLInvalid,
 		},
 		{
 			name: "negative max open connections",
@@ -114,7 +116,26 @@ func TestConfigValidate(t *testing.T) {
 				c.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
 				c.BaseURL = "example.com"
 			},
-			wantErr: errors.ErrBaseURLRequired,
+			wantErr:    errors.ErrBaseURLInvalid,
+			notWantErr: errors.ErrBaseURLRequired,
+		},
+		{
+			name: "base URL with unparsable value",
+			mutate: func(c *Config) {
+				c.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+				c.BaseURL = ":not-a-url"
+			},
+			wantErr:    errors.ErrBaseURLInvalid,
+			notWantErr: errors.ErrBaseURLRequired,
+		},
+		{
+			name: "base URL with non-http scheme",
+			mutate: func(c *Config) {
+				c.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+				c.BaseURL = "ftp://example.com"
+			},
+			wantErr:    errors.ErrBaseURLInvalid,
+			notWantErr: errors.ErrBaseURLRequired,
 		},
 		{
 			name: "base URL trailing slash removed",
@@ -204,6 +225,9 @@ func TestConfigValidate(t *testing.T) {
 				}
 			} else if err != nil {
 				t.Fatalf("Validate() unexpected err = %v", err)
+			}
+			if tt.notWantErr != nil && errors.Is(err, tt.notWantErr) {
+				t.Fatalf("Validate() err = %v, must not match %v", err, tt.notWantErr)
 			}
 			if tt.wantErr == nil && tt.wantMigrationsPath != "" && cfg.MigrationsPath != tt.wantMigrationsPath {
 				t.Errorf("got migrations path %q, want %q", cfg.MigrationsPath, tt.wantMigrationsPath)

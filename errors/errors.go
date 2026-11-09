@@ -185,6 +185,7 @@ var (
 	ErrConnMaxLifetimeNegative      = New(CodeInvalidConfig, "conn max lifetime cannot be negative", nil)
 	ErrConnMaxIdleTimeNegative      = New(CodeInvalidConfig, "conn max idle time cannot be negative", nil)
 	ErrBaseURLRequired              = New(CodeInvalidConfig, "base URL is required", nil)
+	ErrBaseURLInvalid               = New(CodeInvalidConfig, "base URL is invalid", nil)
 	ErrEmailDispatchTimeoutNegative = New(CodeInvalidConfig, "email dispatch timeout cannot be negative", nil)
 )
 

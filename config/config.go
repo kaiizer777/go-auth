@@ -39,7 +39,8 @@ type Config struct {
 	ConnMaxIdleTime time.Duration
 
 	// BaseURL is the public URL used to construct verification and password reset links.
-	// Must be non-empty; Config.Validate() returns ErrBaseURLRequired if empty.
+	// Must be non-empty; Config.Validate() returns ErrBaseURLRequired if empty and
+	// ErrBaseURLInvalid if it is not a well-formed http/https URL.
 	BaseURL string
 
 	// Email delivery hooks (provided by host app)
@@ -77,7 +78,7 @@ func (c *Config) Validate() error {
 	}
 	baseURL, err := url.Parse(c.BaseURL)
 	if err != nil || baseURL.Host == "" || (baseURL.Scheme != "http" && baseURL.Scheme != "https") {
-		return errors.ErrBaseURLRequired
+		return errors.ErrBaseURLInvalid
 	}
 	c.BaseURL = strings.TrimRight(c.BaseURL, "/")
 	if c.MigrationsPath == "" {
