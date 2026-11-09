@@ -267,10 +267,7 @@ func TestDispatch_PanicTypeOnly(t *testing.T) {
 	if !strings.Contains(buf.String(), "EMAIL_DISPATCH_FAILED") {
 		t.Fatalf("expected EMAIL_DISPATCH_FAILED in log, got: %s", buf.String())
 	}
-	if strings.Contains(buf.String(), "42") {
-		// "42" may appear elsewhere; only fail if it appears as panic value? Best-effort.
-		// We still assert type name present.
-	}
+
 	if !strings.Contains(buf.String(), "int") {
 		t.Fatalf("expected panic type in log, got: %s", buf.String())
 	}
