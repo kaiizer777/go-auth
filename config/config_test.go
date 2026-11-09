@@ -36,6 +36,19 @@ func TestDefaultConfig(t *testing.T) {
 	}
 }
 
+func TestConfigValidate_ZeroValueUsesAsyncEmailDispatch(t *testing.T) {
+	cfg := Config{
+		DatabaseURL: "postgres://user:pass@localhost:5432/testdb",
+		BaseURL:     "https://example.com",
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() unexpected err = %v", err)
+	}
+	if cfg.DisableAsyncEmailDispatch {
+		t.Fatal("zero-value config disabled async email dispatch")
+	}
+}
+
 func TestConfigValidate(t *testing.T) {
 	tests := []struct {
 		name               string
@@ -96,6 +109,22 @@ func TestConfigValidate(t *testing.T) {
 			wantErr: errors.ErrMaxIdleExceedsOpen,
 		},
 		{
+			name: "invalid base URL",
+			mutate: func(c *Config) {
+				c.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+				c.BaseURL = "example.com"
+			},
+			wantErr: errors.ErrBaseURLRequired,
+		},
+		{
+			name: "base URL trailing slash removed",
+			mutate: func(c *Config) {
+				c.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+				c.BaseURL = "https://example.com/"
+			},
+			wantErr: nil,
+		},
+		{
 			name: "negative conn max lifetime",
 			mutate: func(c *Config) {
 				c.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
@@ -114,6 +143,15 @@ func TestConfigValidate(t *testing.T) {
 			wantErr: errors.ErrConnMaxIdleTimeNegative,
 		},
 		{
+			name: "negative email dispatch timeout",
+			mutate: func(c *Config) {
+				c.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+				c.BaseURL = "https://example.com"
+				c.EmailDispatchTimeout = -time.Second
+			},
+			wantErr: errors.ErrEmailDispatchTimeoutNegative,
+		},
+		{
 			name: "zero durations permitted as no-limit",
 			mutate: func(c *Config) {
 				c.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
@@ -123,6 +161,15 @@ func TestConfigValidate(t *testing.T) {
 			},
 			wantErr:            nil,
 			wantMigrationsPath: "db/migrations",
+		},
+		{
+			name: "zero email dispatch timeout uses default",
+			mutate: func(c *Config) {
+				c.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+				c.BaseURL = "https://example.com"
+				c.EmailDispatchTimeout = 0
+			},
+			wantErr: nil,
 		},
 		{
 			name: "empty migrations path falls back to default",
@@ -160,6 +207,12 @@ func TestConfigValidate(t *testing.T) {
 			}
 			if tt.wantErr == nil && tt.wantMigrationsPath != "" && cfg.MigrationsPath != tt.wantMigrationsPath {
 				t.Errorf("got migrations path %q, want %q", cfg.MigrationsPath, tt.wantMigrationsPath)
+			}
+			if tt.name == "zero email dispatch timeout uses default" && cfg.EmailDispatchTimeout != 10*time.Second {
+				t.Errorf("got email dispatch timeout %v, want 10s", cfg.EmailDispatchTimeout)
+			}
+			if tt.name == "base URL trailing slash removed" && cfg.BaseURL != "https://example.com" {
+				t.Errorf("got base URL %q, want %q", cfg.BaseURL, "https://example.com")
 			}
 		})
 	}

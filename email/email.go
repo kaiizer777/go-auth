@@ -2,6 +2,7 @@ package email
 
 import (
 	"context"
+	"net/url"
 	"time"
 )
 
@@ -31,12 +32,12 @@ type SendPasswordResetEmailFunc func(ctx context.Context, payload PasswordResetE
 
 // BuildVerificationURL constructs the verification link URL.
 func BuildVerificationURL(baseURL, token string) string {
-	return baseURL + "/auth/verify/email?token=" + token
+	return baseURL + "/auth/verify/email?token=" + url.QueryEscape(token)
 }
 
 // BuildResetURL constructs the password reset link URL.
 func BuildResetURL(baseURL, token string) string {
-	return baseURL + "/auth/password/reset?token=" + token
+	return baseURL + "/auth/password/reset?token=" + url.QueryEscape(token)
 }
 
 func buildVerificationURL(baseURL, token string) string {
@@ -49,9 +50,9 @@ func buildResetURL(baseURL, token string) string {
 
 // DispatcherConfig holds email dispatcher settings owned by the email package.
 type DispatcherConfig struct {
-	BaseURL                string
-	AsyncEmailDispatch     bool
-	EmailDispatchTimeout   time.Duration
-	SendVerificationEmail  SendVerificationEmailFunc
-	SendPasswordResetEmail SendPasswordResetEmailFunc
+	BaseURL                   string
+	DisableAsyncEmailDispatch bool
+	EmailDispatchTimeout      time.Duration
+	SendVerificationEmail     SendVerificationEmailFunc
+	SendPasswordResetEmail    SendPasswordResetEmailFunc
 }

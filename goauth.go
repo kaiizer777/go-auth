@@ -44,11 +44,11 @@ func New(cfg config.Config) (*Auth, error) {
 		db:  database,
 		cfg: cfg,
 		emailDispatcher: email.NewAsyncDispatcher(email.DispatcherConfig{
-			BaseURL:                cfg.BaseURL,
-			AsyncEmailDispatch:     cfg.AsyncEmailDispatch,
-			EmailDispatchTimeout:   cfg.EmailDispatchTimeout,
-			SendVerificationEmail:  cfg.SendVerificationEmail,
-			SendPasswordResetEmail: cfg.SendPasswordResetEmail,
+			BaseURL:                   cfg.BaseURL,
+			DisableAsyncEmailDispatch: cfg.DisableAsyncEmailDispatch,
+			EmailDispatchTimeout:      cfg.EmailDispatchTimeout,
+			SendVerificationEmail:     cfg.SendVerificationEmail,
+			SendPasswordResetEmail:    cfg.SendPasswordResetEmail,
 		}, slog.Default()),
 		Handler: h,
 	}, nil

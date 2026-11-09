@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/kaiizer777/go-auth/errors"
@@ -32,10 +33,10 @@ type AsyncDispatcher struct {
 // NewAsyncDispatcher constructs an AsyncDispatcher from opts.
 func NewAsyncDispatcher(opts DispatcherConfig, logger *slog.Logger) *AsyncDispatcher {
 	d := &AsyncDispatcher{
-		baseURL: opts.BaseURL,
+		baseURL: strings.TrimRight(opts.BaseURL, "/"),
 		logger:  slog.Default(),
 		timeout: 10 * time.Second,
-		async:   opts.AsyncEmailDispatch,
+		async:   !opts.DisableAsyncEmailDispatch,
 		sem:     make(chan struct{}, emailDispatchSemaphoreSize),
 	}
 	if logger != nil {
@@ -57,6 +58,7 @@ func NewAsyncDispatcher(opts DispatcherConfig, logger *slog.Logger) *AsyncDispat
 
 // DispatchVerification dispatches a verification email hook.
 func (d *AsyncDispatcher) DispatchVerification(ctx context.Context, payload VerificationEmailPayload) {
+	payload.URL = BuildVerificationURL(d.baseURL, payload.Token)
 	d.dispatch(ctx, "verification", func(c context.Context) error {
 		if d.sendVerification == nil {
 			d.logger.Warn("email hook is nil", "op", "verification", "code", string(errors.CodeEmailHookNil))
@@ -68,6 +70,7 @@ func (d *AsyncDispatcher) DispatchVerification(ctx context.Context, payload Veri
 
 // DispatchPasswordReset dispatches a password reset email hook.
 func (d *AsyncDispatcher) DispatchPasswordReset(ctx context.Context, payload PasswordResetEmailPayload) {
+	payload.URL = BuildResetURL(d.baseURL, payload.Token)
 	d.dispatch(ctx, "password_reset", func(c context.Context) error {
 		if d.sendPasswordReset == nil {
 			d.logger.Warn("email hook is nil", "op", "password_reset", "code", string(errors.CodeEmailHookNil))
@@ -79,12 +82,7 @@ func (d *AsyncDispatcher) DispatchPasswordReset(ctx context.Context, payload Pas
 
 func (d *AsyncDispatcher) dispatch(ctx context.Context, op string, run func(context.Context) error) {
 	if d.async {
-		select {
-		case d.sem <- struct{}{}:
-		default:
-			d.logger.Warn("email dispatch dropped", "op", op, "reason", "semaphore full")
-			return
-		}
+		d.sem <- struct{}{}
 		go func() {
 			defer func() { <-d.sem }()
 			defer func() {
@@ -112,37 +110,15 @@ func (d *AsyncDispatcher) execute(ctx context.Context, op string, run func(conte
 		timeout = 10 * time.Second
 	}
 	cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
+	defer cancel()
 
-	type result struct {
-		err error
+	err := run(cctx)
+	if err == nil {
+		return
 	}
-	resCh := make(chan result, 1)
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				d.logger.Error("email dispatch panicked", "op", op, "panic", fmt.Sprintf("%T", r), "code", string(errors.CodeEmailDispatchFailed))
-				resCh <- result{}
-			}
-		}()
-		resCh <- result{err: run(cctx)}
-	}()
-
-	select {
-	case res := <-resCh:
-		cancel()
-		if res.err != nil {
-			code := errors.CodeEmailDispatchFailed
-			if errors.Is(res.err, context.DeadlineExceeded) {
-				code = errors.CodeEmailDispatchTimeout
-			}
-			d.logger.Error("email dispatch failed", "op", op, "err", res.err.Error(), "code", string(code))
-		}
-	case <-cctx.Done():
-		cancel()
-		d.logger.Error("email dispatch failed", "op", op, "err", context.DeadlineExceeded.Error(), "code", string(errors.CodeEmailDispatchTimeout))
-		// Drain a late result in the background to avoid leaking the worker goroutine.
-		go func() {
-			<-resCh
-		}()
+	code := errors.CodeEmailDispatchFailed
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(cctx.Err(), context.DeadlineExceeded) {
+		code = errors.CodeEmailDispatchTimeout
 	}
+	d.logger.Error("email dispatch failed", "op", op, "code", string(code))
 }

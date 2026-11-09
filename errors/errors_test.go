@@ -231,6 +231,7 @@ func TestSentinels(t *testing.T) {
 		ErrMaxIdleExceedsOpen,
 		ErrConnMaxLifetimeNegative,
 		ErrConnMaxIdleTimeNegative,
+		ErrEmailDispatchTimeoutNegative,
 	}
 
 	for _, s := range sentinels {

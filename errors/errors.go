@@ -178,13 +178,14 @@ var (
 
 // Predefined sentinel errors for config.Validate().
 var (
-	ErrDatabaseURLRequired     = New(CodeInvalidConfig, "database URL is required", nil)
-	ErrMaxOpenConnsNegative    = New(CodeInvalidConfig, "max open conns cannot be negative", nil)
-	ErrMaxIdleConnsNegative    = New(CodeInvalidConfig, "max idle conns cannot be negative", nil)
-	ErrMaxIdleExceedsOpen      = New(CodeInvalidConfig, "max idle conns cannot exceed max open conns", nil)
-	ErrConnMaxLifetimeNegative = New(CodeInvalidConfig, "conn max lifetime cannot be negative", nil)
-	ErrConnMaxIdleTimeNegative = New(CodeInvalidConfig, "conn max idle time cannot be negative", nil)
-	ErrBaseURLRequired         = New(CodeInvalidConfig, "base URL is required", nil)
+	ErrDatabaseURLRequired          = New(CodeInvalidConfig, "database URL is required", nil)
+	ErrMaxOpenConnsNegative         = New(CodeInvalidConfig, "max open conns cannot be negative", nil)
+	ErrMaxIdleConnsNegative         = New(CodeInvalidConfig, "max idle conns cannot be negative", nil)
+	ErrMaxIdleExceedsOpen           = New(CodeInvalidConfig, "max idle conns cannot exceed max open conns", nil)
+	ErrConnMaxLifetimeNegative      = New(CodeInvalidConfig, "conn max lifetime cannot be negative", nil)
+	ErrConnMaxIdleTimeNegative      = New(CodeInvalidConfig, "conn max idle time cannot be negative", nil)
+	ErrBaseURLRequired              = New(CodeInvalidConfig, "base URL is required", nil)
+	ErrEmailDispatchTimeoutNegative = New(CodeInvalidConfig, "email dispatch timeout cannot be negative", nil)
 )
 
 // WriteJSON writes an error response envelope to the response writer with the appropriate HTTP status.

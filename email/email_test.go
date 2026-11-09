@@ -23,9 +23,25 @@ func TestBuildVerificationURL(t *testing.T) {
 	}
 }
 
+func TestBuildVerificationURL_EscapesToken(t *testing.T) {
+	got := buildVerificationURL("https://example.com", "a b&c=d")
+	want := "https://example.com/auth/verify/email?token=a+b%26c%3Dd"
+	if got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
 func TestBuildResetURL(t *testing.T) {
 	got := buildResetURL("https://example.com", "tok123")
 	want := "https://example.com/auth/password/reset?token=tok123"
+	if got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
+func TestBuildResetURL_EscapesToken(t *testing.T) {
+	got := buildResetURL("https://example.com", "a b&c=d")
+	want := "https://example.com/auth/password/reset?token=a+b%26c%3Dd"
 	if got != want {
 		t.Fatalf("got %q, want %q", got, want)
 	}
@@ -43,8 +59,8 @@ func TestDispatchVerification_PayloadCaptured(t *testing.T) {
 		return nil
 	}
 	d := NewAsyncDispatcher(DispatcherConfig{
+		BaseURL:               "https://example.com",
 		SendVerificationEmail: hook,
-		AsyncEmailDispatch:    true,
 		EmailDispatchTimeout:  time.Second,
 	}, captureLogger(&bytes.Buffer{}))
 
@@ -95,8 +111,8 @@ func TestDispatchPasswordReset_PayloadCaptured(t *testing.T) {
 		return nil
 	}
 	d := NewAsyncDispatcher(DispatcherConfig{
+		BaseURL:                "https://example.com",
 		SendPasswordResetEmail: hook,
-		AsyncEmailDispatch:     true,
 		EmailDispatchTimeout:   time.Second,
 	}, captureLogger(&bytes.Buffer{}))
 
@@ -135,7 +151,7 @@ func TestDispatchPasswordReset_PayloadCaptured(t *testing.T) {
 func TestDispatch_NilHookSync(t *testing.T) {
 	var buf bytes.Buffer
 	logger := captureLogger(&buf)
-	d := NewAsyncDispatcher(DispatcherConfig{AsyncEmailDispatch: false}, logger)
+	d := NewAsyncDispatcher(DispatcherConfig{DisableAsyncEmailDispatch: true}, logger)
 	d.DispatchVerification(context.Background(), VerificationEmailPayload{})
 
 	if !strings.Contains(buf.String(), "EMAIL_HOOK_NIL") {
@@ -150,17 +166,17 @@ func TestDispatch_TypedErrorSync(t *testing.T) {
 	var buf bytes.Buffer
 	logger := captureLogger(&buf)
 	d := NewAsyncDispatcher(DispatcherConfig{
-		SendVerificationEmail: hook,
-		AsyncEmailDispatch:    false,
-		EmailDispatchTimeout:  time.Second,
+		SendVerificationEmail:     hook,
+		DisableAsyncEmailDispatch: true,
+		EmailDispatchTimeout:      time.Second,
 	}, logger)
 	d.DispatchVerification(context.Background(), VerificationEmailPayload{Token: "secret-token"})
 
 	if !strings.Contains(buf.String(), "EMAIL_DISPATCH_FAILED") {
 		t.Fatalf("expected EMAIL_DISPATCH_FAILED in log, got: %s", buf.String())
 	}
-	if !strings.Contains(buf.String(), "boom") {
-		t.Fatalf("expected error message in log, got: %s", buf.String())
+	if strings.Contains(buf.String(), "boom") {
+		t.Fatalf("hook error leaked into log: %s", buf.String())
 	}
 }
 
@@ -172,9 +188,9 @@ func TestDispatch_PanicRecovered(t *testing.T) {
 	var buf bytes.Buffer
 	logger := captureLogger(&buf)
 	d := NewAsyncDispatcher(DispatcherConfig{
-		SendVerificationEmail: hook,
-		AsyncEmailDispatch:    false,
-		EmailDispatchTimeout:  time.Second,
+		SendVerificationEmail:     hook,
+		DisableAsyncEmailDispatch: true,
+		EmailDispatchTimeout:      time.Second,
 	}, logger)
 
 	func() {
@@ -194,33 +210,68 @@ func TestDispatch_PanicRecovered(t *testing.T) {
 	}
 }
 
-func TestDispatch_AsyncNonBlocking(t *testing.T) {
+func TestDispatch_AsyncDefault(t *testing.T) {
 	started := make(chan struct{})
-	done := make(chan struct{})
+	release := make(chan struct{})
 	hook := func(ctx context.Context, p VerificationEmailPayload) error {
 		close(started)
-		time.Sleep(200 * time.Millisecond)
-		close(done)
+		<-release
 		return nil
 	}
 	d := NewAsyncDispatcher(DispatcherConfig{
 		SendVerificationEmail: hook,
-		AsyncEmailDispatch:    true,
-		EmailDispatchTimeout:  time.Second,
 	}, captureLogger(&bytes.Buffer{}))
 
-	start := time.Now()
-	d.DispatchVerification(context.Background(), VerificationEmailPayload{})
-	elapsed := time.Since(start)
-	if elapsed > 50*time.Millisecond {
-		t.Fatalf("dispatch blocked for %v", elapsed)
+	returned := make(chan struct{})
+	go func() {
+		d.DispatchVerification(context.Background(), VerificationEmailPayload{})
+		close(returned)
+	}()
+	select {
+	case <-returned:
+	case <-time.After(2 * time.Second):
+		t.Fatal("dispatch blocked")
 	}
-
 	select {
 	case <-started:
 	case <-time.After(2 * time.Second):
 		t.Fatal("hook did not start")
 	}
+	close(release)
+}
+
+func TestDispatch_AsyncNonBlocking(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	done := make(chan struct{})
+	hook := func(ctx context.Context, p VerificationEmailPayload) error {
+		close(started)
+		<-release
+		close(done)
+		return nil
+	}
+	d := NewAsyncDispatcher(DispatcherConfig{
+		SendVerificationEmail: hook,
+		EmailDispatchTimeout:  time.Second,
+	}, captureLogger(&bytes.Buffer{}))
+
+	returned := make(chan struct{})
+	go func() {
+		d.DispatchVerification(context.Background(), VerificationEmailPayload{})
+		close(returned)
+	}()
+
+	select {
+	case <-returned:
+	case <-time.After(2 * time.Second):
+		t.Fatal("dispatch blocked")
+	}
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("hook did not start")
+	}
+	close(release)
 	select {
 	case <-done:
 	case <-time.After(2 * time.Second):
@@ -228,17 +279,69 @@ func TestDispatch_AsyncNonBlocking(t *testing.T) {
 	}
 }
 
+func TestDispatch_VerificationBaseURLUsed(t *testing.T) {
+	called := make(chan struct{})
+	var got string
+	hook := func(ctx context.Context, p VerificationEmailPayload) error {
+		got = p.URL
+		close(called)
+		return nil
+	}
+	d := NewAsyncDispatcher(DispatcherConfig{
+		BaseURL:                   "https://example.com/",
+		SendVerificationEmail:     hook,
+		DisableAsyncEmailDispatch: true,
+	}, captureLogger(&bytes.Buffer{}))
+	d.DispatchVerification(context.Background(), VerificationEmailPayload{Token: "tok 123"})
+
+	select {
+	case <-called:
+	case <-time.After(2 * time.Second):
+		t.Fatal("hook not called")
+	}
+	want := "https://example.com/auth/verify/email?token=tok+123"
+	if got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
+func TestDispatch_PasswordResetBaseURLUsed(t *testing.T) {
+	called := make(chan struct{})
+	var got string
+	hook := func(ctx context.Context, p PasswordResetEmailPayload) error {
+		got = p.URL
+		close(called)
+		return nil
+	}
+	d := NewAsyncDispatcher(DispatcherConfig{
+		BaseURL:                   "https://example.com/",
+		SendPasswordResetEmail:    hook,
+		DisableAsyncEmailDispatch: true,
+	}, captureLogger(&bytes.Buffer{}))
+	d.DispatchPasswordReset(context.Background(), PasswordResetEmailPayload{Token: "tok 123"})
+
+	select {
+	case <-called:
+	case <-time.After(2 * time.Second):
+		t.Fatal("hook not called")
+	}
+	want := "https://example.com/auth/password/reset?token=tok+123"
+	if got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
 func TestDispatch_PasswordResetTypedErrorNoSecret(t *testing.T) {
 	secret := "reset-secret-token"
 	hook := func(ctx context.Context, p PasswordResetEmailPayload) error {
-		return errors.New("reset failed")
+		return errors.New("reset failed: " + secret)
 	}
 	var buf bytes.Buffer
 	logger := captureLogger(&buf)
 	d := NewAsyncDispatcher(DispatcherConfig{
-		SendPasswordResetEmail: hook,
-		AsyncEmailDispatch:     false,
-		EmailDispatchTimeout:   time.Second,
+		SendPasswordResetEmail:    hook,
+		DisableAsyncEmailDispatch: true,
+		EmailDispatchTimeout:      time.Second,
 	}, logger)
 	d.DispatchPasswordReset(context.Background(), PasswordResetEmailPayload{Token: secret, URL: "https://example.com/auth/password/reset?token=" + secret})
 
@@ -258,9 +361,9 @@ func TestDispatch_PanicTypeOnly(t *testing.T) {
 	var buf bytes.Buffer
 	logger := captureLogger(&buf)
 	d := NewAsyncDispatcher(DispatcherConfig{
-		SendVerificationEmail: hook,
-		AsyncEmailDispatch:    false,
-		EmailDispatchTimeout:  time.Second,
+		SendVerificationEmail:     hook,
+		DisableAsyncEmailDispatch: true,
+		EmailDispatchTimeout:      time.Second,
 	}, logger)
 	d.DispatchVerification(context.Background(), VerificationEmailPayload{})
 
@@ -285,9 +388,9 @@ func TestDispatch_Timeout(t *testing.T) {
 	var buf bytes.Buffer
 	logger := captureLogger(&buf)
 	d := NewAsyncDispatcher(DispatcherConfig{
-		SendVerificationEmail: hook,
-		AsyncEmailDispatch:    false,
-		EmailDispatchTimeout:  50 * time.Millisecond,
+		SendVerificationEmail:     hook,
+		DisableAsyncEmailDispatch: true,
+		EmailDispatchTimeout:      50 * time.Millisecond,
 	}, logger)
 	d.DispatchVerification(context.Background(), VerificationEmailPayload{})
 
@@ -297,11 +400,11 @@ func TestDispatch_Timeout(t *testing.T) {
 }
 
 func TestNewAsyncDispatcher_NilLogger(t *testing.T) {
-	d := NewAsyncDispatcher(DispatcherConfig{}, nil)
+	d := NewAsyncDispatcher(DispatcherConfig{DisableAsyncEmailDispatch: true}, nil)
 	if d == nil {
 		t.Fatal("nil dispatcher")
 	}
-	// smoke: dispatch nil hook async-ish sync? async default true; set via cfg not needed.
+	d.DispatchVerification(context.Background(), VerificationEmailPayload{})
 }
 
 func TestDispatch_EmptyUserIDZeroExpiresAt(t *testing.T) {
@@ -313,9 +416,9 @@ func TestDispatch_EmptyUserIDZeroExpiresAt(t *testing.T) {
 		return nil
 	}
 	d := NewAsyncDispatcher(DispatcherConfig{
-		SendVerificationEmail: hook,
-		AsyncEmailDispatch:    false,
-		EmailDispatchTimeout:  time.Second,
+		SendVerificationEmail:     hook,
+		DisableAsyncEmailDispatch: true,
+		EmailDispatchTimeout:      time.Second,
 	}, captureLogger(&bytes.Buffer{}))
 	payload := VerificationEmailPayload{UserID: "", To: "a@b.com", Token: "t", URL: buildVerificationURL("https://example.com", "t"), ExpiresAt: time.Time{}}
 	d.DispatchVerification(context.Background(), payload)

@@ -1,13 +1,13 @@
 package config
 
 import (
+	"net/url"
+	"strings"
 	"time"
 
 	"github.com/kaiizer777/go-auth/email"
 	"github.com/kaiizer777/go-auth/errors"
 )
-
-var errEmailDispatchTimeoutNegative = errors.New(errors.CodeInvalidConfig, "email dispatch timeout cannot be negative", nil)
 
 // Re-exported payload and hook types owned by email package.
 type VerificationEmailPayload = email.VerificationEmailPayload
@@ -46,8 +46,8 @@ type Config struct {
 	SendVerificationEmail  SendVerificationEmailFunc
 	SendPasswordResetEmail SendPasswordResetEmailFunc
 
-	// AsyncEmailDispatch controls background non-blocking execution (default: true).
-	AsyncEmailDispatch bool
+	// DisableAsyncEmailDispatch opts out of background non-blocking execution.
+	DisableAsyncEmailDispatch bool
 	// EmailDispatchTimeout max duration for email callback execution (default: 10s).
 	EmailDispatchTimeout time.Duration
 }
@@ -63,7 +63,6 @@ func DefaultConfig() Config {
 		ConnMaxIdleTime:      30 * time.Minute,
 		AllowedMethods:       []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
 		AllowedHeaders:       []string{"Authorization", "Content-Type"},
-		AsyncEmailDispatch:   true,
 		EmailDispatchTimeout: 10 * time.Second,
 	}
 }
@@ -76,6 +75,11 @@ func (c *Config) Validate() error {
 	if c.BaseURL == "" {
 		return errors.ErrBaseURLRequired
 	}
+	baseURL, err := url.Parse(c.BaseURL)
+	if err != nil || baseURL.Host == "" || (baseURL.Scheme != "http" && baseURL.Scheme != "https") {
+		return errors.ErrBaseURLRequired
+	}
+	c.BaseURL = strings.TrimRight(c.BaseURL, "/")
 	if c.MigrationsPath == "" {
 		c.MigrationsPath = "db/migrations"
 	}
@@ -95,7 +99,7 @@ func (c *Config) Validate() error {
 		return errors.ErrConnMaxIdleTimeNegative
 	}
 	if c.EmailDispatchTimeout < 0 {
-		return errEmailDispatchTimeoutNegative
+		return errors.ErrEmailDispatchTimeoutNegative
 	}
 	if c.EmailDispatchTimeout == 0 {
 		c.EmailDispatchTimeout = 10 * time.Second
