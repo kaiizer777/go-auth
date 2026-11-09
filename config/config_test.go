@@ -1,0 +1,105 @@
+package config
+
+import (
+	"testing"
+	"time"
+)
+
+func TestDefaultConfig(t *testing.T) {
+	cfg := DefaultConfig()
+
+	if cfg.MigrationsPath != "db/migrations" {
+		t.Errorf("got %q, want %q", cfg.MigrationsPath, "db/migrations")
+	}
+	if cfg.MaxOpenConns != 25 {
+		t.Errorf("got %d, want 25", cfg.MaxOpenConns)
+	}
+	if cfg.MaxIdleConns != 10 {
+		t.Errorf("got %d, want 10", cfg.MaxIdleConns)
+	}
+	if cfg.ConnMaxLifetime != time.Hour {
+		t.Errorf("got %v, want 1h", cfg.ConnMaxLifetime)
+	}
+	if cfg.ConnMaxIdleTime != 30*time.Minute {
+		t.Errorf("got %v, want 30m", cfg.ConnMaxIdleTime)
+	}
+	if len(cfg.AllowedOrigins) != 0 {
+		t.Errorf("expected empty AllowedOrigins, got %v", cfg.AllowedOrigins)
+	}
+	if len(cfg.AllowedMethods) == 0 {
+		t.Error("expected non-empty AllowedMethods")
+	}
+	if len(cfg.AllowedHeaders) == 0 {
+		t.Error("expected non-empty AllowedHeaders")
+	}
+}
+
+func TestConfigValidate(t *testing.T) {
+	tests := []struct {
+		name    string
+		mutate  func(*Config)
+		wantErr bool
+	}{
+		{
+			name: "valid configuration",
+			mutate: func(c *Config) {
+				c.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+			},
+			wantErr: false,
+		},
+		{
+			name: "missing database URL",
+			mutate: func(c *Config) {
+				c.DatabaseURL = ""
+			},
+			wantErr: true,
+		},
+		{
+			name: "negative max open connections",
+			mutate: func(c *Config) {
+				c.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+				c.MaxOpenConns = -1
+			},
+			wantErr: true,
+		},
+		{
+			name: "negative max idle connections",
+			mutate: func(c *Config) {
+				c.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+				c.MaxIdleConns = -1
+			},
+			wantErr: true,
+		},
+		{
+			name: "max idle exceeds max open",
+			mutate: func(c *Config) {
+				c.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+				c.MaxOpenConns = 5
+				c.MaxIdleConns = 10
+			},
+			wantErr: true,
+		},
+		{
+			name: "empty migrations path falls back to default",
+			mutate: func(c *Config) {
+				c.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+				c.MigrationsPath = ""
+			},
+			wantErr: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := DefaultConfig()
+			tt.mutate(&cfg)
+			err := cfg.Validate()
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("Validate() err = %v, wantErr = %v", err, tt.wantErr)
+			}
+			if !tt.wantErr && cfg.MigrationsPath == "" {
+				t.Errorf("expected default migrations path, got empty")
+			}
+		})
+	}
+}
