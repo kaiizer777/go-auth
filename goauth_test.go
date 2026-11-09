@@ -4,7 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"database/sql/driver"
-	"errors"
+	stderrors "errors"
 	"strings"
 	"sync"
 	"testing"
@@ -13,6 +13,7 @@ import (
 	"gorm.io/gorm"
 
 	"github.com/kaiizer777/go-auth/config"
+	"github.com/kaiizer777/go-auth/errors"
 )
 
 var registerMockOnce sync.Once
@@ -28,7 +29,7 @@ type mockAuthConn struct {
 }
 
 func (c *mockAuthConn) Prepare(query string) (driver.Stmt, error) {
-	return nil, errors.New("not implemented")
+	return nil, stderrors.New("not implemented")
 }
 
 func (c *mockAuthConn) Close() error {
@@ -37,7 +38,7 @@ func (c *mockAuthConn) Close() error {
 }
 
 func (c *mockAuthConn) Begin() (driver.Tx, error) {
-	return nil, errors.New("not implemented")
+	return nil, stderrors.New("not implemented")
 }
 
 func (c *mockAuthConn) Ping(ctx context.Context) error {
@@ -52,6 +53,16 @@ func TestNew_InvalidConfig(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "goauth: invalid configuration") {
 		t.Fatalf("expected error containing 'goauth: invalid configuration', got: %v", err)
+	}
+	if !errors.Is(err, errors.ErrDatabaseURLRequired) {
+		t.Fatalf("expected errors.Is(err, ErrDatabaseURLRequired), got: %v", err)
+	}
+	var appErr *errors.Error
+	if !errors.As(err, &appErr) {
+		t.Fatalf("expected *errors.Error, got %T", err)
+	}
+	if appErr.Code() != errors.CodeInvalidConfig {
+		t.Errorf("expected CodeInvalidConfig, got %s", appErr.Code())
 	}
 	if auth != nil {
 		t.Fatalf("expected nil Auth on error, got %+v", auth)
