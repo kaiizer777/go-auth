@@ -61,6 +61,9 @@ func newMockGormDB(t *testing.T, healthy bool) *gorm.DB {
 	if err != nil {
 		t.Fatalf("failed to open mock db: %v", err)
 	}
+	t.Cleanup(func() {
+		_ = sqlDB.Close()
+	})
 	gormDB, err := gorm.Open(postgres.New(postgres.Config{Conn: sqlDB}), &gorm.Config{
 		DisableAutomaticPing: true,
 	})
@@ -104,8 +107,11 @@ func TestNewHandler_HealthEndpoint_UnhealthyDB(t *testing.T) {
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("expected status %d, got %d", http.StatusServiceUnavailable, rec.Code)
 	}
-	if !strings.Contains(rec.Body.String(), `{"status":"unavailable"}`) {
-		t.Errorf("expected body to contain unavailable, got %q", rec.Body.String())
+	if got := rec.Header().Get("Content-Type"); got != "application/json" {
+		t.Errorf("expected Content-Type application/json, got %q", got)
+	}
+	if body := strings.TrimSpace(rec.Body.String()); body != `{"status":"unavailable"}` {
+		t.Errorf("expected body %q, got %q", `{"status":"unavailable"}`, body)
 	}
 }
 
@@ -120,6 +126,12 @@ func TestNewHandler_HealthEndpoint_NilDB(t *testing.T) {
 
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("expected status %d, got %d", http.StatusServiceUnavailable, rec.Code)
+	}
+	if got := rec.Header().Get("Content-Type"); got != "application/json" {
+		t.Errorf("expected Content-Type application/json, got %q", got)
+	}
+	if body := strings.TrimSpace(rec.Body.String()); body != `{"status":"unavailable"}` {
+		t.Errorf("expected body %q, got %q", `{"status":"unavailable"}`, body)
 	}
 }
 

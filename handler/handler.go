@@ -30,16 +30,18 @@ func New(db *gorm.DB, cfg config.Config) http.Handler {
 func (h *Handler) registerRoutes() {
 	// Base routes mounted in Phase 1; additional auth routes mount in subsequent phases.
 	h.mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
 		if h.db == nil {
-			http.Error(w, `{"status":"unavailable"}`, http.StatusServiceUnavailable)
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte(`{"status":"unavailable"}`))
 			return
 		}
 		sqlDB, err := h.db.DB()
 		if err != nil || sqlDB.Ping() != nil {
-			http.Error(w, `{"status":"unavailable"}`, http.StatusServiceUnavailable)
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte(`{"status":"unavailable"}`))
 			return
 		}
-		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"status":"ok"}`))
 	})
