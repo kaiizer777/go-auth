@@ -19,6 +19,11 @@ const (
 	CodeNotFound            Code = "NOT_FOUND"
 	CodeMethodNotAllowed    Code = "METHOD_NOT_ALLOWED"
 
+	// Phase 2: email hook dispatch (log correlation only)
+	CodeEmailHookNil         Code = "EMAIL_HOOK_NIL"
+	CodeEmailDispatchFailed  Code = "EMAIL_DISPATCH_FAILED"
+	CodeEmailDispatchTimeout Code = "EMAIL_DISPATCH_TIMEOUT"
+
 	// Aliases
 	INVALID_CONFIG       = CodeInvalidConfig
 	DATABASE_ERROR       = CodeDatabaseError
@@ -27,6 +32,10 @@ const (
 	INTERNAL_ERROR       = CodeInternalError
 	NOT_FOUND            = CodeNotFound
 	METHOD_NOT_ALLOWED   = CodeMethodNotAllowed
+
+	EMAIL_HOOK_NIL         = CodeEmailHookNil
+	EMAIL_DISPATCH_FAILED  = CodeEmailDispatchFailed
+	EMAIL_DISPATCH_TIMEOUT = CodeEmailDispatchTimeout
 )
 
 // HTTPStatus maps error codes deterministically to HTTP response status codes.
@@ -175,6 +184,7 @@ var (
 	ErrMaxIdleExceedsOpen      = New(CodeInvalidConfig, "max idle conns cannot exceed max open conns", nil)
 	ErrConnMaxLifetimeNegative = New(CodeInvalidConfig, "conn max lifetime cannot be negative", nil)
 	ErrConnMaxIdleTimeNegative = New(CodeInvalidConfig, "conn max idle time cannot be negative", nil)
+	ErrBaseURLRequired         = New(CodeInvalidConfig, "base URL is required", nil)
 )
 
 // WriteJSON writes an error response envelope to the response writer with the appropriate HTTP status.

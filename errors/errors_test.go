@@ -225,6 +225,7 @@ func TestWriteJSON(t *testing.T) {
 func TestSentinels(t *testing.T) {
 	sentinels := []*Error{
 		ErrDatabaseURLRequired,
+		ErrBaseURLRequired,
 		ErrMaxOpenConnsNegative,
 		ErrMaxIdleConnsNegative,
 		ErrMaxIdleExceedsOpen,

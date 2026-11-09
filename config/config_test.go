@@ -47,6 +47,7 @@ func TestConfigValidate(t *testing.T) {
 			name: "valid configuration",
 			mutate: func(c *Config) {
 				c.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+				c.BaseURL = "https://example.com"
 			},
 			wantErr:            nil,
 			wantMigrationsPath: "db/migrations",
@@ -59,9 +60,18 @@ func TestConfigValidate(t *testing.T) {
 			wantErr: errors.ErrDatabaseURLRequired,
 		},
 		{
+			name: "missing base URL",
+			mutate: func(c *Config) {
+				c.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+				c.BaseURL = ""
+			},
+			wantErr: errors.ErrBaseURLRequired,
+		},
+		{
 			name: "negative max open connections",
 			mutate: func(c *Config) {
 				c.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+				c.BaseURL = "https://example.com"
 				c.MaxOpenConns = -1
 			},
 			wantErr: errors.ErrMaxOpenConnsNegative,
@@ -70,6 +80,7 @@ func TestConfigValidate(t *testing.T) {
 			name: "negative max idle connections",
 			mutate: func(c *Config) {
 				c.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+				c.BaseURL = "https://example.com"
 				c.MaxIdleConns = -1
 			},
 			wantErr: errors.ErrMaxIdleConnsNegative,
@@ -78,6 +89,7 @@ func TestConfigValidate(t *testing.T) {
 			name: "max idle exceeds max open",
 			mutate: func(c *Config) {
 				c.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+				c.BaseURL = "https://example.com"
 				c.MaxOpenConns = 5
 				c.MaxIdleConns = 10
 			},
@@ -87,6 +99,7 @@ func TestConfigValidate(t *testing.T) {
 			name: "negative conn max lifetime",
 			mutate: func(c *Config) {
 				c.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+				c.BaseURL = "https://example.com"
 				c.ConnMaxLifetime = -time.Second
 			},
 			wantErr: errors.ErrConnMaxLifetimeNegative,
@@ -95,6 +108,7 @@ func TestConfigValidate(t *testing.T) {
 			name: "negative conn max idle time",
 			mutate: func(c *Config) {
 				c.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+				c.BaseURL = "https://example.com"
 				c.ConnMaxIdleTime = -time.Second
 			},
 			wantErr: errors.ErrConnMaxIdleTimeNegative,
@@ -103,6 +117,7 @@ func TestConfigValidate(t *testing.T) {
 			name: "zero durations permitted as no-limit",
 			mutate: func(c *Config) {
 				c.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+				c.BaseURL = "https://example.com"
 				c.ConnMaxLifetime = 0
 				c.ConnMaxIdleTime = 0
 			},
@@ -113,6 +128,7 @@ func TestConfigValidate(t *testing.T) {
 			name: "empty migrations path falls back to default",
 			mutate: func(c *Config) {
 				c.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+				c.BaseURL = "https://example.com"
 				c.MigrationsPath = ""
 			},
 			wantErr:            nil,
@@ -122,6 +138,7 @@ func TestConfigValidate(t *testing.T) {
 			name: "custom migrations path preserved",
 			mutate: func(c *Config) {
 				c.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+				c.BaseURL = "https://example.com"
 				c.MigrationsPath = "custom/migrations"
 			},
 			wantErr:            nil,
