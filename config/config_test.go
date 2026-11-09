@@ -100,6 +100,9 @@ func TestConfigValidate(t *testing.T) {
 			if !tt.wantErr && cfg.MigrationsPath == "" {
 				t.Errorf("expected default migrations path, got empty")
 			}
+			if tt.name == "empty migrations path falls back to default" && cfg.MigrationsPath != "db/migrations" {
+				t.Errorf("got migrations path %q, want %q", cfg.MigrationsPath, "db/migrations")
+			}
 		})
 	}
 }
