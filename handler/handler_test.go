@@ -252,3 +252,38 @@ func TestNewHandler_WrapsCORSMiddleware(t *testing.T) {
 		t.Fatalf("Access-Control-Max-Age = %q; want 86400", got)
 	}
 }
+
+func TestResponseInterceptor_HonorsFirstWriteHeader(t *testing.T) {
+	rec := httptest.NewRecorder()
+	ri := &responseInterceptor{ResponseWriter: rec}
+
+	ri.WriteHeader(http.StatusNotFound)
+	ri.WriteHeader(http.StatusInternalServerError)
+
+	if ri.statusCode != http.StatusNotFound {
+		t.Errorf("expected statusCode %d, got %d", http.StatusNotFound, ri.statusCode)
+	}
+}
+
+func TestResponseInterceptor_JSONContentTypeWithParameters(t *testing.T) {
+	rec := httptest.NewRecorder()
+	ri := &responseInterceptor{ResponseWriter: rec}
+
+	ri.Header().Set("Content-Type", "application/json; charset=utf-8")
+	ri.WriteHeader(http.StatusNotFound)
+	customBody := `{"custom":"not found"}`
+	n, err := ri.Write([]byte(customBody))
+	if err != nil {
+		t.Fatalf("Write failed: %v", err)
+	}
+	if n != len(customBody) {
+		t.Fatalf("Write wrote %d bytes, want %d", n, len(customBody))
+	}
+
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("expected recorder status %d, got %d", http.StatusNotFound, rec.Code)
+	}
+	if strings.TrimSpace(rec.Body.String()) != customBody {
+		t.Errorf("expected body %q, got %q", customBody, rec.Body.String())
+	}
+}

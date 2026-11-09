@@ -28,12 +28,12 @@ type Auth struct {
 // runs pending migrations, and initializes the HTTP handler chain.
 func New(cfg config.Config) (*Auth, error) {
 	if err := cfg.Validate(); err != nil {
-		return nil, errors.New(errors.CodeInvalidConfig, "goauth: invalid configuration", err)
+		return nil, errors.Wrap(err, errors.CodeInvalidConfig, "goauth: invalid configuration")
 	}
 
 	database, err := db.Connect(cfg)
 	if err != nil {
-		return nil, errors.New(errors.CodeDatabaseError, "goauth: failed to connect to database", err)
+		return nil, errors.Wrap(err, errors.CodeDatabaseError, "goauth: failed to connect to database")
 	}
 
 	h := handler.New(database, cfg)

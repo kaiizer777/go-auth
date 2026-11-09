@@ -29,7 +29,7 @@ var defaultMigrationsFS embed.FS
 func Connect(cfg config.Config) (*gorm.DB, error) {
 	// 1. Run migrations first
 	if err := runMigrations(cfg.DatabaseURL, cfg.MigrationsPath); err != nil {
-		return nil, errors.New(errors.CodeMigrationFailed, "migration failed", err)
+		return nil, err
 	}
 
 	// 2. Open GORM

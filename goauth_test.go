@@ -57,6 +57,13 @@ func TestNew_InvalidConfig(t *testing.T) {
 	if !errors.Is(err, errors.ErrDatabaseURLRequired) {
 		t.Fatalf("expected errors.Is(err, ErrDatabaseURLRequired), got: %v", err)
 	}
+	var appErr *errors.Error
+	if !errors.As(err, &appErr) {
+		t.Fatalf("expected *errors.Error, got %T", err)
+	}
+	if appErr.Code() != errors.CodeInvalidConfig {
+		t.Errorf("expected CodeInvalidConfig, got %s", appErr.Code())
+	}
 	if auth != nil {
 		t.Fatalf("expected nil Auth on error, got %+v", auth)
 	}

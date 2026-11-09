@@ -2,7 +2,9 @@ package handler
 
 import (
 	"bytes"
+	"mime"
 	"net/http"
+	"strings"
 
 	"gorm.io/gorm"
 
@@ -102,7 +104,7 @@ type responseInterceptor struct {
 }
 
 func (rw *responseInterceptor) WriteHeader(code int) {
-	if rw.headerWritten {
+	if rw.headerWritten || rw.statusCode != 0 {
 		return
 	}
 	rw.statusCode = code
@@ -112,12 +114,20 @@ func (rw *responseInterceptor) WriteHeader(code int) {
 	}
 }
 
+func isJSONContentType(ct string) bool {
+	mediaType, _, err := mime.ParseMediaType(ct)
+	if err != nil {
+		return strings.HasPrefix(strings.ToLower(strings.TrimSpace(ct)), "application/json")
+	}
+	return mediaType == "application/json" || strings.HasSuffix(mediaType, "+json")
+}
+
 func (rw *responseInterceptor) Write(b []byte) (int, error) {
 	if !rw.headerWritten {
 		if rw.statusCode == 0 {
 			rw.statusCode = http.StatusOK
 		}
-		if rw.Header().Get("Content-Type") == "application/json" {
+		if isJSONContentType(rw.Header().Get("Content-Type")) {
 			rw.headerWritten = true
 			rw.ResponseWriter.WriteHeader(rw.statusCode)
 			return rw.ResponseWriter.Write(b)
@@ -128,7 +138,7 @@ func (rw *responseInterceptor) Write(b []byte) (int, error) {
 			return rw.ResponseWriter.Write(b)
 		}
 	}
-	if (rw.statusCode == http.StatusNotFound || rw.statusCode == http.StatusMethodNotAllowed) && rw.Header().Get("Content-Type") != "application/json" {
+	if (rw.statusCode == http.StatusNotFound || rw.statusCode == http.StatusMethodNotAllowed) && !isJSONContentType(rw.Header().Get("Content-Type")) {
 		return rw.body.Write(b)
 	}
 	return rw.ResponseWriter.Write(b)

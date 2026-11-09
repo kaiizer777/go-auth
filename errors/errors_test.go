@@ -83,6 +83,14 @@ func TestError_Is(t *testing.T) {
 	if !Is(ErrDatabaseURLRequired, ErrDatabaseURLRequired) {
 		t.Error("expected sentinel to match itself")
 	}
+
+	var typedNil *Error
+	if Is(err1, typedNil) {
+		t.Error("expected non-nil error not to match typed-nil target")
+	}
+	if Is(typedNil, err1) {
+		t.Error("expected typed-nil error not to match non-nil target")
+	}
 }
 
 func TestError_As(t *testing.T) {
@@ -93,8 +101,8 @@ func TestError_As(t *testing.T) {
 	if !As(wrapped, &target) {
 		t.Fatal("expected As to find *Error")
 	}
-	if target.Code != CodeInternalError {
-		t.Errorf("got code %s, want %s", target.Code, CodeInternalError)
+	if target.Code() != CodeInternalError {
+		t.Errorf("got code %s, want %s", target.Code(), CodeInternalError)
 	}
 }
 
@@ -174,8 +182,30 @@ func TestWriteJSON(t *testing.T) {
 		if resp.Code != CodeInternalError {
 			t.Errorf("got code %q, want %q", resp.Code, CodeInternalError)
 		}
-		if resp.Message != "unexpected crash" {
-			t.Errorf("got message %q, want %q", resp.Message, "unexpected crash")
+		if resp.Message != "internal server error" {
+			t.Errorf("got message %q, want %q", resp.Message, "internal server error")
+		}
+	})
+
+	t.Run("internal error with empty message masks underlying cause", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		err := New(CodeInternalError, "", stderrors.New("pq: password authentication failed"))
+
+		WriteJSON(rec, err)
+
+		if rec.Code != http.StatusInternalServerError {
+			t.Fatalf("expected status %d, got %d", http.StatusInternalServerError, rec.Code)
+		}
+
+		var resp Response
+		if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+			t.Fatalf("failed to decode response: %v", err)
+		}
+		if resp.Code != CodeInternalError {
+			t.Errorf("got code %q, want %q", resp.Code, CodeInternalError)
+		}
+		if resp.Message != "internal server error" {
+			t.Errorf("got message %q, want %q", resp.Message, "internal server error")
 		}
 	})
 
@@ -203,11 +233,44 @@ func TestSentinels(t *testing.T) {
 	}
 
 	for _, s := range sentinels {
-		if s.Code != CodeInvalidConfig {
-			t.Errorf("expected %s to have CodeInvalidConfig, got %s", s.Message, s.Code)
+		if s.Code() != CodeInvalidConfig {
+			t.Errorf("expected %s to have CodeInvalidConfig, got %s", s.Message(), s.Code())
 		}
-		if s.Message == "" {
+		if s.Message() == "" {
 			t.Errorf("sentinel %v has empty message", s)
 		}
 	}
+}
+
+func TestWrap(t *testing.T) {
+	t.Run("nil cause returns nil", func(t *testing.T) {
+		if got := Wrap(nil, CodeDatabaseError, "wrapped"); got != nil {
+			t.Fatalf("expected nil, got %v", got)
+		}
+	})
+
+	t.Run("untyped error uses default code", func(t *testing.T) {
+		cause := stderrors.New("disk failure")
+		wrapped := Wrap(cause, CodeDatabaseError, "failed to read")
+		if wrapped.Code() != CodeDatabaseError {
+			t.Errorf("got code %s, want %s", wrapped.Code(), CodeDatabaseError)
+		}
+		if wrapped.Message() != "failed to read" {
+			t.Errorf("got message %q, want %q", wrapped.Message(), "failed to read")
+		}
+		if wrapped.Unwrap() != cause {
+			t.Errorf("got cause %v, want %v", wrapped.Unwrap(), cause)
+		}
+	})
+
+	t.Run("typed error preserves original code", func(t *testing.T) {
+		cause := New(CodeDatabaseUnavailable, "db unreachable", nil)
+		wrapped := Wrap(cause, CodeDatabaseError, "outer layer")
+		if wrapped.Code() != CodeDatabaseUnavailable {
+			t.Errorf("got code %s, want %s", wrapped.Code(), CodeDatabaseUnavailable)
+		}
+		if !Is(wrapped, cause) {
+			t.Errorf("expected wrapped error to match cause via Is")
+		}
+	})
 }
