@@ -11,7 +11,7 @@ import (
 
 	"github.com/golang-migrate/migrate/v4"
 	pgmigrate "github.com/golang-migrate/migrate/v4/database/postgres"
-	_ "github.com/golang-migrate/migrate/v4/source/file"
+	"github.com/golang-migrate/migrate/v4/source"
 	"github.com/golang-migrate/migrate/v4/source/iofs"
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"gorm.io/driver/postgres"
@@ -47,6 +47,7 @@ func Connect(cfg config.Config) (*gorm.DB, error) {
 	db, err := gorm.Open(postgres.Open(cfg.DatabaseURL), &gorm.Config{
 		Logger:                                   gormLogger,
 		DisableForeignKeyConstraintWhenMigrating: true,
+		DisableAutomaticPing:                     true,
 		PrepareStmt:                              true,
 	})
 	if err != nil {
@@ -92,26 +93,26 @@ func runMigrations(databaseURL, migrationsPath string) error {
 		return err
 	}
 
-	var m *migrate.Migrate
+	var sourceDriver source.Driver
 	if isDefaultMigrationsPath(migrationsPath) {
-		sourceDriver, err := iofs.New(defaultMigrationsFS, "migrations")
+		sourceDriver, err = iofs.New(defaultMigrationsFS, "migrations")
 		if err != nil {
 			_ = driver.Close()
 			return fmt.Errorf("init embedded migrations source: %w", err)
 		}
-		m, err = migrate.NewWithInstance("iofs", sourceDriver, "pgx", driver)
-		if err != nil {
-			_ = sourceDriver.Close()
-			_ = driver.Close()
-			return fmt.Errorf("init migrate instance: %w", err)
-		}
 	} else {
-		sourceURL := fmt.Sprintf("file://%s", filepath.ToSlash(migrationsPath))
-		m, err = migrate.NewWithDatabaseInstance(sourceURL, "pgx", driver)
+		sourceDriver, err = iofs.New(os.DirFS(migrationsPath), ".")
 		if err != nil {
 			_ = driver.Close()
-			return fmt.Errorf("init migrate instance: %w", err)
+			return fmt.Errorf("init custom migrations source: %w", err)
 		}
+	}
+
+	m, err := migrate.NewWithInstance("iofs", sourceDriver, "pgx", driver)
+	if err != nil {
+		_ = sourceDriver.Close()
+		_ = driver.Close()
+		return fmt.Errorf("init migrate instance: %w", err)
 	}
 
 	defer func() {

@@ -1,10 +1,34 @@
 package db
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/golang-migrate/migrate/v4/source/iofs"
 )
+
+func TestCustomMigrationsFS(t *testing.T) {
+	tmpDir := t.TempDir()
+	upFile := filepath.Join(tmpDir, "000001_init.up.sql")
+	if err := os.WriteFile(upFile, []byte("SELECT 1;"), 0o600); err != nil {
+		t.Fatalf("failed to write test migration file: %v", err)
+	}
+
+	driver, err := iofs.New(os.DirFS(tmpDir), ".")
+	if err != nil {
+		t.Fatalf("iofs.New(os.DirFS) err = %v", err)
+	}
+	defer func() { _ = driver.Close() }()
+
+	first, err := driver.First()
+	if err != nil {
+		t.Fatalf("driver.First() err = %v", err)
+	}
+	if first != 1 {
+		t.Fatalf("driver.First() = %d, want 1", first)
+	}
+}
 
 func TestDefaultMigrationsEmbedded(t *testing.T) {
 	driver, err := iofs.New(defaultMigrationsFS, "migrations")
