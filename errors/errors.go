@@ -147,7 +147,8 @@ func New(code Code, message string, cause error) *Error {
 
 // Wrap wraps an existing error with a classified domain error. If cause is already
 // an *Error with a non-empty code, its code is preserved; otherwise defaultCode is used.
-func Wrap(cause error, defaultCode Code, message string) *Error {
+// It returns error (rather than *Error) so a nil cause safely returns a true nil interface.
+func Wrap(cause error, defaultCode Code, message string) error {
 	if cause == nil {
 		return nil
 	}

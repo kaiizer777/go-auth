@@ -243,31 +243,40 @@ func TestSentinels(t *testing.T) {
 }
 
 func TestWrap(t *testing.T) {
-	t.Run("nil cause returns nil", func(t *testing.T) {
-		if got := Wrap(nil, CodeDatabaseError, "wrapped"); got != nil {
-			t.Fatalf("expected nil, got %v", got)
+	t.Run("nil cause returns true nil interface", func(t *testing.T) {
+		var err error = Wrap(nil, CodeDatabaseError, "wrapped")
+		if err != nil {
+			t.Fatalf("expected nil interface, got non-nil: %v", err)
 		}
 	})
 
 	t.Run("untyped error uses default code", func(t *testing.T) {
 		cause := stderrors.New("disk failure")
 		wrapped := Wrap(cause, CodeDatabaseError, "failed to read")
-		if wrapped.Code() != CodeDatabaseError {
-			t.Errorf("got code %s, want %s", wrapped.Code(), CodeDatabaseError)
+		var appErr *Error
+		if !As(wrapped, &appErr) {
+			t.Fatalf("expected *Error, got %T", wrapped)
 		}
-		if wrapped.Message() != "failed to read" {
-			t.Errorf("got message %q, want %q", wrapped.Message(), "failed to read")
+		if appErr.Code() != CodeDatabaseError {
+			t.Errorf("got code %s, want %s", appErr.Code(), CodeDatabaseError)
 		}
-		if wrapped.Unwrap() != cause {
-			t.Errorf("got cause %v, want %v", wrapped.Unwrap(), cause)
+		if appErr.Message() != "failed to read" {
+			t.Errorf("got message %q, want %q", appErr.Message(), "failed to read")
+		}
+		if appErr.Unwrap() != cause {
+			t.Errorf("got cause %v, want %v", appErr.Unwrap(), cause)
 		}
 	})
 
 	t.Run("typed error preserves original code", func(t *testing.T) {
 		cause := New(CodeDatabaseUnavailable, "db unreachable", nil)
 		wrapped := Wrap(cause, CodeDatabaseError, "outer layer")
-		if wrapped.Code() != CodeDatabaseUnavailable {
-			t.Errorf("got code %s, want %s", wrapped.Code(), CodeDatabaseUnavailable)
+		var appErr *Error
+		if !As(wrapped, &appErr) {
+			t.Fatalf("expected *Error, got %T", wrapped)
+		}
+		if appErr.Code() != CodeDatabaseUnavailable {
+			t.Errorf("got code %s, want %s", appErr.Code(), CodeDatabaseUnavailable)
 		}
 		if !Is(wrapped, cause) {
 			t.Errorf("expected wrapped error to match cause via Is")
