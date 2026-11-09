@@ -10,13 +10,6 @@
 
 ---
 
-## Roadmap & Scope
-
-- [v1 Feature Roadmap](docs/roadmap.md) — What is included in the initial release.
-- [Deferred Features (v2+)](docs/not-in-v1.md) — What is explicitly out of scope for v1 (Passkeys, 2FA/TOTP, SAML, etc.).
-
----
-
 ## Project Structure
 
 `go-auth` strictly enforces separation between the public API facade and internal subsystem logic.
@@ -36,7 +29,7 @@ go-auth/
 │   └── credential-password/          # Email/Password authentication plugin
 ├── examples/
 │   └── basic-nethttp/                # Standard net/http integration example
-└── docs/                             # Architecture & roadmap documentation
+└── docs/                             # Project documentation
 ```
 
 ### Why this layout?
