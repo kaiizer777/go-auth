@@ -34,6 +34,12 @@ func TestIsAllowedOrigin(t *testing.T) {
 			want:    false,
 		},
 		{
+			name:    "case-insensitive match",
+			origin:  "https://APP.example.com",
+			allowed: []string{"https://app.example.com"},
+			want:    true,
+		},
+		{
 			name:    "wildcard match",
 			origin:  "https://any-domain.org",
 			allowed: []string{"*"},
@@ -70,6 +76,13 @@ func TestCheckOrigin(t *testing.T) {
 			origin:               "https://app.example.com",
 			allowed:              []string{"https://app.example.com"},
 			wantOrigin:           "https://app.example.com",
+			wantAllowCredentials: true,
+		},
+		{
+			name:                 "case-insensitive match allows credentials",
+			origin:               "https://APP.example.com",
+			allowed:              []string{"https://app.example.com"},
+			wantOrigin:           "https://APP.example.com",
 			wantAllowCredentials: true,
 		},
 		{
@@ -285,6 +298,32 @@ func TestCORSMiddleware_PreflightDisallowed(t *testing.T) {
 	}
 	if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "" {
 		t.Fatalf("Access-Control-Allow-Origin = %q; want empty for disallowed origin", got)
+	}
+}
+
+func TestCORSMiddleware_OptionsWithoutOriginPassThrough(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.AllowedOrigins = []string{"https://app.example.com"}
+
+	nextCalled := false
+	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		nextCalled = true
+		w.WriteHeader(http.StatusOK)
+	})
+
+	mw := CORS(cfg)(next)
+
+	req := httptest.NewRequest(http.MethodOptions, "/test", nil)
+	req.Header.Set("Access-Control-Request-Method", "POST")
+	rec := httptest.NewRecorder()
+
+	mw.ServeHTTP(rec, req)
+
+	if !nextCalled {
+		t.Fatal("expected OPTIONS request without Origin header to pass through to next handler")
+	}
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d; want %d", rec.Code, http.StatusOK)
 	}
 }
 

@@ -29,7 +29,7 @@ func CORS(cfg config.Config) func(http.Handler) http.Handler {
 				}
 			}
 
-			if r.Method == http.MethodOptions && r.Header.Get("Access-Control-Request-Method") != "" {
+			if r.Method == http.MethodOptions && r.Header.Get("Origin") != "" && r.Header.Get("Access-Control-Request-Method") != "" {
 				w.Header().Set("Access-Control-Max-Age", "86400")
 				w.WriteHeader(http.StatusNoContent)
 				return
@@ -47,7 +47,7 @@ func checkOrigin(origin string, allowed []string) (allowedOrigin string, allowCr
 		return "", false
 	}
 	for _, o := range allowed {
-		if o == origin && o != "*" {
+		if o != "*" && strings.EqualFold(origin, o) {
 			return origin, true
 		}
 	}

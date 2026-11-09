@@ -29,7 +29,18 @@ func New(db *gorm.DB, cfg config.Config) http.Handler {
 // registerRoutes configures default and endpoint routes on the internal multiplexer.
 func (h *Handler) registerRoutes() {
 	// Base routes mounted in Phase 1; additional auth routes mount in subsequent phases.
-	h.mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+	h.mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
+		if h.db == nil {
+			http.Error(w, `{"status":"unavailable"}`, http.StatusServiceUnavailable)
+			return
+		}
+		sqlDB, err := h.db.DB()
+		if err != nil || sqlDB.Ping() != nil {
+			http.Error(w, `{"status":"unavailable"}`, http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
 	})
 }
