@@ -3,7 +3,6 @@ package db
 import (
 	"database/sql"
 	"embed"
-	"fmt"
 	"log"
 	"os"
 	"path/filepath"
@@ -19,6 +18,7 @@ import (
 	"gorm.io/gorm/logger"
 
 	"github.com/kaiizer777/go-auth/config"
+	"github.com/kaiizer777/go-auth/errors"
 )
 
 //go:embed migrations/*.sql
@@ -29,7 +29,7 @@ var defaultMigrationsFS embed.FS
 func Connect(cfg config.Config) (*gorm.DB, error) {
 	// 1. Run migrations first
 	if err := runMigrations(cfg.DatabaseURL, cfg.MigrationsPath); err != nil {
-		return nil, fmt.Errorf("migration failed: %w", err)
+		return nil, errors.New(errors.CodeMigrationFailed, "migration failed", err)
 	}
 
 	// 2. Open GORM
@@ -51,13 +51,13 @@ func Connect(cfg config.Config) (*gorm.DB, error) {
 		PrepareStmt:                              true,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("gorm open: %w", err)
+		return nil, errors.New(errors.CodeDatabaseError, "gorm open failed", err)
 	}
 
 	// 3. Pool config
 	sqlDB, err := db.DB()
 	if err != nil {
-		return nil, fmt.Errorf("get sql.DB: %w", err)
+		return nil, errors.New(errors.CodeDatabaseError, "get sql.DB failed", err)
 	}
 	sqlDB.SetMaxOpenConns(cfg.MaxOpenConns)
 	sqlDB.SetMaxIdleConns(cfg.MaxIdleConns)
@@ -66,7 +66,7 @@ func Connect(cfg config.Config) (*gorm.DB, error) {
 
 	if err := sqlDB.Ping(); err != nil {
 		_ = sqlDB.Close()
-		return nil, fmt.Errorf("db ping failed: %w", err)
+		return nil, errors.New(errors.CodeDatabaseUnavailable, "db ping failed", err)
 	}
 
 	return db, nil
@@ -77,7 +77,7 @@ func Connect(cfg config.Config) (*gorm.DB, error) {
 func runMigrations(databaseURL, migrationsPath string) error {
 	db, err := sql.Open("pgx", databaseURL)
 	if err != nil {
-		return fmt.Errorf("open: %w", err)
+		return errors.New(errors.CodeDatabaseError, "open database connection failed", err)
 	}
 	defer func() {
 		_ = db.Close()
@@ -85,12 +85,12 @@ func runMigrations(databaseURL, migrationsPath string) error {
 
 	// validate connection before passing to migrate
 	if err := db.Ping(); err != nil {
-		return fmt.Errorf("ping: %w", err)
+		return errors.New(errors.CodeDatabaseUnavailable, "ping database failed", err)
 	}
 
 	driver, err := pgmigrate.WithInstance(db, &pgmigrate.Config{})
 	if err != nil {
-		return err
+		return errors.New(errors.CodeMigrationFailed, "initialize postgres migration driver failed", err)
 	}
 
 	var sourceDriver source.Driver
@@ -98,13 +98,13 @@ func runMigrations(databaseURL, migrationsPath string) error {
 		sourceDriver, err = iofs.New(defaultMigrationsFS, "migrations")
 		if err != nil {
 			_ = driver.Close()
-			return fmt.Errorf("init embedded migrations source: %w", err)
+			return errors.New(errors.CodeMigrationFailed, "init embedded migrations source failed", err)
 		}
 	} else {
 		sourceDriver, err = iofs.New(os.DirFS(migrationsPath), ".")
 		if err != nil {
 			_ = driver.Close()
-			return fmt.Errorf("init custom migrations source: %w", err)
+			return errors.New(errors.CodeMigrationFailed, "init custom migrations source failed", err)
 		}
 	}
 
@@ -112,7 +112,7 @@ func runMigrations(databaseURL, migrationsPath string) error {
 	if err != nil {
 		_ = sourceDriver.Close()
 		_ = driver.Close()
-		return fmt.Errorf("init migrate instance: %w", err)
+		return errors.New(errors.CodeMigrationFailed, "init migrate instance failed", err)
 	}
 
 	defer func() {
@@ -120,7 +120,7 @@ func runMigrations(databaseURL, migrationsPath string) error {
 	}()
 
 	if err := m.Up(); err != nil && err != migrate.ErrNoChange {
-		return err
+		return errors.New(errors.CodeMigrationFailed, "execute migrations failed", err)
 	}
 	return nil
 }

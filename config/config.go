@@ -1,8 +1,9 @@
 package config
 
 import (
-	"errors"
 	"time"
+
+	"github.com/kaiizer777/go-auth/errors"
 )
 
 // Config holds all database, CORS, and connection pool settings.
@@ -46,25 +47,25 @@ func DefaultConfig() Config {
 // Validate ensures required fields are set and connection parameters are sane.
 func (c *Config) Validate() error {
 	if c.DatabaseURL == "" {
-		return errors.New("database URL is required")
+		return errors.ErrDatabaseURLRequired
 	}
 	if c.MigrationsPath == "" {
 		c.MigrationsPath = "db/migrations"
 	}
 	if c.MaxOpenConns < 0 {
-		return errors.New("max open conns cannot be negative")
+		return errors.ErrMaxOpenConnsNegative
 	}
 	if c.MaxIdleConns < 0 {
-		return errors.New("max idle conns cannot be negative")
+		return errors.ErrMaxIdleConnsNegative
 	}
 	if c.MaxOpenConns > 0 && c.MaxIdleConns > c.MaxOpenConns {
-		return errors.New("max idle conns cannot exceed max open conns")
+		return errors.ErrMaxIdleExceedsOpen
 	}
 	if c.ConnMaxLifetime < 0 {
-		return errors.New("conn max lifetime cannot be negative")
+		return errors.ErrConnMaxLifetimeNegative
 	}
 	if c.ConnMaxIdleTime < 0 {
-		return errors.New("conn max idle time cannot be negative")
+		return errors.ErrConnMaxIdleTimeNegative
 	}
 	return nil
 }

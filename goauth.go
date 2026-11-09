@@ -5,13 +5,13 @@
 package goauth
 
 import (
-	"fmt"
 	"net/http"
 
 	"gorm.io/gorm"
 
 	"github.com/kaiizer777/go-auth/config"
 	"github.com/kaiizer777/go-auth/db"
+	"github.com/kaiizer777/go-auth/errors"
 	"github.com/kaiizer777/go-auth/handler"
 )
 
@@ -28,12 +28,12 @@ type Auth struct {
 // runs pending migrations, and initializes the HTTP handler chain.
 func New(cfg config.Config) (*Auth, error) {
 	if err := cfg.Validate(); err != nil {
-		return nil, fmt.Errorf("goauth: invalid configuration: %w", err)
+		return nil, errors.New(errors.CodeInvalidConfig, "goauth: invalid configuration", err)
 	}
 
 	database, err := db.Connect(cfg)
 	if err != nil {
-		return nil, fmt.Errorf("goauth: failed to connect to database: %w", err)
+		return nil, errors.New(errors.CodeDatabaseError, "goauth: failed to connect to database", err)
 	}
 
 	h := handler.New(database, cfg)
@@ -51,7 +51,10 @@ func (a *Auth) Close() error {
 	}
 	sqlDB, err := a.db.DB()
 	if err != nil {
-		return err
+		return errors.New(errors.CodeDatabaseError, "failed to get sql.DB", err)
 	}
-	return sqlDB.Close()
+	if err := sqlDB.Close(); err != nil {
+		return errors.New(errors.CodeDatabaseError, "failed to close database", err)
+	}
+	return nil
 }
