@@ -7,7 +7,7 @@ Security is paramount for an authentication library. If you discover a security 
 **Do not open a public issue.**
 
 Please report security vulnerabilities by email:
-- **Email**: security@kaiizer.dev (placeholder)
+- **Email**: mdsufiyanbari866@gmail.com
 - **Response Time**: TBD (initial acknowledgment expected within 48 business hours)
 
 Please include the following details in your report:
