@@ -8,7 +8,7 @@
 
 ## Checklist
 
-- [ ] Tests pass (`go test ./...`)
+- [ ] Tests pass (`go test -v -race ./...`)
 - [ ] Code formatted with gofmt (`gofmt -s -w .`)
 - [ ] Linter clean (`golangci-lint run`)
 - [ ] Documentation updated (if applicable)
