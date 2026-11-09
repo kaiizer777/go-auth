@@ -2,6 +2,7 @@ package db
 
 import (
 	"database/sql"
+	"embed"
 	"fmt"
 	"log"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"github.com/golang-migrate/migrate/v4"
 	pgmigrate "github.com/golang-migrate/migrate/v4/database/postgres"
 	_ "github.com/golang-migrate/migrate/v4/source/file"
+	"github.com/golang-migrate/migrate/v4/source/iofs"
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
@@ -18,6 +20,9 @@ import (
 
 	"github.com/kaiizer777/go-auth/config"
 )
+
+//go:embed migrations/*.sql
+var defaultMigrationsFS embed.FS
 
 // Connect runs pending migrations, initializes the GORM PostgreSQL connection,
 // and applies connection pooling limits.
@@ -34,6 +39,7 @@ func Connect(cfg config.Config) (*gorm.DB, error) {
 			SlowThreshold:             200 * time.Millisecond,
 			LogLevel:                  logger.Warn,
 			IgnoreRecordNotFoundError: true,
+			ParameterizedQueries:      true,
 			Colorful:                  false,
 		},
 	)
@@ -58,6 +64,7 @@ func Connect(cfg config.Config) (*gorm.DB, error) {
 	sqlDB.SetConnMaxIdleTime(cfg.ConnMaxIdleTime)
 
 	if err := sqlDB.Ping(); err != nil {
+		_ = sqlDB.Close()
 		return nil, fmt.Errorf("db ping failed: %w", err)
 	}
 
@@ -83,14 +90,39 @@ func runMigrations(databaseURL, migrationsPath string) error {
 		return err
 	}
 
-	sourceURL := fmt.Sprintf("file://%s", filepath.ToSlash(migrationsPath))
-	m, err := migrate.NewWithDatabaseInstance(sourceURL, "pgx", driver)
-	if err != nil {
-		return err
+	var m *migrate.Migrate
+	if isDefaultMigrationsPath(migrationsPath) {
+		sourceDriver, err := iofs.New(defaultMigrationsFS, "migrations")
+		if err != nil {
+			_ = driver.Close()
+			return fmt.Errorf("init embedded migrations source: %w", err)
+		}
+		m, err = migrate.NewWithInstance("iofs", sourceDriver, "pgx", driver)
+		if err != nil {
+			_ = sourceDriver.Close()
+			_ = driver.Close()
+			return fmt.Errorf("init migrate instance: %w", err)
+		}
+	} else {
+		sourceURL := fmt.Sprintf("file://%s", filepath.ToSlash(migrationsPath))
+		m, err = migrate.NewWithDatabaseInstance(sourceURL, "pgx", driver)
+		if err != nil {
+			_ = driver.Close()
+			return fmt.Errorf("init migrate instance: %w", err)
+		}
 	}
+
+	defer func() {
+		_, _ = m.Close()
+	}()
 
 	if err := m.Up(); err != nil && err != migrate.ErrNoChange {
 		return err
 	}
 	return nil
+}
+
+func isDefaultMigrationsPath(p string) bool {
+	clean := filepath.ToSlash(filepath.Clean(p))
+	return p == "" || clean == "db/migrations"
 }
