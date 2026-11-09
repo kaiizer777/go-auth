@@ -44,3 +44,15 @@ func New(cfg config.Config) (*Auth, error) {
 		Handler: h,
 	}, nil
 }
+
+// Close terminates the underlying database connection pool.
+func (a *Auth) Close() error {
+	if a.DB == nil {
+		return nil
+	}
+	sqlDB, err := a.DB.DB()
+	if err != nil {
+		return err
+	}
+	return sqlDB.Close()
+}
