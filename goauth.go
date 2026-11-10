@@ -68,3 +68,11 @@ func (a *Auth) Close() error {
 	}
 	return nil
 }
+
+// EmailDispatcher returns the configured email dispatcher.
+func (a *Auth) EmailDispatcher() email.Dispatcher {
+	if a == nil || a.emailDispatcher == nil {
+		return nil
+	}
+	return a.emailDispatcher
+}
