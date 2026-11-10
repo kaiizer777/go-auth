@@ -38,6 +38,10 @@ var ErrInvalidHashFormat = errors.New(errors.CodeInternalError, "invalid argon2i
 
 // HashPassword hashes a plain text password using Argon2id and returns a standard PHC formatted string.
 func HashPassword(password string, params HashParams) (string, error) {
+	if params.Time < 1 || params.Parallelism < 1 || params.Memory < 1 || params.SaltLength == 0 || params.KeyLength == 0 {
+		return "", errors.New(errors.CodeInternalError, "invalid argon2 hash parameters", nil)
+	}
+
 	salt := make([]byte, params.SaltLength)
 	if _, err := io.ReadFull(rand.Reader, salt); err != nil {
 		return "", errors.New(errors.CodeInternalError, "failed to generate crypto salt", err)
@@ -75,18 +79,18 @@ func VerifyPassword(password, phcHash string) (bool, error) {
 		return false, ErrInvalidHashFormat
 	}
 
-	if parts[1] != "argon2id" {
+	if parts[0] != "" || parts[1] != "argon2id" {
 		return false, ErrInvalidHashFormat
 	}
 
 	var version int
-	if _, err := fmt.Sscanf(parts[2], "v=%d", &version); err != nil || version != argon2.Version {
+	if n, err := fmt.Sscanf(parts[2], "v=%d", &version); err != nil || n != 1 || version != argon2.Version {
 		return false, ErrInvalidHashFormat
 	}
 
 	var memory, time uint32
 	var parallelism uint8
-	if _, err := fmt.Sscanf(parts[3], "m=%d,t=%d,p=%d", &memory, &time, &parallelism); err != nil {
+	if n, err := fmt.Sscanf(parts[3], "m=%d,t=%d,p=%d", &memory, &time, &parallelism); err != nil || n != 3 {
 		return false, ErrInvalidHashFormat
 	}
 
@@ -97,6 +101,10 @@ func VerifyPassword(password, phcHash string) (bool, error) {
 
 	expectedHash, err := base64.RawStdEncoding.DecodeString(parts[5])
 	if err != nil {
+		return false, ErrInvalidHashFormat
+	}
+
+	if time < 1 || parallelism < 1 || memory < 1 || len(salt) < 16 || len(expectedHash) == 0 {
 		return false, ErrInvalidHashFormat
 	}
 

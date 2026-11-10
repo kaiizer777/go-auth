@@ -24,13 +24,13 @@ func GenerateToken() (rawHex string, hash [32]byte, err error) {
 
 // HashToken decodes a 64-character hex token and returns the SHA-256 digest of the raw 32 bytes.
 func HashToken(rawHex string) ([32]byte, error) {
+	if len(rawHex) != 64 {
+		return [32]byte{}, errors.New(errors.CodeInvalidToken, "invalid token length: must be 64 hex characters", nil)
+	}
+
 	rawBytes, err := hex.DecodeString(rawHex)
 	if err != nil {
 		return [32]byte{}, errors.New(errors.CodeInvalidToken, "invalid token hex encoding", err)
-	}
-
-	if len(rawBytes) != 32 {
-		return [32]byte{}, errors.New(errors.CodeInvalidToken, "invalid token length: must be 32 raw bytes (64 hex characters)", nil)
 	}
 
 	return sha256.Sum256(rawBytes), nil

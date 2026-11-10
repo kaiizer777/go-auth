@@ -54,20 +54,47 @@ func TestArgon2HashAndVerify(t *testing.T) {
 }
 
 func TestVerifyPassword_MalformedHashes(t *testing.T) {
+	// Base64 encoding of 16 bytes: "c2FsdHNhbHQxNmJ5dGVz" (16 bytes: "saltsalt16bytes")
+	validSaltB64 := "c2FsdHNhbHQxNmJ5dGVz"
 	malformed := []string{
 		"",
 		"not-a-hash",
-		"$argon2i$v=19$m=65536,t=3,p=4$c2FsdA$aGFzaA", // argon2i instead of argon2id
-		"$argon2id$v=18$m=65536,t=3,p=4$c2FsdA$aGFzaA", // unsupported version
-		"$argon2id$v=19$badparams$c2FsdA$aGFzaA",
+		"$argon2i$v=19$m=65536,t=3,p=4$" + validSaltB64 + "$aGFzaA", // argon2i instead of argon2id
+		"$argon2id$v=18$m=65536,t=3,p=4$" + validSaltB64 + "$aGFzaA", // unsupported version
+		"$argon2id$v=19$badparams$" + validSaltB64 + "$aGFzaA",
 		"$argon2id$v=19$m=65536,t=3,p=4$invalid-base64!$aGFzaA",
-		"$argon2id$v=19$m=65536,t=3,p=4$c2FsdA$invalid-base64!",
+		"$argon2id$v=19$m=65536,t=3,p=4$" + validSaltB64 + "$invalid-base64!",
+		"$argon2id$v=19$m=65536,t=0,p=4$" + validSaltB64 + "$aGFzaA",  // t=0
+		"$argon2id$v=19$m=65536,t=3,p=0$" + validSaltB64 + "$aGFzaA",  // p=0
+		"$argon2id$v=19$m=0,t=3,p=4$" + validSaltB64 + "$aGFzaA",      // m=0
+		"$argon2id$v=19$m=65536,t=3,p=4$" + validSaltB64 + "$",        // empty hash
+		"$argon2id$v=19$m=65536,t=3,p=4$$aGFzaA",                      // empty salt
+		"bad$argon2id$v=19$m=65536,t=3,p=4$" + validSaltB64 + "$aGFzaA", // no leading $
+		"$argon2id$v=19$m=65536,t=3,p=4extra$" + validSaltB64 + "$aGFzaA", // trailing param chars
+		"$argon2id$v=19$m=65536,t=3,p=4$c2FsdA$aGFzaA",                // salt < 16 bytes ("salt" = 4 bytes)
 	}
 
 	for _, hash := range malformed {
 		match, err := VerifyPassword("password", hash)
 		if match || err == nil {
 			t.Errorf("expected error and false for malformed hash %q, got match=%v err=%v", hash, match, err)
+		}
+	}
+}
+
+func TestHashPassword_InvalidParams(t *testing.T) {
+	invalidParams := []HashParams{
+		{Memory: 0, Time: 3, Parallelism: 4, SaltLength: 16, KeyLength: 32},
+		{Memory: 65536, Time: 0, Parallelism: 4, SaltLength: 16, KeyLength: 32},
+		{Memory: 65536, Time: 3, Parallelism: 0, SaltLength: 16, KeyLength: 32},
+		{Memory: 65536, Time: 3, Parallelism: 4, SaltLength: 0, KeyLength: 32},
+		{Memory: 65536, Time: 3, Parallelism: 4, SaltLength: 16, KeyLength: 0},
+	}
+
+	for _, p := range invalidParams {
+		_, err := HashPassword("testpass", p)
+		if err == nil {
+			t.Errorf("expected error for invalid params %+v, got nil", p)
 		}
 	}
 }
@@ -148,17 +175,26 @@ func TestHashToken(t *testing.T) {
 		t.Fatalf("computed hash %x does not match expected hash %x", computedHash, expectedHash)
 	}
 
-	// Malformed hex
-	_, err = HashToken("invalid-hex-characters-zzzz")
+	// Malformed hex (64 non-hex characters)
+	_, err = HashToken(strings.Repeat("z", 64))
 	if err == nil {
 		t.Fatalf("expected error for non-hex characters")
 	}
 
-	// Invalid length (less than 32 bytes / 64 hex chars)
-	shortHex := hex.EncodeToString([]byte("too-short"))
+	// Invalid lengths
+	shortHex := strings.Repeat("a", 63)
 	_, err = HashToken(shortHex)
 	if err == nil {
-		t.Fatalf("expected error for short hex token")
+		t.Fatalf("expected error for short hex token (63 chars)")
+	}
+	if !errors.Is(err, errors.New(errors.CodeInvalidToken, "", nil)) {
+		t.Errorf("expected CodeInvalidToken, got %v", err)
+	}
+
+	longHex := strings.Repeat("a", 65)
+	_, err = HashToken(longHex)
+	if err == nil {
+		t.Fatalf("expected error for long hex token (65 chars)")
 	}
 	if !errors.Is(err, errors.New(errors.CodeInvalidToken, "", nil)) {
 		t.Errorf("expected CodeInvalidToken, got %v", err)
