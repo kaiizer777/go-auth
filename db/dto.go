@@ -54,7 +54,8 @@ func ValidateToken(token string) error {
 	if len(token) != 64 {
 		return errors.New(errors.CodeInvalidToken, "token must be 64 hex characters", nil)
 	}
-	if _, err := hex.DecodeString(token); err != nil {
+	var buf [32]byte
+	if _, err := hex.Decode(buf[:], []byte(token)); err != nil {
 		return errors.New(errors.CodeInvalidToken, "token must be valid hexadecimal", err)
 	}
 	return nil
