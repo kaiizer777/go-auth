@@ -221,6 +221,50 @@ func TestWriteJSON(t *testing.T) {
 		}
 	})
 
+	t.Run("internal error with explicit sensitive message is masked", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		err := New(CodeInternalError, "sensitive database credentials leaked", stderrors.New("pq: password authentication failed"))
+
+		WriteJSON(rec, err)
+
+		if rec.Code != http.StatusInternalServerError {
+			t.Fatalf("expected status %d, got %d", http.StatusInternalServerError, rec.Code)
+		}
+
+		var resp Response
+		if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+			t.Fatalf("failed to decode response: %v", err)
+		}
+		if resp.Code != CodeInternalError {
+			t.Errorf("got code %q, want %q", resp.Code, CodeInternalError)
+		}
+		if resp.Message != "internal server error" {
+			t.Errorf("got message %q, want %q", resp.Message, "internal server error")
+		}
+	})
+
+	t.Run("database error 500 status is masked", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		err := New(CodeDatabaseError, "SELECT * FROM users WHERE password = secret", nil)
+
+		WriteJSON(rec, err)
+
+		if rec.Code != http.StatusInternalServerError {
+			t.Fatalf("expected status %d, got %d", http.StatusInternalServerError, rec.Code)
+		}
+
+		var resp Response
+		if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+			t.Fatalf("failed to decode response: %v", err)
+		}
+		if resp.Code != CodeInternalError {
+			t.Errorf("got code %q, want %q", resp.Code, CodeInternalError)
+		}
+		if resp.Message != "internal server error" {
+			t.Errorf("got message %q, want %q", resp.Message, "internal server error")
+		}
+	})
+
 	t.Run("nil error writes 200 OK", func(t *testing.T) {
 		rec := httptest.NewRecorder()
 		WriteJSON(rec, nil)

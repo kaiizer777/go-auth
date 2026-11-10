@@ -254,6 +254,13 @@ func WriteJSON(w http.ResponseWriter, err error) {
 		}
 	}
 
+	if status == http.StatusInternalServerError {
+		resp = Response{
+			Code:    CodeInternalError,
+			Message: "internal server error",
+		}
+	}
+
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(resp)
 }

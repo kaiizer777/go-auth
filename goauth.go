@@ -48,7 +48,7 @@ func New(cfg config.Config) (*Auth, error) {
 		return nil, err
 	}
 
-	h := handler.New(database, cfg)
+	h := handler.New(database, cfg, authSvc)
 	return &Auth{
 		db:  database,
 		cfg: cfg,
