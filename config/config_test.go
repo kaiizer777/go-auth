@@ -34,6 +34,36 @@ func TestDefaultConfig(t *testing.T) {
 	if len(cfg.AllowedHeaders) == 0 {
 		t.Error("expected non-empty AllowedHeaders")
 	}
+	if cfg.Argon2.Memory != 65536 {
+		t.Errorf("got %d, want 65536", cfg.Argon2.Memory)
+	}
+	if cfg.Argon2.Time != 3 {
+		t.Errorf("got %d, want 3", cfg.Argon2.Time)
+	}
+	if cfg.Argon2.Parallelism != 4 {
+		t.Errorf("got %d, want 4", cfg.Argon2.Parallelism)
+	}
+	if cfg.Argon2.SaltLength != 16 {
+		t.Errorf("got %d, want 16", cfg.Argon2.SaltLength)
+	}
+	if cfg.Argon2.KeyLength != 32 {
+		t.Errorf("got %d, want 32", cfg.Argon2.KeyLength)
+	}
+	if cfg.PasswordMinLength != 8 {
+		t.Errorf("got %d, want 8", cfg.PasswordMinLength)
+	}
+	if cfg.PasswordMaxLength != 128 {
+		t.Errorf("got %d, want 128", cfg.PasswordMaxLength)
+	}
+	if cfg.RequireEmailVerification {
+		t.Errorf("expected RequireEmailVerification false, got true")
+	}
+	if cfg.VerificationTokenExpiry != 30*time.Minute {
+		t.Errorf("got %v, want 30m", cfg.VerificationTokenExpiry)
+	}
+	if cfg.PasswordResetTokenExpiry != 30*time.Minute {
+		t.Errorf("got %v, want 30m", cfg.PasswordResetTokenExpiry)
+	}
 }
 
 func TestConfigValidate_ZeroValueUsesAsyncEmailDispatch(t *testing.T) {
@@ -212,6 +242,209 @@ func TestConfigValidate(t *testing.T) {
 			wantErr:            nil,
 			wantMigrationsPath: "custom/migrations",
 		},
+		{
+			name: "zero value struct defaults all phase 3 settings",
+			mutate: func(c *Config) {
+				*c = Config{
+					DatabaseURL: "postgres://user:pass@localhost:5432/testdb",
+					BaseURL:     "https://example.com",
+				}
+			},
+			wantErr:            nil,
+			wantMigrationsPath: "db/migrations",
+		},
+		{
+			name: "argon2 memory too low",
+			mutate: func(c *Config) {
+				c.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+				c.BaseURL = "https://example.com"
+				c.Argon2.Memory = 19455
+			},
+			wantErr: errors.ErrArgon2MemoryTooLow,
+		},
+		{
+			name: "argon2 memory at boundary",
+			mutate: func(c *Config) {
+				c.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+				c.BaseURL = "https://example.com"
+				c.Argon2.Memory = 19456
+			},
+			wantErr: nil,
+		},
+		{
+			name: "argon2 time too low",
+			mutate: func(c *Config) {
+				c.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+				c.BaseURL = "https://example.com"
+				c.Argon2.Time = 1
+			},
+			wantErr: errors.ErrArgon2TimeTooLow,
+		},
+		{
+			name: "argon2 time at boundary",
+			mutate: func(c *Config) {
+				c.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+				c.BaseURL = "https://example.com"
+				c.Argon2.Time = 2
+			},
+			wantErr: nil,
+		},
+		{
+			name: "argon2 parallelism zero uses default",
+			mutate: func(c *Config) {
+				c.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+				c.BaseURL = "https://example.com"
+				c.Argon2.Parallelism = 0
+			},
+			wantErr: nil,
+		},
+		{
+			name: "argon2 parallelism at boundary",
+			mutate: func(c *Config) {
+				c.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+				c.BaseURL = "https://example.com"
+				c.Argon2.Parallelism = 1
+			},
+			wantErr: nil,
+		},
+		{
+			name: "argon2 salt length too short",
+			mutate: func(c *Config) {
+				c.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+				c.BaseURL = "https://example.com"
+				c.Argon2.SaltLength = 15
+			},
+			wantErr: errors.ErrArgon2SaltLengthTooShort,
+		},
+		{
+			name: "argon2 salt length at boundary",
+			mutate: func(c *Config) {
+				c.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+				c.BaseURL = "https://example.com"
+				c.Argon2.SaltLength = 16
+			},
+			wantErr: nil,
+		},
+		{
+			name: "argon2 key length too short",
+			mutate: func(c *Config) {
+				c.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+				c.BaseURL = "https://example.com"
+				c.Argon2.KeyLength = 31
+			},
+			wantErr: errors.ErrArgon2KeyLengthTooShort,
+		},
+		{
+			name: "argon2 key length at boundary",
+			mutate: func(c *Config) {
+				c.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+				c.BaseURL = "https://example.com"
+				c.Argon2.KeyLength = 32
+			},
+			wantErr: nil,
+		},
+		{
+			name: "password min length too short",
+			mutate: func(c *Config) {
+				c.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+				c.BaseURL = "https://example.com"
+				c.PasswordMinLength = 7
+			},
+			wantErr: errors.ErrPasswordMinLengthTooShort,
+		},
+		{
+			name: "password max length less than min length",
+			mutate: func(c *Config) {
+				c.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+				c.BaseURL = "https://example.com"
+				c.PasswordMinLength = 10
+				c.PasswordMaxLength = 9
+			},
+			wantErr: errors.ErrPasswordMaxLengthInvalid,
+		},
+		{
+			name: "password max length equal to min length",
+			mutate: func(c *Config) {
+				c.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+				c.BaseURL = "https://example.com"
+				c.PasswordMinLength = 10
+				c.PasswordMaxLength = 10
+			},
+			wantErr: errors.ErrPasswordMaxLengthInvalid,
+		},
+		{
+			name: "password max length exceeds 128",
+			mutate: func(c *Config) {
+				c.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+				c.BaseURL = "https://example.com"
+				c.PasswordMaxLength = 129
+			},
+			wantErr: errors.ErrPasswordMaxLengthInvalid,
+		},
+		{
+			name: "password limits at boundary",
+			mutate: func(c *Config) {
+				c.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+				c.BaseURL = "https://example.com"
+				c.PasswordMinLength = 8
+				c.PasswordMaxLength = 128
+			},
+			wantErr: nil,
+		},
+		{
+			name: "verification token expiry below 15m",
+			mutate: func(c *Config) {
+				c.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+				c.BaseURL = "https://example.com"
+				c.VerificationTokenExpiry = 14 * time.Minute
+			},
+			wantErr: errors.ErrVerificationTokenExpiryInvalid,
+		},
+		{
+			name: "verification token expiry above 60m",
+			mutate: func(c *Config) {
+				c.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+				c.BaseURL = "https://example.com"
+				c.VerificationTokenExpiry = 61 * time.Minute
+			},
+			wantErr: errors.ErrVerificationTokenExpiryInvalid,
+		},
+		{
+			name: "verification token expiry boundaries valid",
+			mutate: func(c *Config) {
+				c.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+				c.BaseURL = "https://example.com"
+				c.VerificationTokenExpiry = 15 * time.Minute
+			},
+			wantErr: nil,
+		},
+		{
+			name: "password reset token expiry below 15m",
+			mutate: func(c *Config) {
+				c.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+				c.BaseURL = "https://example.com"
+				c.PasswordResetTokenExpiry = 14 * time.Minute
+			},
+			wantErr: errors.ErrPasswordResetTokenExpiryInvalid,
+		},
+		{
+			name: "password reset token expiry above 60m",
+			mutate: func(c *Config) {
+				c.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+				c.BaseURL = "https://example.com"
+				c.PasswordResetTokenExpiry = 61 * time.Minute
+			},
+			wantErr: errors.ErrPasswordResetTokenExpiryInvalid,
+		},
+		{
+			name: "password reset token expiry boundaries valid",
+			mutate: func(c *Config) {
+				c.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+				c.BaseURL = "https://example.com"
+				c.PasswordResetTokenExpiry = 60 * time.Minute
+			},
+			wantErr: nil,
+		},
 	}
 
 	for _, tt := range tests {
@@ -238,6 +471,37 @@ func TestConfigValidate(t *testing.T) {
 			if tt.name == "base URL trailing slash removed" && cfg.BaseURL != "https://example.com" {
 				t.Errorf("got base URL %q, want %q", cfg.BaseURL, "https://example.com")
 			}
+			if tt.name == "argon2 parallelism zero uses default" && cfg.Argon2.Parallelism != 4 {
+				t.Errorf("got parallelism %d, want 4", cfg.Argon2.Parallelism)
+			}
 		})
+	}
+}
+
+func TestConfigValidate_PartialArgon2Overrides(t *testing.T) {
+	cfg := Config{
+		DatabaseURL: "postgres://user:pass@localhost:5432/testdb",
+		BaseURL:     "https://example.com",
+		Argon2: Argon2Config{
+			Memory: 32768,
+		},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("unexpected validation error: %v", err)
+	}
+	if cfg.Argon2.Memory != 32768 {
+		t.Errorf("got Memory %d, want 32768", cfg.Argon2.Memory)
+	}
+	if cfg.Argon2.Time != 3 {
+		t.Errorf("got Time %d, want 3", cfg.Argon2.Time)
+	}
+	if cfg.Argon2.Parallelism != 4 {
+		t.Errorf("got Parallelism %d, want 4", cfg.Argon2.Parallelism)
+	}
+	if cfg.Argon2.SaltLength != 16 {
+		t.Errorf("got SaltLength %d, want 16", cfg.Argon2.SaltLength)
+	}
+	if cfg.Argon2.KeyLength != 32 {
+		t.Errorf("got KeyLength %d, want 32", cfg.Argon2.KeyLength)
 	}
 }

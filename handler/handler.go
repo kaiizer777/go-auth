@@ -8,23 +8,26 @@ import (
 
 	"gorm.io/gorm"
 
+	"github.com/kaiizer777/go-auth/auth"
 	"github.com/kaiizer777/go-auth/config"
 	"github.com/kaiizer777/go-auth/errors"
 )
 
 // Handler maintains the HTTP router, database connection, and configuration.
 type Handler struct {
-	mux *http.ServeMux
-	db  *gorm.DB
-	cfg config.Config
+	mux     *http.ServeMux
+	db      *gorm.DB
+	cfg     config.Config
+	authSvc auth.Service
 }
 
 // New initializes the handler scaffold, registers routes, and applies CORS middleware.
-func New(db *gorm.DB, cfg config.Config) http.Handler {
+func New(db *gorm.DB, cfg config.Config, authSvc auth.Service) http.Handler {
 	h := &Handler{
-		mux: http.NewServeMux(),
-		db:  db,
-		cfg: cfg,
+		mux:     http.NewServeMux(),
+		db:      db,
+		cfg:     cfg,
+		authSvc: authSvc,
 	}
 	h.registerRoutes()
 	return CORS(cfg)(h)
@@ -94,6 +97,25 @@ func (h *Handler) registerRoutes() {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"status":"ok"}`))
 	})
+
+	if h.authSvc != nil {
+		authH := NewAuthHandler(h.authSvc)
+		// Canonical routes:
+		h.mux.HandleFunc("POST /auth/signup", authH.Signup)
+		h.mux.HandleFunc("POST /auth/login", authH.Login)
+		h.mux.HandleFunc("POST /auth/logout", authH.Logout)
+		h.mux.HandleFunc("POST /auth/verify", authH.VerifyEmail)
+		h.mux.HandleFunc("POST /auth/password/reset-request", authH.RequestPasswordReset)
+		h.mux.HandleFunc("POST /auth/password/reset", authH.ResetPassword)
+
+		// Aliases:
+		h.mux.HandleFunc("POST /api/auth/signup", authH.Signup)
+		h.mux.HandleFunc("POST /api/auth/login", authH.Login)
+		h.mux.HandleFunc("POST /api/auth/logout", authH.Logout)
+		h.mux.HandleFunc("POST /api/auth/verify-email", authH.VerifyEmail)
+		h.mux.HandleFunc("POST /api/auth/request-password-reset", authH.RequestPasswordReset)
+		h.mux.HandleFunc("POST /api/auth/reset-password", authH.ResetPassword)
+	}
 }
 
 type responseInterceptor struct {

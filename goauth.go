@@ -5,11 +5,13 @@
 package goauth
 
 import (
+	"context"
 	"log/slog"
 	"net/http"
 
 	"gorm.io/gorm"
 
+	"github.com/kaiizer777/go-auth/auth"
 	"github.com/kaiizer777/go-auth/config"
 	"github.com/kaiizer777/go-auth/db"
 	"github.com/kaiizer777/go-auth/email"
@@ -25,6 +27,9 @@ type Auth struct {
 
 	// Handler is the root HTTP handler with mounted routes and middleware.
 	Handler http.Handler
+
+	// Auth is the core authentication service.
+	Auth auth.Service
 }
 
 // New validates runtime configuration, establishes database connectivity,
@@ -39,7 +44,35 @@ func New(cfg config.Config) (*Auth, error) {
 		return nil, errors.Wrap(err, errors.CodeDatabaseError, "goauth: failed to connect to database")
 	}
 
-	h := handler.New(database, cfg)
+	emailHooks := cfg.EmailHooks
+	if emailHooks.SendVerificationEmail == nil && cfg.SendVerificationEmail != nil {
+		emailHooks.SendVerificationEmail = func(ctx context.Context, recipient, token string) error {
+			return cfg.SendVerificationEmail(ctx, email.VerificationEmailPayload{
+				To:    recipient,
+				Token: token,
+				URL:   email.BuildVerificationURL(cfg.BaseURL, token),
+			})
+		}
+	}
+	if emailHooks.SendPasswordResetEmail == nil && cfg.SendPasswordResetEmail != nil {
+		emailHooks.SendPasswordResetEmail = func(ctx context.Context, recipient, token string) error {
+			return cfg.SendPasswordResetEmail(ctx, email.PasswordResetEmailPayload{
+				To:    recipient,
+				Token: token,
+				URL:   email.BuildResetURL(cfg.BaseURL, token),
+			})
+		}
+	}
+
+	authSvc, err := auth.New(cfg, database, emailHooks)
+	if err != nil {
+		if sqlDB, dbErr := database.DB(); dbErr == nil {
+			_ = sqlDB.Close()
+		}
+		return nil, err
+	}
+
+	h := handler.New(database, cfg, authSvc)
 	return &Auth{
 		db:  database,
 		cfg: cfg,
@@ -51,6 +84,7 @@ func New(cfg config.Config) (*Auth, error) {
 			SendPasswordResetEmail:    cfg.SendPasswordResetEmail,
 		}, slog.Default()),
 		Handler: h,
+		Auth:    authSvc,
 	}, nil
 }
 

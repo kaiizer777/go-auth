@@ -16,6 +16,9 @@ type User struct {
 	UpdatedAt     time.Time
 }
 
+// TableName returns the table name for User.
+func (User) TableName() string { return "users" }
+
 // Session represents an active authenticated user session.
 type Session struct {
 	ID            uuid.UUID `gorm:"primaryKey;type:uuid;default:uuid_generate_v4()"`
@@ -26,22 +29,27 @@ type Session struct {
 	CreatedAt     time.Time
 }
 
+// TableName returns the table name for Session.
+func (Session) TableName() string { return "sessions" }
+
 // VerificationToken represents an email verification token record.
 type VerificationToken struct {
-	ID        uuid.UUID `gorm:"primaryKey;type:uuid;default:uuid_generate_v4()"`
-	UserID    uuid.UUID `gorm:"type:uuid;not null;index"`
-	TokenHash string    `gorm:"column:token_hash;type:text;uniqueIndex;not null"`
+	TokenHash []byte    `gorm:"primaryKey;column:token_hash;type:bytea"`
+	UserID    uuid.UUID `gorm:"type:uuid;not null;index:idx_verification_tokens_user_id"`
 	ExpiresAt time.Time `gorm:"not null"`
-	Used      bool      `gorm:"default:false;not null"`
 	CreatedAt time.Time
 }
 
+// TableName returns the table name for VerificationToken.
+func (VerificationToken) TableName() string { return "verification_tokens" }
+
 // PasswordResetToken represents a single-use password reset token record.
 type PasswordResetToken struct {
-	ID        uuid.UUID `gorm:"primaryKey;type:uuid;default:uuid_generate_v4()"`
-	UserID    uuid.UUID `gorm:"type:uuid;not null;index"`
-	TokenHash string    `gorm:"column:token_hash;type:text;uniqueIndex;not null"`
+	TokenHash []byte    `gorm:"primaryKey;column:token_hash;type:bytea"`
+	UserID    uuid.UUID `gorm:"type:uuid;not null;index:idx_password_reset_tokens_user_id"`
 	ExpiresAt time.Time `gorm:"not null"`
-	Used      bool      `gorm:"default:false;not null"`
 	CreatedAt time.Time
 }
+
+// TableName returns the table name for PasswordResetToken.
+func (PasswordResetToken) TableName() string { return "password_reset_tokens" }

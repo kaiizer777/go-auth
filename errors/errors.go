@@ -24,6 +24,20 @@ const (
 	CodeEmailDispatchFailed  Code = "EMAIL_DISPATCH_FAILED"
 	CodeEmailDispatchTimeout Code = "EMAIL_DISPATCH_TIMEOUT"
 
+	// Phase 3 Core Auth error codes
+	CodeInvalidCredentials Code = "INVALID_CREDENTIALS"
+	CodeUnauthenticated    Code = "UNAUTHENTICATED"
+	CodeEmailNotVerified   Code = "EMAIL_NOT_VERIFIED"
+	CodePasswordTooShort   Code = "PASSWORD_TOO_SHORT"
+	CodePasswordTooLong    Code = "PASSWORD_TOO_LONG"
+	CodePasswordTooCommon  Code = "PASSWORD_TOO_COMMON"
+	CodeInvalidEmail       Code = "INVALID_EMAIL"
+	CodeValidationError    Code = "VALIDATION_ERROR"
+	CodeInvalidToken       Code = "INVALID_TOKEN"
+	CodeTokenExpired       Code = "TOKEN_EXPIRED"
+	CodeUserAlreadyExists  Code = "USER_ALREADY_EXISTS"
+	CodeUserNotFound       Code = "USER_NOT_FOUND"
+
 	// Aliases
 	INVALID_CONFIG       = CodeInvalidConfig
 	DATABASE_ERROR       = CodeDatabaseError
@@ -41,12 +55,19 @@ const (
 // HTTPStatus maps error codes deterministically to HTTP response status codes.
 func (c Code) HTTPStatus() int {
 	switch c {
-	case CodeDatabaseUnavailable:
-		return http.StatusServiceUnavailable
+	case CodePasswordTooShort, CodePasswordTooLong, CodePasswordTooCommon,
+		CodeInvalidEmail, CodeValidationError, CodeInvalidToken, CodeTokenExpired:
+		return http.StatusBadRequest
+	case CodeInvalidCredentials, CodeUnauthenticated:
+		return http.StatusUnauthorized
+	case CodeEmailNotVerified:
+		return http.StatusForbidden
 	case CodeNotFound:
 		return http.StatusNotFound
 	case CodeMethodNotAllowed:
 		return http.StatusMethodNotAllowed
+	case CodeDatabaseUnavailable:
+		return http.StatusServiceUnavailable
 	default:
 		return http.StatusInternalServerError
 	}
@@ -178,15 +199,24 @@ var (
 
 // Predefined sentinel errors for config.Validate().
 var (
-	ErrDatabaseURLRequired          = New(CodeInvalidConfig, "database URL is required", nil)
-	ErrMaxOpenConnsNegative         = New(CodeInvalidConfig, "max open conns cannot be negative", nil)
-	ErrMaxIdleConnsNegative         = New(CodeInvalidConfig, "max idle conns cannot be negative", nil)
-	ErrMaxIdleExceedsOpen           = New(CodeInvalidConfig, "max idle conns cannot exceed max open conns", nil)
-	ErrConnMaxLifetimeNegative      = New(CodeInvalidConfig, "conn max lifetime cannot be negative", nil)
-	ErrConnMaxIdleTimeNegative      = New(CodeInvalidConfig, "conn max idle time cannot be negative", nil)
-	ErrBaseURLRequired              = New(CodeInvalidConfig, "base URL is required", nil)
-	ErrBaseURLInvalid               = New(CodeInvalidConfig, "base URL is invalid", nil)
-	ErrEmailDispatchTimeoutNegative = New(CodeInvalidConfig, "email dispatch timeout cannot be negative", nil)
+	ErrDatabaseURLRequired             = New(CodeInvalidConfig, "database URL is required", nil)
+	ErrMaxOpenConnsNegative            = New(CodeInvalidConfig, "max open conns cannot be negative", nil)
+	ErrMaxIdleConnsNegative            = New(CodeInvalidConfig, "max idle conns cannot be negative", nil)
+	ErrMaxIdleExceedsOpen              = New(CodeInvalidConfig, "max idle conns cannot exceed max open conns", nil)
+	ErrConnMaxLifetimeNegative         = New(CodeInvalidConfig, "conn max lifetime cannot be negative", nil)
+	ErrConnMaxIdleTimeNegative         = New(CodeInvalidConfig, "conn max idle time cannot be negative", nil)
+	ErrBaseURLRequired                 = New(CodeInvalidConfig, "base URL is required", nil)
+	ErrBaseURLInvalid                  = New(CodeInvalidConfig, "base URL is invalid", nil)
+	ErrEmailDispatchTimeoutNegative    = New(CodeInvalidConfig, "email dispatch timeout cannot be negative", nil)
+	ErrArgon2MemoryTooLow              = New(CodeInvalidConfig, "argon2 memory too low", nil)
+	ErrArgon2TimeTooLow                = New(CodeInvalidConfig, "argon2 time too low", nil)
+	ErrArgon2ParallelismZero           = New(CodeInvalidConfig, "argon2 parallelism must be at least 1", nil)
+	ErrArgon2SaltLengthTooShort        = New(CodeInvalidConfig, "argon2 salt length too short", nil)
+	ErrArgon2KeyLengthTooShort         = New(CodeInvalidConfig, "argon2 key length too short", nil)
+	ErrPasswordMinLengthTooShort       = New(CodeInvalidConfig, "password min length must be at least 8", nil)
+	ErrPasswordMaxLengthInvalid        = New(CodeInvalidConfig, "password max length must be greater than min length and at most 128", nil)
+	ErrVerificationTokenExpiryInvalid  = New(CodeInvalidConfig, "verification token expiry must be between 15m and 60m", nil)
+	ErrPasswordResetTokenExpiryInvalid = New(CodeInvalidConfig, "password reset token expiry must be between 15m and 60m", nil)
 )
 
 // WriteJSON writes an error response envelope to the response writer with the appropriate HTTP status.
@@ -218,6 +248,13 @@ func WriteJSON(w http.ResponseWriter, err error) {
 		}
 	} else {
 		status = http.StatusInternalServerError
+		resp = Response{
+			Code:    CodeInternalError,
+			Message: "internal server error",
+		}
+	}
+
+	if status == http.StatusInternalServerError {
 		resp = Response{
 			Code:    CodeInternalError,
 			Message: "internal server error",

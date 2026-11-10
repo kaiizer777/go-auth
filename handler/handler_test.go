@@ -76,7 +76,7 @@ func newMockGormDB(t *testing.T, healthy bool) *gorm.DB {
 func TestNewHandler_HealthEndpoint_Healthy(t *testing.T) {
 	cfg := config.DefaultConfig()
 	db := newMockGormDB(t, true)
-	h := New(db, cfg)
+	h := New(db, cfg, nil)
 
 	req := httptest.NewRequest(http.MethodGet, "/health", nil)
 	rec := httptest.NewRecorder()
@@ -97,7 +97,7 @@ func TestNewHandler_HealthEndpoint_Healthy(t *testing.T) {
 func TestNewHandler_HealthEndpoint_UnhealthyDB(t *testing.T) {
 	cfg := config.DefaultConfig()
 	db := newMockGormDB(t, false)
-	h := New(db, cfg)
+	h := New(db, cfg, nil)
 
 	req := httptest.NewRequest(http.MethodGet, "/health", nil)
 	rec := httptest.NewRecorder()
@@ -118,7 +118,7 @@ func TestNewHandler_HealthEndpoint_UnhealthyDB(t *testing.T) {
 
 func TestNewHandler_HealthEndpoint_NilDB(t *testing.T) {
 	cfg := config.DefaultConfig()
-	h := New(nil, cfg)
+	h := New(nil, cfg, nil)
 
 	req := httptest.NewRequest(http.MethodGet, "/health", nil)
 	rec := httptest.NewRecorder()
@@ -140,7 +140,7 @@ func TestNewHandler_HealthEndpoint_NilDB(t *testing.T) {
 func TestNewHandler_HealthEndpoint_MethodNotAllowed(t *testing.T) {
 	cfg := config.DefaultConfig()
 	db := newMockGormDB(t, true)
-	h := New(db, cfg)
+	h := New(db, cfg, nil)
 
 	req := httptest.NewRequest(http.MethodPost, "/health", nil)
 	rec := httptest.NewRecorder()
@@ -161,7 +161,7 @@ func TestNewHandler_HealthEndpoint_MethodNotAllowed(t *testing.T) {
 
 func TestNewHandler_NotFound(t *testing.T) {
 	cfg := config.DefaultConfig()
-	h := New(nil, cfg)
+	h := New(nil, cfg, nil)
 
 	req := httptest.NewRequest(http.MethodGet, "/non-existent-endpoint", nil)
 	rec := httptest.NewRecorder()
@@ -221,7 +221,7 @@ func TestNewHandler_WrapsCORSMiddleware(t *testing.T) {
 	cfg.AllowedOrigins = []string{"https://dashboard.example.com"}
 	db := newMockGormDB(t, true)
 
-	h := New(db, cfg)
+	h := New(db, cfg, nil)
 
 	// Test GET with Origin
 	req := httptest.NewRequest(http.MethodGet, "/health", nil)
