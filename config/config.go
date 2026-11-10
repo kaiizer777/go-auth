@@ -145,14 +145,20 @@ func (c *Config) Validate() error {
 		c.EmailDispatchTimeout = 10 * time.Second
 	}
 
-	if c.Argon2 == (Argon2Config{}) {
-		c.Argon2 = Argon2Config{
-			Memory:      65536,
-			Time:        3,
-			Parallelism: 4,
-			SaltLength:  16,
-			KeyLength:   32,
-		}
+	if c.Argon2.Memory == 0 {
+		c.Argon2.Memory = 65536
+	}
+	if c.Argon2.Time == 0 {
+		c.Argon2.Time = 3
+	}
+	if c.Argon2.Parallelism == 0 {
+		c.Argon2.Parallelism = 4
+	}
+	if c.Argon2.SaltLength == 0 {
+		c.Argon2.SaltLength = 16
+	}
+	if c.Argon2.KeyLength == 0 {
+		c.Argon2.KeyLength = 32
 	}
 	if c.Argon2.Memory < 19456 {
 		return errors.ErrArgon2MemoryTooLow

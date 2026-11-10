@@ -2,6 +2,7 @@ package handler
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 
 	"github.com/kaiizer777/go-auth/auth"
@@ -25,9 +26,13 @@ func decodeJSON[T any](w http.ResponseWriter, r *http.Request) (T, bool) {
 		errors.WriteJSON(w, errors.New(errors.CodeValidationError, "invalid request body", nil))
 		return target, false
 	}
-	decoder := json.NewDecoder(r.Body)
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
 	if err := decoder.Decode(&target); err != nil {
 		errors.WriteJSON(w, errors.New(errors.CodeValidationError, "invalid request body", err))
+		return target, false
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		errors.WriteJSON(w, errors.New(errors.CodeValidationError, "unexpected trailing data in request body", nil))
 		return target, false
 	}
 	return target, true

@@ -54,19 +54,22 @@ func TestArgon2HashAndVerify(t *testing.T) {
 }
 
 func TestVerifyPassword_MalformedHashes(t *testing.T) {
-	// Base64 encoding of 16 bytes: "c2FsdHNhbHQxNmJ5dGVz" (16 bytes: "saltsalt16bytes")
-	validSaltB64 := "c2FsdHNhbHQxNmJ5dGVz"
+	// Base64 encoding of 16 bytes: "c2FsdHNhbHQxNmJ5dGVzIQ" (16 bytes: "saltsalt16bytes!")
+	validSaltB64 := "c2FsdHNhbHQxNmJ5dGVzIQ"
 	malformed := []string{
 		"",
 		"not-a-hash",
 		"$argon2i$v=19$m=65536,t=3,p=4$" + validSaltB64 + "$aGFzaA", // argon2i instead of argon2id
 		"$argon2id$v=18$m=65536,t=3,p=4$" + validSaltB64 + "$aGFzaA", // unsupported version
+		"$argon2id$v=19extra$m=65536,t=3,p=4$" + validSaltB64 + "$aGFzaA", // trailing version chars
 		"$argon2id$v=19$badparams$" + validSaltB64 + "$aGFzaA",
 		"$argon2id$v=19$m=65536,t=3,p=4$invalid-base64!$aGFzaA",
 		"$argon2id$v=19$m=65536,t=3,p=4$" + validSaltB64 + "$invalid-base64!",
 		"$argon2id$v=19$m=65536,t=0,p=4$" + validSaltB64 + "$aGFzaA",  // t=0
 		"$argon2id$v=19$m=65536,t=3,p=0$" + validSaltB64 + "$aGFzaA",  // p=0
 		"$argon2id$v=19$m=0,t=3,p=4$" + validSaltB64 + "$aGFzaA",      // m=0
+		"$argon2id$v=19$m=262145,t=3,p=4$" + validSaltB64 + "$aGFzaA",  // memory > 262144
+		"$argon2id$v=19$m=65536,t=11,p=4$" + validSaltB64 + "$aGFzaA",  // time > 10
 		"$argon2id$v=19$m=65536,t=3,p=4$" + validSaltB64 + "$",        // empty hash
 		"$argon2id$v=19$m=65536,t=3,p=4$$aGFzaA",                      // empty salt
 		"bad$argon2id$v=19$m=65536,t=3,p=4$" + validSaltB64 + "$aGFzaA", // no leading $
@@ -88,6 +91,7 @@ func TestHashPassword_InvalidParams(t *testing.T) {
 		{Memory: 65536, Time: 0, Parallelism: 4, SaltLength: 16, KeyLength: 32},
 		{Memory: 65536, Time: 3, Parallelism: 0, SaltLength: 16, KeyLength: 32},
 		{Memory: 65536, Time: 3, Parallelism: 4, SaltLength: 0, KeyLength: 32},
+		{Memory: 65536, Time: 3, Parallelism: 4, SaltLength: 15, KeyLength: 32},
 		{Memory: 65536, Time: 3, Parallelism: 4, SaltLength: 16, KeyLength: 0},
 	}
 
@@ -96,6 +100,12 @@ func TestHashPassword_InvalidParams(t *testing.T) {
 		if err == nil {
 			t.Errorf("expected error for invalid params %+v, got nil", p)
 		}
+	}
+
+	// Boundary test: SaltLength 16 passes
+	validParams := HashParams{Memory: 19456, Time: 2, Parallelism: 1, SaltLength: 16, KeyLength: 32}
+	if _, err := HashPassword("testpass", validParams); err != nil {
+		t.Fatalf("expected SaltLength 16 to succeed, got %v", err)
 	}
 }
 

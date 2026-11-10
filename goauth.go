@@ -66,6 +66,9 @@ func New(cfg config.Config) (*Auth, error) {
 
 	authSvc, err := auth.New(cfg, database, emailHooks)
 	if err != nil {
+		if sqlDB, dbErr := database.DB(); dbErr == nil {
+			_ = sqlDB.Close()
+		}
 		return nil, err
 	}
 

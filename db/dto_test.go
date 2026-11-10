@@ -21,6 +21,7 @@ func TestValidateEmail(t *testing.T) {
 		{name: "valid with tag and subdomain", email: "user+tag@sub.domain.co", wantError: false},
 		{name: "valid with multiple subdomains", email: "alice.smith+filter@mail.internal.example.org", wantError: false},
 		{name: "valid numeric local part", email: "12345@domain.com", wantError: false},
+		{name: "quoted local-part with @", email: "\"foo@bar\"@example.com", wantError: false},
 		{name: "empty email", email: "", wantError: true, wantCode: errors.CodeInvalidEmail},
 		{name: "missing at symbol", email: "userexample.com", wantError: true, wantCode: errors.CodeInvalidEmail},
 		{name: "spaces in email", email: "user @example.com", wantError: true, wantCode: errors.CodeInvalidEmail},

@@ -290,13 +290,13 @@ func TestConfigValidate(t *testing.T) {
 			wantErr: nil,
 		},
 		{
-			name: "argon2 parallelism zero",
+			name: "argon2 parallelism zero uses default",
 			mutate: func(c *Config) {
 				c.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
 				c.BaseURL = "https://example.com"
 				c.Argon2.Parallelism = 0
 			},
-			wantErr: errors.ErrArgon2ParallelismZero,
+			wantErr: nil,
 		},
 		{
 			name: "argon2 parallelism at boundary",
@@ -471,6 +471,37 @@ func TestConfigValidate(t *testing.T) {
 			if tt.name == "base URL trailing slash removed" && cfg.BaseURL != "https://example.com" {
 				t.Errorf("got base URL %q, want %q", cfg.BaseURL, "https://example.com")
 			}
+			if tt.name == "argon2 parallelism zero uses default" && cfg.Argon2.Parallelism != 4 {
+				t.Errorf("got parallelism %d, want 4", cfg.Argon2.Parallelism)
+			}
 		})
+	}
+}
+
+func TestConfigValidate_PartialArgon2Overrides(t *testing.T) {
+	cfg := Config{
+		DatabaseURL: "postgres://user:pass@localhost:5432/testdb",
+		BaseURL:     "https://example.com",
+		Argon2: Argon2Config{
+			Memory: 32768,
+		},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("unexpected validation error: %v", err)
+	}
+	if cfg.Argon2.Memory != 32768 {
+		t.Errorf("got Memory %d, want 32768", cfg.Argon2.Memory)
+	}
+	if cfg.Argon2.Time != 3 {
+		t.Errorf("got Time %d, want 3", cfg.Argon2.Time)
+	}
+	if cfg.Argon2.Parallelism != 4 {
+		t.Errorf("got Parallelism %d, want 4", cfg.Argon2.Parallelism)
+	}
+	if cfg.Argon2.SaltLength != 16 {
+		t.Errorf("got SaltLength %d, want 16", cfg.Argon2.SaltLength)
+	}
+	if cfg.Argon2.KeyLength != 32 {
+		t.Errorf("got KeyLength %d, want 32", cfg.Argon2.KeyLength)
 	}
 }

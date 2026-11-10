@@ -932,3 +932,35 @@ func TestRoutingAndAliases(t *testing.T) {
 		t.Fatalf("expected 200 on /api/auth/request-password-reset, got %d", recApiResetReq.Code)
 	}
 }
+
+func TestRequestBodyHardening(t *testing.T) {
+	_, _, h, _ := setupTestEnv(t)
+
+	t.Run("trailing data in request body rejected", func(t *testing.T) {
+		body := strings.NewReader(`{"email":"user@example.com","password":"validpassword123"} {"trailing": true}`)
+		req := httptest.NewRequest(http.MethodPost, "/auth/signup", body)
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400 for trailing data, got %d", rec.Code)
+		}
+		errResp := decodeResponseBody[errors.Response](t, rec)
+		if errResp.Code != errors.CodeValidationError {
+			t.Fatalf("expected CodeValidationError, got %s", errResp.Code)
+		}
+	})
+
+	t.Run("body exceeding 1 MiB rejected", func(t *testing.T) {
+		largeBody := `{"email":"` + strings.Repeat("a", 1024*1024+10) + `@example.com","password":"validpassword123"}`
+		req := httptest.NewRequest(http.MethodPost, "/auth/signup", strings.NewReader(largeBody))
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400 for oversized body, got %d", rec.Code)
+		}
+	})
+}

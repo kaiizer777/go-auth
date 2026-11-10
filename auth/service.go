@@ -120,6 +120,13 @@ func (s *authService) Signup(ctx context.Context, req db.SignupRequest) (*db.Use
 		return tx.Create(&tok).Error
 	})
 	if err != nil {
+		var existingUser db.User
+		if queryErr := s.db.WithContext(ctx).Where("LOWER(email) = LOWER(?)", req.Email).First(&existingUser).Error; queryErr == nil {
+			// Anti-enumeration parity: concurrent signup succeeded
+			_, _ = crypto.HashPassword(req.Password, s.hashParams)
+			go func() {}()
+			return nil, "", nil
+		}
 		return nil, "", errors.Wrap(err, errors.CodeDatabaseError, "failed to create user")
 	}
 
@@ -186,16 +193,25 @@ func (s *authService) VerifyEmail(ctx context.Context, req db.VerifyEmailRequest
 	}
 
 	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		res := tx.Where("token_hash = ?", tokenHash[:]).Delete(&db.VerificationToken{})
+		res := tx.Where("token_hash = ? AND expires_at > ?", tokenHash[:], time.Now().UTC()).Delete(&db.VerificationToken{})
 		if res.Error != nil {
 			return res.Error
 		}
 		if res.RowsAffected == 0 {
+			var count int64
+			if err := tx.Model(&db.VerificationToken{}).Where("token_hash = ?", tokenHash[:]).Count(&count).Error; err == nil && count > 0 {
+				_ = tx.Where("token_hash = ?", tokenHash[:]).Delete(&db.VerificationToken{}).Error
+				return errors.New(errors.CodeTokenExpired, "verification token has expired", nil)
+			}
 			return errors.New(errors.CodeInvalidToken, "invalid token", nil)
 		}
 		return tx.Model(&db.User{}).Where("id = ?", tok.UserID).Update("email_verified", true).Error
 	})
 	if err != nil {
+		var appErr *errors.Error
+		if errors.As(err, &appErr) && (appErr.Code() == errors.CodeInvalidToken || appErr.Code() == errors.CodeTokenExpired) {
+			return err
+		}
 		return errors.Wrap(err, errors.CodeDatabaseError, "failed to verify email")
 	}
 
@@ -273,11 +289,16 @@ func (s *authService) ResetPassword(ctx context.Context, req db.PasswordResetCon
 	}
 
 	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		res := tx.Where("token_hash = ?", tokenHash[:]).Delete(&db.PasswordResetToken{})
+		res := tx.Where("token_hash = ? AND expires_at > ?", tokenHash[:], time.Now().UTC()).Delete(&db.PasswordResetToken{})
 		if res.Error != nil {
 			return res.Error
 		}
 		if res.RowsAffected == 0 {
+			var count int64
+			if err := tx.Model(&db.PasswordResetToken{}).Where("token_hash = ?", tokenHash[:]).Count(&count).Error; err == nil && count > 0 {
+				_ = tx.Where("token_hash = ?", tokenHash[:]).Delete(&db.PasswordResetToken{}).Error
+				return errors.New(errors.CodeTokenExpired, "password reset token has expired", nil)
+			}
 			return errors.New(errors.CodeInvalidToken, "invalid token", nil)
 		}
 
@@ -288,6 +309,10 @@ func (s *authService) ResetPassword(ctx context.Context, req db.PasswordResetCon
 		return tx.Where("user_id = ?", tok.UserID).Delete(&db.PasswordResetToken{}).Error
 	})
 	if err != nil {
+		var appErr *errors.Error
+		if errors.As(err, &appErr) && (appErr.Code() == errors.CodeInvalidToken || appErr.Code() == errors.CodeTokenExpired) {
+			return err
+		}
 		return errors.Wrap(err, errors.CodeDatabaseError, "failed to reset password")
 	}
 

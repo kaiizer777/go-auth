@@ -2,6 +2,7 @@ package db
 
 import (
 	"encoding/hex"
+	"fmt"
 	"net/mail"
 	"strings"
 
@@ -25,21 +26,27 @@ func ValidateEmail(email string) error {
 	}
 
 	parsed, err := mail.ParseAddress(email)
-	if err != nil || parsed.Address != email {
+	if err != nil {
 		return errors.New(errors.CodeInvalidEmail, "invalid email format", err)
 	}
 
-	parts := strings.Split(parsed.Address, "@")
-	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+	lastAt := strings.LastIndex(parsed.Address, "@")
+	if lastAt == -1 || lastAt == 0 || lastAt == len(parsed.Address)-1 {
 		return errors.New(errors.CodeInvalidEmail, "invalid email format", nil)
 	}
 
-	domain := parts[1]
-	if !strings.Contains(domain, ".") {
+	localPart := parsed.Address[:lastAt]
+	domainPart := parsed.Address[lastAt+1:]
+
+	if parsed.Address != email && email != fmt.Sprintf("%q@%s", localPart, domainPart) {
+		return errors.New(errors.CodeInvalidEmail, "invalid email format", nil)
+	}
+
+	if !strings.Contains(domainPart, ".") {
 		return errors.New(errors.CodeInvalidEmail, "invalid email domain", nil)
 	}
 
-	labels := strings.Split(domain, ".")
+	labels := strings.Split(domainPart, ".")
 	for _, label := range labels {
 		if label == "" {
 			return errors.New(errors.CodeInvalidEmail, "invalid email domain", nil)

@@ -228,6 +228,28 @@ func TestService_Signup(t *testing.T) {
 			t.Fatalf("expected 1 user row, found %d", count)
 		}
 	})
+
+	t.Run("duplicate email race condition during insertion returns silent success", func(t *testing.T) {
+		raceEmail := "race_user@example.com"
+		// Simulate a concurrent insert happening: first insert the user directly
+		raceUser := db.User{
+			ID:           uuid.New(),
+			Email:        raceEmail,
+			PasswordHash: "somehash",
+		}
+		if err := database.Create(&raceUser).Error; err != nil {
+			t.Fatalf("failed to insert race user: %v", err)
+		}
+
+		// Calling Signup with the same email will detect collision and return silent success
+		u, tok, err := svc.Signup(ctx, db.SignupRequest{Email: raceEmail, Password: "SecureAlpha#2026!"})
+		if err != nil {
+			t.Fatalf("expected nil error on race duplicate, got: %v", err)
+		}
+		if u != nil || tok != "" {
+			t.Fatalf("expected nil user and empty token, got u=%v, tok=%s", u, tok)
+		}
+	})
 }
 
 func TestService_Login(t *testing.T) {
