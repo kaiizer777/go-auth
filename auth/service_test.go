@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -231,23 +232,55 @@ func TestService_Signup(t *testing.T) {
 
 	t.Run("duplicate email race condition during insertion returns silent success", func(t *testing.T) {
 		raceEmail := "race_user@example.com"
-		// Simulate a concurrent insert happening: first insert the user directly
-		raceUser := db.User{
-			ID:           uuid.New(),
-			Email:        raceEmail,
-			PasswordHash: "somehash",
+		var wg sync.WaitGroup
+		type signupResult struct {
+			user  *db.User
+			token string
+			err   error
 		}
-		if err := database.Create(&raceUser).Error; err != nil {
-			t.Fatalf("failed to insert race user: %v", err)
+		results := make([]signupResult, 2)
+
+		wg.Add(2)
+		for i := 0; i < 2; i++ {
+			go func(idx int) {
+				defer wg.Done()
+				u, tok, err := svc.Signup(ctx, db.SignupRequest{
+					Email:    raceEmail,
+					Password: "SecureAlpha#2026!",
+				})
+				results[idx] = signupResult{user: u, token: tok, err: err}
+			}(i)
+		}
+		wg.Wait()
+
+		for i, res := range results {
+			if res.err != nil {
+				t.Fatalf("goroutine %d returned unexpected error: %v", i, res.err)
+			}
 		}
 
-		// Calling Signup with the same email will detect collision and return silent success
-		u, tok, err := svc.Signup(ctx, db.SignupRequest{Email: raceEmail, Password: "SecureAlpha#2026!"})
-		if err != nil {
-			t.Fatalf("expected nil error on race duplicate, got: %v", err)
+		var successCount int
+		for _, res := range results {
+			if res.user != nil {
+				successCount++
+				if res.token == "" {
+					t.Fatalf("expected non-empty token for created user")
+				}
+			} else if res.token != "" {
+				t.Fatalf("expected empty token for silent success duplicate")
+			}
 		}
-		if u != nil || tok != "" {
-			t.Fatalf("expected nil user and empty token, got u=%v, tok=%s", u, tok)
+
+		if successCount != 1 {
+			t.Fatalf("expected exactly 1 signup call to create user, got %d", successCount)
+		}
+
+		var count int64
+		if err := database.Model(&db.User{}).Where("LOWER(email) = LOWER(?)", raceEmail).Count(&count).Error; err != nil {
+			t.Fatalf("failed to count users in db: %v", err)
+		}
+		if count != 1 {
+			t.Fatalf("expected exactly 1 user row in db, got %d", count)
 		}
 	})
 }

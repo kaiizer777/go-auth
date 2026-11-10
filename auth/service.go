@@ -199,11 +199,14 @@ func (s *authService) VerifyEmail(ctx context.Context, req db.VerifyEmailRequest
 		}
 		if res.RowsAffected == 0 {
 			var count int64
-			if err := tx.Model(&db.VerificationToken{}).Where("token_hash = ?", tokenHash[:]).Count(&count).Error; err == nil && count > 0 {
+			if err := tx.Model(&db.VerificationToken{}).Where("token_hash = ?", tokenHash[:]).Count(&count).Error; err != nil {
+				return err
+			}
+			if count > 0 {
 				_ = tx.Where("token_hash = ?", tokenHash[:]).Delete(&db.VerificationToken{}).Error
 				return errors.New(errors.CodeTokenExpired, "verification token has expired", nil)
 			}
-			return errors.New(errors.CodeInvalidToken, "invalid token", nil)
+			return errors.New(errors.CodeInvalidToken, "invalid or consumed verification token", nil)
 		}
 		return tx.Model(&db.User{}).Where("id = ?", tok.UserID).Update("email_verified", true).Error
 	})
@@ -295,11 +298,14 @@ func (s *authService) ResetPassword(ctx context.Context, req db.PasswordResetCon
 		}
 		if res.RowsAffected == 0 {
 			var count int64
-			if err := tx.Model(&db.PasswordResetToken{}).Where("token_hash = ?", tokenHash[:]).Count(&count).Error; err == nil && count > 0 {
+			if err := tx.Model(&db.PasswordResetToken{}).Where("token_hash = ?", tokenHash[:]).Count(&count).Error; err != nil {
+				return err
+			}
+			if count > 0 {
 				_ = tx.Where("token_hash = ?", tokenHash[:]).Delete(&db.PasswordResetToken{}).Error
 				return errors.New(errors.CodeTokenExpired, "password reset token has expired", nil)
 			}
-			return errors.New(errors.CodeInvalidToken, "invalid token", nil)
+			return errors.New(errors.CodeInvalidToken, "invalid or consumed password reset token", nil)
 		}
 
 		if err := tx.Model(&db.User{}).Where("id = ?", tok.UserID).Update("password_hash", newHash).Error; err != nil {
