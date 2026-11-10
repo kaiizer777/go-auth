@@ -47,14 +47,20 @@ func TestDefaultMigrationsEmbedded(t *testing.T) {
 		t.Fatalf("first migration = %d; want 1", first)
 	}
 
-	// Verify all up migrations can be read
+	// Verify all up and down migrations can be read
 	current := first
 	for {
-		rc, _, err := driver.ReadUp(current)
+		rcUp, _, err := driver.ReadUp(current)
 		if err != nil {
 			t.Fatalf("failed to read up migration for version %d: %v", current, err)
 		}
-		_ = rc.Close()
+		_ = rcUp.Close()
+
+		rcDown, _, err := driver.ReadDown(current)
+		if err != nil {
+			t.Fatalf("failed to read down migration for version %d: %v", current, err)
+		}
+		_ = rcDown.Close()
 
 		next, err := driver.Next(current)
 		if err != nil {
