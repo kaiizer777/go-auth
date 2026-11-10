@@ -225,11 +225,14 @@ func TestWriteJSON(t *testing.T) {
 func TestSentinels(t *testing.T) {
 	sentinels := []*Error{
 		ErrDatabaseURLRequired,
+		ErrBaseURLRequired,
+		ErrBaseURLInvalid,
 		ErrMaxOpenConnsNegative,
 		ErrMaxIdleConnsNegative,
 		ErrMaxIdleExceedsOpen,
 		ErrConnMaxLifetimeNegative,
 		ErrConnMaxIdleTimeNegative,
+		ErrEmailDispatchTimeoutNegative,
 	}
 
 	for _, s := range sentinels {

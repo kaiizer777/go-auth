@@ -13,6 +13,7 @@ import (
 	"gorm.io/gorm"
 
 	"github.com/kaiizer777/go-auth/config"
+	"github.com/kaiizer777/go-auth/email"
 	"github.com/kaiizer777/go-auth/errors"
 )
 
@@ -99,5 +100,41 @@ func TestAuth_Close_WithDB(t *testing.T) {
 
 	if err := auth.Close(); err != nil {
 		t.Fatalf("auth.Close() failed: %v", err)
+	}
+}
+
+func TestAuth_EmailDispatcher(t *testing.T) {
+	dispatcher := email.NewAsyncDispatcher(email.DispatcherConfig{
+		BaseURL:                   "https://example.com",
+		DisableAsyncEmailDispatch: true,
+	}, nil)
+	auth := &Auth{
+		emailDispatcher: dispatcher,
+	}
+
+	d := auth.EmailDispatcher()
+	if d == nil {
+		t.Fatal("expected non-nil email dispatcher, got nil")
+	}
+	if d != dispatcher {
+		t.Fatalf("got dispatcher %v, want %v", d, dispatcher)
+	}
+
+	d.DispatchVerification(context.Background(), email.VerificationEmailPayload{
+		UserID: "usr_test",
+		To:     "test@example.com",
+		Token:  "token_abc",
+	})
+}
+
+func TestAuth_EmailDispatcher_Nil(t *testing.T) {
+	var nilAuth *Auth
+	if nilAuth.EmailDispatcher() != nil {
+		t.Fatal("expected nil dispatcher for nil Auth")
+	}
+
+	emptyAuth := &Auth{}
+	if emptyAuth.EmailDispatcher() != nil {
+		t.Fatal("expected nil dispatcher for uninitialized Auth")
 	}
 }

@@ -5,20 +5,23 @@
 package goauth
 
 import (
+	"log/slog"
 	"net/http"
 
 	"gorm.io/gorm"
 
 	"github.com/kaiizer777/go-auth/config"
 	"github.com/kaiizer777/go-auth/db"
+	"github.com/kaiizer777/go-auth/email"
 	"github.com/kaiizer777/go-auth/errors"
 	"github.com/kaiizer777/go-auth/handler"
 )
 
 // Auth is the main entry point for the authentication library.
 type Auth struct {
-	db  *gorm.DB
-	cfg config.Config
+	db              *gorm.DB
+	cfg             config.Config
+	emailDispatcher *email.AsyncDispatcher
 
 	// Handler is the root HTTP handler with mounted routes and middleware.
 	Handler http.Handler
@@ -38,8 +41,15 @@ func New(cfg config.Config) (*Auth, error) {
 
 	h := handler.New(database, cfg)
 	return &Auth{
-		db:      database,
-		cfg:     cfg,
+		db:  database,
+		cfg: cfg,
+		emailDispatcher: email.NewAsyncDispatcher(email.DispatcherConfig{
+			BaseURL:                   cfg.BaseURL,
+			DisableAsyncEmailDispatch: cfg.DisableAsyncEmailDispatch,
+			EmailDispatchTimeout:      cfg.EmailDispatchTimeout,
+			SendVerificationEmail:     cfg.SendVerificationEmail,
+			SendPasswordResetEmail:    cfg.SendPasswordResetEmail,
+		}, slog.Default()),
 		Handler: h,
 	}, nil
 }
@@ -57,4 +67,12 @@ func (a *Auth) Close() error {
 		return errors.New(errors.CodeDatabaseError, "failed to close database", err)
 	}
 	return nil
+}
+
+// EmailDispatcher returns the configured email dispatcher.
+func (a *Auth) EmailDispatcher() email.Dispatcher {
+	if a == nil || a.emailDispatcher == nil {
+		return nil
+	}
+	return a.emailDispatcher
 }

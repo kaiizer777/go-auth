@@ -36,17 +36,32 @@ func TestDefaultConfig(t *testing.T) {
 	}
 }
 
+func TestConfigValidate_ZeroValueUsesAsyncEmailDispatch(t *testing.T) {
+	cfg := Config{
+		DatabaseURL: "postgres://user:pass@localhost:5432/testdb",
+		BaseURL:     "https://example.com",
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() unexpected err = %v", err)
+	}
+	if cfg.DisableAsyncEmailDispatch {
+		t.Fatal("zero-value config disabled async email dispatch")
+	}
+}
+
 func TestConfigValidate(t *testing.T) {
 	tests := []struct {
 		name               string
 		mutate             func(*Config)
 		wantErr            error
+		notWantErr         error
 		wantMigrationsPath string
 	}{
 		{
 			name: "valid configuration",
 			mutate: func(c *Config) {
 				c.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+				c.BaseURL = "https://example.com"
 			},
 			wantErr:            nil,
 			wantMigrationsPath: "db/migrations",
@@ -59,9 +74,19 @@ func TestConfigValidate(t *testing.T) {
 			wantErr: errors.ErrDatabaseURLRequired,
 		},
 		{
+			name: "missing base URL",
+			mutate: func(c *Config) {
+				c.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+				c.BaseURL = ""
+			},
+			wantErr:    errors.ErrBaseURLRequired,
+			notWantErr: errors.ErrBaseURLInvalid,
+		},
+		{
 			name: "negative max open connections",
 			mutate: func(c *Config) {
 				c.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+				c.BaseURL = "https://example.com"
 				c.MaxOpenConns = -1
 			},
 			wantErr: errors.ErrMaxOpenConnsNegative,
@@ -70,6 +95,7 @@ func TestConfigValidate(t *testing.T) {
 			name: "negative max idle connections",
 			mutate: func(c *Config) {
 				c.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+				c.BaseURL = "https://example.com"
 				c.MaxIdleConns = -1
 			},
 			wantErr: errors.ErrMaxIdleConnsNegative,
@@ -78,15 +104,52 @@ func TestConfigValidate(t *testing.T) {
 			name: "max idle exceeds max open",
 			mutate: func(c *Config) {
 				c.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+				c.BaseURL = "https://example.com"
 				c.MaxOpenConns = 5
 				c.MaxIdleConns = 10
 			},
 			wantErr: errors.ErrMaxIdleExceedsOpen,
 		},
 		{
+			name: "invalid base URL",
+			mutate: func(c *Config) {
+				c.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+				c.BaseURL = "example.com"
+			},
+			wantErr:    errors.ErrBaseURLInvalid,
+			notWantErr: errors.ErrBaseURLRequired,
+		},
+		{
+			name: "base URL with unparsable value",
+			mutate: func(c *Config) {
+				c.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+				c.BaseURL = ":not-a-url"
+			},
+			wantErr:    errors.ErrBaseURLInvalid,
+			notWantErr: errors.ErrBaseURLRequired,
+		},
+		{
+			name: "base URL with non-http scheme",
+			mutate: func(c *Config) {
+				c.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+				c.BaseURL = "ftp://example.com"
+			},
+			wantErr:    errors.ErrBaseURLInvalid,
+			notWantErr: errors.ErrBaseURLRequired,
+		},
+		{
+			name: "base URL trailing slash removed",
+			mutate: func(c *Config) {
+				c.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+				c.BaseURL = "https://example.com/"
+			},
+			wantErr: nil,
+		},
+		{
 			name: "negative conn max lifetime",
 			mutate: func(c *Config) {
 				c.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+				c.BaseURL = "https://example.com"
 				c.ConnMaxLifetime = -time.Second
 			},
 			wantErr: errors.ErrConnMaxLifetimeNegative,
@@ -95,14 +158,25 @@ func TestConfigValidate(t *testing.T) {
 			name: "negative conn max idle time",
 			mutate: func(c *Config) {
 				c.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+				c.BaseURL = "https://example.com"
 				c.ConnMaxIdleTime = -time.Second
 			},
 			wantErr: errors.ErrConnMaxIdleTimeNegative,
 		},
 		{
+			name: "negative email dispatch timeout",
+			mutate: func(c *Config) {
+				c.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+				c.BaseURL = "https://example.com"
+				c.EmailDispatchTimeout = -time.Second
+			},
+			wantErr: errors.ErrEmailDispatchTimeoutNegative,
+		},
+		{
 			name: "zero durations permitted as no-limit",
 			mutate: func(c *Config) {
 				c.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+				c.BaseURL = "https://example.com"
 				c.ConnMaxLifetime = 0
 				c.ConnMaxIdleTime = 0
 			},
@@ -110,9 +184,19 @@ func TestConfigValidate(t *testing.T) {
 			wantMigrationsPath: "db/migrations",
 		},
 		{
+			name: "zero email dispatch timeout uses default",
+			mutate: func(c *Config) {
+				c.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+				c.BaseURL = "https://example.com"
+				c.EmailDispatchTimeout = 0
+			},
+			wantErr: nil,
+		},
+		{
 			name: "empty migrations path falls back to default",
 			mutate: func(c *Config) {
 				c.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+				c.BaseURL = "https://example.com"
 				c.MigrationsPath = ""
 			},
 			wantErr:            nil,
@@ -122,6 +206,7 @@ func TestConfigValidate(t *testing.T) {
 			name: "custom migrations path preserved",
 			mutate: func(c *Config) {
 				c.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+				c.BaseURL = "https://example.com"
 				c.MigrationsPath = "custom/migrations"
 			},
 			wantErr:            nil,
@@ -141,8 +226,17 @@ func TestConfigValidate(t *testing.T) {
 			} else if err != nil {
 				t.Fatalf("Validate() unexpected err = %v", err)
 			}
+			if tt.notWantErr != nil && errors.Is(err, tt.notWantErr) {
+				t.Fatalf("Validate() err = %v, must not match %v", err, tt.notWantErr)
+			}
 			if tt.wantErr == nil && tt.wantMigrationsPath != "" && cfg.MigrationsPath != tt.wantMigrationsPath {
 				t.Errorf("got migrations path %q, want %q", cfg.MigrationsPath, tt.wantMigrationsPath)
+			}
+			if tt.name == "zero email dispatch timeout uses default" && cfg.EmailDispatchTimeout != 10*time.Second {
+				t.Errorf("got email dispatch timeout %v, want 10s", cfg.EmailDispatchTimeout)
+			}
+			if tt.name == "base URL trailing slash removed" && cfg.BaseURL != "https://example.com" {
+				t.Errorf("got base URL %q, want %q", cfg.BaseURL, "https://example.com")
 			}
 		})
 	}
