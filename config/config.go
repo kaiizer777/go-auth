@@ -15,6 +15,15 @@ type PasswordResetEmailPayload = email.PasswordResetEmailPayload
 type SendVerificationEmailFunc = email.SendVerificationEmailFunc
 type SendPasswordResetEmailFunc = email.SendPasswordResetEmailFunc
 
+// Argon2Config defines cryptographic parameters for Argon2id password hashing.
+type Argon2Config struct {
+	Memory      uint32 // KiB per hash. Min: 19456. Default: 65536 (64 MiB)
+	Time        uint32 // Iterations. Min: 2. Default: 3
+	Parallelism uint8  // Threads. Min: 1. Default: 4
+	SaltLength  uint32 // Bytes. Min: 16. Default: 16
+	KeyLength   uint32 // Output bytes. Min: 32. Default: 32
+}
+
 // Config holds all database, CORS, connection pool, and email hook settings.
 type Config struct {
 	// DatabaseURL is the PostgreSQL connection string.
@@ -51,20 +60,47 @@ type Config struct {
 	DisableAsyncEmailDispatch bool
 	// EmailDispatchTimeout max duration for email callback execution (default: 10s).
 	EmailDispatchTimeout time.Duration
+
+	// Argon2 holds parameters for password hashing.
+	Argon2 Argon2Config
+
+	// PasswordMinLength specifies minimum allowed password length in Unicode code points. Min: 8. Default: 8.
+	PasswordMinLength uint
+	// PasswordMaxLength specifies maximum allowed password length in Unicode code points. Max: 128. Default: 128.
+	PasswordMaxLength uint
+
+	// RequireEmailVerification blocks login for unverified accounts when true.
+	RequireEmailVerification bool
+	// VerificationTokenExpiry defines the lifetime of email verification tokens [15m..60m]. Default: 30m.
+	VerificationTokenExpiry time.Duration
+	// PasswordResetTokenExpiry defines the lifetime of password reset tokens [15m..60m]. Default: 30m.
+	PasswordResetTokenExpiry time.Duration
 }
 
 // DefaultConfig returns safe default settings. AllowedOrigins is intentionally
 // empty so callers must explicitly declare trusted origins.
 func DefaultConfig() Config {
 	return Config{
-		MigrationsPath:       "db/migrations",
-		MaxOpenConns:         25,
-		MaxIdleConns:         10,
-		ConnMaxLifetime:      time.Hour,
-		ConnMaxIdleTime:      30 * time.Minute,
-		AllowedMethods:       []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
-		AllowedHeaders:       []string{"Authorization", "Content-Type"},
-		EmailDispatchTimeout: 10 * time.Second,
+		MigrationsPath:           "db/migrations",
+		MaxOpenConns:             25,
+		MaxIdleConns:             10,
+		ConnMaxLifetime:          time.Hour,
+		ConnMaxIdleTime:          30 * time.Minute,
+		AllowedMethods:           []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
+		AllowedHeaders:           []string{"Authorization", "Content-Type"},
+		EmailDispatchTimeout:     10 * time.Second,
+		Argon2: Argon2Config{
+			Memory:      65536,
+			Time:        3,
+			Parallelism: 4,
+			SaltLength:  16,
+			KeyLength:   32,
+		},
+		PasswordMinLength:        8,
+		PasswordMaxLength:        128,
+		RequireEmailVerification: false,
+		VerificationTokenExpiry:  30 * time.Minute,
+		PasswordResetTokenExpiry: 30 * time.Minute,
 	}
 }
 
@@ -104,6 +140,56 @@ func (c *Config) Validate() error {
 	}
 	if c.EmailDispatchTimeout == 0 {
 		c.EmailDispatchTimeout = 10 * time.Second
+	}
+
+	if c.Argon2 == (Argon2Config{}) {
+		c.Argon2 = Argon2Config{
+			Memory:      65536,
+			Time:        3,
+			Parallelism: 4,
+			SaltLength:  16,
+			KeyLength:   32,
+		}
+	}
+	if c.Argon2.Memory < 19456 {
+		return errors.ErrArgon2MemoryTooLow
+	}
+	if c.Argon2.Time < 2 {
+		return errors.ErrArgon2TimeTooLow
+	}
+	if c.Argon2.Parallelism < 1 {
+		return errors.ErrArgon2ParallelismZero
+	}
+	if c.Argon2.SaltLength < 16 {
+		return errors.ErrArgon2SaltLengthTooShort
+	}
+	if c.Argon2.KeyLength < 32 {
+		return errors.ErrArgon2KeyLengthTooShort
+	}
+
+	if c.PasswordMinLength == 0 {
+		c.PasswordMinLength = 8
+	}
+	if c.PasswordMaxLength == 0 {
+		c.PasswordMaxLength = 128
+	}
+	if c.PasswordMinLength < 8 {
+		return errors.ErrPasswordMinLengthTooShort
+	}
+	if c.PasswordMaxLength <= c.PasswordMinLength || c.PasswordMaxLength > 128 {
+		return errors.ErrPasswordMaxLengthInvalid
+	}
+
+	if c.VerificationTokenExpiry == 0 {
+		c.VerificationTokenExpiry = 30 * time.Minute
+	} else if c.VerificationTokenExpiry < 15*time.Minute || c.VerificationTokenExpiry > 60*time.Minute {
+		return errors.ErrVerificationTokenExpiryInvalid
+	}
+
+	if c.PasswordResetTokenExpiry == 0 {
+		c.PasswordResetTokenExpiry = 30 * time.Minute
+	} else if c.PasswordResetTokenExpiry < 15*time.Minute || c.PasswordResetTokenExpiry > 60*time.Minute {
+		return errors.ErrPasswordResetTokenExpiryInvalid
 	}
 	return nil
 }

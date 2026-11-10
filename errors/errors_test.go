@@ -118,6 +118,18 @@ func TestCode_HTTPStatus(t *testing.T) {
 		{CodeDatabaseError, http.StatusInternalServerError},
 		{CodeMigrationFailed, http.StatusInternalServerError},
 		{CodeInternalError, http.StatusInternalServerError},
+		{CodeInvalidCredentials, http.StatusUnauthorized},
+		{CodeUnauthenticated, http.StatusUnauthorized},
+		{CodeEmailNotVerified, http.StatusForbidden},
+		{CodePasswordTooShort, http.StatusBadRequest},
+		{CodePasswordTooLong, http.StatusBadRequest},
+		{CodePasswordTooCommon, http.StatusBadRequest},
+		{CodeInvalidEmail, http.StatusBadRequest},
+		{CodeValidationError, http.StatusBadRequest},
+		{CodeInvalidToken, http.StatusBadRequest},
+		{CodeTokenExpired, http.StatusBadRequest},
+		{CodeUserAlreadyExists, http.StatusInternalServerError},
+		{CodeUserNotFound, http.StatusInternalServerError},
 		{Code("CUSTOM_UNKNOWN"), http.StatusInternalServerError},
 	}
 
@@ -233,6 +245,15 @@ func TestSentinels(t *testing.T) {
 		ErrConnMaxLifetimeNegative,
 		ErrConnMaxIdleTimeNegative,
 		ErrEmailDispatchTimeoutNegative,
+		ErrArgon2MemoryTooLow,
+		ErrArgon2TimeTooLow,
+		ErrArgon2ParallelismZero,
+		ErrArgon2SaltLengthTooShort,
+		ErrArgon2KeyLengthTooShort,
+		ErrPasswordMinLengthTooShort,
+		ErrPasswordMaxLengthInvalid,
+		ErrVerificationTokenExpiryInvalid,
+		ErrPasswordResetTokenExpiryInvalid,
 	}
 
 	for _, s := range sentinels {
