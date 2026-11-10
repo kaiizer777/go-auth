@@ -75,6 +75,9 @@ type Config struct {
 	VerificationTokenExpiry time.Duration
 	// PasswordResetTokenExpiry defines the lifetime of password reset tokens [15m..60m]. Default: 30m.
 	PasswordResetTokenExpiry time.Duration
+
+	// EmailHooks holds optional callbacks for transactional email events.
+	EmailHooks email.Hooks
 }
 
 // DefaultConfig returns safe default settings. AllowedOrigins is intentionally

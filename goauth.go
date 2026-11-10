@@ -10,6 +10,7 @@ import (
 
 	"gorm.io/gorm"
 
+	"github.com/kaiizer777/go-auth/auth"
 	"github.com/kaiizer777/go-auth/config"
 	"github.com/kaiizer777/go-auth/db"
 	"github.com/kaiizer777/go-auth/email"
@@ -25,6 +26,9 @@ type Auth struct {
 
 	// Handler is the root HTTP handler with mounted routes and middleware.
 	Handler http.Handler
+
+	// Auth is the core authentication service.
+	Auth auth.Service
 }
 
 // New validates runtime configuration, establishes database connectivity,
@@ -39,6 +43,11 @@ func New(cfg config.Config) (*Auth, error) {
 		return nil, errors.Wrap(err, errors.CodeDatabaseError, "goauth: failed to connect to database")
 	}
 
+	authSvc, err := auth.New(cfg, database, cfg.EmailHooks)
+	if err != nil {
+		return nil, err
+	}
+
 	h := handler.New(database, cfg)
 	return &Auth{
 		db:  database,
@@ -51,6 +60,7 @@ func New(cfg config.Config) (*Auth, error) {
 			SendPasswordResetEmail:    cfg.SendPasswordResetEmail,
 		}, slog.Default()),
 		Handler: h,
+		Auth:    authSvc,
 	}, nil
 }
 
