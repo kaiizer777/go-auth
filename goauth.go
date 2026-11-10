@@ -5,6 +5,7 @@
 package goauth
 
 import (
+	"context"
 	"log/slog"
 	"net/http"
 
@@ -43,7 +44,27 @@ func New(cfg config.Config) (*Auth, error) {
 		return nil, errors.Wrap(err, errors.CodeDatabaseError, "goauth: failed to connect to database")
 	}
 
-	authSvc, err := auth.New(cfg, database, cfg.EmailHooks)
+	emailHooks := cfg.EmailHooks
+	if emailHooks.SendVerificationEmail == nil && cfg.SendVerificationEmail != nil {
+		emailHooks.SendVerificationEmail = func(ctx context.Context, recipient, token string) error {
+			return cfg.SendVerificationEmail(ctx, email.VerificationEmailPayload{
+				To:    recipient,
+				Token: token,
+				URL:   email.BuildVerificationURL(cfg.BaseURL, token),
+			})
+		}
+	}
+	if emailHooks.SendPasswordResetEmail == nil && cfg.SendPasswordResetEmail != nil {
+		emailHooks.SendPasswordResetEmail = func(ctx context.Context, recipient, token string) error {
+			return cfg.SendPasswordResetEmail(ctx, email.PasswordResetEmailPayload{
+				To:    recipient,
+				Token: token,
+				URL:   email.BuildResetURL(cfg.BaseURL, token),
+			})
+		}
+	}
+
+	authSvc, err := auth.New(cfg, database, emailHooks)
 	if err != nil {
 		return nil, err
 	}

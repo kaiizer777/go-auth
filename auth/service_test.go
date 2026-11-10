@@ -23,6 +23,7 @@ import (
 func testConfig() config.Config {
 	cfg := config.DefaultConfig()
 	cfg.DatabaseURL = "postgres://test:test@localhost:5432/test"
+	cfg.BaseURL = "http://localhost:8080"
 	cfg.Argon2 = config.Argon2Config{
 		Memory:      19456, // Fast RFC 9106 test floor
 		Time:        2,
