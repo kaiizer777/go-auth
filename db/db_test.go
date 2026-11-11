@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/golang-migrate/migrate/v4/source/iofs"
+	"github.com/kaiizer777/go-auth/config"
 )
 
 func TestCustomMigrationsFS(t *testing.T) {
@@ -89,3 +90,26 @@ func TestIsDefaultMigrationsPath(t *testing.T) {
 		}
 	}
 }
+
+func TestConnectInvalidURL(t *testing.T) {
+	cfg := config.Config{
+		DatabaseURL: "postgres://invalid:invalid@127.0.0.1:54329/nonexistent?sslmode=disable&connect_timeout=1",
+	}
+	gormDB, err := Connect(cfg)
+	if err == nil {
+		if gormDB != nil {
+			if sqlDB, errDB := gormDB.DB(); errDB == nil {
+				_ = sqlDB.Close()
+			}
+		}
+		t.Fatal("Connect with invalid database URL expected error, got nil")
+	}
+}
+
+func TestRunMigrationsInvalidURL(t *testing.T) {
+	err := runMigrations("postgres://invalid:invalid@127.0.0.1:54329/nonexistent?sslmode=disable&connect_timeout=1", "")
+	if err == nil {
+		t.Fatal("runMigrations with invalid database URL expected error, got nil")
+	}
+}
+

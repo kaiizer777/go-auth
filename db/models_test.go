@@ -96,3 +96,29 @@ func TestModelTableNames(t *testing.T) {
 		})
 	}
 }
+
+func TestModelUserIDIndexTags(t *testing.T) {
+	models := []struct {
+		name        string
+		model       any
+		expectedTag string
+	}{
+		{name: "Session", model: Session{}, expectedTag: "type:uuid;not null;index:idx_sessions_user_id"},
+		{name: "VerificationToken", model: VerificationToken{}, expectedTag: "type:uuid;not null;index:idx_verification_tokens_user_id"},
+		{name: "PasswordResetToken", model: PasswordResetToken{}, expectedTag: "type:uuid;not null;index:idx_password_reset_tokens_user_id"},
+	}
+
+	for _, tc := range models {
+		t.Run(tc.name, func(t *testing.T) {
+			field, ok := reflect.TypeOf(tc.model).FieldByName("UserID")
+			if !ok {
+				t.Fatalf("model %s missing UserID field", tc.name)
+			}
+			tag := field.Tag.Get("gorm")
+			if tag != tc.expectedTag {
+				t.Fatalf("model %s UserID gorm tag = %q; want %q", tc.name, tag, tc.expectedTag)
+			}
+		})
+	}
+}
+

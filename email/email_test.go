@@ -434,3 +434,24 @@ func TestDispatch_EmptyUserIDZeroExpiresAt(t *testing.T) {
 		t.Errorf("ExpiresAt = %v, want zero", got.ExpiresAt)
 	}
 }
+
+func TestDispatch_NilContext(t *testing.T) {
+	called := make(chan struct{})
+	hook := func(ctx context.Context, p VerificationEmailPayload) error {
+		close(called)
+		return nil
+	}
+	d := NewAsyncDispatcher(DispatcherConfig{
+		SendVerificationEmail:     hook,
+		DisableAsyncEmailDispatch: true,
+		EmailDispatchTimeout:      time.Second,
+	}, captureLogger(&bytes.Buffer{}))
+
+	// Should not panic when ctx is nil
+	d.DispatchVerification(nil, VerificationEmailPayload{To: "nilctx@example.com"})
+	select {
+	case <-called:
+	case <-time.After(time.Second):
+		t.Fatal("hook not called with nil context")
+	}
+}

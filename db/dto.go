@@ -56,6 +56,11 @@ func ValidateEmail(email string) error {
 	return nil
 }
 
+// NormalizeEmail trims leading and trailing whitespace and converts the email address to lowercase.
+func NormalizeEmail(email string) string {
+	return strings.ToLower(strings.TrimSpace(email))
+}
+
 // ValidateToken validates a 64-character hexadecimal token string.
 func ValidateToken(token string) error {
 	if len(token) != 64 {
@@ -85,6 +90,16 @@ func (r SignupRequest) Validate() error {
 	return nil
 }
 
+// NormalizedEmail returns the trimmed, lowercase email address.
+func (r SignupRequest) NormalizedEmail() string {
+	return NormalizeEmail(r.Email)
+}
+
+// Normalize trims and lowercases the email address in-place.
+func (r *SignupRequest) Normalize() {
+	r.Email = NormalizeEmail(r.Email)
+}
+
 // LoginRequest represents the payload for user login.
 type LoginRequest struct {
 	Email    string `json:"email"`
@@ -100,6 +115,16 @@ func (r LoginRequest) Validate() error {
 		return errors.New(errors.CodeValidationError, "password is required", nil)
 	}
 	return nil
+}
+
+// NormalizedEmail returns the trimmed, lowercase email address.
+func (r LoginRequest) NormalizedEmail() string {
+	return NormalizeEmail(r.Email)
+}
+
+// Normalize trims and lowercases the email address in-place.
+func (r *LoginRequest) Normalize() {
+	r.Email = NormalizeEmail(r.Email)
 }
 
 // VerifyEmailRequest represents the payload for email verification.
@@ -120,6 +145,16 @@ type PasswordResetRequest struct {
 // Validate validates the password reset request fields.
 func (r PasswordResetRequest) Validate() error {
 	return ValidateEmail(r.Email)
+}
+
+// NormalizedEmail returns the trimmed, lowercase email address.
+func (r PasswordResetRequest) NormalizedEmail() string {
+	return NormalizeEmail(r.Email)
+}
+
+// Normalize trims and lowercases the email address in-place.
+func (r *PasswordResetRequest) Normalize() {
+	r.Email = NormalizeEmail(r.Email)
 }
 
 // PasswordResetConfirmRequest represents the payload for confirming a password reset.

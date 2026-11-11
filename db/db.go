@@ -3,6 +3,7 @@ package db
 import (
 	"database/sql"
 	"embed"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -57,18 +58,29 @@ func Connect(cfg config.Config) (*gorm.DB, error) {
 	// 3. Pool config
 	sqlDB, err := db.DB()
 	if err != nil {
+		if closer, ok := db.ConnPool.(io.Closer); ok {
+			_ = closer.Close()
+		}
 		return nil, errors.New(errors.CodeDatabaseError, "get sql.DB failed", err)
 	}
+
+	var success bool
+	defer func() {
+		if !success {
+			_ = sqlDB.Close()
+		}
+	}()
+
 	sqlDB.SetMaxOpenConns(cfg.MaxOpenConns)
 	sqlDB.SetMaxIdleConns(cfg.MaxIdleConns)
 	sqlDB.SetConnMaxLifetime(cfg.ConnMaxLifetime)
 	sqlDB.SetConnMaxIdleTime(cfg.ConnMaxIdleTime)
 
 	if err := sqlDB.Ping(); err != nil {
-		_ = sqlDB.Close()
 		return nil, errors.New(errors.CodeDatabaseUnavailable, "db ping failed", err)
 	}
 
+	success = true
 	return db, nil
 }
 
@@ -79,17 +91,16 @@ func runMigrations(databaseURL, migrationsPath string) error {
 	if err != nil {
 		return errors.New(errors.CodeDatabaseError, "open database connection failed", err)
 	}
-	defer func() {
-		_ = db.Close()
-	}()
 
 	// validate connection before passing to migrate
 	if err := db.Ping(); err != nil {
+		_ = db.Close()
 		return errors.New(errors.CodeDatabaseUnavailable, "ping database failed", err)
 	}
 
 	driver, err := pgmigrate.WithInstance(db, &pgmigrate.Config{})
 	if err != nil {
+		_ = db.Close()
 		return errors.New(errors.CodeMigrationFailed, "initialize postgres migration driver failed", err)
 	}
 

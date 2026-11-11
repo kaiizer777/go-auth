@@ -22,7 +22,7 @@ func (User) TableName() string { return "users" }
 // Session represents an active authenticated user session.
 type Session struct {
 	ID            uuid.UUID `gorm:"primaryKey;type:uuid;default:uuid_generate_v4()"`
-	UserID        uuid.UUID `gorm:"type:uuid;not null;index"`
+	UserID        uuid.UUID `gorm:"type:uuid;not null;index:idx_sessions_user_id"`
 	TokenHash     string    `gorm:"column:token_hash;type:text;uniqueIndex;not null"` // raw token is never persisted
 	ExpiresAt     time.Time `gorm:"not null"`
 	IdleExpiresAt time.Time `gorm:"not null"`

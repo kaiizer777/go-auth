@@ -109,6 +109,9 @@ func (d *AsyncDispatcher) execute(ctx context.Context, op string, run func(conte
 	if timeout <= 0 {
 		timeout = 10 * time.Second
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
 	defer cancel()
 

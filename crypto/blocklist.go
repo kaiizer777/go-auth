@@ -13,15 +13,23 @@ var embeddedPasswords string
 
 var commonPasswords map[string]struct{}
 
-func init() {
-	lines := strings.Split(embeddedPasswords, "\n")
-	commonPasswords = make(map[string]struct{}, len(lines))
+// parseBlocklist parses newline-separated passwords, handling CRLF (\r\n), LF (\n), and CR (\r).
+func parseBlocklist(data string) map[string]struct{} {
+	lines := strings.FieldsFunc(data, func(r rune) bool {
+		return r == '\r' || r == '\n'
+	})
+	blocklist := make(map[string]struct{}, len(lines))
 	for _, line := range lines {
 		normalized := strings.ToLower(strings.TrimSpace(line))
 		if normalized != "" {
-			commonPasswords[normalized] = struct{}{}
+			blocklist[normalized] = struct{}{}
 		}
 	}
+	return blocklist
+}
+
+func init() {
+	commonPasswords = parseBlocklist(embeddedPasswords)
 }
 
 // IsCommonPassword checks whether a password exists in the static common password blocklist.

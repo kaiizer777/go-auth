@@ -25,12 +25,15 @@ type Service interface {
 	ResetPassword(ctx context.Context, req db.PasswordResetConfirmRequest) error
 }
 
+const emailDispatchSemaphoreSize = 128
+
 type authService struct {
 	cfg        config.Config
 	db         *gorm.DB
 	hooks      email.Hooks
 	dummyHash  string
 	hashParams crypto.HashParams
+	emailSem   chan struct{}
 }
 
 // New constructs a new concrete auth Service.
@@ -61,6 +64,7 @@ func New(cfg config.Config, database *gorm.DB, hooks email.Hooks) (Service, erro
 		hooks:      hooks,
 		dummyHash:  dummyHash,
 		hashParams: hashParams,
+		emailSem:   make(chan struct{}, emailDispatchSemaphoreSize),
 	}, nil
 }
 
@@ -78,9 +82,8 @@ func (s *authService) Signup(ctx context.Context, req db.SignupRequest) (*db.Use
 	var existing db.User
 	err := s.db.WithContext(ctx).Where("LOWER(email) = LOWER(?)", req.Email).First(&existing).Error
 	if err == nil {
-		// Anti-enumeration parity: perform dummy hashing and scheduling
+		// Anti-enumeration parity: perform dummy hashing
 		_, _ = crypto.HashPassword(req.Password, s.hashParams)
-		go func() {}()
 		return nil, "", nil
 	}
 	if !errors.Is(err, gorm.ErrRecordNotFound) {
@@ -124,7 +127,6 @@ func (s *authService) Signup(ctx context.Context, req db.SignupRequest) (*db.Use
 		if queryErr := s.db.WithContext(ctx).Where("LOWER(email) = LOWER(?)", req.Email).First(&existingUser).Error; queryErr == nil {
 			// Anti-enumeration parity: concurrent signup succeeded
 			_, _ = crypto.HashPassword(req.Password, s.hashParams)
-			go func() {}()
 			return nil, "", nil
 		}
 		return nil, "", errors.Wrap(err, errors.CodeDatabaseError, "failed to create user")
@@ -179,35 +181,29 @@ func (s *authService) VerifyEmail(ctx context.Context, req db.VerifyEmailRequest
 		return errors.New(errors.CodeInvalidToken, "invalid token", err)
 	}
 
-	var tok db.VerificationToken
-	if err := s.db.WithContext(ctx).Where("token_hash = ?", tokenHash[:]).First(&tok).Error; err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return errors.New(errors.CodeInvalidToken, "invalid token", nil)
-		}
-		return errors.Wrap(err, errors.CodeDatabaseError, "failed to query verification token")
-	}
-
-	if time.Now().UTC().After(tok.ExpiresAt) {
-		_ = s.db.WithContext(ctx).Where("token_hash = ?", tokenHash[:]).Delete(&db.VerificationToken{}).Error
-		return errors.New(errors.CodeTokenExpired, "verification token has expired", nil)
-	}
-
+	var isExpired bool
 	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		res := tx.Where("token_hash = ? AND expires_at > ?", tokenHash[:], time.Now().UTC()).Delete(&db.VerificationToken{})
+		var tok db.VerificationToken
+		if err := tx.Where("token_hash = ?", tokenHash[:]).First(&tok).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return errors.New(errors.CodeInvalidToken, "invalid token", nil)
+			}
+			return errors.Wrap(err, errors.CodeDatabaseError, "failed to query verification token")
+		}
+
+		if time.Now().UTC().After(tok.ExpiresAt) {
+			isExpired = true
+			return tx.Where("token_hash = ?", tokenHash[:]).Delete(&db.VerificationToken{}).Error
+		}
+
+		res := tx.Where("token_hash = ?", tokenHash[:]).Delete(&db.VerificationToken{})
 		if res.Error != nil {
 			return res.Error
 		}
 		if res.RowsAffected == 0 {
-			var count int64
-			if err := tx.Model(&db.VerificationToken{}).Where("token_hash = ?", tokenHash[:]).Count(&count).Error; err != nil {
-				return err
-			}
-			if count > 0 {
-				_ = tx.Where("token_hash = ?", tokenHash[:]).Delete(&db.VerificationToken{}).Error
-				return errors.New(errors.CodeTokenExpired, "verification token has expired", nil)
-			}
 			return errors.New(errors.CodeInvalidToken, "invalid or consumed verification token", nil)
 		}
+
 		return tx.Model(&db.User{}).Where("id = ?", tok.UserID).Update("email_verified", true).Error
 	})
 	if err != nil {
@@ -216,6 +212,9 @@ func (s *authService) VerifyEmail(ctx context.Context, req db.VerifyEmailRequest
 			return err
 		}
 		return errors.Wrap(err, errors.CodeDatabaseError, "failed to verify email")
+	}
+	if isExpired {
+		return errors.New(errors.CodeTokenExpired, "verification token has expired", nil)
 	}
 
 	return nil
@@ -233,7 +232,6 @@ func (s *authService) RequestPasswordReset(ctx context.Context, req db.PasswordR
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			_, _, _ = crypto.GenerateToken()
-			go func() {}()
 			return "", nil
 		}
 		return "", errors.Wrap(err, errors.CodeDatabaseError, "failed to query user")
@@ -273,38 +271,31 @@ func (s *authService) ResetPassword(ctx context.Context, req db.PasswordResetCon
 		return errors.New(errors.CodeInvalidToken, "invalid token", err)
 	}
 
-	var tok db.PasswordResetToken
-	if err := s.db.WithContext(ctx).Where("token_hash = ?", tokenHash[:]).First(&tok).Error; err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return errors.New(errors.CodeInvalidToken, "invalid token", nil)
-		}
-		return errors.Wrap(err, errors.CodeDatabaseError, "failed to query password reset token")
-	}
-
-	if time.Now().UTC().After(tok.ExpiresAt) {
-		_ = s.db.WithContext(ctx).Where("token_hash = ?", tokenHash[:]).Delete(&db.PasswordResetToken{}).Error
-		return errors.New(errors.CodeTokenExpired, "password reset token has expired", nil)
-	}
-
 	newHash, err := crypto.HashPassword(req.NewPassword, s.hashParams)
 	if err != nil {
 		return errors.Wrap(err, errors.CodeInternalError, "failed to hash password")
 	}
 
+	var isExpired bool
 	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		res := tx.Where("token_hash = ? AND expires_at > ?", tokenHash[:], time.Now().UTC()).Delete(&db.PasswordResetToken{})
+		var tok db.PasswordResetToken
+		if err := tx.Where("token_hash = ?", tokenHash[:]).First(&tok).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return errors.New(errors.CodeInvalidToken, "invalid token", nil)
+			}
+			return errors.Wrap(err, errors.CodeDatabaseError, "failed to query password reset token")
+		}
+
+		if time.Now().UTC().After(tok.ExpiresAt) {
+			isExpired = true
+			return tx.Where("token_hash = ?", tokenHash[:]).Delete(&db.PasswordResetToken{}).Error
+		}
+
+		res := tx.Where("token_hash = ?", tokenHash[:]).Delete(&db.PasswordResetToken{})
 		if res.Error != nil {
 			return res.Error
 		}
 		if res.RowsAffected == 0 {
-			var count int64
-			if err := tx.Model(&db.PasswordResetToken{}).Where("token_hash = ?", tokenHash[:]).Count(&count).Error; err != nil {
-				return err
-			}
-			if count > 0 {
-				_ = tx.Where("token_hash = ?", tokenHash[:]).Delete(&db.PasswordResetToken{}).Error
-				return errors.New(errors.CodeTokenExpired, "password reset token has expired", nil)
-			}
 			return errors.New(errors.CodeInvalidToken, "invalid or consumed password reset token", nil)
 		}
 
@@ -321,20 +312,33 @@ func (s *authService) ResetPassword(ctx context.Context, req db.PasswordResetCon
 		}
 		return errors.Wrap(err, errors.CodeDatabaseError, "failed to reset password")
 	}
+	if isExpired {
+		return errors.New(errors.CodeTokenExpired, "password reset token has expired", nil)
+	}
 
 	return nil
 }
 
 func (s *authService) dispatchVerificationEmail(ctx context.Context, recipient, token string) {
 	if s.hooks.SendVerificationEmail == nil {
-		go func() {}()
 		return
 	}
 	detachedCtx := context.Background()
 	if ctx != nil {
 		detachedCtx = context.WithoutCancel(ctx)
 	}
+	if s.emailSem != nil {
+		s.emailSem <- struct{}{}
+	}
 	go func() {
+		if s.emailSem != nil {
+			defer func() { <-s.emailSem }()
+		}
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("email: panic recovered in verification email dispatch to %s: %v", recipient, r)
+			}
+		}()
 		if err := s.hooks.SendVerificationEmail(detachedCtx, recipient, token); err != nil {
 			log.Printf("email: failed to send verification email to %s: %v", recipient, err)
 		}
@@ -343,14 +347,24 @@ func (s *authService) dispatchVerificationEmail(ctx context.Context, recipient, 
 
 func (s *authService) dispatchPasswordResetEmail(ctx context.Context, recipient, token string) {
 	if s.hooks.SendPasswordResetEmail == nil {
-		go func() {}()
 		return
 	}
 	detachedCtx := context.Background()
 	if ctx != nil {
 		detachedCtx = context.WithoutCancel(ctx)
 	}
+	if s.emailSem != nil {
+		s.emailSem <- struct{}{}
+	}
 	go func() {
+		if s.emailSem != nil {
+			defer func() { <-s.emailSem }()
+		}
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("email: panic recovered in password reset email dispatch to %s: %v", recipient, r)
+			}
+		}()
 		if err := s.hooks.SendPasswordResetEmail(detachedCtx, recipient, token); err != nil {
 			log.Printf("email: failed to send password reset email to %s: %v", recipient, err)
 		}

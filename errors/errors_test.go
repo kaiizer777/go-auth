@@ -80,6 +80,17 @@ func TestError_Is(t *testing.T) {
 	if !Is(err1, root) {
 		t.Error("expected err1 to match root cause via unwrap")
 	}
+	if !err1.Is(root) {
+		t.Error("expected direct err1.Is(root) to match wrapped stdlib error")
+	}
+	unrelated := stderrors.New("unrelated error")
+	if err1.Is(unrelated) {
+		t.Error("expected err1.Is(unrelated) to be false")
+	}
+	errNoCause := New(CodeInvalidConfig, "no cause", nil)
+	if errNoCause.Is(root) {
+		t.Error("expected errNoCause.Is(root) to be false")
+	}
 	if !Is(ErrDatabaseURLRequired, ErrDatabaseURLRequired) {
 		t.Error("expected sentinel to match itself")
 	}
@@ -128,8 +139,8 @@ func TestCode_HTTPStatus(t *testing.T) {
 		{CodeValidationError, http.StatusBadRequest},
 		{CodeInvalidToken, http.StatusBadRequest},
 		{CodeTokenExpired, http.StatusBadRequest},
-		{CodeUserAlreadyExists, http.StatusInternalServerError},
-		{CodeUserNotFound, http.StatusInternalServerError},
+		{CodeUserAlreadyExists, http.StatusConflict},
+		{CodeUserNotFound, http.StatusNotFound},
 		{Code("CUSTOM_UNKNOWN"), http.StatusInternalServerError},
 	}
 
@@ -283,6 +294,7 @@ func TestSentinels(t *testing.T) {
 		ErrDatabaseURLRequired,
 		ErrBaseURLRequired,
 		ErrBaseURLInvalid,
+		ErrAllowedOriginInvalid,
 		ErrMaxOpenConnsNegative,
 		ErrMaxIdleConnsNegative,
 		ErrMaxIdleExceedsOpen,

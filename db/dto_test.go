@@ -258,3 +258,63 @@ func TestResponseDTOJSONSerialization(t *testing.T) {
 		}
 	})
 }
+
+func TestNormalizeEmail(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{name: "trims leading and trailing whitespace", input: "   user@example.com  ", want: "user@example.com"},
+		{name: "lowercases uppercase email", input: "USER@EXAMPLE.COM", want: "user@example.com"},
+		{name: "trims whitespace and lowercases mixed case", input: " \t User.Name+Tag@Sub.Domain.Co \n ", want: "user.name+tag@sub.domain.co"},
+		{name: "preserves already normalized email", input: "user@example.com", want: "user@example.com"},
+		{name: "handles empty string", input: "", want: ""},
+		{name: "handles whitespace-only string", input: "   \t\n  ", want: ""},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := NormalizeEmail(tc.input)
+			if got != tc.want {
+				t.Fatalf("NormalizeEmail(%q) = %q; want %q", tc.input, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestRequestDTONormalize(t *testing.T) {
+	t.Run("SignupRequest", func(t *testing.T) {
+		req := SignupRequest{Email: "  Alice@Example.COM  ", Password: "Password123"}
+		if got := req.NormalizedEmail(); got != "alice@example.com" {
+			t.Fatalf("req.NormalizedEmail() = %q; want %q", got, "alice@example.com")
+		}
+		req.Normalize()
+		if req.Email != "alice@example.com" {
+			t.Fatalf("req.Normalize() failed: got %q, want %q", req.Email, "alice@example.com")
+		}
+	})
+
+	t.Run("LoginRequest", func(t *testing.T) {
+		req := LoginRequest{Email: "  Bob@Example.COM  ", Password: "Password123"}
+		if got := req.NormalizedEmail(); got != "bob@example.com" {
+			t.Fatalf("req.NormalizedEmail() = %q; want %q", got, "bob@example.com")
+		}
+		req.Normalize()
+		if req.Email != "bob@example.com" {
+			t.Fatalf("req.Normalize() failed: got %q, want %q", req.Email, "bob@example.com")
+		}
+	})
+
+	t.Run("PasswordResetRequest", func(t *testing.T) {
+		req := PasswordResetRequest{Email: "  Charlie@Example.COM  "}
+		if got := req.NormalizedEmail(); got != "charlie@example.com" {
+			t.Fatalf("req.NormalizedEmail() = %q; want %q", got, "charlie@example.com")
+		}
+		req.Normalize()
+		if req.Email != "charlie@example.com" {
+			t.Fatalf("req.Normalize() failed: got %q, want %q", req.Email, "charlie@example.com")
+		}
+	})
+}
+

@@ -6,6 +6,8 @@ import (
 	"encoding/base64"
 	"fmt"
 	"io"
+	"runtime"
+	"strconv"
 	"strings"
 
 	"golang.org/x/crypto/argon2"
@@ -36,6 +38,12 @@ func DefaultHashParams() HashParams {
 // ErrInvalidHashFormat is returned when a hash string does not conform to the Argon2id PHC format.
 var ErrInvalidHashFormat = errors.New(errors.CodeInternalError, "invalid argon2id hash format", nil)
 
+// wipeBytes securely clears sensitive bytes in memory and prevents compiler dead-store elimination.
+func wipeBytes(b []byte) {
+	clear(b)
+	runtime.KeepAlive(b)
+}
+
 // HashPassword hashes a plain text password using Argon2id and returns a standard PHC formatted string.
 func HashPassword(password string, params HashParams) (string, error) {
 	if params.Time < 1 || params.Parallelism < 1 || params.Memory < 1 || params.SaltLength < 16 || params.KeyLength == 0 {
@@ -47,14 +55,18 @@ func HashPassword(password string, params HashParams) (string, error) {
 		return "", errors.New(errors.CodeInternalError, "failed to generate crypto salt", err)
 	}
 
+	pwdBytes := []byte(password)
+	defer wipeBytes(pwdBytes)
+
 	hash := argon2.IDKey(
-		[]byte(password),
+		pwdBytes,
 		salt,
 		params.Time,
 		params.Memory,
 		params.Parallelism,
 		params.KeyLength,
 	)
+	defer wipeBytes(hash)
 
 	b64Salt := base64.RawStdEncoding.EncodeToString(salt)
 	b64Hash := base64.RawStdEncoding.EncodeToString(hash)
@@ -83,14 +95,58 @@ func VerifyPassword(password, phcHash string) (bool, error) {
 		return false, ErrInvalidHashFormat
 	}
 
-	var version int
-	if n, err := fmt.Sscanf(parts[2], "v=%d", &version); err != nil || n != 1 || version != argon2.Version || fmt.Sprintf("v=%d", version) != parts[2] {
+	if !strings.HasPrefix(parts[2], "v=") {
+		return false, ErrInvalidHashFormat
+	}
+	vStr := parts[2][2:]
+	versionVal, err := strconv.ParseUint(vStr, 10, 32)
+	if err != nil || versionVal != argon2.Version || strconv.FormatUint(versionVal, 10) != vStr {
 		return false, ErrInvalidHashFormat
 	}
 
-	var memory, time uint32
-	var parallelism uint8
-	if n, err := fmt.Sscanf(parts[3], "m=%d,t=%d,p=%d", &memory, &time, &parallelism); err != nil || n != 3 || fmt.Sprintf("m=%d,t=%d,p=%d", memory, time, parallelism) != parts[3] {
+	var (
+		memory      uint32
+		time        uint32
+		parallelism uint8
+		hasM        bool
+		hasT        bool
+		hasP        bool
+	)
+
+	for _, param := range strings.Split(parts[3], ",") {
+		k, v, found := strings.Cut(param, "=")
+		if !found || len(v) == 0 {
+			return false, ErrInvalidHashFormat
+		}
+		val, err := strconv.ParseUint(v, 10, 32)
+		if err != nil || strconv.FormatUint(val, 10) != v {
+			return false, ErrInvalidHashFormat
+		}
+		switch k {
+		case "m":
+			if hasM {
+				return false, ErrInvalidHashFormat
+			}
+			hasM = true
+			memory = uint32(val)
+		case "t":
+			if hasT {
+				return false, ErrInvalidHashFormat
+			}
+			hasT = true
+			time = uint32(val)
+		case "p":
+			if hasP || val > 255 {
+				return false, ErrInvalidHashFormat
+			}
+			hasP = true
+			parallelism = uint8(val)
+		default:
+			return false, ErrInvalidHashFormat
+		}
+	}
+
+	if !hasM || !hasT || !hasP {
 		return false, ErrInvalidHashFormat
 	}
 
@@ -107,19 +163,24 @@ func VerifyPassword(password, phcHash string) (bool, error) {
 	if err != nil {
 		return false, ErrInvalidHashFormat
 	}
+	defer wipeBytes(expectedHash)
 
 	if time < 1 || parallelism < 1 || memory < 1 || len(salt) < 16 || len(expectedHash) == 0 {
 		return false, ErrInvalidHashFormat
 	}
 
+	pwdBytes := []byte(password)
+	defer wipeBytes(pwdBytes)
+
 	computedHash := argon2.IDKey(
-		[]byte(password),
+		pwdBytes,
 		salt,
 		time,
 		memory,
 		parallelism,
 		uint32(len(expectedHash)),
 	)
+	defer wipeBytes(computedHash)
 
 	match := subtle.ConstantTimeCompare(computedHash, expectedHash) == 1
 	return match, nil
@@ -131,5 +192,6 @@ func GenerateDummyHash(params HashParams) (string, error) {
 	if _, err := io.ReadFull(rand.Reader, dummySecret); err != nil {
 		return "", errors.New(errors.CodeInternalError, "failed to generate dummy secret", err)
 	}
+	defer wipeBytes(dummySecret)
 	return HashPassword(base64.RawStdEncoding.EncodeToString(dummySecret), params)
 }
