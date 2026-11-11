@@ -447,8 +447,9 @@ func TestDispatch_NilContext(t *testing.T) {
 		EmailDispatchTimeout:      time.Second,
 	}, captureLogger(&bytes.Buffer{}))
 
-	// Should not panic when ctx is nil
-	d.DispatchVerification(nil, VerificationEmailPayload{To: "nilctx@example.com"})
+	// Should not panic when ctx is nil (nil via var to satisfy SA1012)
+	var ctx context.Context
+	d.DispatchVerification(ctx, VerificationEmailPayload{To: "nilctx@example.com"})
 	select {
 	case <-called:
 	case <-time.After(time.Second):
