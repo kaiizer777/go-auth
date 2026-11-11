@@ -107,6 +107,14 @@ func DefaultConfig() Config {
 	}
 }
 
+// isAllowedOriginScheme reports whether an origin scheme can appear in a
+// browser Origin header and therefore in checkOrigin's exact-match allowlist.
+// chrome-extension origins are explicitly configured extension origins that
+// CORS honors at runtime, so Validate must not reject them.
+func isAllowedOriginScheme(scheme string) bool {
+	return scheme == "http" || scheme == "https" || scheme == "chrome-extension"
+}
+
 // Validate ensures required fields are set and connection parameters are sane.
 func (c *Config) Validate() error {
 	if c.DatabaseURL == "" {
@@ -128,7 +136,7 @@ func (c *Config) Validate() error {
 		}
 		origin = strings.TrimRight(origin, "/")
 		parsed, err := url.Parse(origin)
-		if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Path != "" || parsed.RawQuery != "" || parsed.Fragment != "" {
+		if err != nil || parsed.Host == "" || !isAllowedOriginScheme(parsed.Scheme) || parsed.Path != "" || parsed.RawQuery != "" || parsed.Fragment != "" {
 			return errors.ErrAllowedOriginInvalid
 		}
 		c.AllowedOrigins[i] = origin

@@ -455,6 +455,15 @@ func TestConfigValidate(t *testing.T) {
 			wantErr: nil,
 		},
 		{
+			name: "allowed origins valid with chrome-extension scheme",
+			mutate: func(c *Config) {
+				c.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+				c.BaseURL = "https://example.com"
+				c.AllowedOrigins = []string{"chrome-extension://abcdefghijklmnopabcdefghijklmnop"}
+			},
+			wantErr: nil,
+		},
+		{
 			name: "allowed origins invalid without scheme",
 			mutate: func(c *Config) {
 				c.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"

@@ -271,31 +271,40 @@ func (s *authService) ResetPassword(ctx context.Context, req db.PasswordResetCon
 		return errors.New(errors.CodeInvalidToken, "invalid token", err)
 	}
 
+	// Cheap existence/expiry gate before the expensive Argon2id hash: unknown
+	// or expired tokens must not trigger a ~64MiB hashing operation.
+	var tok db.PasswordResetToken
+	if err := s.db.WithContext(ctx).Where("token_hash = ?", tokenHash[:]).First(&tok).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return errors.New(errors.CodeInvalidToken, "invalid token", nil)
+		}
+		return errors.Wrap(err, errors.CodeDatabaseError, "failed to query password reset token")
+	}
+
+	if time.Now().UTC().After(tok.ExpiresAt) {
+		_ = s.db.WithContext(ctx).Where("token_hash = ?", tokenHash[:]).Delete(&db.PasswordResetToken{}).Error
+		return errors.New(errors.CodeTokenExpired, "password reset token has expired", nil)
+	}
+
 	newHash, err := crypto.HashPassword(req.NewPassword, s.hashParams)
 	if err != nil {
 		return errors.Wrap(err, errors.CodeInternalError, "failed to hash password")
 	}
 
-	var isExpired bool
 	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		var tok db.PasswordResetToken
-		if err := tx.Where("token_hash = ?", tokenHash[:]).First(&tok).Error; err != nil {
-			if errors.Is(err, gorm.ErrRecordNotFound) {
-				return errors.New(errors.CodeInvalidToken, "invalid token", nil)
-			}
-			return errors.Wrap(err, errors.CodeDatabaseError, "failed to query password reset token")
-		}
-
-		if time.Now().UTC().After(tok.ExpiresAt) {
-			isExpired = true
-			return tx.Where("token_hash = ?", tokenHash[:]).Delete(&db.PasswordResetToken{}).Error
-		}
-
-		res := tx.Where("token_hash = ?", tokenHash[:]).Delete(&db.PasswordResetToken{})
+		res := tx.Where("token_hash = ? AND expires_at > ?", tokenHash[:], time.Now().UTC()).Delete(&db.PasswordResetToken{})
 		if res.Error != nil {
 			return res.Error
 		}
 		if res.RowsAffected == 0 {
+			var count int64
+			if err := tx.Model(&db.PasswordResetToken{}).Where("token_hash = ?", tokenHash[:]).Count(&count).Error; err != nil {
+				return err
+			}
+			if count > 0 {
+				_ = tx.Where("token_hash = ?", tokenHash[:]).Delete(&db.PasswordResetToken{}).Error
+				return errors.New(errors.CodeTokenExpired, "password reset token has expired", nil)
+			}
 			return errors.New(errors.CodeInvalidToken, "invalid or consumed password reset token", nil)
 		}
 
@@ -312,25 +321,49 @@ func (s *authService) ResetPassword(ctx context.Context, req db.PasswordResetCon
 		}
 		return errors.Wrap(err, errors.CodeDatabaseError, "failed to reset password")
 	}
-	if isExpired {
-		return errors.New(errors.CodeTokenExpired, "password reset token has expired", nil)
-	}
 
 	return nil
+}
+
+// emailHookTimeout returns the bound for email hook execution, defaulting to
+// 10s when the configuration carries no positive timeout.
+func (s *authService) emailHookTimeout() time.Duration {
+	if s.cfg.EmailDispatchTimeout > 0 {
+		return s.cfg.EmailDispatchTimeout
+	}
+	return 10 * time.Second
+}
+
+// tryAcquireEmailSlot non-blockingly acquires a dispatch slot so request
+// handlers never stall on a saturated semaphore; it reports whether the
+// caller must release the slot after dispatch.
+func (s *authService) tryAcquireEmailSlot(recipient string) bool {
+	if s.emailSem == nil {
+		return false
+	}
+	select {
+	case s.emailSem <- struct{}{}:
+		return true
+	default:
+		log.Printf("email: dispatch queue saturated, dropping email to %s", recipient)
+		return false
+	}
 }
 
 func (s *authService) dispatchVerificationEmail(ctx context.Context, recipient, token string) {
 	if s.hooks.SendVerificationEmail == nil {
 		return
 	}
+	if !s.tryAcquireEmailSlot(recipient) && s.emailSem != nil {
+		return
+	}
 	detachedCtx := context.Background()
 	if ctx != nil {
 		detachedCtx = context.WithoutCancel(ctx)
 	}
-	if s.emailSem != nil {
-		s.emailSem <- struct{}{}
-	}
+	timeoutCtx, cancel := context.WithTimeout(detachedCtx, s.emailHookTimeout())
 	go func() {
+		defer cancel()
 		if s.emailSem != nil {
 			defer func() { <-s.emailSem }()
 		}
@@ -339,7 +372,7 @@ func (s *authService) dispatchVerificationEmail(ctx context.Context, recipient, 
 				log.Printf("email: panic recovered in verification email dispatch to %s: %v", recipient, r)
 			}
 		}()
-		if err := s.hooks.SendVerificationEmail(detachedCtx, recipient, token); err != nil {
+		if err := s.hooks.SendVerificationEmail(timeoutCtx, recipient, token); err != nil {
 			log.Printf("email: failed to send verification email to %s: %v", recipient, err)
 		}
 	}()
@@ -349,14 +382,16 @@ func (s *authService) dispatchPasswordResetEmail(ctx context.Context, recipient,
 	if s.hooks.SendPasswordResetEmail == nil {
 		return
 	}
+	if !s.tryAcquireEmailSlot(recipient) && s.emailSem != nil {
+		return
+	}
 	detachedCtx := context.Background()
 	if ctx != nil {
 		detachedCtx = context.WithoutCancel(ctx)
 	}
-	if s.emailSem != nil {
-		s.emailSem <- struct{}{}
-	}
+	timeoutCtx, cancel := context.WithTimeout(detachedCtx, s.emailHookTimeout())
 	go func() {
+		defer cancel()
 		if s.emailSem != nil {
 			defer func() { <-s.emailSem }()
 		}
@@ -365,7 +400,7 @@ func (s *authService) dispatchPasswordResetEmail(ctx context.Context, recipient,
 				log.Printf("email: panic recovered in password reset email dispatch to %s: %v", recipient, r)
 			}
 		}()
-		if err := s.hooks.SendPasswordResetEmail(detachedCtx, recipient, token); err != nil {
+		if err := s.hooks.SendPasswordResetEmail(timeoutCtx, recipient, token); err != nil {
 			log.Printf("email: failed to send password reset email to %s: %v", recipient, err)
 		}
 	}()
