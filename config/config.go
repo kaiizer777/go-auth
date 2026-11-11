@@ -136,7 +136,7 @@ func (c *Config) Validate() error {
 		}
 		origin = strings.TrimRight(origin, "/")
 		parsed, err := url.Parse(origin)
-		if err != nil || parsed.Host == "" || !isAllowedOriginScheme(parsed.Scheme) || parsed.Path != "" || parsed.RawQuery != "" || parsed.Fragment != "" {
+		if err != nil || parsed.Host == "" || parsed.Hostname() == "" || parsed.User != nil || parsed.Opaque != "" || !isAllowedOriginScheme(parsed.Scheme) || parsed.Path != "" || parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" {
 			return errors.ErrAllowedOriginInvalid
 		}
 		c.AllowedOrigins[i] = origin

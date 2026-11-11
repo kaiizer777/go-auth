@@ -722,3 +722,32 @@ func TestService_Logout(t *testing.T) {
 		t.Fatalf("logout returned non-nil err: %v", err)
 	}
 }
+
+func TestDispatchVerificationEmail_SaturatedSemaphoreRetries(t *testing.T) {
+	cfg := testConfig()
+	called := make(chan string, 1)
+	svc := &authService{
+		cfg: cfg,
+		hooks: email.Hooks{
+			SendVerificationEmail: func(ctx context.Context, recipient, token string) error {
+				called <- recipient
+				return nil
+			},
+		},
+		emailSem: make(chan struct{}, 1),
+	}
+	svc.emailSem <- struct{}{}
+
+	svc.dispatchVerificationEmail(context.Background(), "retry@example.com", "tok")
+
+	time.AfterFunc(100*time.Millisecond, func() { <-svc.emailSem })
+
+	select {
+	case got := <-called:
+		if got != "retry@example.com" {
+			t.Fatalf("hook got recipient %q, want retry@example.com", got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("hook not called after semaphore capacity returned")
+	}
+}

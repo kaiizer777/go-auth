@@ -56,9 +56,21 @@ func ValidateEmail(email string) error {
 	return nil
 }
 
-// NormalizeEmail trims leading and trailing whitespace and converts the email address to lowercase.
+// NormalizeEmail trims leading and trailing whitespace and converts the email
+// address to lowercase. It defines the single lookup-key policy used for
+// case-insensitive account matching: callers normalize the input with this
+// helper and queries compare with LOWER on both sides, so matching does not
+// depend on database locale. Stored account emails keep their original case
+// for delivery (RFC 5321 local parts can be case-sensitive); only the lookup
+// key is folded.
 func NormalizeEmail(email string) string {
 	return strings.ToLower(strings.TrimSpace(email))
+}
+
+// LookupKey returns the canonical case-insensitive lookup key for an email
+// address. It is the single policy shared by all account queries.
+func LookupKey(email string) string {
+	return NormalizeEmail(email)
 }
 
 // ValidateToken validates a 64-character hexadecimal token string.

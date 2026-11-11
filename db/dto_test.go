@@ -283,6 +283,25 @@ func TestNormalizeEmail(t *testing.T) {
 	}
 }
 
+func TestLookupKey(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{name: "lowercases mixed case", input: "Alice@Example.COM", want: "alice@example.com"},
+		{name: "trims whitespace", input: "  Bob@Example.com  ", want: "bob@example.com"},
+		{name: "single policy matches NormalizeEmail", input: "User.Name+Tag@Sub.Domain.Co", want: NormalizeEmail("User.Name+Tag@Sub.Domain.Co")},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := LookupKey(tc.input); got != tc.want {
+				t.Fatalf("LookupKey(%q) = %q; want %q", tc.input, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestRequestDTONormalize(t *testing.T) {
 	t.Run("SignupRequest", func(t *testing.T) {
 		req := SignupRequest{Email: "  Alice@Example.COM  ", Password: "Password123"}

@@ -80,7 +80,7 @@ func (s *authService) Signup(ctx context.Context, req db.SignupRequest) (*db.Use
 	}
 
 	var existing db.User
-	err := s.db.WithContext(ctx).Where("LOWER(email) = LOWER(?)", req.Email).First(&existing).Error
+	err := s.db.WithContext(ctx).Where("LOWER(email) = LOWER(?)", db.LookupKey(req.Email)).First(&existing).Error
 	if err == nil {
 		// Anti-enumeration parity: perform dummy hashing
 		_, _ = crypto.HashPassword(req.Password, s.hashParams)
@@ -124,7 +124,7 @@ func (s *authService) Signup(ctx context.Context, req db.SignupRequest) (*db.Use
 	})
 	if err != nil {
 		var existingUser db.User
-		if queryErr := s.db.WithContext(ctx).Where("LOWER(email) = LOWER(?)", req.Email).First(&existingUser).Error; queryErr == nil {
+		if queryErr := s.db.WithContext(ctx).Where("LOWER(email) = LOWER(?)", db.LookupKey(req.Email)).First(&existingUser).Error; queryErr == nil {
 			// Anti-enumeration parity: concurrent signup succeeded
 			_, _ = crypto.HashPassword(req.Password, s.hashParams)
 			return nil, "", nil
@@ -144,7 +144,7 @@ func (s *authService) Login(ctx context.Context, req db.LoginRequest) (*db.User,
 	}
 
 	var user db.User
-	err := s.db.WithContext(ctx).Where("LOWER(email) = LOWER(?)", req.Email).First(&user).Error
+	err := s.db.WithContext(ctx).Where("LOWER(email) = LOWER(?)", db.LookupKey(req.Email)).First(&user).Error
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			_, _ = crypto.VerifyPassword(req.Password, s.dummyHash)
@@ -228,7 +228,7 @@ func (s *authService) RequestPasswordReset(ctx context.Context, req db.PasswordR
 	}
 
 	var user db.User
-	err := s.db.WithContext(ctx).Where("LOWER(email) = LOWER(?)", req.Email).First(&user).Error
+	err := s.db.WithContext(ctx).Where("LOWER(email) = LOWER(?)", db.LookupKey(req.Email)).First(&user).Error
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			_, _, _ = crypto.GenerateToken()
@@ -345,63 +345,65 @@ func (s *authService) tryAcquireEmailSlot(recipient string) bool {
 	case s.emailSem <- struct{}{}:
 		return true
 	default:
-		log.Printf("email: dispatch queue saturated, dropping email to %s", recipient)
+		log.Printf("email: dispatch queue saturated for %s, parking bounded retry", recipient)
 		return false
 	}
+}
+
+// dispatchEmailAsync runs send on a semaphore slot without blocking the caller.
+// When the semaphore is saturated it parks a bounded waiter that retries
+// acquisition, so verification and reset work is retained instead of silently
+// dropped; the request path still returns immediately.
+func (s *authService) dispatchEmailAsync(ctx context.Context, recipient, token, op string, send func(context.Context, string, string) error) {
+	detached := context.Background()
+	if ctx != nil {
+		detached = context.WithoutCancel(ctx)
+	}
+	run := func() {
+		timeoutCtx, cancel := context.WithTimeout(detached, s.emailHookTimeout())
+		defer cancel()
+		if s.emailSem != nil {
+			defer func() { <-s.emailSem }()
+		}
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("email: panic recovered in %s email dispatch to %s: %v", op, recipient, r)
+			}
+		}()
+		if err := send(timeoutCtx, recipient, token); err != nil {
+			log.Printf("email: failed to send %s email to %s: %v", op, recipient, err)
+		}
+	}
+	if s.emailSem == nil {
+		go run()
+		return
+	}
+	if s.tryAcquireEmailSlot(recipient) {
+		go run()
+		return
+	}
+	go func() {
+		wait, cancel := context.WithTimeout(context.Background(), s.emailHookTimeout())
+		defer cancel()
+		select {
+		case s.emailSem <- struct{}{}:
+			run()
+		case <-wait.Done():
+			log.Printf("email: dispatch queue saturated, giving up on %s email to %s", op, recipient)
+		}
+	}()
 }
 
 func (s *authService) dispatchVerificationEmail(ctx context.Context, recipient, token string) {
 	if s.hooks.SendVerificationEmail == nil {
 		return
 	}
-	if !s.tryAcquireEmailSlot(recipient) && s.emailSem != nil {
-		return
-	}
-	detachedCtx := context.Background()
-	if ctx != nil {
-		detachedCtx = context.WithoutCancel(ctx)
-	}
-	timeoutCtx, cancel := context.WithTimeout(detachedCtx, s.emailHookTimeout())
-	go func() {
-		defer cancel()
-		if s.emailSem != nil {
-			defer func() { <-s.emailSem }()
-		}
-		defer func() {
-			if r := recover(); r != nil {
-				log.Printf("email: panic recovered in verification email dispatch to %s: %v", recipient, r)
-			}
-		}()
-		if err := s.hooks.SendVerificationEmail(timeoutCtx, recipient, token); err != nil {
-			log.Printf("email: failed to send verification email to %s: %v", recipient, err)
-		}
-	}()
+	s.dispatchEmailAsync(ctx, recipient, token, "verification", s.hooks.SendVerificationEmail)
 }
 
 func (s *authService) dispatchPasswordResetEmail(ctx context.Context, recipient, token string) {
 	if s.hooks.SendPasswordResetEmail == nil {
 		return
 	}
-	if !s.tryAcquireEmailSlot(recipient) && s.emailSem != nil {
-		return
-	}
-	detachedCtx := context.Background()
-	if ctx != nil {
-		detachedCtx = context.WithoutCancel(ctx)
-	}
-	timeoutCtx, cancel := context.WithTimeout(detachedCtx, s.emailHookTimeout())
-	go func() {
-		defer cancel()
-		if s.emailSem != nil {
-			defer func() { <-s.emailSem }()
-		}
-		defer func() {
-			if r := recover(); r != nil {
-				log.Printf("email: panic recovered in password reset email dispatch to %s: %v", recipient, r)
-			}
-		}()
-		if err := s.hooks.SendPasswordResetEmail(timeoutCtx, recipient, token); err != nil {
-			log.Printf("email: failed to send password reset email to %s: %v", recipient, err)
-		}
-	}()
+	s.dispatchEmailAsync(ctx, recipient, token, "password reset", s.hooks.SendPasswordResetEmail)
 }
