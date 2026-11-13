@@ -21,12 +21,10 @@ import (
 const defaultTestDBURL = "postgres://postgres:postgres@localhost:5432/goauth_test?sslmode=disable"
 
 // resolveDatabaseURL resolves the PostgreSQL connection URL from environment variables,
-// falling back to local PostgreSQL on default port.
+// prioritizing TEST_DATABASE_URL and falling back strictly to defaultTestDBURL.
+// Generic DATABASE_URL is deliberately ignored to prevent accidental truncation of developer databases.
 func resolveDatabaseURL() string {
 	if u := os.Getenv("TEST_DATABASE_URL"); u != "" {
-		return u
-	}
-	if u := os.Getenv("DATABASE_URL"); u != "" {
 		return u
 	}
 	return defaultTestDBURL
@@ -58,6 +56,9 @@ func setupDB(t *testing.T) (*gorm.DB, config.Config) {
 	// Probe connectivity first before failing tests
 	sqlDB, err := sql.Open("pgx", dbURL)
 	if err != nil {
+		if os.Getenv("CI") != "" {
+			t.Fatalf("CI: failed to open postgres connection at %s: %v", sanitizeURL(dbURL), err)
+		}
 		t.Skipf("Postgres not available, skipping integration tests: %v", err)
 	}
 
@@ -66,6 +67,9 @@ func setupDB(t *testing.T) (*gorm.DB, config.Config) {
 
 	if err := sqlDB.PingContext(ctx); err != nil {
 		_ = sqlDB.Close()
+		if os.Getenv("CI") != "" {
+			t.Fatalf("CI: PostgreSQL connection failed at %s: %v", sanitizeURL(dbURL), err)
+		}
 		t.Skipf("Postgres not available at %s, skipping integration tests: %v", sanitizeURL(dbURL), err)
 	}
 	_ = sqlDB.Close()
@@ -106,3 +110,27 @@ func sanitizeURL(rawURL string) string {
 	}
 	return strings.ReplaceAll(u.String(), "%3A", ":")
 }
+
+func TestResolveDatabaseURL_IgnoresGenericDatabaseURL(t *testing.T) {
+	origTestURL := os.Getenv("TEST_DATABASE_URL")
+	origDBURL := os.Getenv("DATABASE_URL")
+	defer func() {
+		_ = os.Setenv("TEST_DATABASE_URL", origTestURL)
+		_ = os.Setenv("DATABASE_URL", origDBURL)
+	}()
+
+	_ = os.Unsetenv("TEST_DATABASE_URL")
+	_ = os.Setenv("DATABASE_URL", "postgres://user:pass@production-host:5432/live_db")
+
+	got := resolveDatabaseURL()
+	if got != defaultTestDBURL {
+		t.Fatalf("expected fallback to %q, got %q", defaultTestDBURL, got)
+	}
+
+	_ = os.Setenv("TEST_DATABASE_URL", "postgres://user:pass@test-host:5432/explicit_test")
+	got = resolveDatabaseURL()
+	if got != "postgres://user:pass@test-host:5432/explicit_test" {
+		t.Fatalf("expected explicit TEST_DATABASE_URL, got %q", got)
+	}
+}
+

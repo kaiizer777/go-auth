@@ -5,6 +5,7 @@ package integration
 import (
 	"context"
 	"database/sql"
+	"os"
 	"testing"
 
 	"github.com/golang-migrate/migrate/v4"
@@ -61,10 +62,16 @@ func TestMigrations_Lifecycle(t *testing.T) {
 	// 1. Verify connectivity
 	testDB, err := sql.Open("pgx", dbURL)
 	if err != nil {
+		if os.Getenv("CI") != "" {
+			t.Fatalf("CI: failed to open postgres connection: %v", err)
+		}
 		t.Skipf("Postgres not available, skipping: %v", err)
 	}
 	if err := testDB.Ping(); err != nil {
 		_ = testDB.Close()
+		if os.Getenv("CI") != "" {
+			t.Fatalf("CI: PostgreSQL connection failed: %v", err)
+		}
 		t.Skipf("Postgres not available, skipping: %v", err)
 	}
 	_ = testDB.Close()
@@ -122,3 +129,4 @@ func TestMigrations_Lifecycle(t *testing.T) {
 		t.Fatalf("expected 4 application tables after re-Up, found %d", tableCount)
 	}
 }
+
