@@ -42,7 +42,7 @@ func IsCommonPassword(password string) bool {
 // ValidatePassword validates password length against Unicode code points and verifies
 // that the password is not present in the common password blocklist.
 func ValidatePassword(password string, minLen, maxLen uint) error {
-	runeCount := uint(utf8.RuneCountInString(password))
+	runeCount := uint(utf8.RuneCountInString(password)) // #nosec G115 -- rune count is non-negative
 
 	if runeCount < minLen {
 		return errors.New(errors.CodePasswordTooShort, "password is too short", nil)

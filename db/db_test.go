@@ -112,4 +112,3 @@ func TestRunMigrationsInvalidURL(t *testing.T) {
 		t.Fatal("runMigrations with invalid database URL expected error, got nil")
 	}
 }
-
