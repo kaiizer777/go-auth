@@ -141,6 +141,26 @@ func TestConfigValidate(t *testing.T) {
 			wantErr: errors.ErrMaxIdleExceedsOpen,
 		},
 		{
+			name: "max open zero permits positive max idle (unlimited connections)",
+			mutate: func(c *Config) {
+				c.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+				c.BaseURL = "https://example.com"
+				c.MaxOpenConns = 0
+				c.MaxIdleConns = 10
+			},
+			wantErr: nil,
+		},
+		{
+			name: "max open equals max idle at boundary",
+			mutate: func(c *Config) {
+				c.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+				c.BaseURL = "https://example.com"
+				c.MaxOpenConns = 10
+				c.MaxIdleConns = 10
+			},
+			wantErr: nil,
+		},
+		{
 			name: "invalid base URL",
 			mutate: func(c *Config) {
 				c.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
@@ -559,5 +579,51 @@ func TestConfigValidate_PartialArgon2Overrides(t *testing.T) {
 	}
 	if cfg.Argon2.KeyLength != 32 {
 		t.Errorf("got KeyLength %d, want 32", cfg.Argon2.KeyLength)
+	}
+}
+
+func TestConfigValidate_MaxOpenConnsZeroUnlimited(t *testing.T) {
+	cfg := Config{
+		DatabaseURL:  "postgres://user:pass@localhost:5432/testdb",
+		BaseURL:      "https://example.com",
+		MaxOpenConns: 0,
+		MaxIdleConns: 50,
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() unexpected err for MaxOpenConns=0 and MaxIdleConns=50: %v", err)
+	}
+	if cfg.MaxOpenConns != 0 {
+		t.Fatalf("cfg.MaxOpenConns = %d; want 0", cfg.MaxOpenConns)
+	}
+	if cfg.MaxIdleConns != 50 {
+		t.Fatalf("cfg.MaxIdleConns = %d; want 50", cfg.MaxIdleConns)
+	}
+}
+
+func TestConfigValidate_EmailDispatchTimeoutRetention(t *testing.T) {
+	cfg := Config{
+		DatabaseURL:          "postgres://user:pass@localhost:5432/testdb",
+		BaseURL:              "https://example.com",
+		EmailDispatchTimeout: 5 * time.Second,
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() unexpected err = %v", err)
+	}
+	if cfg.EmailDispatchTimeout != 5*time.Second {
+		t.Fatalf("EmailDispatchTimeout = %v; want 5s", cfg.EmailDispatchTimeout)
+	}
+}
+
+func TestConfigValidate_EmailDispatchTimeoutDefault(t *testing.T) {
+	cfg := Config{
+		DatabaseURL:          "postgres://user:pass@localhost:5432/testdb",
+		BaseURL:              "https://example.com",
+		EmailDispatchTimeout: 0,
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() unexpected err = %v", err)
+	}
+	if cfg.EmailDispatchTimeout != 10*time.Second {
+		t.Fatalf("EmailDispatchTimeout = %v; want 10s", cfg.EmailDispatchTimeout)
 	}
 }
