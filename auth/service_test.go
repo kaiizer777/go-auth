@@ -1117,6 +1117,135 @@ func TestService_Signup_UnverifiedAccountRecovery(t *testing.T) {
 	}
 }
 
+func TestService_Signup_UnverifiedRecovery_ConcurrentVerificationRace(t *testing.T) {
+	database := setupTestDB(t)
+	cfg := testConfig()
+
+	type hookData struct {
+		recipient string
+		token     string
+	}
+	hookCh := make(chan hookData, 10)
+	hooks := email.Hooks{
+		SendVerificationEmail: func(ctx context.Context, recipient, token string) error {
+			hookCh <- hookData{recipient: recipient, token: token}
+			return nil
+		},
+	}
+
+	authSvc, err := New(cfg, database, hooks)
+	if err != nil {
+		t.Fatalf("failed to create service: %v", err)
+	}
+	svc := authSvc.(*authService)
+
+	ctx := context.Background()
+	origPass := "OriginalPassword#12345"
+	user, _, err := svc.Signup(ctx, db.SignupRequest{Email: "race@example.com", Password: origPass})
+	if err != nil {
+		t.Fatalf("initial signup failed: %v", err)
+	}
+	if user == nil {
+		t.Fatal("expected non-nil user")
+	}
+
+	select {
+	case <-hookCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("initial verification hook not received")
+	}
+
+	svc.recoveryMu.Lock()
+
+	signupDone := make(chan struct{})
+	var signupErr error
+	var signupUser *db.User
+	var signupToken string
+
+	go func() {
+		defer close(signupDone)
+		signupUser, signupToken, signupErr = svc.Signup(ctx, db.SignupRequest{
+			Email:    "race@example.com",
+			Password: "AttemptedNewPassword#67890",
+		})
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+
+	if err := database.Model(&db.User{}).Where("id = ?", user.ID).Update("email_verified", true).Error; err != nil {
+		t.Fatalf("failed to concurrently verify user: %v", err)
+	}
+
+	svc.recoveryMu.Unlock()
+
+	select {
+	case <-signupDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("signup did not complete after releasing recovery lock")
+	}
+
+	if signupErr != nil {
+		t.Fatalf("expected silent success for duplicate email, got: %v", signupErr)
+	}
+	if signupUser != nil || signupToken != "" {
+		t.Fatalf("expected nil user and empty token, got user=%v, token=%s", signupUser, signupToken)
+	}
+
+	select {
+	case h := <-hookCh:
+		t.Fatalf("unexpected verification email sent to %s during race", h.recipient)
+	default:
+	}
+
+	var dbUser db.User
+	if err := database.Where("id = ?", user.ID).First(&dbUser).Error; err != nil {
+		t.Fatalf("failed to query user: %v", err)
+	}
+	match, err := crypto.VerifyPassword(origPass, dbUser.PasswordHash)
+	if err != nil || !match {
+		t.Fatalf("expected original password to remain valid when recovery was bypassed by concurrent verification: match=%v, err=%v", match, err)
+	}
+	matchNew, _ := crypto.VerifyPassword("AttemptedNewPassword#67890", dbUser.PasswordHash)
+	if matchNew {
+		t.Fatal("attempted new password should not have been set")
+	}
+}
+
+func TestService_Signup_UnverifiedRecovery_TransactionFailure(t *testing.T) {
+	database := setupTestDB(t)
+	cfg := testConfig()
+
+	svc, err := New(cfg, database, email.Hooks{})
+	if err != nil {
+		t.Fatalf("failed to create service: %v", err)
+	}
+
+	ctx := context.Background()
+
+	user, _, err := svc.Signup(ctx, db.SignupRequest{Email: "txfail@example.com", Password: "OriginalPassword#12345"})
+	if err != nil {
+		t.Fatalf("initial signup failed: %v", err)
+	}
+	if user == nil {
+		t.Fatal("expected non-nil user")
+	}
+
+	if err := database.Exec("DROP TABLE verification_tokens").Error; err != nil {
+		t.Fatalf("failed to drop verification_tokens table: %v", err)
+	}
+
+	_, _, err = svc.Signup(ctx, db.SignupRequest{Email: "txfail@example.com", Password: "NewPassword#67890"})
+	if err == nil {
+		t.Fatal("expected transaction failure error, got nil")
+	}
+
+	var appErr *errors.Error
+	if !errors.As(err, &appErr) || appErr.Code() != errors.CodeDatabaseError {
+		t.Fatalf("expected CodeDatabaseError, got: %v", err)
+	}
+}
+
+
 
 
 
