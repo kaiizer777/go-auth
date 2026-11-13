@@ -190,4 +190,3 @@ func TestPasswordReset_AliasRoutesAndValidation(t *testing.T) {
 		t.Fatalf("expected 'password reset successful', got %v", bodyConfirm)
 	}
 }
-

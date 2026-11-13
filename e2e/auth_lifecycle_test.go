@@ -295,5 +295,3 @@ func TestAuthLifecycle_InputValidationRejections(t *testing.T) {
 		})
 	}
 }
-
-

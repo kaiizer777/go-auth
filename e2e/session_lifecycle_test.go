@@ -60,4 +60,3 @@ func TestSessionLifecycle_LogoutInvalidation(t *testing.T) {
 func TestSessionLifecycle_ConcurrentSessionsAndRevocation(t *testing.T) {
 	t.Skip("Session cookie propagation and logout invalidation pending Phase 4")
 }
-
