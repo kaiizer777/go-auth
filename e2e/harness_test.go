@@ -268,7 +268,7 @@ func requestOPTIONS(t *testing.T, client *http.Client, targetURL, origin, method
 
 func readJSONBody(t *testing.T, resp *http.Response) map[string]any {
 	t.Helper()
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	bodyBytes, err := io.ReadAll(resp.Body)
 	if err != nil {

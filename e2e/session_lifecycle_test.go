@@ -48,7 +48,7 @@ func TestSessionLifecycle_LogoutInvalidation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to execute logout request: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusNoContent {
 		t.Fatalf("expected 204 No Content on logout, got %d", resp.StatusCode)

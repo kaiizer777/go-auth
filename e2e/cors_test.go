@@ -14,7 +14,7 @@ func TestCORS_PreflightOptions(t *testing.T) {
 
 	// Preflight OPTIONS request for trusted origin
 	resp := requestOPTIONS(t, client, server.URL+"/auth/signup", "http://example.com", http.MethodPost)
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusNoContent {
 		t.Fatalf("expected 204 No Content for preflight OPTIONS, got %d", resp.StatusCode)
@@ -57,7 +57,7 @@ func TestCORS_CredentialedCrossOriginRequest(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to execute request: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if got := resp.Header.Get("Access-Control-Allow-Origin"); got != "http://localhost:3000" {
 		t.Fatalf("expected Access-Control-Allow-Origin 'http://localhost:3000', got %q", got)
@@ -71,7 +71,7 @@ func TestCORS_UntrustedOriginOmitted(t *testing.T) {
 	server, client, _, _ := setupE2EServer(t)
 
 	resp := requestOPTIONS(t, client, server.URL+"/auth/signup", "http://malicious.evil.com", http.MethodPost)
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if got := resp.Header.Get("Access-Control-Allow-Origin"); got != "" {
 		t.Fatalf("expected empty Access-Control-Allow-Origin for untrusted origin, got %q", got)
