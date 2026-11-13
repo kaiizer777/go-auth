@@ -751,3 +751,68 @@ func TestDispatchVerificationEmail_SaturatedSemaphoreRetries(t *testing.T) {
 		t.Fatal("hook not called after semaphore capacity returned")
 	}
 }
+
+func TestTryAcquireEmailSlot(t *testing.T) {
+	t.Run("nil semaphore returns false", func(t *testing.T) {
+		svc := &authService{}
+		if svc.tryAcquireEmailSlot("user@example.com") {
+			t.Fatal("expected false for nil semaphore, got true")
+		}
+	})
+
+	t.Run("available slot acquires and returns true", func(t *testing.T) {
+		svc := &authService{
+			emailSem: make(chan struct{}, 1),
+		}
+		if !svc.tryAcquireEmailSlot("user@example.com") {
+			t.Fatal("expected true when slot is available, got false")
+		}
+		if len(svc.emailSem) != 1 {
+			t.Fatalf("expected 1 item in emailSem, got %d", len(svc.emailSem))
+		}
+	})
+
+	t.Run("saturated semaphore returns false", func(t *testing.T) {
+		svc := &authService{
+			emailSem: make(chan struct{}, 1),
+		}
+		svc.emailSem <- struct{}{}
+		if svc.tryAcquireEmailSlot("user@example.com") {
+			t.Fatal("expected false when semaphore is saturated, got true")
+		}
+	})
+}
+
+func TestEmailHookTimeout(t *testing.T) {
+	t.Run("default timeout when unset or zero", func(t *testing.T) {
+		svc := &authService{
+			cfg: config.Config{},
+		}
+		if got := svc.emailHookTimeout(); got != 10*time.Second {
+			t.Fatalf("expected 10s default timeout, got %v", got)
+		}
+	})
+
+	t.Run("default timeout when negative", func(t *testing.T) {
+		svc := &authService{
+			cfg: config.Config{
+				EmailDispatchTimeout: -5 * time.Second,
+			},
+		}
+		if got := svc.emailHookTimeout(); got != 10*time.Second {
+			t.Fatalf("expected 10s default timeout for negative value, got %v", got)
+		}
+	})
+
+	t.Run("custom positive timeout", func(t *testing.T) {
+		svc := &authService{
+			cfg: config.Config{
+				EmailDispatchTimeout: 3 * time.Second,
+			},
+		}
+		if got := svc.emailHookTimeout(); got != 3*time.Second {
+			t.Fatalf("expected 3s timeout, got %v", got)
+		}
+	})
+}
+
