@@ -1157,6 +1157,11 @@ func TestService_Signup_UnverifiedRecovery_ConcurrentVerificationRace(t *testing
 		t.Fatal("initial verification hook not received")
 	}
 
+	recoveryLookupDone := make(chan struct{})
+	svc.onPreRecoveryLock = func() {
+		close(recoveryLookupDone)
+	}
+
 	svc.recoveryMu.Lock()
 
 	signupDone := make(chan struct{})
@@ -1172,7 +1177,11 @@ func TestService_Signup_UnverifiedRecovery_ConcurrentVerificationRace(t *testing
 		})
 	}()
 
-	time.Sleep(50 * time.Millisecond)
+	select {
+	case <-recoveryLookupDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for signup initial unverified lookup")
+	}
 
 	if err := database.Model(&db.User{}).Where("id = ?", user.ID).Update("email_verified", true).Error; err != nil {
 		t.Fatalf("failed to concurrently verify user: %v", err)

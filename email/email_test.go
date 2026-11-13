@@ -502,16 +502,22 @@ func TestDispatch_SemaphoreSaturation(t *testing.T) {
 
 	// Dispatch the 129th item in a separate goroutine.
 	// Because semaphore capacity is 128, DispatchVerification should block attempting to send to d.sem.
-	dispatch129Started := make(chan struct{})
+	dispatch129Acquiring := make(chan struct{})
+	d.beforeAcquireSem = func() {
+		close(dispatch129Acquiring)
+	}
 	dispatch129Finished := make(chan struct{})
 
 	go func() {
-		close(dispatch129Started)
 		d.DispatchVerification(context.Background(), payload)
 		close(dispatch129Finished)
 	}()
 
-	<-dispatch129Started
+	select {
+	case <-dispatch129Acquiring:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for 129th dispatch to reach semaphore acquisition")
+	}
 
 	// Verify the 129th dispatch is indeed blocked on semaphore saturation.
 	select {
