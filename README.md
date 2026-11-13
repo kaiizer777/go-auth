@@ -5,9 +5,8 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 > [!WARNING]
-> **Status: Early development — not yet usable in production.**
+> **Status: Early development —**
 > APIs and interfaces are undergoing initial design and scaffolding.
-> (exp: 12-31-2026)
 
 ---
 
