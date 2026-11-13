@@ -1003,4 +1003,123 @@ func TestLogoutInvokesService(t *testing.T) {
 			t.Fatalf("expected 500 on db error, got %d", rec.Code)
 		}
 	})
+
+	t.Run("session_id cookie fallback", func(t *testing.T) {
+		var receivedSessionID string
+		mockSvc := &mockAuthService{
+			logoutFn: func(ctx context.Context, sessionID string) error {
+				receivedSessionID = sessionID
+				return nil
+			},
+		}
+		h := New(nil, config.DefaultConfig(), mockSvc)
+		req := httptest.NewRequest(http.MethodPost, "/auth/logout", nil)
+		req.AddCookie(&http.Cookie{Name: "session_id", Value: "alt_sess_456"})
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusNoContent {
+			t.Fatalf("expected 204, got %d", rec.Code)
+		}
+		if receivedSessionID != "alt_sess_456" {
+			t.Fatalf("expected alt_sess_456, got %q", receivedSessionID)
+		}
+	})
+
+	t.Run("X-Session-ID header fallback", func(t *testing.T) {
+		var receivedSessionID string
+		mockSvc := &mockAuthService{
+			logoutFn: func(ctx context.Context, sessionID string) error {
+				receivedSessionID = sessionID
+				return nil
+			},
+		}
+		h := New(nil, config.DefaultConfig(), mockSvc)
+		req := httptest.NewRequest(http.MethodPost, "/auth/logout", nil)
+		req.Header.Set("X-Session-ID", "header_sess_789")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusNoContent {
+			t.Fatalf("expected 204, got %d", rec.Code)
+		}
+		if receivedSessionID != "header_sess_789" {
+			t.Fatalf("expected header_sess_789, got %q", receivedSessionID)
+		}
+	})
+
+	t.Run("nil service in AuthHandler", func(t *testing.T) {
+		authH := NewAuthHandler(nil)
+		req := httptest.NewRequest(http.MethodPost, "/auth/logout", nil)
+		rec := httptest.NewRecorder()
+		authH.Logout(rec, req)
+
+		if rec.Code != http.StatusNoContent {
+			t.Fatalf("expected 204 on nil service, got %d", rec.Code)
+		}
+	})
+}
+
+func TestDecodeJSON_NilBody(t *testing.T) {
+	mockSvc := &mockAuthService{}
+	authH := NewAuthHandler(mockSvc)
+
+	endpoints := []struct {
+		name string
+		call func(http.ResponseWriter, *http.Request)
+	}{
+		{"Signup", authH.Signup},
+		{"Login", authH.Login},
+		{"VerifyEmail", authH.VerifyEmail},
+		{"RequestPasswordReset", authH.RequestPasswordReset},
+		{"ResetPassword", authH.ResetPassword},
+	}
+
+	for _, ep := range endpoints {
+		t.Run(ep.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/auth/"+ep.name, nil)
+			req.Body = nil // Explicitly set Body to nil to exercise r.Body == nil branch
+			rec := httptest.NewRecorder()
+
+			ep.call(rec, req)
+
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("expected status 400 for nil body, got %d", rec.Code)
+			}
+			if got := rec.Header().Get("Content-Type"); got != "application/json" {
+				t.Errorf("expected Content-Type application/json, got %q", got)
+			}
+			errResp := decodeResponseBody[errors.Response](t, rec)
+			if errResp.Code != errors.CodeValidationError {
+				t.Errorf("expected code %s, got %s", errors.CodeValidationError, errResp.Code)
+			}
+			if errResp.Message != "invalid request body" {
+				t.Errorf("expected message 'invalid request body', got %q", errResp.Message)
+			}
+		})
+	}
+}
+
+func TestWriteJSON_Helper(t *testing.T) {
+	t.Run("encodes data and sets headers correctly", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		payload := map[string]string{"status": "custom_ok", "key": "value"}
+
+		writeJSON(rec, http.StatusCreated, payload)
+
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("expected status %d, got %d", http.StatusCreated, rec.Code)
+		}
+		if got := rec.Header().Get("Content-Type"); got != "application/json" {
+			t.Errorf("expected Content-Type application/json, got %q", got)
+		}
+
+		var decoded map[string]string
+		if err := json.NewDecoder(rec.Body).Decode(&decoded); err != nil {
+			t.Fatalf("failed to decode response: %v", err)
+		}
+		if decoded["status"] != "custom_ok" || decoded["key"] != "value" {
+			t.Errorf("unexpected decoded payload: %v", decoded)
+		}
+	})
 }
