@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -455,4 +456,88 @@ func TestDispatch_NilContext(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("hook not called with nil context")
 	}
+}
+
+func TestDispatch_SemaphoreSaturation(t *testing.T) {
+	const capacity = emailDispatchSemaphoreSize // 128
+	var startedWg sync.WaitGroup
+	var completedWg sync.WaitGroup
+	startedWg.Add(capacity)
+	completedWg.Add(capacity + 1)
+
+	releaseHooks := make(chan struct{})
+	var hookCount atomic.Int32
+
+	hook := func(ctx context.Context, p VerificationEmailPayload) error {
+		if hookCount.Add(1) <= capacity {
+			startedWg.Done()
+			<-releaseHooks
+		}
+		completedWg.Done()
+		return nil
+	}
+
+	d := NewAsyncDispatcher(DispatcherConfig{
+		SendVerificationEmail: hook,
+		EmailDispatchTimeout:  10 * time.Second,
+	}, captureLogger(&bytes.Buffer{}))
+
+	payload := VerificationEmailPayload{
+		UserID: "user-saturation",
+		To:     "user@example.com",
+		Token:  "tok-saturation",
+	}
+
+	// Dispatch 128 items to saturate the semaphore channel capacity.
+	for i := 0; i < capacity; i++ {
+		d.DispatchVerification(context.Background(), payload)
+	}
+
+	// Wait until all 128 goroutines have acquired a slot and started running.
+	startedWg.Wait()
+
+	if got := len(d.sem); got != capacity {
+		t.Fatalf("expected semaphore to be fully saturated at %d, got %d", capacity, got)
+	}
+
+	// Dispatch the 129th item in a separate goroutine.
+	// Because semaphore capacity is 128, DispatchVerification should block attempting to send to d.sem.
+	dispatch129Acquiring := make(chan struct{})
+	d.beforeAcquireSem = func() {
+		close(dispatch129Acquiring)
+	}
+	dispatch129Finished := make(chan struct{})
+
+	go func() {
+		d.DispatchVerification(context.Background(), payload)
+		close(dispatch129Finished)
+	}()
+
+	select {
+	case <-dispatch129Acquiring:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for 129th dispatch to reach semaphore acquisition")
+	}
+
+	// Verify the 129th dispatch is indeed blocked on semaphore saturation.
+	select {
+	case <-dispatch129Finished:
+		t.Fatal("expected 129th dispatch to block on saturated semaphore, but it returned prematurely")
+	case <-time.After(50 * time.Millisecond):
+		// Block confirmed.
+	}
+
+	// Release blocked workers so semaphore slots are freed.
+	close(releaseHooks)
+
+	// Verify the 129th dispatch now unblocks and finishes.
+	select {
+	case <-dispatch129Finished:
+		// Succeeded unblocking.
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for 129th dispatch to complete after releasing semaphore")
+	}
+
+	// Wait for all 129 goroutines to finish.
+	completedWg.Wait()
 }

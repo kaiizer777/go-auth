@@ -34,14 +34,15 @@ const emailDispatchSemaphoreSize = 128
 const emailDispatchPendingSize = 256
 
 type authService struct {
-	cfg             config.Config
-	db              *gorm.DB
-	hooks           email.Hooks
-	dummyHash       string
-	hashParams      crypto.HashParams
-	emailSem        chan struct{}
-	emailPendingSem chan struct{}
-	recoveryMu      sync.Mutex
+	cfg               config.Config
+	db                *gorm.DB
+	hooks             email.Hooks
+	dummyHash         string
+	hashParams        crypto.HashParams
+	emailSem          chan struct{}
+	emailPendingSem   chan struct{}
+	recoveryMu        sync.Mutex
+	onPreRecoveryLock func()
 }
 
 // New constructs a new concrete auth Service.
@@ -97,6 +98,9 @@ func (s *authService) Signup(ctx context.Context, req db.SignupRequest) (*db.Use
 		// unverified account cannot be activated by verification. Invalidate
 		// any prior verification tokens for this user first.
 		if !existing.EmailVerified {
+			if s.onPreRecoveryLock != nil {
+				s.onPreRecoveryLock()
+			}
 			s.recoveryMu.Lock()
 			defer s.recoveryMu.Unlock()
 

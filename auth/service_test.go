@@ -751,3 +751,507 @@ func TestDispatchVerificationEmail_SaturatedSemaphoreRetries(t *testing.T) {
 		t.Fatal("hook not called after semaphore capacity returned")
 	}
 }
+
+func TestTryAcquireEmailSlot(t *testing.T) {
+	t.Run("nil semaphore returns false", func(t *testing.T) {
+		svc := &authService{}
+		if svc.tryAcquireEmailSlot("user@example.com") {
+			t.Fatal("expected false for nil semaphore, got true")
+		}
+	})
+
+	t.Run("available slot acquires and returns true", func(t *testing.T) {
+		svc := &authService{
+			emailSem: make(chan struct{}, 1),
+		}
+		if !svc.tryAcquireEmailSlot("user@example.com") {
+			t.Fatal("expected true when slot is available, got false")
+		}
+		if len(svc.emailSem) != 1 {
+			t.Fatalf("expected 1 item in emailSem, got %d", len(svc.emailSem))
+		}
+	})
+
+	t.Run("saturated semaphore returns false", func(t *testing.T) {
+		svc := &authService{
+			emailSem: make(chan struct{}, 1),
+		}
+		svc.emailSem <- struct{}{}
+		if svc.tryAcquireEmailSlot("user@example.com") {
+			t.Fatal("expected false when semaphore is saturated, got true")
+		}
+	})
+}
+
+func TestEmailHookTimeout(t *testing.T) {
+	t.Run("default timeout when unset or zero", func(t *testing.T) {
+		svc := &authService{
+			cfg: config.Config{},
+		}
+		if got := svc.emailHookTimeout(); got != 10*time.Second {
+			t.Fatalf("expected 10s default timeout, got %v", got)
+		}
+	})
+
+	t.Run("default timeout when negative", func(t *testing.T) {
+		svc := &authService{
+			cfg: config.Config{
+				EmailDispatchTimeout: -5 * time.Second,
+			},
+		}
+		if got := svc.emailHookTimeout(); got != 10*time.Second {
+			t.Fatalf("expected 10s default timeout for negative value, got %v", got)
+		}
+	})
+
+	t.Run("custom positive timeout", func(t *testing.T) {
+		svc := &authService{
+			cfg: config.Config{
+				EmailDispatchTimeout: 3 * time.Second,
+			},
+		}
+		if got := svc.emailHookTimeout(); got != 3*time.Second {
+			t.Fatalf("expected 3s timeout, got %v", got)
+		}
+	})
+}
+
+func TestDispatchEmailAsync_ExecutionBranches(t *testing.T) {
+	t.Run("nil emailSem directly spawns goroutine and executes hook", func(t *testing.T) {
+		done := make(chan struct{})
+		svc := &authService{
+			cfg:      config.Config{EmailDispatchTimeout: time.Second},
+			emailSem: nil,
+		}
+		svc.dispatchEmailAsync(context.Background(), "nilsem@example.com", "tok1", "test", func(ctx context.Context, recipient, token string) error {
+			if recipient != "nilsem@example.com" || token != "tok1" {
+				t.Errorf("unexpected args: recipient=%s, token=%s", recipient, token)
+			}
+			close(done)
+			return nil
+		})
+
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatal("hook was not executed when emailSem is nil")
+		}
+	})
+
+	t.Run("context detachment preserves hook execution with canceled parent ctx", func(t *testing.T) {
+		canceledCtx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		done := make(chan struct{})
+		svc := &authService{
+			cfg:      config.Config{EmailDispatchTimeout: time.Second},
+			emailSem: make(chan struct{}, 1),
+		}
+
+		svc.dispatchEmailAsync(canceledCtx, "detached@example.com", "tok2", "test", func(ctx context.Context, recipient, token string) error {
+			if err := ctx.Err(); err != nil {
+				t.Errorf("expected detached context without cancel error, got: %v", err)
+			}
+			close(done)
+			return nil
+		})
+
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatal("hook was not executed")
+		}
+	})
+
+	t.Run("nil parent context executes cleanly", func(t *testing.T) {
+		done := make(chan struct{})
+		svc := &authService{
+			cfg:      config.Config{EmailDispatchTimeout: time.Second},
+			emailSem: make(chan struct{}, 1),
+		}
+
+		var nilCtx context.Context
+		//nolint:staticcheck // SA1012 intentionally testing nil context fallback
+		svc.dispatchEmailAsync(nilCtx, "nilctx@example.com", "tok3", "test", func(ctx context.Context, recipient, token string) error {
+			if ctx == nil {
+				t.Error("expected non-nil timeout context in hook")
+			}
+			close(done)
+			return nil
+		})
+
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatal("hook was not executed")
+		}
+	})
+
+	t.Run("hook error is logged and semaphore is released", func(t *testing.T) {
+		done := make(chan struct{})
+		sem := make(chan struct{}, 1)
+		svc := &authService{
+			cfg:      config.Config{EmailDispatchTimeout: time.Second},
+			emailSem: sem,
+		}
+
+		svc.dispatchEmailAsync(context.Background(), "err@example.com", "tok4", "test", func(ctx context.Context, recipient, token string) error {
+			defer close(done)
+			return fmt.Errorf("simulated delivery failure")
+		})
+
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatal("hook was not executed")
+		}
+
+		select {
+		case sem <- struct{}{}:
+			<-sem
+		case <-time.After(1 * time.Second):
+			t.Fatal("semaphore slot was not released after hook error")
+		}
+	})
+
+	t.Run("hook panic is recovered and semaphore is released", func(t *testing.T) {
+		done := make(chan struct{})
+		sem := make(chan struct{}, 1)
+		svc := &authService{
+			cfg:      config.Config{EmailDispatchTimeout: time.Second},
+			emailSem: sem,
+		}
+
+		svc.dispatchEmailAsync(context.Background(), "panic@example.com", "tok5", "test", func(ctx context.Context, recipient, token string) error {
+			defer close(done)
+			panic("simulated fatal hook crash")
+		})
+
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatal("hook was not executed")
+		}
+
+		select {
+		case sem <- struct{}{}:
+			<-sem
+		case <-time.After(1 * time.Second):
+			t.Fatal("semaphore slot was not released after hook panic")
+		}
+	})
+}
+
+func TestDispatchEmailAsync_SaturationAndOverflow(t *testing.T) {
+	t.Run("pending queue overflow drops request without executing hook", func(t *testing.T) {
+		emailSem := make(chan struct{}, 1)
+		emailSem <- struct{}{}
+
+		emailPendingSem := make(chan struct{}, 1)
+		emailPendingSem <- struct{}{}
+
+		hookCalled := make(chan struct{}, 1)
+		svc := &authService{
+			cfg:             config.Config{EmailDispatchTimeout: 50 * time.Millisecond},
+			emailSem:        emailSem,
+			emailPendingSem: emailPendingSem,
+		}
+
+		svc.dispatchEmailAsync(context.Background(), "overflow@example.com", "tok", "verification", func(ctx context.Context, recipient, token string) error {
+			hookCalled <- struct{}{}
+			return nil
+		})
+
+		select {
+		case <-hookCalled:
+			t.Fatal("hook should not have been called on overflow drop")
+		case <-time.After(150 * time.Millisecond):
+		}
+
+		<-emailSem
+		<-emailPendingSem
+	})
+
+	t.Run("wait timeout gives up and releases pending slot when emailSem never frees", func(t *testing.T) {
+		emailSem := make(chan struct{}, 1)
+		emailSem <- struct{}{}
+
+		emailPendingSem := make(chan struct{}, 1)
+
+		hookCalled := make(chan struct{}, 1)
+		svc := &authService{
+			cfg:             config.Config{EmailDispatchTimeout: 50 * time.Millisecond},
+			emailSem:        emailSem,
+			emailPendingSem: emailPendingSem,
+		}
+
+		svc.dispatchEmailAsync(context.Background(), "timeout@example.com", "tok", "password reset", func(ctx context.Context, recipient, token string) error {
+			hookCalled <- struct{}{}
+			return nil
+		})
+
+		select {
+		case <-hookCalled:
+			t.Fatal("hook should not have been called after wait timeout")
+		case <-time.After(150 * time.Millisecond):
+		}
+
+		select {
+		case emailPendingSem <- struct{}{}:
+			<-emailPendingSem
+		case <-time.After(500 * time.Millisecond):
+			t.Fatal("emailPendingSem was not released after wait timeout give-up")
+		}
+
+		<-emailSem
+	})
+}
+
+func TestService_Signup_UnverifiedAccountRecovery(t *testing.T) {
+	database := setupTestDB(t)
+	cfg := testConfig()
+
+	type hookData struct {
+		recipient string
+		token     string
+	}
+	hookCh := make(chan hookData, 10)
+
+	hooks := email.Hooks{
+		SendVerificationEmail: func(ctx context.Context, recipient, token string) error {
+			hookCh <- hookData{recipient: recipient, token: token}
+			return nil
+		},
+	}
+
+	svc, err := New(cfg, database, hooks)
+	if err != nil {
+		t.Fatalf("failed to create service: %v", err)
+	}
+
+	ctx := context.Background()
+
+	initialPass := "InitialPass#12345"
+	user, origToken, err := svc.Signup(ctx, db.SignupRequest{Email: "recover@example.com", Password: initialPass})
+	if err != nil {
+		t.Fatalf("initial signup failed: %v", err)
+	}
+	if user == nil || origToken == "" {
+		t.Fatal("expected user and token on initial signup")
+	}
+
+	select {
+	case <-hookCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("initial verification email hook not received")
+	}
+
+	var dbUserBefore db.User
+	if err := database.Where("id = ?", user.ID).First(&dbUserBefore).Error; err != nil {
+		t.Fatalf("failed to query user before recovery: %v", err)
+	}
+	oldHash := dbUserBefore.PasswordHash
+
+	newPass := "RecoveredPass#67890"
+	recUser, recToken, err := svc.Signup(ctx, db.SignupRequest{Email: "recover@example.com", Password: newPass})
+	if err != nil {
+		t.Fatalf("unverified recovery signup failed: %v", err)
+	}
+	if recUser != nil || recToken != "" {
+		t.Fatalf("expected nil user and empty token for unverified recovery anti-enumeration, got user=%v token=%s", recUser, recToken)
+	}
+
+	var newHookData hookData
+	select {
+	case newHookData = <-hookCh:
+		if newHookData.recipient != "recover@example.com" {
+			t.Fatalf("expected recipient recover@example.com, got %s", newHookData.recipient)
+		}
+		if newHookData.token == "" || newHookData.token == origToken {
+			t.Fatalf("expected new verification token, got %s", newHookData.token)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("recovery verification email hook not received")
+	}
+
+	oldTokenHash, err := crypto.HashToken(origToken)
+	if err != nil {
+		t.Fatalf("failed to hash origToken: %v", err)
+	}
+	var countOld int64
+	database.Model(&db.VerificationToken{}).Where("token_hash = ?", oldTokenHash[:]).Count(&countOld)
+	if countOld != 0 {
+		t.Fatalf("expected old verification token to be deleted, found %d", countOld)
+	}
+
+	newTokenHash, err := crypto.HashToken(newHookData.token)
+	if err != nil {
+		t.Fatalf("failed to hash newHookData.token: %v", err)
+	}
+	var countNew int64
+	database.Model(&db.VerificationToken{}).Where("token_hash = ?", newTokenHash[:]).Count(&countNew)
+	if countNew != 1 {
+		t.Fatalf("expected new verification token in DB, found %d", countNew)
+	}
+
+	var dbUserAfter db.User
+	if err := database.Where("id = ?", user.ID).First(&dbUserAfter).Error; err != nil {
+		t.Fatalf("failed to query user after recovery: %v", err)
+	}
+	if dbUserAfter.PasswordHash == oldHash {
+		t.Fatal("expected password hash to be updated in DB after unverified recovery")
+	}
+
+	if err := svc.VerifyEmail(ctx, db.VerifyEmailRequest{Token: origToken}); err == nil {
+		t.Fatal("expected old token verification to fail, got nil")
+	}
+
+	if err := svc.VerifyEmail(ctx, db.VerifyEmailRequest{Token: newHookData.token}); err != nil {
+		t.Fatalf("expected new token verification to succeed, got %v", err)
+	}
+
+	loggedIn, err := svc.Login(ctx, db.LoginRequest{Email: "recover@example.com", Password: newPass})
+	if err != nil {
+		t.Fatalf("expected login with new password to succeed, got %v", err)
+	}
+	if loggedIn == nil {
+		t.Fatal("expected non-nil logged-in user")
+	}
+}
+
+func TestService_Signup_UnverifiedRecovery_ConcurrentVerificationRace(t *testing.T) {
+	database := setupTestDB(t)
+	cfg := testConfig()
+
+	type hookData struct {
+		recipient string
+		token     string
+	}
+	hookCh := make(chan hookData, 10)
+	hooks := email.Hooks{
+		SendVerificationEmail: func(ctx context.Context, recipient, token string) error {
+			hookCh <- hookData{recipient: recipient, token: token}
+			return nil
+		},
+	}
+
+	authSvc, err := New(cfg, database, hooks)
+	if err != nil {
+		t.Fatalf("failed to create service: %v", err)
+	}
+	svc := authSvc.(*authService)
+
+	ctx := context.Background()
+	origPass := "OriginalPassword#12345"
+	user, _, err := svc.Signup(ctx, db.SignupRequest{Email: "race@example.com", Password: origPass})
+	if err != nil {
+		t.Fatalf("initial signup failed: %v", err)
+	}
+	if user == nil {
+		t.Fatal("expected non-nil user")
+	}
+
+	select {
+	case <-hookCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("initial verification hook not received")
+	}
+
+	recoveryLookupDone := make(chan struct{})
+	svc.onPreRecoveryLock = func() {
+		close(recoveryLookupDone)
+	}
+
+	svc.recoveryMu.Lock()
+
+	signupDone := make(chan struct{})
+	var signupErr error
+	var signupUser *db.User
+	var signupToken string
+
+	go func() {
+		defer close(signupDone)
+		signupUser, signupToken, signupErr = svc.Signup(ctx, db.SignupRequest{
+			Email:    "race@example.com",
+			Password: "AttemptedNewPassword#67890",
+		})
+	}()
+
+	select {
+	case <-recoveryLookupDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for signup initial unverified lookup")
+	}
+
+	if err := database.Model(&db.User{}).Where("id = ?", user.ID).Update("email_verified", true).Error; err != nil {
+		t.Fatalf("failed to concurrently verify user: %v", err)
+	}
+
+	svc.recoveryMu.Unlock()
+
+	select {
+	case <-signupDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("signup did not complete after releasing recovery lock")
+	}
+
+	if signupErr != nil {
+		t.Fatalf("expected silent success for duplicate email, got: %v", signupErr)
+	}
+	if signupUser != nil || signupToken != "" {
+		t.Fatalf("expected nil user and empty token, got user=%v, token=%s", signupUser, signupToken)
+	}
+
+	select {
+	case h := <-hookCh:
+		t.Fatalf("unexpected verification email sent to %s during race", h.recipient)
+	default:
+	}
+
+	var dbUser db.User
+	if err := database.Where("id = ?", user.ID).First(&dbUser).Error; err != nil {
+		t.Fatalf("failed to query user: %v", err)
+	}
+	match, err := crypto.VerifyPassword(origPass, dbUser.PasswordHash)
+	if err != nil || !match {
+		t.Fatalf("expected original password to remain valid when recovery was bypassed by concurrent verification: match=%v, err=%v", match, err)
+	}
+	matchNew, _ := crypto.VerifyPassword("AttemptedNewPassword#67890", dbUser.PasswordHash)
+	if matchNew {
+		t.Fatal("attempted new password should not have been set")
+	}
+}
+
+func TestService_Signup_UnverifiedRecovery_TransactionFailure(t *testing.T) {
+	database := setupTestDB(t)
+	cfg := testConfig()
+
+	svc, err := New(cfg, database, email.Hooks{})
+	if err != nil {
+		t.Fatalf("failed to create service: %v", err)
+	}
+
+	ctx := context.Background()
+
+	user, _, err := svc.Signup(ctx, db.SignupRequest{Email: "txfail@example.com", Password: "OriginalPassword#12345"})
+	if err != nil {
+		t.Fatalf("initial signup failed: %v", err)
+	}
+	if user == nil {
+		t.Fatal("expected non-nil user")
+	}
+
+	if err := database.Exec("DROP TABLE verification_tokens").Error; err != nil {
+		t.Fatalf("failed to drop verification_tokens table: %v", err)
+	}
+
+	_, _, err = svc.Signup(ctx, db.SignupRequest{Email: "txfail@example.com", Password: "NewPassword#67890"})
+	if err == nil {
+		t.Fatal("expected transaction failure error, got nil")
+	}
+
+	var appErr *errors.Error
+	if !errors.As(err, &appErr) || appErr.Code() != errors.CodeDatabaseError {
+		t.Fatalf("expected CodeDatabaseError, got: %v", err)
+	}
+}

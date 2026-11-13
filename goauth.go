@@ -32,6 +32,8 @@ type Auth struct {
 	Auth auth.Service
 }
 
+var dbConnectFn = db.Connect
+
 // New validates runtime configuration, establishes database connectivity,
 // runs pending migrations, and initializes the HTTP handler chain.
 func New(cfg config.Config) (*Auth, error) {
@@ -39,7 +41,7 @@ func New(cfg config.Config) (*Auth, error) {
 		return nil, errors.Wrap(err, errors.CodeInvalidConfig, "goauth: invalid configuration")
 	}
 
-	database, err := db.Connect(cfg)
+	database, err := dbConnectFn(cfg)
 	if err != nil {
 		return nil, errors.Wrap(err, errors.CodeDatabaseError, "goauth: failed to connect to database")
 	}

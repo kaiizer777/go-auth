@@ -28,6 +28,7 @@ type AsyncDispatcher struct {
 	async             bool
 	logger            *slog.Logger
 	sem               chan struct{}
+	beforeAcquireSem  func()
 }
 
 // NewAsyncDispatcher constructs an AsyncDispatcher from opts.
@@ -82,6 +83,9 @@ func (d *AsyncDispatcher) DispatchPasswordReset(ctx context.Context, payload Pas
 
 func (d *AsyncDispatcher) dispatch(ctx context.Context, op string, run func(context.Context) error) {
 	if d.async {
+		if d.beforeAcquireSem != nil {
+			d.beforeAcquireSem()
+		}
 		d.sem <- struct{}{}
 		go func() {
 			defer func() { <-d.sem }()

@@ -26,11 +26,17 @@ import (
 //go:embed migrations/*.sql
 var defaultMigrationsFS embed.FS
 
+var (
+	runMigrationsFn = runMigrations
+	getSQLDBFn      = func(db *gorm.DB) (*sql.DB, error) { return db.DB() }
+	sqlDBPingFn     = func(db *sql.DB) error { return db.Ping() }
+)
+
 // Connect runs pending migrations, initializes the GORM PostgreSQL connection,
 // and applies connection pooling limits.
 func Connect(cfg config.Config) (*gorm.DB, error) {
 	// 1. Run migrations first
-	if err := runMigrations(cfg.DatabaseURL, cfg.MigrationsPath); err != nil {
+	if err := runMigrationsFn(cfg.DatabaseURL, cfg.MigrationsPath); err != nil {
 		return nil, err
 	}
 
@@ -57,7 +63,7 @@ func Connect(cfg config.Config) (*gorm.DB, error) {
 	}
 
 	// 3. Pool config
-	sqlDB, err := db.DB()
+	sqlDB, err := getSQLDBFn(db)
 	if err != nil {
 		if closer, ok := db.ConnPool.(io.Closer); ok {
 			_ = closer.Close()
@@ -77,7 +83,7 @@ func Connect(cfg config.Config) (*gorm.DB, error) {
 	sqlDB.SetConnMaxLifetime(cfg.ConnMaxLifetime)
 	sqlDB.SetConnMaxIdleTime(cfg.ConnMaxIdleTime)
 
-	if err := sqlDB.Ping(); err != nil {
+	if err := sqlDBPingFn(sqlDB); err != nil {
 		return nil, errors.New(errors.CodeDatabaseUnavailable, "db ping failed", err)
 	}
 

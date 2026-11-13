@@ -5,6 +5,7 @@ import (
 	stderrors "errors"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -360,6 +361,149 @@ func TestWrap(t *testing.T) {
 		}
 		if !Is(wrapped, cause) {
 			t.Errorf("expected wrapped error to match cause via Is")
+		}
+	})
+}
+
+func TestWriteJSON_EmptyMessageNon500(t *testing.T) {
+	tests := []struct {
+		code           Code
+		expectedStatus int
+		expectedMsg    string
+	}{
+		{CodeValidationError, http.StatusBadRequest, "bad request"},
+		{CodeInvalidEmail, http.StatusBadRequest, "bad request"},
+		{CodeInvalidCredentials, http.StatusUnauthorized, "unauthorized"},
+		{CodeEmailNotVerified, http.StatusForbidden, "forbidden"},
+		{CodeNotFound, http.StatusNotFound, "not found"},
+		{CodeUserNotFound, http.StatusNotFound, "not found"},
+		{CodeMethodNotAllowed, http.StatusMethodNotAllowed, "method not allowed"},
+		{CodeUserAlreadyExists, http.StatusConflict, "conflict"},
+		{CodeDatabaseUnavailable, http.StatusServiceUnavailable, "service unavailable"},
+	}
+
+	for _, tt := range tests {
+		t.Run(string(tt.code), func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			err := New(tt.code, "", nil)
+
+			WriteJSON(rec, err)
+
+			if rec.Code != tt.expectedStatus {
+				t.Fatalf("expected status %d, got %d", tt.expectedStatus, rec.Code)
+			}
+			if got := rec.Header().Get("Content-Type"); got != "application/json" {
+				t.Errorf("expected Content-Type application/json, got %q", got)
+			}
+
+			var resp Response
+			if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+				t.Fatalf("failed to decode response: %v", err)
+			}
+			if resp.Code != tt.code {
+				t.Errorf("got code %q, want %q", resp.Code, tt.code)
+			}
+			if resp.Message != tt.expectedMsg {
+				t.Errorf("got message %q, want %q", resp.Message, tt.expectedMsg)
+			}
+		})
+	}
+}
+
+type nonComparableError struct {
+	tags []string
+}
+
+func (e nonComparableError) Error() string {
+	return strings.Join(e.tags, ",")
+}
+
+func (e nonComparableError) Is(target error) bool {
+	t, ok := target.(nonComparableError)
+	if !ok {
+		return false
+	}
+	return slices.Equal(e.tags, t.tags)
+}
+
+func TestError_Is_EdgeCases(t *testing.T) {
+	t.Run("empty target identity comparison", func(t *testing.T) {
+		empty1 := &Error{}
+		empty2 := &Error{}
+		errWithCode := New(CodeNotFound, "", nil)
+		errWithMsg := New("", "some message", nil)
+		errWithCause := New("", "", stderrors.New("cause"))
+
+		if !Is(empty1, empty1) {
+			t.Error("expected empty error to match itself by identity")
+		}
+		if Is(empty1, empty2) {
+			t.Error("expected distinct empty errors not to match")
+		}
+		if Is(errWithCode, empty1) {
+			t.Error("expected error with code not to match empty error")
+		}
+		if Is(errWithMsg, empty1) {
+			t.Error("expected error with message not to match empty error")
+		}
+		if Is(errWithCause, empty1) {
+			t.Error("expected error with cause not to match empty error")
+		}
+	})
+
+	t.Run("code and message mismatch combinations", func(t *testing.T) {
+		root1 := stderrors.New("cause 1")
+		root2 := stderrors.New("cause 2")
+
+		errA := New(CodeNotFound, "msg", root1)
+		errB := New(CodeNotFound, "msg", root2)
+		if errA.Is(errB) {
+			t.Error("expected errA not to match errB with different cause")
+		}
+
+		errC := New(CodeNotFound, "msg1", nil)
+		errD := New(CodeNotFound, "msg2", nil)
+		if errC.Is(errD) {
+			t.Error("expected errC not to match errD with different message")
+		}
+
+		errE := New(CodeNotFound, "msg", nil)
+		errF := New(CodeValidationError, "msg", nil)
+		if errE.Is(errF) {
+			t.Error("expected errE not to match errF with different code")
+		}
+	})
+
+	t.Run("nil receiver and nil target edge cases", func(t *testing.T) {
+		var nilErr *Error
+		nonNilErr := New(CodeNotFound, "msg", nil)
+
+		if nilErr.Is(nonNilErr) {
+			t.Error("expected nil *Error not to match non-nil *Error")
+		}
+		if !nilErr.Is(nil) {
+			t.Error("expected nil *Error to match nil error")
+		}
+		if nonNilErr.Is(nil) {
+			t.Error("expected non-nil *Error not to match nil error")
+		}
+	})
+
+	t.Run("non-comparable error target", func(t *testing.T) {
+		target := nonComparableError{tags: []string{"a", "b"}}
+		err := New(CodeInternalError, "wrapper", nil)
+		if err.Is(target) {
+			t.Error("expected err without cause not to match nonComparableError")
+		}
+
+		errWithSameCause := New(CodeInternalError, "wrapper", target)
+		if !errWithSameCause.Is(target) {
+			t.Error("expected err with nonComparableError cause to match via unwrap")
+		}
+
+		differentTarget := nonComparableError{tags: []string{"different"}}
+		if errWithSameCause.Is(differentTarget) {
+			t.Error("expected err with different nonComparableError tags not to match")
 		}
 	})
 }

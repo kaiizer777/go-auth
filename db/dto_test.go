@@ -204,6 +204,33 @@ func TestRequestDTOValidation(t *testing.T) {
 			t.Fatalf("PasswordResetConfirmRequest.Validate() got error code %v, want %v", appErr.Code(), errors.CodeInvalidToken)
 		}
 
+		emptyTokenReq := PasswordResetConfirmRequest{Token: "", NewPassword: "NewSecurePassword123"}
+		err = emptyTokenReq.Validate()
+		if err == nil {
+			t.Fatal("PasswordResetConfirmRequest.Validate() expected error for empty token")
+		}
+		if !errors.As(err, &appErr) || appErr.Code() != errors.CodeInvalidToken {
+			t.Fatalf("PasswordResetConfirmRequest.Validate() got error code %v, want %v", appErr.Code(), errors.CodeInvalidToken)
+		}
+
+		whitespaceTokenReq := PasswordResetConfirmRequest{Token: "   ", NewPassword: "NewSecurePassword123"}
+		err = whitespaceTokenReq.Validate()
+		if err == nil {
+			t.Fatal("PasswordResetConfirmRequest.Validate() expected error for whitespace token")
+		}
+		if !errors.As(err, &appErr) || appErr.Code() != errors.CodeInvalidToken {
+			t.Fatalf("PasswordResetConfirmRequest.Validate() got error code %v, want %v", appErr.Code(), errors.CodeInvalidToken)
+		}
+
+		nonHexTokenReq := PasswordResetConfirmRequest{Token: strings.Repeat("z", 64), NewPassword: "NewSecurePassword123"}
+		err = nonHexTokenReq.Validate()
+		if err == nil {
+			t.Fatal("PasswordResetConfirmRequest.Validate() expected error for non-hex token")
+		}
+		if !errors.As(err, &appErr) || appErr.Code() != errors.CodeInvalidToken {
+			t.Fatalf("PasswordResetConfirmRequest.Validate() got error code %v, want %v", appErr.Code(), errors.CodeInvalidToken)
+		}
+
 		emptyPasswordReq := PasswordResetConfirmRequest{Token: validToken, NewPassword: ""}
 		err = emptyPasswordReq.Validate()
 		if err == nil {
@@ -211,6 +238,15 @@ func TestRequestDTOValidation(t *testing.T) {
 		}
 		if !errors.As(err, &appErr) || appErr.Code() != errors.CodeValidationError {
 			t.Fatalf("PasswordResetConfirmRequest.Validate() got error code %v, want %v", appErr.Code(), errors.CodeValidationError)
+		}
+
+		missingBothReq := PasswordResetConfirmRequest{Token: "", NewPassword: ""}
+		err = missingBothReq.Validate()
+		if err == nil {
+			t.Fatal("PasswordResetConfirmRequest.Validate() expected error for missing both fields")
+		}
+		if !errors.As(err, &appErr) || appErr.Code() != errors.CodeInvalidToken {
+			t.Fatalf("PasswordResetConfirmRequest.Validate() got error code %v, want %v", appErr.Code(), errors.CodeInvalidToken)
 		}
 	})
 }
