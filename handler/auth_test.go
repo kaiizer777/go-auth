@@ -964,3 +964,43 @@ func TestRequestBodyHardening(t *testing.T) {
 		}
 	})
 }
+
+func TestLogoutInvokesService(t *testing.T) {
+	t.Run("success with session cookie", func(t *testing.T) {
+		var receivedSessionID string
+		mockSvc := &mockAuthService{
+			logoutFn: func(ctx context.Context, sessionID string) error {
+				receivedSessionID = sessionID
+				return nil
+			},
+		}
+		h := New(nil, config.DefaultConfig(), mockSvc)
+		req := httptest.NewRequest(http.MethodPost, "/auth/logout", nil)
+		req.AddCookie(&http.Cookie{Name: "session", Value: "sess_12345"})
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusNoContent {
+			t.Fatalf("expected 204, got %d", rec.Code)
+		}
+		if receivedSessionID != "sess_12345" {
+			t.Fatalf("expected session ID sess_12345, got %q", receivedSessionID)
+		}
+	})
+
+	t.Run("service error propagation", func(t *testing.T) {
+		mockSvc := &mockAuthService{
+			logoutFn: func(ctx context.Context, sessionID string) error {
+				return errors.New(errors.CodeDatabaseError, "db fail", nil)
+			},
+		}
+		h := New(nil, config.DefaultConfig(), mockSvc)
+		req := httptest.NewRequest(http.MethodPost, "/auth/logout", nil)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusInternalServerError {
+			t.Fatalf("expected 500 on db error, got %d", rec.Code)
+		}
+	})
+}

@@ -42,6 +42,9 @@ func (c *mockConn) Begin() (driver.Tx, error) {
 }
 
 func (c *mockConn) Ping(ctx context.Context) error {
+	if ctx != nil && ctx.Err() != nil {
+		return ctx.Err()
+	}
 	if !c.healthy {
 		return stderrors.New("database ping error")
 	}
@@ -285,5 +288,23 @@ func TestResponseInterceptor_JSONContentTypeWithParameters(t *testing.T) {
 	}
 	if strings.TrimSpace(rec.Body.String()) != customBody {
 		t.Errorf("expected body %q, got %q", customBody, rec.Body.String())
+	}
+}
+
+func TestNewHandler_HealthEndpoint_CanceledContext(t *testing.T) {
+	cfg := config.DefaultConfig()
+	db := newMockGormDB(t, true)
+	h := New(db, cfg, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	req := httptest.NewRequest(http.MethodGet, "/health", nil).WithContext(ctx)
+	rec := httptest.NewRecorder()
+
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected status %d on canceled context, got %d", http.StatusServiceUnavailable, rec.Code)
 	}
 }

@@ -44,6 +44,15 @@ func New(cfg config.Config) (*Auth, error) {
 		return nil, errors.Wrap(err, errors.CodeDatabaseError, "goauth: failed to connect to database")
 	}
 
+	success := false
+	defer func() {
+		if !success {
+			if sqlDB, dbErr := database.DB(); dbErr == nil {
+				_ = sqlDB.Close()
+			}
+		}
+	}()
+
 	emailHooks := cfg.EmailHooks
 	if emailHooks.SendVerificationEmail == nil && cfg.SendVerificationEmail != nil {
 		emailHooks.SendVerificationEmail = func(ctx context.Context, recipient, token string) error {
@@ -66,14 +75,11 @@ func New(cfg config.Config) (*Auth, error) {
 
 	authSvc, err := auth.New(cfg, database, emailHooks)
 	if err != nil {
-		if sqlDB, dbErr := database.DB(); dbErr == nil {
-			_ = sqlDB.Close()
-		}
 		return nil, err
 	}
 
 	h := handler.New(database, cfg, authSvc)
-	return &Auth{
+	a := &Auth{
 		db:  database,
 		cfg: cfg,
 		emailDispatcher: email.NewAsyncDispatcher(email.DispatcherConfig{
@@ -85,7 +91,9 @@ func New(cfg config.Config) (*Auth, error) {
 		}, slog.Default()),
 		Handler: h,
 		Auth:    authSvc,
-	}, nil
+	}
+	success = true
+	return a, nil
 }
 
 // Close terminates the underlying database connection pool.

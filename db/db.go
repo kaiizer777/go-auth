@@ -1,8 +1,10 @@
 package db
 
 import (
+	"context"
 	"database/sql"
 	"embed"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -57,18 +59,29 @@ func Connect(cfg config.Config) (*gorm.DB, error) {
 	// 3. Pool config
 	sqlDB, err := db.DB()
 	if err != nil {
+		if closer, ok := db.ConnPool.(io.Closer); ok {
+			_ = closer.Close()
+		}
 		return nil, errors.New(errors.CodeDatabaseError, "get sql.DB failed", err)
 	}
+
+	var success bool
+	defer func() {
+		if !success {
+			_ = sqlDB.Close()
+		}
+	}()
+
 	sqlDB.SetMaxOpenConns(cfg.MaxOpenConns)
 	sqlDB.SetMaxIdleConns(cfg.MaxIdleConns)
 	sqlDB.SetConnMaxLifetime(cfg.ConnMaxLifetime)
 	sqlDB.SetConnMaxIdleTime(cfg.ConnMaxIdleTime)
 
 	if err := sqlDB.Ping(); err != nil {
-		_ = sqlDB.Close()
 		return nil, errors.New(errors.CodeDatabaseUnavailable, "db ping failed", err)
 	}
 
+	success = true
 	return db, nil
 }
 
@@ -79,17 +92,27 @@ func runMigrations(databaseURL, migrationsPath string) error {
 	if err != nil {
 		return errors.New(errors.CodeDatabaseError, "open database connection failed", err)
 	}
-	defer func() {
-		_ = db.Close()
-	}()
 
 	// validate connection before passing to migrate
 	if err := db.Ping(); err != nil {
+		_ = db.Close()
 		return errors.New(errors.CodeDatabaseUnavailable, "ping database failed", err)
 	}
 
-	driver, err := pgmigrate.WithInstance(db, &pgmigrate.Config{})
+	// Check out a dedicated connection explicitly: pgmigrate.WithInstance leaks
+	// the checked-out *sql.Conn when its internal WithConnection call fails, so
+	// the conn lifecycle is owned here instead. WithConnection leaves the driver
+	// without a pool reference, so the pool is closed explicitly below.
+	conn, err := db.Conn(context.Background())
 	if err != nil {
+		_ = db.Close()
+		return errors.New(errors.CodeDatabaseError, "checkout migration connection failed", err)
+	}
+
+	driver, err := pgmigrate.WithConnection(context.Background(), conn, &pgmigrate.Config{})
+	if err != nil {
+		_ = conn.Close()
+		_ = db.Close()
 		return errors.New(errors.CodeMigrationFailed, "initialize postgres migration driver failed", err)
 	}
 
@@ -98,12 +121,14 @@ func runMigrations(databaseURL, migrationsPath string) error {
 		sourceDriver, err = iofs.New(defaultMigrationsFS, "migrations")
 		if err != nil {
 			_ = driver.Close()
+			_ = db.Close()
 			return errors.New(errors.CodeMigrationFailed, "init embedded migrations source failed", err)
 		}
 	} else {
 		sourceDriver, err = iofs.New(os.DirFS(migrationsPath), ".")
 		if err != nil {
 			_ = driver.Close()
+			_ = db.Close()
 			return errors.New(errors.CodeMigrationFailed, "init custom migrations source failed", err)
 		}
 	}
@@ -112,11 +137,13 @@ func runMigrations(databaseURL, migrationsPath string) error {
 	if err != nil {
 		_ = sourceDriver.Close()
 		_ = driver.Close()
+		_ = db.Close()
 		return errors.New(errors.CodeMigrationFailed, "init migrate instance failed", err)
 	}
 
 	defer func() {
 		_, _ = m.Close()
+		_ = db.Close()
 	}()
 
 	if err := m.Up(); err != nil && err != migrate.ErrNoChange {

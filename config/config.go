@@ -120,6 +120,19 @@ func (c *Config) Validate() error {
 		return errors.ErrBaseURLInvalid
 	}
 	c.BaseURL = strings.TrimRight(c.BaseURL, "/")
+	for i, origin := range c.AllowedOrigins {
+		origin = strings.TrimSpace(origin)
+		if origin == "*" {
+			c.AllowedOrigins[i] = "*"
+			continue
+		}
+		origin = strings.TrimRight(origin, "/")
+		parsed, err := url.Parse(origin)
+		if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Path != "" || parsed.RawQuery != "" || parsed.Fragment != "" {
+			return errors.ErrAllowedOriginInvalid
+		}
+		c.AllowedOrigins[i] = origin
+	}
 	if c.MigrationsPath == "" {
 		c.MigrationsPath = "db/migrations"
 	}

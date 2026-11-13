@@ -62,8 +62,10 @@ func (c Code) HTTPStatus() int {
 		return http.StatusUnauthorized
 	case CodeEmailNotVerified:
 		return http.StatusForbidden
-	case CodeNotFound:
+	case CodeNotFound, CodeUserNotFound:
 		return http.StatusNotFound
+	case CodeUserAlreadyExists:
+		return http.StatusConflict
 	case CodeMethodNotAllowed:
 		return http.StatusMethodNotAllowed
 	case CodeDatabaseUnavailable:
@@ -138,12 +140,16 @@ func (e *Error) Is(target error) bool {
 	}
 	t, ok := target.(*Error)
 	if !ok {
-		return false
+		return e != nil && e.cause != nil && stderrors.Is(e.cause, target)
 	}
 	if e == t {
 		return true
 	}
 	if e == nil || t == nil {
+		return false
+	}
+	// An empty *Error (no code, message, or cause) matches only by identity.
+	if t.code == "" && t.message == "" && t.cause == nil {
 		return false
 	}
 	if t.code != "" && e.code != t.code {
@@ -207,6 +213,7 @@ var (
 	ErrConnMaxIdleTimeNegative         = New(CodeInvalidConfig, "conn max idle time cannot be negative", nil)
 	ErrBaseURLRequired                 = New(CodeInvalidConfig, "base URL is required", nil)
 	ErrBaseURLInvalid                  = New(CodeInvalidConfig, "base URL is invalid", nil)
+	ErrAllowedOriginInvalid            = New(CodeInvalidConfig, "allowed origin is invalid", nil)
 	ErrEmailDispatchTimeoutNegative    = New(CodeInvalidConfig, "email dispatch timeout cannot be negative", nil)
 	ErrArgon2MemoryTooLow              = New(CodeInvalidConfig, "argon2 memory too low", nil)
 	ErrArgon2TimeTooLow                = New(CodeInvalidConfig, "argon2 time too low", nil)

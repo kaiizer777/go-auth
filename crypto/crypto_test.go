@@ -75,6 +75,13 @@ func TestVerifyPassword_MalformedHashes(t *testing.T) {
 		"bad$argon2id$v=19$m=65536,t=3,p=4$" + validSaltB64 + "$aGFzaA", // no leading $
 		"$argon2id$v=19$m=65536,t=3,p=4extra$" + validSaltB64 + "$aGFzaA", // trailing param chars
 		"$argon2id$v=19$m=65536,t=3,p=4$c2FsdA$aGFzaA",                // salt < 16 bytes ("salt" = 4 bytes)
+		"$argon2id$v=$m=65536,t=3,p=4$" + validSaltB64 + "$aGFzaA",        // empty version
+		"$argon2id$v=019$m=65536,t=3,p=4$" + validSaltB64 + "$aGFzaA",      // non-canonical version with leading zero
+		"$argon2id$v=19$m=65536,t=3$" + validSaltB64 + "$aGFzaA",           // missing p parameter
+		"$argon2id$v=19$m=65536,t=3,p=4,m=65536$" + validSaltB64 + "$aGFzaA", // duplicate m parameter
+		"$argon2id$v=19$m=65536,t=3,p=4,x=1$" + validSaltB64 + "$aGFzaA",    // unexpected extra parameter
+		"$argon2id$v=19$m=065536,t=3,p=4$" + validSaltB64 + "$aGFzaA",     // leading zero in memory param
+		"$argon2id$v=19$m=65536,t=3,p=256$" + validSaltB64 + "$aGFzaA",    // parallelism overflow uint8
 	}
 
 	for _, hash := range malformed {
@@ -337,3 +344,90 @@ func TestValidatePassword(t *testing.T) {
 		})
 	}
 }
+
+func TestVerifyPassword_ParameterOrderPermutations(t *testing.T) {
+	params := fastTestParams()
+	password := "SecretP@ssw0rd!"
+
+	phc, err := HashPassword(password, params)
+	if err != nil {
+		t.Fatalf("HashPassword failed: %v", err)
+	}
+
+	// Swap parameter ordering from m=...,t=...,p=... to t=...,p=...,m=...
+	parts := strings.Split(phc, "$")
+	if len(parts) != 6 {
+		t.Fatalf("unexpected hash format")
+	}
+
+	reorderedParams := strings.Replace(parts[3], "m=19456,t=2,p=1", "t=2,p=1,m=19456", 1)
+	parts[3] = reorderedParams
+	reorderedPHC := strings.Join(parts, "$")
+
+	match, err := VerifyPassword(password, reorderedPHC)
+	if err != nil {
+		t.Fatalf("VerifyPassword failed with reordered params: %v", err)
+	}
+	if !match {
+		t.Fatalf("expected password to match hash with reordered params")
+	}
+}
+
+func TestWipeBytes(t *testing.T) {
+	b := []byte{1, 2, 3, 4, 5, 6, 7, 8}
+	wipeBytes(b)
+	for i, v := range b {
+		if v != 0 {
+			t.Fatalf("expected byte at index %d to be 0, got %d", i, v)
+		}
+	}
+}
+
+func TestParseBlocklist_LineEndings(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected []string
+	}{
+		{
+			name:     "LF line endings",
+			input:    "password123\nadmin\nsecret\n",
+			expected: []string{"password123", "admin", "secret"},
+		},
+		{
+			name:     "CRLF line endings",
+			input:    "password123\r\nadmin\r\nsecret\r\n",
+			expected: []string{"password123", "admin", "secret"},
+		},
+		{
+			name:     "Mixed LF and CRLF with blank lines",
+			input:    "\r\npassword123\n\r\nadmin\r\n\nsecret\r\n\r\n",
+			expected: []string{"password123", "admin", "secret"},
+		},
+		{
+			name:     "CR line endings",
+			input:    "password123\radmin\rsecret\r",
+			expected: []string{"password123", "admin", "secret"},
+		},
+		{
+			name:     "Whitespace trimming and lowercase normalization",
+			input:    "  PASSWORD123 \r\n\tAdmin\t\n  \r\n secret \n",
+			expected: []string{"password123", "admin", "secret"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := parseBlocklist(tt.input)
+			if len(m) != len(tt.expected) {
+				t.Fatalf("expected %d entries, got %d", len(tt.expected), len(m))
+			}
+			for _, exp := range tt.expected {
+				if _, ok := m[exp]; !ok {
+					t.Errorf("expected entry %q not found in blocklist map", exp)
+				}
+			}
+		})
+	}
+}
+

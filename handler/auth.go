@@ -85,6 +85,21 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 
 // Logout terminates the current session.
 func (h *AuthHandler) Logout(w http.ResponseWriter, r *http.Request) {
+	var sessionID string
+	if cookie, err := r.Cookie("session"); err == nil {
+		sessionID = cookie.Value
+	} else if cookie, err := r.Cookie("session_id"); err == nil {
+		sessionID = cookie.Value
+	}
+	if sessionID == "" {
+		sessionID = r.Header.Get("X-Session-ID")
+	}
+	if h.svc != nil {
+		if err := h.svc.Logout(r.Context(), sessionID); err != nil {
+			errors.WriteJSON(w, err)
+			return
+		}
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
 

@@ -445,6 +445,51 @@ func TestConfigValidate(t *testing.T) {
 			},
 			wantErr: nil,
 		},
+		{
+			name: "allowed origins valid with trimming",
+			mutate: func(c *Config) {
+				c.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+				c.BaseURL = "https://example.com"
+				c.AllowedOrigins = []string{" https://app.example.com/ ", "*", "http://localhost:3000"}
+			},
+			wantErr: nil,
+		},
+		{
+			name: "allowed origins invalid without scheme",
+			mutate: func(c *Config) {
+				c.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+				c.BaseURL = "https://example.com"
+				c.AllowedOrigins = []string{"app.example.com"}
+			},
+			wantErr: errors.ErrAllowedOriginInvalid,
+		},
+		{
+			name: "allowed origins invalid with non-http scheme",
+			mutate: func(c *Config) {
+				c.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+				c.BaseURL = "https://example.com"
+				c.AllowedOrigins = []string{"ftp://app.example.com"}
+			},
+			wantErr: errors.ErrAllowedOriginInvalid,
+		},
+		{
+			name: "allowed origins invalid with path",
+			mutate: func(c *Config) {
+				c.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+				c.BaseURL = "https://example.com"
+				c.AllowedOrigins = []string{"https://app.example.com/api"}
+			},
+			wantErr: errors.ErrAllowedOriginInvalid,
+		},
+		{
+			name: "allowed origins invalid empty string",
+			mutate: func(c *Config) {
+				c.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+				c.BaseURL = "https://example.com"
+				c.AllowedOrigins = []string{""}
+			},
+			wantErr: errors.ErrAllowedOriginInvalid,
+		},
 	}
 
 	for _, tt := range tests {
@@ -473,6 +518,17 @@ func TestConfigValidate(t *testing.T) {
 			}
 			if tt.name == "argon2 parallelism zero uses default" && cfg.Argon2.Parallelism != 4 {
 				t.Errorf("got parallelism %d, want 4", cfg.Argon2.Parallelism)
+			}
+			if tt.name == "allowed origins valid with trimming" {
+				if cfg.AllowedOrigins[0] != "https://app.example.com" {
+					t.Errorf("got origin %q, want https://app.example.com", cfg.AllowedOrigins[0])
+				}
+				if cfg.AllowedOrigins[1] != "*" {
+					t.Errorf("got origin %q, want *", cfg.AllowedOrigins[1])
+				}
+				if cfg.AllowedOrigins[2] != "http://localhost:3000" {
+					t.Errorf("got origin %q, want http://localhost:3000", cfg.AllowedOrigins[2])
+				}
 			}
 		})
 	}

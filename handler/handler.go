@@ -89,7 +89,7 @@ func (h *Handler) registerRoutes() {
 			return
 		}
 		sqlDB, err := h.db.DB()
-		if err != nil || sqlDB.Ping() != nil {
+		if err != nil || sqlDB.PingContext(r.Context()) != nil {
 			errors.WriteJSON(w, errors.New(errors.CodeDatabaseUnavailable, "database unavailable", nil))
 			return
 		}
