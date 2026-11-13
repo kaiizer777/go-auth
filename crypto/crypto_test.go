@@ -59,29 +59,29 @@ func TestVerifyPassword_MalformedHashes(t *testing.T) {
 	malformed := []string{
 		"",
 		"not-a-hash",
-		"$argon2i$v=19$m=65536,t=3,p=4$" + validSaltB64 + "$aGFzaA", // argon2i instead of argon2id
-		"$argon2id$v=18$m=65536,t=3,p=4$" + validSaltB64 + "$aGFzaA", // unsupported version
+		"$argon2i$v=19$m=65536,t=3,p=4$" + validSaltB64 + "$aGFzaA",       // argon2i instead of argon2id
+		"$argon2id$v=18$m=65536,t=3,p=4$" + validSaltB64 + "$aGFzaA",      // unsupported version
 		"$argon2id$v=19extra$m=65536,t=3,p=4$" + validSaltB64 + "$aGFzaA", // trailing version chars
 		"$argon2id$v=19$badparams$" + validSaltB64 + "$aGFzaA",
 		"$argon2id$v=19$m=65536,t=3,p=4$invalid-base64!$aGFzaA",
 		"$argon2id$v=19$m=65536,t=3,p=4$" + validSaltB64 + "$invalid-base64!",
-		"$argon2id$v=19$m=65536,t=0,p=4$" + validSaltB64 + "$aGFzaA",  // t=0
-		"$argon2id$v=19$m=65536,t=3,p=0$" + validSaltB64 + "$aGFzaA",  // p=0
-		"$argon2id$v=19$m=0,t=3,p=4$" + validSaltB64 + "$aGFzaA",      // m=0
-		"$argon2id$v=19$m=262145,t=3,p=4$" + validSaltB64 + "$aGFzaA",  // memory > 262144
-		"$argon2id$v=19$m=65536,t=11,p=4$" + validSaltB64 + "$aGFzaA",  // time > 10
-		"$argon2id$v=19$m=65536,t=3,p=4$" + validSaltB64 + "$",        // empty hash
-		"$argon2id$v=19$m=65536,t=3,p=4$$aGFzaA",                      // empty salt
-		"bad$argon2id$v=19$m=65536,t=3,p=4$" + validSaltB64 + "$aGFzaA", // no leading $
-		"$argon2id$v=19$m=65536,t=3,p=4extra$" + validSaltB64 + "$aGFzaA", // trailing param chars
-		"$argon2id$v=19$m=65536,t=3,p=4$c2FsdA$aGFzaA",                // salt < 16 bytes ("salt" = 4 bytes)
-		"$argon2id$v=$m=65536,t=3,p=4$" + validSaltB64 + "$aGFzaA",        // empty version
-		"$argon2id$v=019$m=65536,t=3,p=4$" + validSaltB64 + "$aGFzaA",      // non-canonical version with leading zero
-		"$argon2id$v=19$m=65536,t=3$" + validSaltB64 + "$aGFzaA",           // missing p parameter
+		"$argon2id$v=19$m=65536,t=0,p=4$" + validSaltB64 + "$aGFzaA",         // t=0
+		"$argon2id$v=19$m=65536,t=3,p=0$" + validSaltB64 + "$aGFzaA",         // p=0
+		"$argon2id$v=19$m=0,t=3,p=4$" + validSaltB64 + "$aGFzaA",             // m=0
+		"$argon2id$v=19$m=262145,t=3,p=4$" + validSaltB64 + "$aGFzaA",        // memory > 262144
+		"$argon2id$v=19$m=65536,t=11,p=4$" + validSaltB64 + "$aGFzaA",        // time > 10
+		"$argon2id$v=19$m=65536,t=3,p=4$" + validSaltB64 + "$",               // empty hash
+		"$argon2id$v=19$m=65536,t=3,p=4$$aGFzaA",                             // empty salt
+		"bad$argon2id$v=19$m=65536,t=3,p=4$" + validSaltB64 + "$aGFzaA",      // no leading $
+		"$argon2id$v=19$m=65536,t=3,p=4extra$" + validSaltB64 + "$aGFzaA",    // trailing param chars
+		"$argon2id$v=19$m=65536,t=3,p=4$c2FsdA$aGFzaA",                       // salt < 16 bytes ("salt" = 4 bytes)
+		"$argon2id$v=$m=65536,t=3,p=4$" + validSaltB64 + "$aGFzaA",           // empty version
+		"$argon2id$v=019$m=65536,t=3,p=4$" + validSaltB64 + "$aGFzaA",        // non-canonical version with leading zero
+		"$argon2id$v=19$m=65536,t=3$" + validSaltB64 + "$aGFzaA",             // missing p parameter
 		"$argon2id$v=19$m=65536,t=3,p=4,m=65536$" + validSaltB64 + "$aGFzaA", // duplicate m parameter
-		"$argon2id$v=19$m=65536,t=3,p=4,x=1$" + validSaltB64 + "$aGFzaA",    // unexpected extra parameter
-		"$argon2id$v=19$m=065536,t=3,p=4$" + validSaltB64 + "$aGFzaA",     // leading zero in memory param
-		"$argon2id$v=19$m=65536,t=3,p=256$" + validSaltB64 + "$aGFzaA",    // parallelism overflow uint8
+		"$argon2id$v=19$m=65536,t=3,p=4,x=1$" + validSaltB64 + "$aGFzaA",     // unexpected extra parameter
+		"$argon2id$v=19$m=065536,t=3,p=4$" + validSaltB64 + "$aGFzaA",        // leading zero in memory param
+		"$argon2id$v=19$m=65536,t=3,p=256$" + validSaltB64 + "$aGFzaA",       // parallelism overflow uint8
 	}
 
 	for _, hash := range malformed {
@@ -430,4 +430,3 @@ func TestParseBlocklist_LineEndings(t *testing.T) {
 		})
 	}
 }
-

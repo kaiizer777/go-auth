@@ -121,4 +121,3 @@ func TestModelUserIDIndexTags(t *testing.T) {
 		})
 	}
 }
-
