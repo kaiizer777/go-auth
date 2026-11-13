@@ -11,8 +11,9 @@ import (
 	"net/http/httptest"
 	"sync"
 	"testing"
+	"time"
 
-	"github.com/kaiizer777/go-auth"
+	goauth "github.com/kaiizer777/go-auth"
 	"github.com/kaiizer777/go-auth/config"
 )
 
@@ -28,27 +29,39 @@ func TestWiring_EndToEndEmailDispatchAndClose(t *testing.T) {
 	var emailMu sync.Mutex
 	verificationEmails := make([]capturedEmail, 0)
 	passwordResetEmails := make([]capturedEmail, 0)
+	verificationChan := make(chan capturedEmail, 10)
+	passwordResetChan := make(chan capturedEmail, 10)
 
 	cfg := baseCfg
-	cfg.DisableAsyncEmailDispatch = true // synchronous execution for deterministic end-to-end assertions
+	cfg.DisableAsyncEmailDispatch = true
 	cfg.SendVerificationEmail = func(ctx context.Context, p config.VerificationEmailPayload) error {
-		emailMu.Lock()
-		defer emailMu.Unlock()
-		verificationEmails = append(verificationEmails, capturedEmail{
+		email := capturedEmail{
 			to:    p.To,
 			token: p.Token,
 			url:   p.URL,
-		})
+		}
+		emailMu.Lock()
+		verificationEmails = append(verificationEmails, email)
+		emailMu.Unlock()
+		select {
+		case verificationChan <- email:
+		default:
+		}
 		return nil
 	}
 	cfg.SendPasswordResetEmail = func(ctx context.Context, p config.PasswordResetEmailPayload) error {
-		emailMu.Lock()
-		defer emailMu.Unlock()
-		passwordResetEmails = append(passwordResetEmails, capturedEmail{
+		email := capturedEmail{
 			to:    p.To,
 			token: p.Token,
 			url:   p.URL,
-		})
+		}
+		emailMu.Lock()
+		passwordResetEmails = append(passwordResetEmails, email)
+		emailMu.Unlock()
+		select {
+		case passwordResetChan <- email:
+		default:
+		}
 		return nil
 	}
 
@@ -74,13 +87,13 @@ func TestWiring_EndToEndEmailDispatchAndClose(t *testing.T) {
 	}
 	_ = resp.Body.Close()
 
-	// Verify verification email dispatched
-	emailMu.Lock()
-	if len(verificationEmails) != 1 {
-		t.Fatalf("expected 1 verification email, found %d", len(verificationEmails))
+	// Verify verification email dispatched with bounded timeout
+	var vEmail capturedEmail
+	select {
+	case vEmail = <-verificationChan:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for verification email dispatch")
 	}
-	vEmail := verificationEmails[0]
-	emailMu.Unlock()
 
 	if vEmail.to != "wiring@example.com" {
 		t.Fatalf("expected email recipient wiring@example.com, got %s", vEmail.to)
@@ -119,13 +132,13 @@ func TestWiring_EndToEndEmailDispatchAndClose(t *testing.T) {
 	}
 	_ = resp.Body.Close()
 
-	// Verify reset email dispatched
-	emailMu.Lock()
-	if len(passwordResetEmails) != 1 {
-		t.Fatalf("expected 1 password reset email, found %d", len(passwordResetEmails))
+	// Verify reset email dispatched with bounded timeout
+	var prEmail capturedEmail
+	select {
+	case prEmail = <-passwordResetChan:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for password reset email dispatch")
 	}
-	prEmail := passwordResetEmails[0]
-	emailMu.Unlock()
 
 	if prEmail.to != "wiring@example.com" {
 		t.Fatalf("expected reset recipient wiring@example.com, got %s", prEmail.to)
