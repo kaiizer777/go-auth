@@ -129,4 +129,3 @@ func TestMigrations_Lifecycle(t *testing.T) {
 		t.Fatalf("expected 4 application tables after re-Up, found %d", tableCount)
 	}
 }
-

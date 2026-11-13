@@ -133,4 +133,3 @@ func TestResolveDatabaseURL_IgnoresGenericDatabaseURL(t *testing.T) {
 		t.Fatalf("expected explicit TEST_DATABASE_URL, got %q", got)
 	}
 }
-
