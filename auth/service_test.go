@@ -1512,3 +1512,136 @@ func TestService_Signup_UnverifiedRecovery_AttackerCredentialBinding_ConcurrentR
 	}
 }
 
+func TestService_DispatchEmailAsync_SaturationOverflowAndPendingRelease(t *testing.T) {
+	database := setupTestDB(t)
+	cfg := testConfig()
+	cfg.EmailDispatchTimeout = 200 * time.Millisecond
+
+	authSvc, err := New(cfg, database, email.Hooks{})
+	if err != nil {
+		t.Fatalf("failed to create service: %v", err)
+	}
+	svc := authSvc.(*authService)
+
+	// Scale down semaphores for fast, deterministic saturation testing:
+	// 2 active slots, 2 pending slots (overflow threshold = 4).
+	svc.emailSem = make(chan struct{}, 2)
+	svc.emailPendingSem = make(chan struct{}, 2)
+
+	activeBlockCh := make(chan struct{})
+	var activeStarted sync.WaitGroup
+	activeStarted.Add(2)
+
+	sendActive := func(ctx context.Context, recipient, token string) error {
+		activeStarted.Done()
+		<-activeBlockCh
+		return nil
+	}
+
+	// 1. Dispatch 2 requests: saturate active slots.
+	ctx := context.Background()
+	svc.dispatchEmailAsync(ctx, "active1@example.com", "tok1", "test", sendActive)
+	svc.dispatchEmailAsync(ctx, "active2@example.com", "tok2", "test", sendActive)
+	activeStarted.Wait()
+
+	if len(svc.emailSem) != 2 {
+		t.Fatalf("expected 2 active slots held, got %d", len(svc.emailSem))
+	}
+
+	// 2. Dispatch 2 requests: saturate pending waiter slots.
+	sendPending := func(ctx context.Context, recipient, token string) error {
+		return nil
+	}
+	svc.dispatchEmailAsync(ctx, "pending1@example.com", "tok3", "test", sendPending)
+	svc.dispatchEmailAsync(ctx, "pending2@example.com", "tok4", "test", sendPending)
+
+	// Verify pending slots are acquired
+	var pendingHeld bool
+	for start := time.Now(); time.Since(start) < 2*time.Second; {
+		if len(svc.emailPendingSem) == 2 {
+			pendingHeld = true
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !pendingHeld {
+		t.Fatalf("expected 2 pending slots held, got %d", len(svc.emailPendingSem))
+	}
+
+	// 3. Dispatch 5th request: exceeds active (2) + pending (2). Must drop immediately without blocking.
+	droppedExecuted := false
+	sendDropped := func(ctx context.Context, recipient, token string) error {
+		droppedExecuted = true
+		return nil
+	}
+	svc.dispatchEmailAsync(ctx, "overflow@example.com", "tok5", "test", sendDropped)
+
+	if droppedExecuted {
+		t.Fatal("overflow dispatch should have been dropped immediately, but executed")
+	}
+
+	// 4. Release active slots and assert pending tasks acquire slots and complete, freeing both semaphores.
+	close(activeBlockCh)
+
+	var semDrained bool
+	for start := time.Now(); time.Since(start) < 2*time.Second; {
+		if len(svc.emailSem) == 0 && len(svc.emailPendingSem) == 0 {
+			semDrained = true
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !semDrained {
+		t.Fatalf("expected semaphores to drain to 0, got emailSem=%d, emailPendingSem=%d",
+			len(svc.emailSem), len(svc.emailPendingSem))
+	}
+}
+
+func TestService_DispatchEmailAsync_PendingTimeoutSlotRelease(t *testing.T) {
+	database := setupTestDB(t)
+	cfg := testConfig()
+	cfg.EmailDispatchTimeout = 50 * time.Millisecond
+
+	authSvc, err := New(cfg, database, email.Hooks{})
+	if err != nil {
+		t.Fatalf("failed to create service: %v", err)
+	}
+	svc := authSvc.(*authService)
+
+	// 1 active slot, 1 pending slot
+	svc.emailSem = make(chan struct{}, 1)
+	svc.emailPendingSem = make(chan struct{}, 1)
+
+	activeHoldCh := make(chan struct{})
+	defer close(activeHoldCh)
+
+	activeStarted := make(chan struct{})
+	sendActive := func(ctx context.Context, recipient, token string) error {
+		close(activeStarted)
+		<-activeHoldCh
+		return nil
+	}
+
+	ctx := context.Background()
+	svc.dispatchEmailAsync(ctx, "active@example.com", "tok1", "test", sendActive)
+	<-activeStarted
+
+	// Park 1 waiter in pending slot while active slot is held indefinitely
+	svc.dispatchEmailAsync(ctx, "pending@example.com", "tok2", "test", func(ctx context.Context, recipient, token string) error {
+		return nil
+	})
+
+	// Waiter should timeout and release pending slot
+	var pendingReleased bool
+	for start := time.Now(); time.Since(start) < 2*time.Second; {
+		if len(svc.emailPendingSem) == 0 {
+			pendingReleased = true
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !pendingReleased {
+		t.Fatalf("expected pending slot to be released upon timeout, got emailPendingSem=%d", len(svc.emailPendingSem))
+	}
+}
+
