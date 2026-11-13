@@ -158,7 +158,11 @@ func runMigrations(databaseURL, migrationsPath string) error {
 	return nil
 }
 
-// isDefaultMigrationsPath reports whether the provided path represents the default embedded migrations directory.
+// MigrationsFS returns the embedded migration filesystem.
+func MigrationsFS() embed.FS {
+	return defaultMigrationsFS
+}
+
 func isDefaultMigrationsPath(p string) bool {
 	clean := filepath.ToSlash(filepath.Clean(p))
 	return p == "" || clean == "db/migrations"
