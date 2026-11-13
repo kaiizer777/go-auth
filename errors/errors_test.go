@@ -508,10 +508,7 @@ func TestError_Is_EdgeCases(t *testing.T) {
 	})
 
 	t.Run("non-comparable target with map field without custom Is", func(t *testing.T) {
-		type mapErr struct {
-			metadata map[string]string
-		}
-		// mapErr implements Error() but has non-comparable map field and no Is method
+		// Non-comparable error with map field and no Is method
 		mErr := struct {
 			error
 			meta map[string]string

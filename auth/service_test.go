@@ -1644,4 +1644,3 @@ func TestService_DispatchEmailAsync_PendingTimeoutSlotRelease(t *testing.T) {
 		t.Fatalf("expected pending slot to be released upon timeout, got emailPendingSem=%d", len(svc.emailPendingSem))
 	}
 }
-
