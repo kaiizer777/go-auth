@@ -297,3 +297,33 @@ func TestHarness_Smoke(t *testing.T) {
 		t.Fatalf("expected status 'ok', got %v", body["status"])
 	}
 }
+
+func TestHarness_EmailCaptureAndDBIsolation(t *testing.T) {
+	_, _, capture, sqlDB := setupE2EServer(t)
+
+	// Verify DB isolation helper truncates cleanly
+	truncateTables(t, sqlDB)
+
+	var count int
+	if err := sqlDB.QueryRow("SELECT COUNT(*) FROM users").Scan(&count); err != nil {
+		t.Fatalf("failed to query users count: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("expected 0 users after truncate, got %d", count)
+	}
+
+	// Verify email token capture buffering
+	testVerificationToken := "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	capture.verificationTokens <- testVerificationToken
+	gotVerification := capture.nextVerificationToken(t, time.Second)
+	if gotVerification != testVerificationToken {
+		t.Fatalf("expected verification token %q, got %q", testVerificationToken, gotVerification)
+	}
+
+	testResetToken := "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+	capture.passwordResetTokens <- testResetToken
+	gotReset := capture.nextResetToken(t, time.Second)
+	if gotReset != testResetToken {
+		t.Fatalf("expected reset token %q, got %q", testResetToken, gotReset)
+	}
+}
