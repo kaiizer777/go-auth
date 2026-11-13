@@ -65,7 +65,9 @@ func TestPasswordReset_BYTEAPrimaryKeyAndASVSPurge(t *testing.T) {
 	tokenHash2, _ := crypto.HashToken(rawResetToken2)
 
 	var activeCount int64
-	database.Model(&db.PasswordResetToken{}).Where("user_id = ?", user.ID).Count(&activeCount)
+	if err := database.Model(&db.PasswordResetToken{}).Where("user_id = ?", user.ID).Count(&activeCount).Error; err != nil {
+		t.Fatalf("counting active reset tokens failed: %v", err)
+	}
 	if activeCount != 2 {
 		t.Fatalf("expected 2 active reset tokens in DB, found %d", activeCount)
 	}
@@ -83,7 +85,9 @@ func TestPasswordReset_BYTEAPrimaryKeyAndASVSPurge(t *testing.T) {
 	// 4. Invariants check:
 	// - ASVS L1 token purge: BOTH token 1 and sibling token 2 must be purged
 	var remainingCount int64
-	database.Model(&db.PasswordResetToken{}).Where("user_id = ?", user.ID).Count(&remainingCount)
+	if err := database.Model(&db.PasswordResetToken{}).Where("user_id = ?", user.ID).Count(&remainingCount).Error; err != nil {
+		t.Fatalf("counting reset tokens after ASVS L1 purge failed: %v", err)
+	}
 	if remainingCount != 0 {
 		t.Fatalf("expected 0 reset tokens after ASVS L1 purge, found %d", remainingCount)
 	}
@@ -184,7 +188,9 @@ func TestPasswordReset_ExpiredTokenPurge(t *testing.T) {
 
 	// Verify token row was purged
 	var count int64
-	database.Model(&db.PasswordResetToken{}).Where("token_hash = ?", tokenHash[:]).Count(&count)
+	if err := database.Model(&db.PasswordResetToken{}).Where("token_hash = ?", tokenHash[:]).Count(&count).Error; err != nil {
+		t.Fatalf("counting expired reset tokens failed: %v", err)
+	}
 	if count != 0 {
 		t.Fatalf("expected expired reset token to be purged, found %d", count)
 	}

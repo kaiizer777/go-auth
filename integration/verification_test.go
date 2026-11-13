@@ -60,7 +60,9 @@ func TestVerification_BYTEAPrimaryKeyAndSuccessfulFlow(t *testing.T) {
 	// 4. Invariant checks post-verification:
 	// - Token row must be consumed/deleted from verification_tokens table
 	var count int64
-	database.Model(&db.VerificationToken{}).Where("token_hash = ?", tokenHash[:]).Count(&count)
+	if err := database.Model(&db.VerificationToken{}).Where("token_hash = ?", tokenHash[:]).Count(&count).Error; err != nil {
+		t.Fatalf("counting verification tokens after verification failed: %v", err)
+	}
 	if count != 0 {
 		t.Fatalf("expected token row to be deleted after verification, found %d", count)
 	}
@@ -133,7 +135,9 @@ func TestVerification_ExpiredTokenPurgedAndRejected(t *testing.T) {
 
 	// Verify expired token was purged from DB
 	var count int64
-	database.Model(&db.VerificationToken{}).Where("token_hash = ?", tokenHash[:]).Count(&count)
+	if err := database.Model(&db.VerificationToken{}).Where("token_hash = ?", tokenHash[:]).Count(&count).Error; err != nil {
+		t.Fatalf("counting verification tokens after expiry purge failed: %v", err)
+	}
 	if count != 0 {
 		t.Fatalf("expected expired token to be purged from DB, found %d", count)
 	}

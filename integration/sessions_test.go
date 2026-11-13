@@ -83,7 +83,9 @@ func TestSessions_PersistenceAndForeignKeyCascade(t *testing.T) {
 	}
 
 	var sessionCount int64
-	database.Model(&db.Session{}).Where("user_id = ?", user.ID).Count(&sessionCount)
+	if err := database.Model(&db.Session{}).Where("user_id = ?", user.ID).Count(&sessionCount).Error; err != nil {
+		t.Fatalf("counting sessions after user deletion failed: %v", err)
+	}
 	if sessionCount != 0 {
 		t.Fatalf("expected 0 sessions after user cascade delete, found %d", sessionCount)
 	}
