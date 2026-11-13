@@ -870,7 +870,9 @@ func TestDispatchEmailAsync_ExecutionBranches(t *testing.T) {
 			emailSem: make(chan struct{}, 1),
 		}
 
-		svc.dispatchEmailAsync(nil, "nilctx@example.com", "tok3", "test", func(ctx context.Context, recipient, token string) error {
+		var nilCtx context.Context
+		//nolint:staticcheck // SA1012 intentionally testing nil context fallback
+		svc.dispatchEmailAsync(nilCtx, "nilctx@example.com", "tok3", "test", func(ctx context.Context, recipient, token string) error {
 			if ctx == nil {
 				t.Error("expected non-nil timeout context in hook")
 			}

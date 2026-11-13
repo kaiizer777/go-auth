@@ -175,7 +175,7 @@ func TestNew_DatabaseConnectionError(t *testing.T) {
 		return nil, stderrors.New("raw connection failure")
 	}
 
-	auth, err = New(cfg)
+	_, err = New(cfg)
 	if err == nil {
 		t.Fatal("expected error with raw connection failure, got nil")
 	}
