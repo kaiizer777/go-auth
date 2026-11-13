@@ -1244,8 +1244,3 @@ func TestService_Signup_UnverifiedRecovery_TransactionFailure(t *testing.T) {
 		t.Fatalf("expected CodeDatabaseError, got: %v", err)
 	}
 }
-
-
-
-
-
