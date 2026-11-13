@@ -4,8 +4,8 @@ Thank you for contributing to `go-auth`!
 
 ## Architectural Rules (Strict)
 
-[!IMPORTANT]
-**No implementation logic in root.** Root contains only the public facade (`goauth.go`). All logic lives in subpackages. PRs that add non-facade `.go` files to root will be asked to relocate them.
+> [!IMPORTANT]
+> **No implementation logic in root.** Root contains only the public facade (`goauth.go`). All logic lives in subpackages. PRs that add non-facade `.go` files to root will be asked to relocate them.
 
 - Package root is strictly reserved for the public facade and high-level configuration.
 - Domain logic, cryptographic helpers, session handling, database adapters, and plugin modules must reside in their respective subpackages.
