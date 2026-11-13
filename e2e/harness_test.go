@@ -119,13 +119,6 @@ func setupE2EServerWithConfig(t *testing.T, mutate func(*config.Config)) (*httpt
 	}
 	_ = probeDB.Close()
 
-	sqlDB, err := sql.Open("pgx", dbURL)
-	if err != nil {
-		t.Fatalf("failed to open sql.DB: %v", err)
-	}
-
-	truncateTables(t, sqlDB)
-
 	capture := newEmailCapture()
 
 	cfg := config.DefaultConfig()
@@ -176,9 +169,16 @@ func setupE2EServerWithConfig(t *testing.T, mutate func(*config.Config)) (*httpt
 
 	app, err := goauth.New(cfg)
 	if err != nil {
-		_ = sqlDB.Close()
 		t.Fatalf("failed to initialize goauth: %v", err)
 	}
+
+	sqlDB, err := sql.Open("pgx", dbURL)
+	if err != nil {
+		_ = app.Close()
+		t.Fatalf("failed to open sql.DB: %v", err)
+	}
+
+	truncateTables(t, sqlDB)
 
 	server := httptest.NewServer(app.Handler)
 
