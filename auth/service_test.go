@@ -1005,5 +1005,118 @@ func TestDispatchEmailAsync_SaturationAndOverflow(t *testing.T) {
 	})
 }
 
+func TestService_Signup_UnverifiedAccountRecovery(t *testing.T) {
+	database := setupTestDB(t)
+	cfg := testConfig()
+
+	type hookData struct {
+		recipient string
+		token     string
+	}
+	hookCh := make(chan hookData, 10)
+
+	hooks := email.Hooks{
+		SendVerificationEmail: func(ctx context.Context, recipient, token string) error {
+			hookCh <- hookData{recipient: recipient, token: token}
+			return nil
+		},
+	}
+
+	svc, err := New(cfg, database, hooks)
+	if err != nil {
+		t.Fatalf("failed to create service: %v", err)
+	}
+
+	ctx := context.Background()
+
+	initialPass := "InitialPass#12345"
+	user, origToken, err := svc.Signup(ctx, db.SignupRequest{Email: "recover@example.com", Password: initialPass})
+	if err != nil {
+		t.Fatalf("initial signup failed: %v", err)
+	}
+	if user == nil || origToken == "" {
+		t.Fatal("expected user and token on initial signup")
+	}
+
+	select {
+	case <-hookCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("initial verification email hook not received")
+	}
+
+	var dbUserBefore db.User
+	if err := database.Where("id = ?", user.ID).First(&dbUserBefore).Error; err != nil {
+		t.Fatalf("failed to query user before recovery: %v", err)
+	}
+	oldHash := dbUserBefore.PasswordHash
+
+	newPass := "RecoveredPass#67890"
+	recUser, recToken, err := svc.Signup(ctx, db.SignupRequest{Email: "recover@example.com", Password: newPass})
+	if err != nil {
+		t.Fatalf("unverified recovery signup failed: %v", err)
+	}
+	if recUser != nil || recToken != "" {
+		t.Fatalf("expected nil user and empty token for unverified recovery anti-enumeration, got user=%v token=%s", recUser, recToken)
+	}
+
+	var newHookData hookData
+	select {
+	case newHookData = <-hookCh:
+		if newHookData.recipient != "recover@example.com" {
+			t.Fatalf("expected recipient recover@example.com, got %s", newHookData.recipient)
+		}
+		if newHookData.token == "" || newHookData.token == origToken {
+			t.Fatalf("expected new verification token, got %s", newHookData.token)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("recovery verification email hook not received")
+	}
+
+	oldTokenHash, err := crypto.HashToken(origToken)
+	if err != nil {
+		t.Fatalf("failed to hash origToken: %v", err)
+	}
+	var countOld int64
+	database.Model(&db.VerificationToken{}).Where("token_hash = ?", oldTokenHash[:]).Count(&countOld)
+	if countOld != 0 {
+		t.Fatalf("expected old verification token to be deleted, found %d", countOld)
+	}
+
+	newTokenHash, err := crypto.HashToken(newHookData.token)
+	if err != nil {
+		t.Fatalf("failed to hash newHookData.token: %v", err)
+	}
+	var countNew int64
+	database.Model(&db.VerificationToken{}).Where("token_hash = ?", newTokenHash[:]).Count(&countNew)
+	if countNew != 1 {
+		t.Fatalf("expected new verification token in DB, found %d", countNew)
+	}
+
+	var dbUserAfter db.User
+	if err := database.Where("id = ?", user.ID).First(&dbUserAfter).Error; err != nil {
+		t.Fatalf("failed to query user after recovery: %v", err)
+	}
+	if dbUserAfter.PasswordHash == oldHash {
+		t.Fatal("expected password hash to be updated in DB after unverified recovery")
+	}
+
+	if err := svc.VerifyEmail(ctx, db.VerifyEmailRequest{Token: origToken}); err == nil {
+		t.Fatal("expected old token verification to fail, got nil")
+	}
+
+	if err := svc.VerifyEmail(ctx, db.VerifyEmailRequest{Token: newHookData.token}); err != nil {
+		t.Fatalf("expected new token verification to succeed, got %v", err)
+	}
+
+	loggedIn, err := svc.Login(ctx, db.LoginRequest{Email: "recover@example.com", Password: newPass})
+	if err != nil {
+		t.Fatalf("expected login with new password to succeed, got %v", err)
+	}
+	if loggedIn == nil {
+		t.Fatal("expected non-nil logged-in user")
+	}
+}
+
+
 
 
