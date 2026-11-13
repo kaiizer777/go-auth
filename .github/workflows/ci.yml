@@ -71,7 +71,7 @@ jobs:
           awk -v t="$total" 'BEGIN { if (t+0 < 79) { print "Coverage below 79%"; exit 1 } }'
 
   integration:
-    name: PostgreSQL Integration Tests
+    name: Integration Tests
     runs-on: ubuntu-latest
     timeout-minutes: 15
     services:
@@ -109,7 +109,7 @@ jobs:
         run: go test -v -race -tags=integration -count=1 -timeout=10m ./integration/...
 
   e2e:
-    name: End-to-End Tests
+    name: E2E
     runs-on: ubuntu-latest
     timeout-minutes: 15
     services:
