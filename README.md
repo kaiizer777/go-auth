@@ -7,6 +7,7 @@
 > [!WARNING]
 > **Status: Early development — not yet usable in production.**
 > APIs and interfaces are undergoing initial design and scaffolding.
+> (exp: 12-31-2026)
 
 ---
 
