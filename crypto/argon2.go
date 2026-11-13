@@ -165,7 +165,7 @@ func VerifyPassword(password, phcHash string) (bool, error) {
 	}
 	defer wipeBytes(expectedHash)
 
-	if time < 1 || parallelism < 1 || memory < 1 || len(salt) < 16 || len(expectedHash) == 0 {
+	if time < 1 || parallelism < 1 || memory < 1 || len(salt) < 16 || len(expectedHash) == 0 || len(expectedHash) > 128 {
 		return false, ErrInvalidHashFormat
 	}
 
@@ -178,7 +178,7 @@ func VerifyPassword(password, phcHash string) (bool, error) {
 		time,
 		memory,
 		parallelism,
-		uint32(len(expectedHash)),
+		uint32(len(expectedHash)), // #nosec G115 -- len(expectedHash) bounded to <=128 above
 	)
 	defer wipeBytes(computedHash)
 

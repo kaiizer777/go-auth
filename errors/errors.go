@@ -25,7 +25,7 @@ const (
 	CodeEmailDispatchTimeout Code = "EMAIL_DISPATCH_TIMEOUT"
 
 	// Phase 3 Core Auth error codes
-	CodeInvalidCredentials Code = "INVALID_CREDENTIALS"
+	CodeInvalidCredentials Code = "INVALID_CREDENTIALS" // #nosec G101 -- error code constant, not a credential
 	CodeUnauthenticated    Code = "UNAUTHENTICATED"
 	CodeEmailNotVerified   Code = "EMAIL_NOT_VERIFIED"
 	CodePasswordTooShort   Code = "PASSWORD_TOO_SHORT"

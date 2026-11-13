@@ -336,4 +336,3 @@ func TestRequestDTONormalize(t *testing.T) {
 		}
 	})
 }
-

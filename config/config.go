@@ -84,14 +84,14 @@ type Config struct {
 // empty so callers must explicitly declare trusted origins.
 func DefaultConfig() Config {
 	return Config{
-		MigrationsPath:           "db/migrations",
-		MaxOpenConns:             25,
-		MaxIdleConns:             10,
-		ConnMaxLifetime:          time.Hour,
-		ConnMaxIdleTime:          30 * time.Minute,
-		AllowedMethods:           []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
-		AllowedHeaders:           []string{"Authorization", "Content-Type"},
-		EmailDispatchTimeout:     10 * time.Second,
+		MigrationsPath:       "db/migrations",
+		MaxOpenConns:         25,
+		MaxIdleConns:         10,
+		ConnMaxLifetime:      time.Hour,
+		ConnMaxIdleTime:      30 * time.Minute,
+		AllowedMethods:       []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
+		AllowedHeaders:       []string{"Authorization", "Content-Type"},
+		EmailDispatchTimeout: 10 * time.Second,
 		Argon2: Argon2Config{
 			Memory:      65536,
 			Time:        3,
