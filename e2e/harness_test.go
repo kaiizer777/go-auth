@@ -1,4 +1,4 @@
-//go:build integration || e2e
+//go:build e2e
 
 package e2e
 
@@ -27,6 +27,12 @@ import (
 const defaultTestDBURL = "postgres://postgres:postgres@localhost:5432/goauth_test?sslmode=disable"
 
 func resolveDatabaseURL() string {
+	if u := os.Getenv("E2E_DATABASE_URL"); u != "" {
+		return u
+	}
+	if u := os.Getenv("DATABASE_URL"); u != "" {
+		return u
+	}
 	if u := os.Getenv("TEST_DATABASE_URL"); u != "" {
 		return u
 	}
