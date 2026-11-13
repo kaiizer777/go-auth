@@ -129,3 +129,171 @@ func TestAuthLifecycle_VerificationAliasRoute(t *testing.T) {
 	}
 }
 
+func TestAuthLifecycle_LoginAndAntiEnumeration(t *testing.T) {
+	server, client, capture, sqlDB := setupE2EServer(t)
+
+	email := "anti-enumeration@example.com"
+	password := "Secure-Password-987!"
+
+	// First signup
+	resp, body := postJSON(t, client, server.URL+"/auth/signup", map[string]string{
+		"email":    email,
+		"password": password,
+	})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 on first signup, got %d", resp.StatusCode)
+	}
+	genericMsg := body["message"]
+
+	verificationToken := capture.nextVerificationToken(t, 2*time.Second)
+
+	// Verify email so account is verified
+	respVerify, _ := postJSON(t, client, server.URL+"/auth/verify", map[string]string{
+		"token": verificationToken,
+	})
+	if respVerify.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 on verify, got %d", respVerify.StatusCode)
+	}
+
+	// Duplicate signup with same email -> identical generic message (anti-enumeration parity)
+	respDup, bodyDup := postJSON(t, client, server.URL+"/auth/signup", map[string]string{
+		"email":    email,
+		"password": "AttackerPassword-456!",
+	})
+	if respDup.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 on duplicate signup, got %d", respDup.StatusCode)
+	}
+	if bodyDup["message"] != genericMsg {
+		t.Fatalf("expected duplicate message parity %q, got %q", genericMsg, bodyDup["message"])
+	}
+
+	// Case-insensitive duplicate signup (e.g. UPPERCASE) -> identical generic response
+	respUpper, bodyUpper := postJSON(t, client, server.URL+"/auth/signup", map[string]string{
+		"email":    "ANTI-ENUMERATION@EXAMPLE.COM",
+		"password": "YetAnotherPassword!",
+	})
+	if respUpper.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 on uppercase duplicate signup, got %d", respUpper.StatusCode)
+	}
+	if bodyUpper["message"] != genericMsg {
+		t.Fatalf("expected uppercase duplicate message parity, got %q", bodyUpper["message"])
+	}
+
+	// Verify only one user account exists in DB
+	var userCount int
+	if err := sqlDB.QueryRow("SELECT COUNT(*) FROM users WHERE LOWER(email) = LOWER($1)", email).Scan(&userCount); err != nil {
+		t.Fatalf("failed to query users count: %v", err)
+	}
+	if userCount != 1 {
+		t.Fatalf("expected exactly 1 user in DB, found %d", userCount)
+	}
+
+	// Login with original correct credentials -> 200 OK (password must NOT be overwritten by duplicate signups)
+	respLogin, bodyLogin := postJSON(t, client, server.URL+"/auth/login", map[string]string{
+		"email":    email,
+		"password": password,
+	})
+	if respLogin.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 on correct login, got %d: %v", respLogin.StatusCode, bodyLogin)
+	}
+	if bodyLogin["user_id"] == nil {
+		t.Fatalf("expected user_id in login response, got %v", bodyLogin)
+	}
+
+	// Login with wrong password -> 401 INVALID_CREDENTIALS
+	respWrongPass, bodyWrongPass := postJSON(t, client, server.URL+"/auth/login", map[string]string{
+		"email":    email,
+		"password": "WrongPassword-123!",
+	})
+	if respWrongPass.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 on wrong password, got %d", respWrongPass.StatusCode)
+	}
+	if bodyWrongPass["code"] != "INVALID_CREDENTIALS" {
+		t.Fatalf("expected INVALID_CREDENTIALS on wrong password, got %v", bodyWrongPass)
+	}
+
+	// Login with unknown email -> identical 401 INVALID_CREDENTIALS
+	respUnknown, bodyUnknown := postJSON(t, client, server.URL+"/auth/login", map[string]string{
+		"email":    "nonexistent-user@example.com",
+		"password": password,
+	})
+	if respUnknown.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 on unknown user login, got %d", respUnknown.StatusCode)
+	}
+	if bodyUnknown["code"] != "INVALID_CREDENTIALS" {
+		t.Fatalf("expected INVALID_CREDENTIALS on unknown user, got %v", bodyUnknown)
+	}
+	if bodyUnknown["message"] != bodyWrongPass["message"] {
+		t.Fatalf("expected identical error message for wrong password and unknown email: %q vs %q",
+			bodyWrongPass["message"], bodyUnknown["message"])
+	}
+}
+
+func TestAuthLifecycle_InputValidationRejections(t *testing.T) {
+	server, client, _, _ := setupE2EServer(t)
+
+	tests := []struct {
+		name       string
+		path       string
+		payload    map[string]string
+		wantStatus int
+		wantCode   string
+	}{
+		{
+			name:       "signup empty email",
+			path:       "/auth/signup",
+			payload:    map[string]string{"email": "", "password": "ValidPassword123!"},
+			wantStatus: http.StatusBadRequest,
+			wantCode:   "INVALID_EMAIL",
+		},
+		{
+			name:       "signup invalid email format",
+			path:       "/auth/signup",
+			payload:    map[string]string{"email": "not-an-email", "password": "ValidPassword123!"},
+			wantStatus: http.StatusBadRequest,
+			wantCode:   "INVALID_EMAIL",
+		},
+		{
+			name:       "signup empty password",
+			path:       "/auth/signup",
+			payload:    map[string]string{"email": "valid@example.com", "password": ""},
+			wantStatus: http.StatusBadRequest,
+			wantCode:   "VALIDATION_ERROR",
+		},
+		{
+			name:       "login invalid email",
+			path:       "/auth/login",
+			payload:    map[string]string{"email": "not-an-email", "password": "ValidPassword123!"},
+			wantStatus: http.StatusBadRequest,
+			wantCode:   "INVALID_EMAIL",
+		},
+		{
+			name:       "login empty password",
+			path:       "/auth/login",
+			payload:    map[string]string{"email": "valid@example.com", "password": ""},
+			wantStatus: http.StatusBadRequest,
+			wantCode:   "VALIDATION_ERROR",
+		},
+		{
+			name:       "verify invalid token format",
+			path:       "/auth/verify",
+			payload:    map[string]string{"token": "not-a-64-char-hex-token"},
+			wantStatus: http.StatusBadRequest,
+			wantCode:   "INVALID_TOKEN",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resp, body := postJSON(t, client, server.URL+tt.path, tt.payload)
+			if resp.StatusCode != tt.wantStatus {
+				t.Fatalf("expected status %d, got %d: %v", tt.wantStatus, resp.StatusCode, body)
+			}
+			if body["code"] != tt.wantCode {
+				t.Fatalf("expected code %q, got %q", tt.wantCode, body["code"])
+			}
+		})
+	}
+}
+
+
