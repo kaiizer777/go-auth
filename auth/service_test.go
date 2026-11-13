@@ -816,3 +816,128 @@ func TestEmailHookTimeout(t *testing.T) {
 	})
 }
 
+func TestDispatchEmailAsync_ExecutionBranches(t *testing.T) {
+	t.Run("nil emailSem directly spawns goroutine and executes hook", func(t *testing.T) {
+		done := make(chan struct{})
+		svc := &authService{
+			cfg:      config.Config{EmailDispatchTimeout: time.Second},
+			emailSem: nil,
+		}
+		svc.dispatchEmailAsync(context.Background(), "nilsem@example.com", "tok1", "test", func(ctx context.Context, recipient, token string) error {
+			if recipient != "nilsem@example.com" || token != "tok1" {
+				t.Errorf("unexpected args: recipient=%s, token=%s", recipient, token)
+			}
+			close(done)
+			return nil
+		})
+
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatal("hook was not executed when emailSem is nil")
+		}
+	})
+
+	t.Run("context detachment preserves hook execution with canceled parent ctx", func(t *testing.T) {
+		canceledCtx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		done := make(chan struct{})
+		svc := &authService{
+			cfg:      config.Config{EmailDispatchTimeout: time.Second},
+			emailSem: make(chan struct{}, 1),
+		}
+
+		svc.dispatchEmailAsync(canceledCtx, "detached@example.com", "tok2", "test", func(ctx context.Context, recipient, token string) error {
+			if err := ctx.Err(); err != nil {
+				t.Errorf("expected detached context without cancel error, got: %v", err)
+			}
+			close(done)
+			return nil
+		})
+
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatal("hook was not executed")
+		}
+	})
+
+	t.Run("nil parent context executes cleanly", func(t *testing.T) {
+		done := make(chan struct{})
+		svc := &authService{
+			cfg:      config.Config{EmailDispatchTimeout: time.Second},
+			emailSem: make(chan struct{}, 1),
+		}
+
+		svc.dispatchEmailAsync(nil, "nilctx@example.com", "tok3", "test", func(ctx context.Context, recipient, token string) error {
+			if ctx == nil {
+				t.Error("expected non-nil timeout context in hook")
+			}
+			close(done)
+			return nil
+		})
+
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatal("hook was not executed")
+		}
+	})
+
+	t.Run("hook error is logged and semaphore is released", func(t *testing.T) {
+		done := make(chan struct{})
+		sem := make(chan struct{}, 1)
+		svc := &authService{
+			cfg:      config.Config{EmailDispatchTimeout: time.Second},
+			emailSem: sem,
+		}
+
+		svc.dispatchEmailAsync(context.Background(), "err@example.com", "tok4", "test", func(ctx context.Context, recipient, token string) error {
+			defer close(done)
+			return fmt.Errorf("simulated delivery failure")
+		})
+
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatal("hook was not executed")
+		}
+
+		select {
+		case sem <- struct{}{}:
+			<-sem
+		case <-time.After(1 * time.Second):
+			t.Fatal("semaphore slot was not released after hook error")
+		}
+	})
+
+	t.Run("hook panic is recovered and semaphore is released", func(t *testing.T) {
+		done := make(chan struct{})
+		sem := make(chan struct{}, 1)
+		svc := &authService{
+			cfg:      config.Config{EmailDispatchTimeout: time.Second},
+			emailSem: sem,
+		}
+
+		svc.dispatchEmailAsync(context.Background(), "panic@example.com", "tok5", "test", func(ctx context.Context, recipient, token string) error {
+			defer close(done)
+			panic("simulated fatal hook crash")
+		})
+
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatal("hook was not executed")
+		}
+
+		select {
+		case sem <- struct{}{}:
+			<-sem
+		case <-time.After(1 * time.Second):
+			t.Fatal("semaphore slot was not released after hook panic")
+		}
+	})
+}
+
+
