@@ -940,4 +940,70 @@ func TestDispatchEmailAsync_ExecutionBranches(t *testing.T) {
 	})
 }
 
+func TestDispatchEmailAsync_SaturationAndOverflow(t *testing.T) {
+	t.Run("pending queue overflow drops request without executing hook", func(t *testing.T) {
+		emailSem := make(chan struct{}, 1)
+		emailSem <- struct{}{}
+
+		emailPendingSem := make(chan struct{}, 1)
+		emailPendingSem <- struct{}{}
+
+		hookCalled := make(chan struct{}, 1)
+		svc := &authService{
+			cfg:             config.Config{EmailDispatchTimeout: 50 * time.Millisecond},
+			emailSem:        emailSem,
+			emailPendingSem: emailPendingSem,
+		}
+
+		svc.dispatchEmailAsync(context.Background(), "overflow@example.com", "tok", "verification", func(ctx context.Context, recipient, token string) error {
+			hookCalled <- struct{}{}
+			return nil
+		})
+
+		select {
+		case <-hookCalled:
+			t.Fatal("hook should not have been called on overflow drop")
+		case <-time.After(150 * time.Millisecond):
+		}
+
+		<-emailSem
+		<-emailPendingSem
+	})
+
+	t.Run("wait timeout gives up and releases pending slot when emailSem never frees", func(t *testing.T) {
+		emailSem := make(chan struct{}, 1)
+		emailSem <- struct{}{}
+
+		emailPendingSem := make(chan struct{}, 1)
+
+		hookCalled := make(chan struct{}, 1)
+		svc := &authService{
+			cfg:             config.Config{EmailDispatchTimeout: 50 * time.Millisecond},
+			emailSem:        emailSem,
+			emailPendingSem: emailPendingSem,
+		}
+
+		svc.dispatchEmailAsync(context.Background(), "timeout@example.com", "tok", "password reset", func(ctx context.Context, recipient, token string) error {
+			hookCalled <- struct{}{}
+			return nil
+		})
+
+		select {
+		case <-hookCalled:
+			t.Fatal("hook should not have been called after wait timeout")
+		case <-time.After(150 * time.Millisecond):
+		}
+
+		select {
+		case emailPendingSem <- struct{}{}:
+			<-emailPendingSem
+		case <-time.After(500 * time.Millisecond):
+			t.Fatal("emailPendingSem was not released after wait timeout give-up")
+		}
+
+		<-emailSem
+	})
+}
+
+
 
