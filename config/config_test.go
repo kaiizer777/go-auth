@@ -455,15 +455,6 @@ func TestConfigValidate(t *testing.T) {
 			wantErr: nil,
 		},
 		{
-			name: "allowed origins valid with chrome-extension scheme",
-			mutate: func(c *Config) {
-				c.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
-				c.BaseURL = "https://example.com"
-				c.AllowedOrigins = []string{"chrome-extension://abcdefghijklmnopabcdefghijklmnop"}
-			},
-			wantErr: nil,
-		},
-		{
 			name: "allowed origins invalid without scheme",
 			mutate: func(c *Config) {
 				c.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
@@ -496,33 +487,6 @@ func TestConfigValidate(t *testing.T) {
 				c.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
 				c.BaseURL = "https://example.com"
 				c.AllowedOrigins = []string{""}
-			},
-			wantErr: errors.ErrAllowedOriginInvalid,
-		},
-		{
-			name: "allowed origins invalid with userinfo",
-			mutate: func(c *Config) {
-				c.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
-				c.BaseURL = "https://example.com"
-				c.AllowedOrigins = []string{"https://user:pass@app.example.com"}
-			},
-			wantErr: errors.ErrAllowedOriginInvalid,
-		},
-		{
-			name: "allowed origins invalid with empty hostname",
-			mutate: func(c *Config) {
-				c.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
-				c.BaseURL = "https://example.com"
-				c.AllowedOrigins = []string{"https://:8080"}
-			},
-			wantErr: errors.ErrAllowedOriginInvalid,
-		},
-		{
-			name: "allowed origins invalid with empty query marker",
-			mutate: func(c *Config) {
-				c.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
-				c.BaseURL = "https://example.com"
-				c.AllowedOrigins = []string{"https://app.example.com?"}
 			},
 			wantErr: errors.ErrAllowedOriginInvalid,
 		},

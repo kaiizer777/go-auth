@@ -140,31 +140,16 @@ func (e *Error) Is(target error) bool {
 	}
 	t, ok := target.(*Error)
 	if !ok {
-		// Walk the cause chain once without re-entering stderrors.Is on
-		// nested *Error tails (which would re-scan their own causes and
-		// turn a linear walk quadratic). Direct *Error segments match by
-		// identity only here; the remaining non-*Error tail delegates to
-		// the standard library a single time.
-		for err := e; err != nil; {
-			cause := err.cause
-			if cause == nil {
-				return false
-			}
-			if nested, ok := cause.(*Error); ok {
-				if nested == target {
-					return true
-				}
-				err = nested
-				continue
-			}
-			return stderrors.Is(cause, target)
-		}
-		return false
+		return e != nil && e.cause != nil && stderrors.Is(e.cause, target)
 	}
 	if e == t {
 		return true
 	}
 	if e == nil || t == nil {
+		return false
+	}
+	// An empty *Error (no code, message, or cause) matches only by identity.
+	if t.code == "" && t.message == "" && t.cause == nil {
 		return false
 	}
 	if t.code != "" && e.code != t.code {

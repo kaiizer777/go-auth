@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"log"
+	"sync"
 	"time"
 
 	"gorm.io/gorm"
@@ -27,13 +28,20 @@ type Service interface {
 
 const emailDispatchSemaphoreSize = 128
 
+// emailDispatchPendingSize bounds the number of dispatch goroutines that may
+// park waiting for a semaphore slot, preventing unbounded goroutine/memory
+// growth under sustained saturated dispatch traffic.
+const emailDispatchPendingSize = 256
+
 type authService struct {
-	cfg        config.Config
-	db         *gorm.DB
-	hooks      email.Hooks
-	dummyHash  string
-	hashParams crypto.HashParams
-	emailSem   chan struct{}
+	cfg             config.Config
+	db              *gorm.DB
+	hooks           email.Hooks
+	dummyHash       string
+	hashParams      crypto.HashParams
+	emailSem        chan struct{}
+	emailPendingSem chan struct{}
+	recoveryMu      sync.Mutex
 }
 
 // New constructs a new concrete auth Service.
@@ -59,12 +67,13 @@ func New(cfg config.Config, database *gorm.DB, hooks email.Hooks) (Service, erro
 	}
 
 	return &authService{
-		cfg:        cfg,
-		db:         database,
-		hooks:      hooks,
-		dummyHash:  dummyHash,
-		hashParams: hashParams,
-		emailSem:   make(chan struct{}, emailDispatchSemaphoreSize),
+		cfg:             cfg,
+		db:              database,
+		hooks:           hooks,
+		dummyHash:       dummyHash,
+		hashParams:      hashParams,
+		emailSem:        make(chan struct{}, emailDispatchSemaphoreSize),
+		emailPendingSem: make(chan struct{}, emailDispatchPendingSize),
 	}, nil
 }
 
@@ -80,8 +89,53 @@ func (s *authService) Signup(ctx context.Context, req db.SignupRequest) (*db.Use
 	}
 
 	var existing db.User
-	err := s.db.WithContext(ctx).Where("LOWER(email) = LOWER(?)", db.LookupKey(req.Email)).First(&existing).Error
+	err := s.db.WithContext(ctx).Where("LOWER(email) = LOWER(?)", req.Email).First(&existing).Error
 	if err == nil {
+		// Recovery: if the account is still unverified (e.g. a dropped
+		// verification email), bind the new (caller-supplied) password to a
+		// fresh verification token so an attacker-set password on the original
+		// unverified account cannot be activated by verification. Invalidate
+		// any prior verification tokens for this user first.
+		if !existing.EmailVerified {
+			s.recoveryMu.Lock()
+			defer s.recoveryMu.Unlock()
+
+			// Re-check under the lock to avoid racing recoveries overwriting
+			// each other's password/token state.
+			var latest db.User
+			if rerr := s.db.WithContext(ctx).Where("id = ?", existing.ID).First(&latest).Error; rerr == nil {
+				existing = latest
+			}
+			if !existing.EmailVerified {
+				passwordHash, herr := crypto.HashPassword(req.Password, s.hashParams)
+				if herr != nil {
+					return nil, "", errors.Wrap(herr, errors.CodeInternalError, "failed to hash password")
+				}
+				rawToken, tokenHash, gerr := crypto.GenerateToken()
+				if gerr != nil {
+					return nil, "", errors.Wrap(gerr, errors.CodeInternalError, "failed to generate verification token")
+				}
+				now := time.Now().UTC()
+				if terr := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+					if err := tx.Model(&db.User{}).Where("id = ?", existing.ID).Update("password_hash", passwordHash).Error; err != nil {
+						return err
+					}
+					if err := tx.Where("user_id = ?", existing.ID).Delete(&db.VerificationToken{}).Error; err != nil {
+						return err
+					}
+					tok := db.VerificationToken{
+						TokenHash: tokenHash[:],
+						UserID:    existing.ID,
+						ExpiresAt: now.Add(s.cfg.VerificationTokenExpiry),
+						CreatedAt: now,
+					}
+					return tx.Create(&tok).Error
+				}); terr != nil {
+					return nil, "", errors.Wrap(terr, errors.CodeDatabaseError, "failed to update unverified account")
+				}
+				s.dispatchVerificationEmail(ctx, existing.Email, rawToken)
+			}
+		}
 		// Anti-enumeration parity: perform dummy hashing
 		_, _ = crypto.HashPassword(req.Password, s.hashParams)
 		return nil, "", nil
@@ -124,7 +178,7 @@ func (s *authService) Signup(ctx context.Context, req db.SignupRequest) (*db.Use
 	})
 	if err != nil {
 		var existingUser db.User
-		if queryErr := s.db.WithContext(ctx).Where("LOWER(email) = LOWER(?)", db.LookupKey(req.Email)).First(&existingUser).Error; queryErr == nil {
+		if queryErr := s.db.WithContext(ctx).Where("LOWER(email) = LOWER(?)", req.Email).First(&existingUser).Error; queryErr == nil {
 			// Anti-enumeration parity: concurrent signup succeeded
 			_, _ = crypto.HashPassword(req.Password, s.hashParams)
 			return nil, "", nil
@@ -144,7 +198,7 @@ func (s *authService) Login(ctx context.Context, req db.LoginRequest) (*db.User,
 	}
 
 	var user db.User
-	err := s.db.WithContext(ctx).Where("LOWER(email) = LOWER(?)", db.LookupKey(req.Email)).First(&user).Error
+	err := s.db.WithContext(ctx).Where("LOWER(email) = LOWER(?)", req.Email).First(&user).Error
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			_, _ = crypto.VerifyPassword(req.Password, s.dummyHash)
@@ -228,7 +282,7 @@ func (s *authService) RequestPasswordReset(ctx context.Context, req db.PasswordR
 	}
 
 	var user db.User
-	err := s.db.WithContext(ctx).Where("LOWER(email) = LOWER(?)", db.LookupKey(req.Email)).First(&user).Error
+	err := s.db.WithContext(ctx).Where("LOWER(email) = LOWER(?)", req.Email).First(&user).Error
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			_, _, _ = crypto.GenerateToken()
@@ -382,7 +436,20 @@ func (s *authService) dispatchEmailAsync(ctx context.Context, recipient, token, 
 		go run()
 		return
 	}
+	// Bound pending dispatch work: only a fixed number of goroutines may park
+	// waiting for a slot; overflow is dropped instead of accumulating.
+	if s.emailPendingSem != nil {
+		select {
+		case s.emailPendingSem <- struct{}{}:
+		default:
+			log.Printf("email: dispatch queue overflow for %s email to %s, dropping", op, recipient)
+			return
+		}
+	}
 	go func() {
+		if s.emailPendingSem != nil {
+			defer func() { <-s.emailPendingSem }()
+		}
 		wait, cancel := context.WithTimeout(context.Background(), s.emailHookTimeout())
 		defer cancel()
 		select {
