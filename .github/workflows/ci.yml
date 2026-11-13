@@ -71,7 +71,7 @@ jobs:
           awk -v t="$total" 'BEGIN { if (t+0 < 79) { print "Coverage below 79%"; exit 1 } }'
 
   integration:
-    name: PostgreSQL Integration Tests
+    name: Integration Tests
     runs-on: ubuntu-latest
     timeout-minutes: 15
     services:
@@ -99,11 +99,46 @@ jobs:
           cache: true
           cache-dependency-path: go.sum
 
+      - name: Vet Integration Tests
+        run: go vet -tags=integration ./integration/...
+
       - name: Run Integration Tests
         shell: bash
         env:
           TEST_DATABASE_URL: postgres://postgres:postgrespassword@localhost:5432/goauth_test?sslmode=disable
         run: go test -v -race -tags=integration -count=1 -timeout=10m ./integration/...
+
+  e2e:
+    name: E2E
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: goauth_test
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgrespassword
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version: '1.26.11'
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Vet E2E Tests
+        run: go vet -tags=e2e ./e2e/...
 
       - name: Run E2E Tests
         shell: bash
