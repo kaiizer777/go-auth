@@ -105,6 +105,12 @@ jobs:
           TEST_DATABASE_URL: postgres://postgres:postgrespassword@localhost:5432/goauth_test?sslmode=disable
         run: go test -v -race -tags=integration -count=1 -timeout=10m ./integration/...
 
+      - name: Run E2E Tests
+        shell: bash
+        env:
+          DATABASE_URL: postgres://postgres:postgrespassword@localhost:5432/goauth_test?sslmode=disable
+        run: go test -v -race -tags=e2e -count=1 -timeout=10m ./e2e/...
+
   quality:
     name: Format, Module & Lint
     runs-on: ubuntu-latest
