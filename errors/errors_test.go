@@ -506,4 +506,82 @@ func TestError_Is_EdgeCases(t *testing.T) {
 			t.Error("expected err with different nonComparableError tags not to match")
 		}
 	})
+
+	t.Run("non-comparable target with map field without custom Is", func(t *testing.T) {
+		// Non-comparable error with map field and no Is method
+		mErr := struct {
+			error
+			meta map[string]string
+		}{
+			error: stderrors.New("map error"),
+			meta:  map[string]string{"key": "value"},
+		}
+
+		err := New(CodeInternalError, "wrapper", stderrors.New("other cause"))
+		// Must not panic under errors.Is
+		if Is(err, mErr) {
+			t.Error("expected non-matching non-comparable error not to match")
+		}
+	})
+
+	t.Run("errors.Join traversal in cause", func(t *testing.T) {
+		cause1 := New(CodeNotFound, "user not found", nil)
+		cause2 := stderrors.New("low-level network error")
+		joinedCause := stderrors.Join(cause1, cause2)
+
+		wrapper := Wrap(joinedCause, CodeInternalError, "wrapper failure")
+
+		// Assert wrapper matches cause1 via errors.Is
+		if !Is(wrapper, cause1) {
+			t.Error("expected wrapper to match cause1 within joined cause")
+		}
+		// Assert wrapper matches cause2 via errors.Is
+		if !Is(wrapper, cause2) {
+			t.Error("expected wrapper to match cause2 within joined cause")
+		}
+		// Assert wrapper does not match an unrelated error
+		unrelated := stderrors.New("unrelated error")
+		if Is(wrapper, unrelated) {
+			t.Error("expected wrapper not to match unrelated error")
+		}
+
+		// Assert errors.As finds *Error inside the joined tree
+		var targetAppErr *Error
+		if !As(wrapper, &targetAppErr) {
+			t.Fatal("expected As to extract *Error from wrapper")
+		}
+		// Wrap preserves the inner *Error's CodeNotFound
+		if targetAppErr.Code() != CodeNotFound {
+			t.Errorf("expected preserved code %s, got %s", CodeNotFound, targetAppErr.Code())
+		}
+	})
+
+	t.Run("errors.Join at root containing multiple *Error types", func(t *testing.T) {
+		errA := New(CodeNotFound, "entity A not found", nil)
+		errB := New(CodeInvalidCredentials, "invalid creds", nil)
+		joinedRoot := stderrors.Join(errA, errB)
+
+		if !Is(joinedRoot, errA) {
+			t.Error("expected joinedRoot to match errA")
+		}
+		if !Is(joinedRoot, errB) {
+			t.Error("expected joinedRoot to match errB")
+		}
+
+		// As extracts the first matching *Error
+		var extracted *Error
+		if !As(joinedRoot, &extracted) {
+			t.Fatal("expected As to extract *Error from joinedRoot")
+		}
+		if extracted.Code() != CodeNotFound {
+			t.Errorf("expected first *Error to have code %s, got %s", CodeNotFound, extracted.Code())
+		}
+
+		// WriteJSON with joined root containing *Error
+		rec := httptest.NewRecorder()
+		WriteJSON(rec, joinedRoot)
+		if rec.Code != http.StatusNotFound {
+			t.Errorf("expected WriteJSON to extract 404 from joined root, got %d", rec.Code)
+		}
+	})
 }

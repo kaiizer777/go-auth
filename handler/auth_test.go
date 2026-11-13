@@ -1123,3 +1123,140 @@ func TestWriteJSON_Helper(t *testing.T) {
 		}
 	})
 }
+
+func TestTamperedCookiesAndHeaders(t *testing.T) {
+	mockSvc := &mockAuthService{
+		logoutFn: func(ctx context.Context, sessionID string) error {
+			return nil
+		},
+	}
+	h := New(nil, config.DefaultConfig(), mockSvc)
+
+	cases := []struct {
+		name       string
+		cookieName string
+		cookieVal  string
+		headerName string
+		headerVal  string
+	}{
+		{
+			name:       "tampered special characters in session cookie",
+			cookieName: "session",
+			cookieVal:  "invalid\x00session;drop table users;--",
+		},
+		{
+			name:       "oversized session cookie",
+			cookieName: "session",
+			cookieVal:  strings.Repeat("A", 8192),
+		},
+		{
+			name:       "XSS injection in session_id cookie",
+			cookieName: "session_id",
+			cookieVal:  `<script>alert("cookie_xss")</script>`,
+		},
+		{
+			name:       "tampered X-Session-ID header",
+			headerName: "X-Session-ID",
+			headerVal:  "' OR 1=1; --",
+		},
+		{
+			name:       "oversized X-Session-ID header",
+			headerName: "X-Session-ID",
+			headerVal:  strings.Repeat("B", 8192),
+		},
+	}
+
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/auth/logout", nil)
+			if tt.cookieName != "" {
+				req.AddCookie(&http.Cookie{Name: tt.cookieName, Value: tt.cookieVal})
+			}
+			if tt.headerName != "" {
+				req.Header.Set(tt.headerName, tt.headerVal)
+			}
+			rec := httptest.NewRecorder()
+
+			h.ServeHTTP(rec, req)
+
+			// Safe handling: 204 No Content, no panic, no 500 secret leakage
+			if rec.Code != http.StatusNoContent {
+				t.Fatalf("expected status 204 No Content for tampered session, got %d", rec.Code)
+			}
+		})
+	}
+}
+
+func TestAdversarialPayloadResilience_JSONEndpoints(t *testing.T) {
+	mockSvc := &mockAuthService{
+		signupFn: func(ctx context.Context, req db.SignupRequest) (*db.User, string, error) {
+			// Mock should never be reached if DTO validation works properly
+			return nil, "", nil
+		},
+		loginFn: func(ctx context.Context, req db.LoginRequest) (*db.User, error) {
+			return nil, nil
+		},
+		verifyEmailFn: func(ctx context.Context, req db.VerifyEmailRequest) error {
+			return nil
+		},
+		resetPasswordFn: func(ctx context.Context, req db.PasswordResetConfirmRequest) error {
+			return nil
+		},
+	}
+	h := New(nil, config.DefaultConfig(), mockSvc)
+
+	t.Run("SQL injection in email fields rejected by validation", func(t *testing.T) {
+		sqliEmails := []string{
+			"' OR '1'='1",
+			"user@test.com; DROP TABLE users;--",
+			`"admin\"--@example.com`,
+			"<script>alert(1)</script>@test.com",
+			"admin'--@domain..com",
+			"attacker@.com",
+		}
+		for _, email := range sqliEmails {
+			rec := executeRequest(t, h, http.MethodPost, "/auth/signup", map[string]string{
+				"email":    email,
+				"password": "ValidPassword123#",
+			})
+			if rec.Code != http.StatusBadRequest {
+				t.Errorf("expected 400 for SQLi email %q, got %d", email, rec.Code)
+			}
+			var resp errors.Response
+			_ = json.NewDecoder(rec.Body).Decode(&resp)
+			if resp.Code != errors.CodeInvalidEmail && resp.Code != errors.CodeValidationError {
+				t.Errorf("expected validation error code for %q, got %s", email, resp.Code)
+			}
+		}
+	})
+
+	t.Run("SQL injection and path traversal in token endpoints rejected", func(t *testing.T) {
+		maliciousTokens := []string{
+			"'; DROP TABLE verification_tokens; --",
+			"../../../../etc/passwd",
+			"<script>alert(1)</script>",
+			"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';--",
+		}
+		for _, token := range maliciousTokens {
+			recVerify := executeRequest(t, h, http.MethodPost, "/auth/verify", map[string]string{
+				"token": token,
+			})
+			if recVerify.Code != http.StatusBadRequest {
+				t.Errorf("expected 400 for malicious verify token %q, got %d", token, recVerify.Code)
+			}
+
+			recReset := executeRequest(t, h, http.MethodPost, "/auth/password/reset", map[string]string{
+				"token":        token,
+				"new_password": "ValidPassword123#",
+			})
+			if recReset.Code != http.StatusBadRequest {
+				t.Errorf("expected 400 for malicious reset token %q, got %d", token, recReset.Code)
+			}
+		}
+	})
+}
+
+func TestBruteForceAccountLockout_RegressionPlaceholder(t *testing.T) {
+	// TODO: implement account lockout regression tests once brute-force/lockout feature is implemented
+	t.Skip("account lockout not yet implemented in service")
+}

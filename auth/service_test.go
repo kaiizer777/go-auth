@@ -1255,3 +1255,392 @@ func TestService_Signup_UnverifiedRecovery_TransactionFailure(t *testing.T) {
 		t.Fatalf("expected CodeDatabaseError, got: %v", err)
 	}
 }
+
+func TestService_Signup_UnverifiedRecovery_AttackerCredentialBinding(t *testing.T) {
+	database := setupTestDB(t)
+	cfg := testConfig()
+
+	type hookData struct {
+		recipient string
+		token     string
+	}
+	hookCh := make(chan hookData, 10)
+	hooks := email.Hooks{
+		SendVerificationEmail: func(ctx context.Context, recipient, token string) error {
+			hookCh <- hookData{recipient: recipient, token: token}
+			return nil
+		},
+	}
+
+	authSvc, err := New(cfg, database, hooks)
+	if err != nil {
+		t.Fatalf("failed to create service: %v", err)
+	}
+	svc := authSvc.(*authService)
+	ctx := context.Background()
+
+	targetEmail := "victim@example.com"
+	attackerPass := "AttackerPass#12345"
+	victimPass := "VictimPass#67890"
+
+	// 1. Attacker registers victim's email with attackerPass.
+	attackerUser, attackerToken, err := svc.Signup(ctx, db.SignupRequest{
+		Email:    targetEmail,
+		Password: attackerPass,
+	})
+	if err != nil {
+		t.Fatalf("attacker signup failed: %v", err)
+	}
+	if attackerUser == nil || attackerToken == "" {
+		t.Fatal("expected user and token on initial attacker signup")
+	}
+
+	var attackerHook hookData
+	select {
+	case attackerHook = <-hookCh:
+		if attackerHook.token != attackerToken {
+			t.Fatalf("expected token %s, got %s", attackerToken, attackerHook.token)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("attacker verification email hook not received")
+	}
+
+	// 2. Before verification, victim registers with their own password.
+	recUser, recToken, err := svc.Signup(ctx, db.SignupRequest{
+		Email:    targetEmail,
+		Password: victimPass,
+	})
+	if err != nil {
+		t.Fatalf("victim recovery signup failed: %v", err)
+	}
+	// Anti-enumeration: returns (nil, "", nil) on unverified recovery.
+	if recUser != nil || recToken != "" {
+		t.Fatalf("expected nil user and empty token for anti-enumeration, got user=%v token=%s", recUser, recToken)
+	}
+
+	var victimHook hookData
+	select {
+	case victimHook = <-hookCh:
+		if victimHook.token == "" || victimHook.token == attackerToken {
+			t.Fatalf("expected fresh victim token, got: %s", victimHook.token)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("victim recovery verification email hook not received")
+	}
+
+	// 3. Attacker token must be purged from database; verifying with it must fail.
+	oldTokenHash, err := crypto.HashToken(attackerToken)
+	if err != nil {
+		t.Fatalf("failed to hash attackerToken: %v", err)
+	}
+	var oldCount int64
+	database.Model(&db.VerificationToken{}).Where("token_hash = ?", oldTokenHash[:]).Count(&oldCount)
+	if oldCount != 0 {
+		t.Fatalf("expected attacker verification token to be deleted, found %d", oldCount)
+	}
+
+	if err := svc.VerifyEmail(ctx, db.VerifyEmailRequest{Token: attackerToken}); err == nil {
+		t.Fatal("expected attacker token verification to fail, got nil")
+	}
+
+	// 4. Victim token must verify successfully and mark account verified.
+	if err := svc.VerifyEmail(ctx, db.VerifyEmailRequest{Token: victimHook.token}); err != nil {
+		t.Fatalf("expected victim token verification to succeed, got %v", err)
+	}
+
+	var verifiedUser db.User
+	if err := database.Where("id = ?", attackerUser.ID).First(&verifiedUser).Error; err != nil {
+		t.Fatalf("failed to load user from db: %v", err)
+	}
+	if !verifiedUser.EmailVerified {
+		t.Fatal("expected user email_verified to be true")
+	}
+
+	// 5. Attacker login with attackerPass MUST fail.
+	_, err = svc.Login(ctx, db.LoginRequest{
+		Email:    targetEmail,
+		Password: attackerPass,
+	})
+	if err == nil {
+		t.Fatal("expected attacker login to fail with invalid credentials, got nil")
+	}
+	var loginErr *errors.Error
+	if !errors.As(err, &loginErr) || loginErr.Code() != errors.CodeInvalidCredentials {
+		t.Fatalf("expected CodeInvalidCredentials for attacker login, got: %v", err)
+	}
+
+	// 6. Victim login with victimPass MUST succeed.
+	loggedInUser, err := svc.Login(ctx, db.LoginRequest{
+		Email:    targetEmail,
+		Password: victimPass,
+	})
+	if err != nil {
+		t.Fatalf("expected victim login to succeed, got: %v", err)
+	}
+	if loggedInUser == nil || loggedInUser.ID != attackerUser.ID {
+		t.Fatalf("expected logged in user ID %s, got %v", attackerUser.ID, loggedInUser)
+	}
+
+	// 7. Post-verification: subsequent signups MUST NOT overwrite victim credentials or issue tokens.
+	intruderPass := "IntruderPass#99999"
+	dupUser, dupToken, err := svc.Signup(ctx, db.SignupRequest{
+		Email:    targetEmail,
+		Password: intruderPass,
+	})
+	if err != nil {
+		t.Fatalf("expected silent success on duplicate signup, got: %v", err)
+	}
+	if dupUser != nil || dupToken != "" {
+		t.Fatalf("expected nil user and empty token on verified duplicate signup")
+	}
+
+	select {
+	case h := <-hookCh:
+		t.Fatalf("unexpected verification email sent after verified duplicate signup: %v", h)
+	default:
+	}
+
+	var postUser db.User
+	if err := database.Where("id = ?", attackerUser.ID).First(&postUser).Error; err != nil {
+		t.Fatalf("failed to query user post-verification: %v", err)
+	}
+	victimMatch, err := crypto.VerifyPassword(victimPass, postUser.PasswordHash)
+	if err != nil || !victimMatch {
+		t.Fatalf("expected victim password to remain unchanged post-verification: match=%v err=%v", victimMatch, err)
+	}
+}
+
+func TestService_Signup_UnverifiedRecovery_AttackerCredentialBinding_ConcurrentRace(t *testing.T) {
+	database := setupTestDB(t)
+	cfg := testConfig()
+
+	type hookData struct {
+		recipient string
+		token     string
+	}
+	hookCh := make(chan hookData, 10)
+	hooks := email.Hooks{
+		SendVerificationEmail: func(ctx context.Context, recipient, token string) error {
+			hookCh <- hookData{recipient: recipient, token: token}
+			return nil
+		},
+	}
+
+	authSvc, err := New(cfg, database, hooks)
+	if err != nil {
+		t.Fatalf("failed to create service: %v", err)
+	}
+	svc := authSvc.(*authService)
+	ctx := context.Background()
+
+	targetEmail := "victim_race@example.com"
+	attackerPass := "AttackerPass#12345"
+	victimPass := "VictimPass#67890"
+
+	user, attackerToken, err := svc.Signup(ctx, db.SignupRequest{
+		Email:    targetEmail,
+		Password: attackerPass,
+	})
+	if err != nil {
+		t.Fatalf("initial attacker signup failed: %v", err)
+	}
+	if user == nil || attackerToken == "" {
+		t.Fatal("expected attacker user and token")
+	}
+
+	select {
+	case <-hookCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("attacker verification email hook not received")
+	}
+
+	// Concurrently attempt multiple victim registrations (recovery)
+	const concurrentAttempts = 5
+	var wg sync.WaitGroup
+	wg.Add(concurrentAttempts)
+
+	for i := 0; i < concurrentAttempts; i++ {
+		go func(idx int) {
+			defer wg.Done()
+			_, _, _ = svc.Signup(ctx, db.SignupRequest{
+				Email:    targetEmail,
+				Password: fmt.Sprintf("%s_%d", victimPass, idx),
+			})
+		}(i)
+	}
+
+	wg.Wait()
+
+	// Drain hookCh and collect verification tokens sent
+	var tokensInDB []db.VerificationToken
+	if err := database.Where("user_id = ?", user.ID).Find(&tokensInDB).Error; err != nil {
+		t.Fatalf("failed to query tokens: %v", err)
+	}
+
+	var latestUser db.User
+	if err := database.Where("id = ?", user.ID).First(&latestUser).Error; err != nil {
+		t.Fatalf("failed to query user: %v", err)
+	}
+
+	if latestUser.EmailVerified {
+		t.Fatal("user should still be unverified before token verification")
+	}
+
+	// Exactly 1 active verification token must exist in DB (each recovery deletes prior tokens)
+	if len(tokensInDB) != 1 {
+		t.Fatalf("expected exactly 1 verification token for unverified user, found %d", len(tokensInDB))
+	}
+
+	// Attacker old token must not match the remaining token in DB
+	oldHash, _ := crypto.HashToken(attackerToken)
+	if string(tokensInDB[0].TokenHash) == string(oldHash[:]) {
+		t.Fatal("attacker old token unexpectedly remained in database")
+	}
+
+	// Attacker old token verification must fail
+	if err := svc.VerifyEmail(ctx, db.VerifyEmailRequest{Token: attackerToken}); err == nil {
+		t.Fatal("expected attacker token verification to fail, got nil")
+	}
+
+	// Attacker login must fail
+	_, err = svc.Login(ctx, db.LoginRequest{
+		Email:    targetEmail,
+		Password: attackerPass,
+	})
+	if err == nil {
+		t.Fatal("expected attacker login to fail")
+	}
+}
+
+func TestService_DispatchEmailAsync_SaturationOverflowAndPendingRelease(t *testing.T) {
+	database := setupTestDB(t)
+	cfg := testConfig()
+	cfg.EmailDispatchTimeout = 200 * time.Millisecond
+
+	authSvc, err := New(cfg, database, email.Hooks{})
+	if err != nil {
+		t.Fatalf("failed to create service: %v", err)
+	}
+	svc := authSvc.(*authService)
+
+	// Scale down semaphores for fast, deterministic saturation testing:
+	// 2 active slots, 2 pending slots (overflow threshold = 4).
+	svc.emailSem = make(chan struct{}, 2)
+	svc.emailPendingSem = make(chan struct{}, 2)
+
+	activeBlockCh := make(chan struct{})
+	var activeStarted sync.WaitGroup
+	activeStarted.Add(2)
+
+	sendActive := func(ctx context.Context, recipient, token string) error {
+		activeStarted.Done()
+		<-activeBlockCh
+		return nil
+	}
+
+	// 1. Dispatch 2 requests: saturate active slots.
+	ctx := context.Background()
+	svc.dispatchEmailAsync(ctx, "active1@example.com", "tok1", "test", sendActive)
+	svc.dispatchEmailAsync(ctx, "active2@example.com", "tok2", "test", sendActive)
+	activeStarted.Wait()
+
+	if len(svc.emailSem) != 2 {
+		t.Fatalf("expected 2 active slots held, got %d", len(svc.emailSem))
+	}
+
+	// 2. Dispatch 2 requests: saturate pending waiter slots.
+	sendPending := func(ctx context.Context, recipient, token string) error {
+		return nil
+	}
+	svc.dispatchEmailAsync(ctx, "pending1@example.com", "tok3", "test", sendPending)
+	svc.dispatchEmailAsync(ctx, "pending2@example.com", "tok4", "test", sendPending)
+
+	// Verify pending slots are acquired
+	var pendingHeld bool
+	for start := time.Now(); time.Since(start) < 2*time.Second; {
+		if len(svc.emailPendingSem) == 2 {
+			pendingHeld = true
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !pendingHeld {
+		t.Fatalf("expected 2 pending slots held, got %d", len(svc.emailPendingSem))
+	}
+
+	// 3. Dispatch 5th request: exceeds active (2) + pending (2). Must drop immediately without blocking.
+	droppedExecuted := false
+	sendDropped := func(ctx context.Context, recipient, token string) error {
+		droppedExecuted = true
+		return nil
+	}
+	svc.dispatchEmailAsync(ctx, "overflow@example.com", "tok5", "test", sendDropped)
+
+	if droppedExecuted {
+		t.Fatal("overflow dispatch should have been dropped immediately, but executed")
+	}
+
+	// 4. Release active slots and assert pending tasks acquire slots and complete, freeing both semaphores.
+	close(activeBlockCh)
+
+	var semDrained bool
+	for start := time.Now(); time.Since(start) < 2*time.Second; {
+		if len(svc.emailSem) == 0 && len(svc.emailPendingSem) == 0 {
+			semDrained = true
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !semDrained {
+		t.Fatalf("expected semaphores to drain to 0, got emailSem=%d, emailPendingSem=%d",
+			len(svc.emailSem), len(svc.emailPendingSem))
+	}
+}
+
+func TestService_DispatchEmailAsync_PendingTimeoutSlotRelease(t *testing.T) {
+	database := setupTestDB(t)
+	cfg := testConfig()
+	cfg.EmailDispatchTimeout = 50 * time.Millisecond
+
+	authSvc, err := New(cfg, database, email.Hooks{})
+	if err != nil {
+		t.Fatalf("failed to create service: %v", err)
+	}
+	svc := authSvc.(*authService)
+
+	// 1 active slot, 1 pending slot
+	svc.emailSem = make(chan struct{}, 1)
+	svc.emailPendingSem = make(chan struct{}, 1)
+
+	activeHoldCh := make(chan struct{})
+	defer close(activeHoldCh)
+
+	activeStarted := make(chan struct{})
+	sendActive := func(ctx context.Context, recipient, token string) error {
+		close(activeStarted)
+		<-activeHoldCh
+		return nil
+	}
+
+	ctx := context.Background()
+	svc.dispatchEmailAsync(ctx, "active@example.com", "tok1", "test", sendActive)
+	<-activeStarted
+
+	// Park 1 waiter in pending slot while active slot is held indefinitely
+	svc.dispatchEmailAsync(ctx, "pending@example.com", "tok2", "test", func(ctx context.Context, recipient, token string) error {
+		return nil
+	})
+
+	// Waiter should timeout and release pending slot
+	var pendingReleased bool
+	for start := time.Now(); time.Since(start) < 2*time.Second; {
+		if len(svc.emailPendingSem) == 0 {
+			pendingReleased = true
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !pendingReleased {
+		t.Fatalf("expected pending slot to be released upon timeout, got emailPendingSem=%d", len(svc.emailPendingSem))
+	}
+}

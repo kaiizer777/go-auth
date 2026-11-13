@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -540,4 +541,80 @@ func TestDispatch_SemaphoreSaturation(t *testing.T) {
 
 	// Wait for all 129 goroutines to finish.
 	completedWg.Wait()
+}
+
+func TestBuildURL_AdversarialEscaping(t *testing.T) {
+	baseURL := "https://example.com"
+
+	payloads := []struct {
+		name    string
+		payload string
+	}{
+		{
+			name:    "SQL injection quote and comment",
+			payload: "' OR '1'='1' --",
+		},
+		{
+			name:    "SQL injection union select",
+			payload: "1' UNION SELECT 1,2,3--",
+		},
+		{
+			name:    "XSS script tag",
+			payload: `<script>alert("xss")</script>`,
+		},
+		{
+			name:    "XSS image onerror event",
+			payload: `<img src=x onerror=alert('xss')>`,
+		},
+		{
+			name:    "query parameter injection with ampersand",
+			payload: "token123&admin=true&role=superuser",
+		},
+		{
+			name:    "path traversal and fragments",
+			payload: "../../etc/passwd#section",
+		},
+		{
+			name:    "whitespace and control characters",
+			payload: "token with spaces\r\nand\tcontrol",
+		},
+		{
+			name:    "double quotes and brackets",
+			payload: `{"token": "evil"}[0]`,
+		},
+	}
+
+	for _, tt := range payloads {
+		t.Run(tt.name, func(t *testing.T) {
+			verifyURL := BuildVerificationURL(baseURL, tt.payload)
+			parsedVerify, err := url.Parse(verifyURL)
+			if err != nil {
+				t.Fatalf("failed to parse verification URL %q: %v", verifyURL, err)
+			}
+
+			// Ensure parameter injection did not succeed: 'token' query param must match payload exactly
+			queryVerify := parsedVerify.Query()
+			if gotToken := queryVerify.Get("token"); gotToken != tt.payload {
+				t.Errorf("BuildVerificationURL: token query = %q, want %q", gotToken, tt.payload)
+			}
+			// Ensure no extra query parameters were injected (e.g. from &admin=true)
+			if len(queryVerify) != 1 {
+				t.Errorf("BuildVerificationURL: expected exactly 1 query parameter, got %d: %v", len(queryVerify), queryVerify)
+			}
+
+			resetURL := BuildResetURL(baseURL, tt.payload)
+			parsedReset, err := url.Parse(resetURL)
+			if err != nil {
+				t.Fatalf("failed to parse reset URL %q: %v", resetURL, err)
+			}
+
+			queryReset := parsedReset.Query()
+			if gotToken := queryReset.Get("token"); gotToken != tt.payload {
+				t.Errorf("BuildResetURL: token query = %q, want %q", gotToken, tt.payload)
+			}
+			if len(queryReset) != 1 {
+				t.Errorf("BuildResetURL: expected exactly 1 query parameter, got %d: %v", len(queryReset), queryReset)
+			}
+		})
+	}
 }
