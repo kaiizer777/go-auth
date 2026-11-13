@@ -9,6 +9,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/glebarez/sqlite"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 
@@ -136,5 +137,162 @@ func TestAuth_EmailDispatcher_Nil(t *testing.T) {
 	emptyAuth := &Auth{}
 	if emptyAuth.EmailDispatcher() != nil {
 		t.Fatal("expected nil dispatcher for uninitialized Auth")
+	}
+}
+
+func TestNew_DatabaseConnectionError(t *testing.T) {
+	cfg := config.Config{
+		DatabaseURL: "postgres://invalid:invalid@127.0.0.1:54329/nonexistent?sslmode=disable&connect_timeout=1",
+		BaseURL:     "https://example.com",
+	}
+
+	auth, err := New(cfg)
+	if err == nil {
+		if auth != nil {
+			_ = auth.Close()
+		}
+		t.Fatal("expected error with unreachable database, got nil")
+	}
+
+	if !strings.Contains(err.Error(), "goauth: failed to connect to database") {
+		t.Fatalf("expected error containing 'goauth: failed to connect to database', got %v", err)
+	}
+
+	var appErr *errors.Error
+	if !errors.As(err, &appErr) || (appErr.Code() != errors.CodeDatabaseUnavailable && appErr.Code() != errors.CodeDatabaseError) {
+		t.Fatalf("expected CodeDatabaseUnavailable or CodeDatabaseError, got %v", appErr.Code())
+	}
+	if auth != nil {
+		t.Fatalf("expected nil Auth on error, got %+v", auth)
+	}
+
+	// Also verify that a generic (non-appErr) DB connection error wraps with CodeDatabaseError
+	oldDBConnect := dbConnectFn
+	t.Cleanup(func() {
+		dbConnectFn = oldDBConnect
+	})
+	dbConnectFn = func(cfg config.Config) (*gorm.DB, error) {
+		return nil, stderrors.New("raw connection failure")
+	}
+
+	auth, err = New(cfg)
+	if err == nil {
+		t.Fatal("expected error with raw connection failure, got nil")
+	}
+	if !errors.As(err, &appErr) || appErr.Code() != errors.CodeDatabaseError {
+		t.Fatalf("expected CodeDatabaseError for raw error, got %v", appErr.Code())
+	}
+}
+
+func TestNew_SuccessAndWiring(t *testing.T) {
+	oldDBConnect := dbConnectFn
+	t.Cleanup(func() {
+		dbConnectFn = oldDBConnect
+	})
+
+	sqliteDB, err := gorm.Open(sqlite.Open("file::memory:?cache=shared"), &gorm.Config{
+		DisableAutomaticPing: true,
+	})
+	if err != nil {
+		t.Fatalf("failed to open sqlite db: %v", err)
+	}
+	t.Cleanup(func() {
+		if sqlDB, errDB := sqliteDB.DB(); errDB == nil {
+			_ = sqlDB.Close()
+		}
+	})
+
+	ddl := `
+	CREATE TABLE IF NOT EXISTS users (
+		id TEXT PRIMARY KEY,
+		email TEXT UNIQUE NOT NULL,
+		password_hash TEXT NOT NULL,
+		email_verified INTEGER NOT NULL DEFAULT 0,
+		created_at DATETIME,
+		updated_at DATETIME
+	);
+	CREATE TABLE IF NOT EXISTS verification_tokens (
+		token_hash BLOB PRIMARY KEY,
+		user_id TEXT NOT NULL,
+		expires_at DATETIME NOT NULL,
+		created_at DATETIME
+	);
+	CREATE TABLE IF NOT EXISTS password_reset_tokens (
+		token_hash BLOB PRIMARY KEY,
+		user_id TEXT NOT NULL,
+		expires_at DATETIME NOT NULL,
+		created_at DATETIME
+	);
+	CREATE TABLE IF NOT EXISTS sessions (
+		id TEXT PRIMARY KEY,
+		user_id TEXT NOT NULL,
+		expires_at DATETIME NOT NULL,
+		created_at DATETIME
+	);
+	`
+	if err := sqliteDB.Exec(ddl).Error; err != nil {
+		t.Fatalf("failed to execute sqlite ddl: %v", err)
+	}
+
+	dbConnectFn = func(cfg config.Config) (*gorm.DB, error) {
+		return sqliteDB, nil
+	}
+
+	var verificationPayload email.VerificationEmailPayload
+	var resetPayload email.PasswordResetEmailPayload
+
+	cfg := config.Config{
+		DatabaseURL:               "postgres://user:pass@localhost:5432/testdb",
+		BaseURL:                   "https://auth.example.com",
+		DisableAsyncEmailDispatch: true,
+		SendVerificationEmail: func(ctx context.Context, payload email.VerificationEmailPayload) error {
+			verificationPayload = payload
+			return nil
+		},
+		SendPasswordResetEmail: func(ctx context.Context, payload email.PasswordResetEmailPayload) error {
+			resetPayload = payload
+			return nil
+		},
+	}
+
+	a, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New(cfg) unexpected err = %v", err)
+	}
+	if a == nil {
+		t.Fatal("expected non-nil Auth, got nil")
+	}
+	if a.Handler == nil {
+		t.Fatal("expected non-nil Handler, got nil")
+	}
+	if a.Auth == nil {
+		t.Fatal("expected non-nil Auth service, got nil")
+	}
+	if a.EmailDispatcher() == nil {
+		t.Fatal("expected non-nil EmailDispatcher, got nil")
+	}
+
+	// Trigger email dispatcher verification and reset to verify hook wiring
+	a.EmailDispatcher().DispatchVerification(context.Background(), email.VerificationEmailPayload{
+		UserID: "usr_123",
+		To:     "user@example.com",
+		Token:  "test-token",
+	})
+	if verificationPayload.To != "user@example.com" {
+		t.Fatalf("verificationPayload.To = %q; want 'user@example.com'", verificationPayload.To)
+	}
+
+	a.EmailDispatcher().DispatchPasswordReset(context.Background(), email.PasswordResetEmailPayload{
+		UserID: "usr_123",
+		To:     "user@example.com",
+		Token:  "test-token",
+	})
+	if resetPayload.To != "user@example.com" {
+		t.Fatalf("resetPayload.To = %q; want 'user@example.com'", resetPayload.To)
+	}
+
+	// Verify Close cleans up cleanly
+	if err := a.Close(); err != nil {
+		t.Fatalf("a.Close() unexpected err = %v", err)
 	}
 }
