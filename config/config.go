@@ -266,6 +266,10 @@ func (c *Config) Validate() error {
 	if c.SessionAbsoluteMaxAge <= c.SessionIdleTimeout {
 		panic("SessionAbsoluteMaxAge must be greater than SessionIdleTimeout")
 	}
+	if c.SessionCookieSameSite == http.SameSiteNoneMode && !c.SessionCookieSecure {
+		slog.Warn("SameSite=None cookies require Secure=true; browsers will reject this cookie")
+		panic("SessionCookieSameSite=None requires SessionCookieSecure=true")
+	}
 	if !c.SessionCookieSecure {
 		slog.Warn("SessionCookieSecure is false — not safe for production")
 	}

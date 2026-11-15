@@ -924,3 +924,49 @@ func TestConfig_RateLimitWindowNegative_Panics(t *testing.T) {
 		})
 	}
 }
+
+func TestConfig_SessionCookieSameSiteNoneWithoutSecure_Panics(t *testing.T) {
+	var buf bytes.Buffer
+	handler := slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})
+	logger := slog.New(handler)
+	prev := slog.Default()
+	slog.SetDefault(logger)
+	t.Cleanup(func() {
+		slog.SetDefault(prev)
+	})
+
+	cfg := DefaultConfig()
+	cfg.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+	cfg.BaseURL = "https://example.com"
+	cfg.SessionCookieSameSite = http.SameSiteNoneMode
+	cfg.SessionCookieSecure = false
+
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("expected panic when SessionCookieSameSite=None without Secure, got nil")
+		}
+		msg, ok := r.(string)
+		if !ok || msg != "SessionCookieSameSite=None requires SessionCookieSecure=true" {
+			t.Fatalf("panic message = %v; want %q", r, "SessionCookieSameSite=None requires SessionCookieSecure=true")
+		}
+		output := buf.String()
+		if !strings.Contains(output, "SameSite=None cookies require Secure=true") {
+			t.Fatalf("expected warning log about SameSite=None requiring Secure=true, got %q", output)
+		}
+	}()
+
+	_ = cfg.Validate()
+}
+
+func TestConfig_SessionCookieSameSiteNoneWithSecure_Valid(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+	cfg.BaseURL = "https://example.com"
+	cfg.SessionCookieSameSite = http.SameSiteNoneMode
+	cfg.SessionCookieSecure = true
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() unexpected err = %v", err)
+	}
+}
