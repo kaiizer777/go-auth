@@ -234,7 +234,7 @@ func (s *service) RotateSession(
 		IPAddress:         ip,
 		UserAgent:         userAgent,
 		LastActiveAt:      now,
-		AbsoluteExpiresAt: now.Add(s.cfg.SessionAbsoluteMaxAge),
+		AbsoluteExpiresAt: oldRecord.AbsoluteExpiresAt,
 		CreatedAt:         now,
 	}
 

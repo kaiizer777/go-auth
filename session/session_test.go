@@ -515,3 +515,46 @@ func TestRotateSession_ConcurrentOrDoubleRotate(t *testing.T) {
 		t.Fatalf("expected ErrSessionNotFound for double-rotation, got %v", err2)
 	}
 }
+
+func TestRotateSession_PreservesAbsoluteExpiresAt(t *testing.T) {
+	database := setupTestDB(t)
+	cfg := testConfig()
+	svc := NewService(database, cfg)
+
+	rawID, _ := generateRawID()
+	now := time.Now().UTC()
+	// Set absolute expiry to 3 hours from now (less than default 24h)
+	initialAbsoluteExpiry := now.Add(3 * time.Hour).Truncate(time.Second)
+	row := &db.Session{
+		ID:                uuid.New(),
+		UserID:            uuid.New(),
+		IDHash:            hashID(rawID),
+		SessionType:       db.SessionTypeCookie,
+		LastActiveAt:      now,
+		AbsoluteExpiresAt: initialAbsoluteExpiry,
+		CreatedAt:         now.Add(-2 * time.Hour),
+	}
+	if err := database.Create(row).Error; err != nil {
+		t.Fatalf("failed to seed session: %v", err)
+	}
+
+	newSess, newRawID, err := svc.RotateSession(context.Background(), rawID, "2.2.2.2", "agent-rot")
+	if err != nil {
+		t.Fatalf("RotateSession failed: %v", err)
+	}
+	if newRawID == "" {
+		t.Fatal("expected non-empty newRawID")
+	}
+
+	if !newSess.AbsoluteExpiresAt.Equal(initialAbsoluteExpiry) {
+		t.Fatalf("expected preserved AbsoluteExpiresAt %v, got %v", initialAbsoluteExpiry, newSess.AbsoluteExpiresAt)
+	}
+
+	var dbRow db.Session
+	if err := database.Where("id_hash = ?", hashID(newRawID)).First(&dbRow).Error; err != nil {
+		t.Fatalf("failed to query new session: %v", err)
+	}
+	if !dbRow.AbsoluteExpiresAt.Equal(initialAbsoluteExpiry) {
+		t.Fatalf("expected DB AbsoluteExpiresAt %v, got %v", initialAbsoluteExpiry, dbRow.AbsoluteExpiresAt)
+	}
+}
