@@ -39,6 +39,7 @@ func setupSecurityApp(t *testing.T, modifyCfg ...func(*config.Config)) (*goauth.
 		id TEXT PRIMARY KEY,
 		email TEXT UNIQUE NOT NULL,
 		password_hash TEXT NOT NULL,
+		credential_version INTEGER NOT NULL DEFAULT 0,
 		email_verified INTEGER NOT NULL DEFAULT 1,
 		created_at DATETIME,
 		updated_at DATETIME
@@ -62,6 +63,7 @@ func setupSecurityApp(t *testing.T, modifyCfg ...func(*config.Config)) (*goauth.
 		session_type VARCHAR(10) NOT NULL DEFAULT 'cookie',
 		ip_address VARCHAR(45) NOT NULL DEFAULT '',
 		user_agent TEXT NOT NULL DEFAULT '',
+		credential_version INTEGER NOT NULL DEFAULT 0,
 		last_active_at DATETIME NOT NULL,
 		absolute_expires_at DATETIME NOT NULL,
 		created_at DATETIME
