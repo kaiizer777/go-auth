@@ -27,22 +27,42 @@ func generateCSRFToken() (string, error) {
 	return hex.EncodeToString(b), nil
 }
 
+// isValidHexToken verifies that s is exactly 64 hexadecimal characters.
+func isValidHexToken(s string) bool {
+	if len(s) != 64 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+			return false
+		}
+	}
+	return true
+}
+
 // Middleware enforces Double Submit Cookie CSRF protection.
 func Middleware(cfg *config.Config) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			// Bearer token requests are inherently immune to CSRF — skip entirely.
+			// Bearer token requests are inherently immune to CSRF — skip only if a non-empty token is present.
 			authHeader := r.Header.Get("Authorization")
-			if authHeader != "" && strings.HasPrefix(strings.ToLower(strings.TrimSpace(authHeader)), "bearer ") {
-				next.ServeHTTP(w, r)
-				return
+			if authHeader != "" {
+				trimmed := strings.TrimSpace(authHeader)
+				if len(trimmed) > 7 && strings.EqualFold(trimmed[:7], "bearer ") {
+					token := strings.TrimSpace(trimmed[7:])
+					if token != "" {
+						next.ServeHTTP(w, r)
+						return
+					}
+				}
 			}
 
 			csrfCookie, err := r.Cookie(cfg.CSRFCookieName)
 
-			// Safe methods ensure cookie exists, then pass through.
+			// Safe methods ensure a valid 64-char hex cookie exists, generating one if absent or invalid.
 			if safeMethods[r.Method] {
-				if err != nil || csrfCookie.Value == "" {
+				if err != nil || !isValidHexToken(csrfCookie.Value) {
 					token, genErr := generateCSRFToken()
 					if genErr != nil {
 						apperrors.WriteHTTP(w, apperrors.New(apperrors.CodeInternalError, "failed to generate CSRF token", genErr))
@@ -57,6 +77,11 @@ func Middleware(cfg *config.Config) func(http.Handler) http.Handler {
 			// State-changing methods (POST, PUT, PATCH, DELETE) enforce cookie and header.
 			if err != nil || csrfCookie.Value == "" {
 				apperrors.WriteHTTP(w, apperrors.ErrCSRFTokenMissing)
+				return
+			}
+
+			if !isValidHexToken(csrfCookie.Value) {
+				apperrors.WriteHTTP(w, apperrors.ErrCSRFTokenInvalid)
 				return
 			}
 

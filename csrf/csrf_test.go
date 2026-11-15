@@ -237,3 +237,104 @@ func TestCSRF_AllStatefulMethods(t *testing.T) {
 		})
 	}
 }
+
+func TestCSRF_InvalidHexCookie(t *testing.T) {
+	cfg := testConfig()
+	mw := Middleware(cfg)(dummyHandler())
+
+	cases := []struct {
+		name        string
+		cookieVal   string
+		headerVal   string
+		expectedErr string
+	}{
+		{
+			name:      "short cookie",
+			cookieVal: "1",
+			headerVal: "1",
+		},
+		{
+			name:      "non-hex 64 chars",
+			cookieVal: "gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg",
+			headerVal: "gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/resource", nil)
+			req.AddCookie(&http.Cookie{
+				Name:  cfg.CSRFCookieName,
+				Value: tc.cookieVal,
+			})
+			req.Header.Set(cfg.CSRFHeaderName, tc.headerVal)
+			rec := httptest.NewRecorder()
+
+			mw.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusForbidden {
+				t.Fatalf("expected status 403, got %d", rec.Code)
+			}
+		})
+	}
+}
+
+func TestCSRF_SafeMethod_InvalidCookieRegenerated(t *testing.T) {
+	cfg := testConfig()
+	mw := Middleware(cfg)(dummyHandler())
+
+	req := httptest.NewRequest(http.MethodGet, "/resource", nil)
+	req.AddCookie(&http.Cookie{
+		Name:  cfg.CSRFCookieName,
+		Value: "invalid-cookie-value",
+	})
+	rec := httptest.NewRecorder()
+
+	mw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", rec.Code)
+	}
+
+	cookies := rec.Result().Cookies()
+	var csrfCookie *http.Cookie
+	for _, c := range cookies {
+		if c.Name == cfg.CSRFCookieName {
+			csrfCookie = c
+			break
+		}
+	}
+
+	if csrfCookie == nil {
+		t.Fatalf("expected invalid cookie to be replaced with new CSRF cookie")
+	}
+	if len(csrfCookie.Value) != 64 {
+		t.Fatalf("expected 64-char hex token, got %d chars", len(csrfCookie.Value))
+	}
+}
+
+func TestCSRF_EmptyBearerToken_DoesNotBypass(t *testing.T) {
+	cfg := testConfig()
+	mw := Middleware(cfg)(dummyHandler())
+
+	cases := []string{
+		"Bearer ",
+		"Bearer    ",
+		"bearer ",
+		"Bearer",
+	}
+
+	for _, authHeader := range cases {
+		t.Run(authHeader, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/resource", nil)
+			req.Header.Set("Authorization", authHeader)
+			rec := httptest.NewRecorder()
+
+			mw.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusForbidden {
+				t.Fatalf("expected status 403 for header %q, got %d", authHeader, rec.Code)
+			}
+		})
+	}
+}
