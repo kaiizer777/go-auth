@@ -64,6 +64,7 @@ func (h *SessionHandler) GetCurrentSession(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(map[string]any{"session": toWireResponse(sess)})
 }
 
@@ -88,6 +89,7 @@ func (h *SessionHandler) Logout(w http.ResponseWriter, r *http.Request) {
 	)
 
 	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(map[string]string{"message": "Logged out successfully"})
 }
 
@@ -142,6 +144,7 @@ func (h *SessionHandler) ListSessions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(map[string]any{"sessions": results})
 }
 
@@ -169,6 +172,7 @@ func (h *SessionHandler) InvalidateAllSessions(w http.ResponseWriter, r *http.Re
 	)
 
 	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(map[string]string{"message": "All sessions invalidated"})
 }
 

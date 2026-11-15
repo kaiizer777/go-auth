@@ -224,12 +224,13 @@ func TestSessionHandler_ListSessions(t *testing.T) {
 
 	var foundCurrent, foundOther bool
 	for _, s := range res.Sessions {
-		if s.SessionID == sess1.IDHash {
+		switch s.SessionID {
+		case sess1.IDHash:
 			if !s.IsCurrent {
 				t.Errorf("expected sess1 to have is_current=true")
 			}
 			foundCurrent = true
-		} else if s.SessionID == sess2.IDHash {
+		case sess2.IDHash:
 			if s.IsCurrent {
 				t.Errorf("expected sess2 to have is_current=false")
 			}
