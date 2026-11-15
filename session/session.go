@@ -70,6 +70,10 @@ func (s *service) CreateSession(
 	sessionType db.SessionType,
 	ip, userAgent string,
 ) (*Session, string, error) {
+	if sessionType != db.SessionTypeCookie && sessionType != db.SessionTypeBearer {
+		return nil, "", apperrors.ErrSessionInvalid
+	}
+
 	rawID, err := generateRawID()
 	if err != nil {
 		return nil, "", apperrors.New(apperrors.CodeInternalError, "failed to generate session ID", err)

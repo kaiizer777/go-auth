@@ -154,6 +154,32 @@ func TestCreateSession_StoresHash(t *testing.T) {
 	}
 }
 
+func TestCreateSession_SessionTypeValidation(t *testing.T) {
+	database := setupTestDB(t)
+	cfg := testConfig()
+	svc := NewService(database, cfg)
+
+	userID := uuid.New()
+
+	if _, _, err := svc.CreateSession(context.Background(), userID, db.SessionTypeCookie, "127.0.0.1", "agent"); err != nil {
+		t.Fatalf("CreateSession(cookie) failed: %v", err)
+	}
+	if _, _, err := svc.CreateSession(context.Background(), userID, db.SessionTypeBearer, "127.0.0.1", "agent"); err != nil {
+		t.Fatalf("CreateSession(bearer) failed: %v", err)
+	}
+
+	invalidTypes := []db.SessionType{"", "header", "jwt", "unsupported"}
+	for _, it := range invalidTypes {
+		sess, rawID, err := svc.CreateSession(context.Background(), userID, it, "127.0.0.1", "agent")
+		if sess != nil || rawID != "" {
+			t.Errorf("expected nil sess and empty rawID for %q, got sess=%+v, rawID=%q", it, sess, rawID)
+		}
+		if !errors.Is(err, apperrors.ErrSessionInvalid) {
+			t.Errorf("expected ErrSessionInvalid for %q, got %v", it, err)
+		}
+	}
+}
+
 func TestGetSession_IdleTimeout(t *testing.T) {
 	database := setupTestDB(t)
 	cfg := testConfig()
