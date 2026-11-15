@@ -364,6 +364,55 @@ func TestAllSessionsInvalidatedOnPasswordChange(t *testing.T) {
 	}
 }
 
+// Test: login whose credential check precedes a password reset must not mint a
+// usable session when it resumes after the reset (issue #27).
+func TestSessionRejectedWhenLoginCapturedOldCredentialVersion(t *testing.T) {
+	app, _, cfg := setupIntegrationApp(t)
+	email := "login_vs_reset@example.com"
+	pass := "OriginalPass123!"
+	newPass := "NewPass9876543!"
+	signupUser(t, app, email, pass)
+
+	// Credential check happens before the reset: capture old version.
+	user, err := app.Auth.Login(context.Background(), db.LoginRequest{Email: email, Password: pass})
+	if err != nil {
+		t.Fatalf("Login failed: %v", err)
+	}
+	oldVersion := user.CredentialVersion
+
+	// Reset completes in between, bumping credential version and purging sessions.
+	tok, err := app.Auth.RequestPasswordReset(context.Background(), db.PasswordResetRequest{Email: email})
+	if err != nil {
+		t.Fatalf("RequestPasswordReset failed: %v", err)
+	}
+	if err := app.Auth.ResetPassword(context.Background(), db.PasswordResetConfirmRequest{
+		Token:       tok,
+		NewPassword: newPass,
+	}); err != nil {
+		t.Fatalf("ResetPassword failed: %v", err)
+	}
+
+	// In-flight login resumes and mints a session stamped with the old version.
+	_, rawID, err := app.Session.CreateSession(context.Background(), user.ID, oldVersion, db.SessionTypeCookie, "127.0.0.1", "agent")
+	if err != nil {
+		t.Fatalf("CreateSession failed: %v", err)
+	}
+
+	// The stale session must be rejected by GetSession.
+	if sess, gerr := app.Session.GetSession(context.Background(), rawID); gerr == nil || sess != nil {
+		t.Fatalf("expected session rejected after reset, got sess=%v err=%v", sess, gerr)
+	}
+
+	// And via the HTTP middleware.
+	req := httptest.NewRequest(http.MethodGet, "/auth/session", nil)
+	req.AddCookie(&http.Cookie{Name: cfg.SessionCookieName, Value: rawID})
+	rec := httptest.NewRecorder()
+	app.Handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for stale session, got %d", rec.Code)
+	}
+}
+
 // Test 5: TestListSessions_MultipleDevices (ASVS V3.2.2)
 // Listing returns all active sessions; is_current is true only for requesting session; session IDs are SHA-256 hashes
 func TestListSessions_MultipleDevices(t *testing.T) {

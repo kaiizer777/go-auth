@@ -534,7 +534,7 @@ func TestBearerTokenEntropy(t *testing.T) {
 	seen := make(map[string]struct{}, count)
 
 	for i := 0; i < count; i++ {
-		_, rawID, err := app.Session.CreateSession(context.Background(), uuid.New(), db.SessionTypeBearer, "127.0.0.1", "ua")
+		_, rawID, err := app.Session.CreateSession(context.Background(), uuid.New(), 0, db.SessionTypeBearer, "127.0.0.1", "ua")
 		if err != nil {
 			t.Fatalf("failed to create session: %v", err)
 		}

@@ -1839,11 +1839,11 @@ func TestLogout_CSRFAndAuthProtection(t *testing.T) {
 	h := New(database, cfg, mockAuth, WithSessionService(sessSvc))
 
 	userID := uuid.New()
-	_, rawCookieID, err := sessSvc.CreateSession(context.Background(), userID, db.SessionTypeCookie, "127.0.0.1", "agent")
+	_, rawCookieID, err := sessSvc.CreateSession(context.Background(), userID, 0, db.SessionTypeCookie, "127.0.0.1", "agent")
 	if err != nil {
 		t.Fatalf("failed to create cookie session: %v", err)
 	}
-	_, rawBearerID, err := sessSvc.CreateSession(context.Background(), userID, db.SessionTypeBearer, "127.0.0.1", "agent")
+	_, rawBearerID, err := sessSvc.CreateSession(context.Background(), userID, 0, db.SessionTypeBearer, "127.0.0.1", "agent")
 	if err != nil {
 		t.Fatalf("failed to create bearer session: %v", err)
 	}
