@@ -230,9 +230,26 @@ func TestGetSession_Valid(t *testing.T) {
 	svc := NewService(database, cfg)
 
 	userID := uuid.New()
-	sessCreated, rawID, err := svc.CreateSession(context.Background(), userID, db.SessionTypeCookie, "127.0.0.1", "agent")
+	rawID, err := generateRawID()
 	if err != nil {
-		t.Fatalf("CreateSession failed: %v", err)
+		t.Fatalf("generateRawID failed: %v", err)
+	}
+
+	now := time.Now().UTC()
+	initialLastActive := now.Add(-5 * time.Minute).Truncate(time.Second)
+	seed := &db.Session{
+		ID:                uuid.New(),
+		UserID:            userID,
+		IDHash:            hashID(rawID),
+		SessionType:       db.SessionTypeCookie,
+		IPAddress:         "127.0.0.1",
+		UserAgent:         "agent",
+		LastActiveAt:      initialLastActive,
+		AbsoluteExpiresAt: now.Add(cfg.SessionAbsoluteMaxAge),
+		CreatedAt:         now.Add(-10 * time.Minute),
+	}
+	if err := database.Create(seed).Error; err != nil {
+		t.Fatalf("failed to seed session: %v", err)
 	}
 
 	sess, err := svc.GetSession(context.Background(), rawID)
@@ -240,8 +257,8 @@ func TestGetSession_Valid(t *testing.T) {
 		t.Fatalf("GetSession failed: %v", err)
 	}
 
-	if sess.IDHash != sessCreated.IDHash {
-		t.Fatalf("expected IDHash %q, got %q", sessCreated.IDHash, sess.IDHash)
+	if sess.IDHash != seed.IDHash {
+		t.Fatalf("expected IDHash %q, got %q", seed.IDHash, sess.IDHash)
 	}
 	if sess.UserID != userID {
 		t.Fatalf("expected UserID %s, got %s", userID, sess.UserID)
@@ -253,8 +270,8 @@ func TestGetSession_Valid(t *testing.T) {
 	if err := database.Where("id_hash = ?", sess.IDHash).First(&row).Error; err != nil {
 		t.Fatalf("failed to query row: %v", err)
 	}
-	if row.LastActiveAt.IsZero() {
-		t.Fatal("expected LastActiveAt to be non-zero")
+	if !row.LastActiveAt.After(initialLastActive) {
+		t.Fatalf("expected LastActiveAt to be updated past %v, got %v", initialLastActive, row.LastActiveAt)
 	}
 }
 

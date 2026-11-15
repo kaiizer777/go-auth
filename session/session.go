@@ -134,10 +134,15 @@ func (s *service) GetSession(ctx context.Context, rawID string) (*Session, error
 	go func() {
 		updateCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
-		_ = s.db.WithContext(updateCtx).
+		if err := s.db.WithContext(updateCtx).
 			Model(&db.Session{}).
 			Where("id = ?", sessionID).
-			Update("last_active_at", now).Error
+			Update("last_active_at", now).Error; err != nil {
+			slog.Error("failed to update session last_active_at",
+				"session_id", sessionID.String(),
+				"error", err,
+			)
+		}
 	}()
 
 	return domainSession, nil
