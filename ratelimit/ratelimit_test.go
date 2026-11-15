@@ -255,6 +255,15 @@ func TestClientIP(t *testing.T) {
 	}
 }
 
+func TestLimiter_StartCleanup_NonPositiveTickDoesNotPanic(t *testing.T) {
+	limiter := NewLimiter(1*time.Minute, 5)
+	done := make(chan struct{})
+	defer close(done)
+
+	limiter.StartCleanup(0, done)
+	limiter.StartCleanup(-1*time.Second, done)
+}
+
 func TestWriteRateLimitError(t *testing.T) {
 	rec := httptest.NewRecorder()
 	WriteRateLimitError(rec, 1500*time.Millisecond)
