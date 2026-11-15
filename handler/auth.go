@@ -99,7 +99,7 @@ func (h *AuthHandler) Signup(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ip := realIP(r)
-	key := ratelimit.Key(ip, req.Email)
+	key := ratelimit.Key(ip, db.NormalizeEmail(req.Email))
 	if h.signupLimiter != nil && !h.signupLimiter.Allow(key) {
 		ratelimit.WriteRateLimitError(w, h.signupLimiter.RetryAfter(key))
 		return
@@ -126,7 +126,7 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ip := realIP(r)
-	key := ratelimit.Key(ip, req.Email)
+	key := ratelimit.Key(ip, db.NormalizeEmail(req.Email))
 	if h.loginLimiter != nil && !h.loginLimiter.Allow(key) {
 		ratelimit.WriteRateLimitError(w, h.loginLimiter.RetryAfter(key))
 		return
@@ -254,7 +254,7 @@ func (h *AuthHandler) RequestPasswordReset(w http.ResponseWriter, r *http.Reques
 	}
 
 	ip := realIP(r)
-	key := ratelimit.Key(ip, req.Email)
+	key := ratelimit.Key(ip, db.NormalizeEmail(req.Email))
 	if h.resetLimiter != nil && !h.resetLimiter.Allow(key) {
 		ratelimit.WriteRateLimitError(w, h.resetLimiter.RetryAfter(key))
 		return
