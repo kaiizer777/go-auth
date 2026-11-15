@@ -89,6 +89,10 @@ func RequireAuth(sessionSvc session.Service, cfg *config.Config) func(http.Handl
 				apperrors.WriteHTTP(w, err)
 				return
 			}
+			if sess == nil {
+				apperrors.WriteHTTP(w, apperrors.ErrSessionNotFound)
+				return
+			}
 
 			// 4. Inject authenticated session data into request context
 			ctx := r.Context()
