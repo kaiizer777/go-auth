@@ -280,21 +280,20 @@ func (c *Config) Validate() error {
 		c.SessionAbsoluteMaxAge = 24 * time.Hour
 	}
 	if c.SessionIdleTimeout <= 0 {
-		panic("SessionIdleTimeout must be greater than zero")
+		return errors.ErrSessionIdleTimeoutInvalid
 	}
 	if c.SessionAbsoluteMaxAge <= c.SessionIdleTimeout {
-		panic("SessionAbsoluteMaxAge must be greater than SessionIdleTimeout")
+		return errors.ErrSessionAbsoluteMaxAgeInvalid
 	}
 	if c.SessionCookieSameSite == http.SameSiteNoneMode && !c.SessionCookieSecure {
-		slog.Warn("SameSite=None cookies require Secure=true; browsers will reject this cookie")
-		panic("SessionCookieSameSite=None requires SessionCookieSecure=true")
+		return errors.ErrSessionSameSiteNoneInsecure
 	}
 	if !c.SessionCookieSecure {
 		slog.Warn("SessionCookieSecure is false — not safe for production")
 	}
 
 	if c.RateLimitLoginWindow < 0 || c.RateLimitResetWindow < 0 || c.RateLimitSignupWindow < 0 || c.RateLimitCleanupTick < 0 {
-		panic("rate limit window and cleanup tick must be greater than zero")
+		return errors.ErrRateLimitWindowInvalid
 	}
 	if c.RateLimitLoginWindow == 0 {
 		c.RateLimitLoginWindow = 15 * time.Minute
@@ -319,7 +318,7 @@ func (c *Config) Validate() error {
 		c.RateLimitSignupMax = 10
 	}
 	if c.RateLimitLoginMax < 1 || c.RateLimitResetMax < 1 || c.RateLimitSignupMax < 1 {
-		panic("rate limit max must be >= 1")
+		return errors.ErrRateLimitMaxInvalid
 	}
 
 	return nil

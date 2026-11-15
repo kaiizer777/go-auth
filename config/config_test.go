@@ -759,7 +759,7 @@ func TestConfig_SessionIdleTimeoutZero_Defaults(t *testing.T) {
 	}
 }
 
-func TestConfig_AbsoluteLessThanIdle_Panics(t *testing.T) {
+func TestConfig_AbsoluteLessThanIdle_Error(t *testing.T) {
 	tests := []struct {
 		name        string
 		idleTimeout time.Duration
@@ -785,18 +785,10 @@ func TestConfig_AbsoluteLessThanIdle_Panics(t *testing.T) {
 			cfg.SessionIdleTimeout = tt.idleTimeout
 			cfg.SessionAbsoluteMaxAge = tt.absoluteAge
 
-			defer func() {
-				r := recover()
-				if r == nil {
-					t.Fatal("expected panic when SessionAbsoluteMaxAge <= SessionIdleTimeout, got nil")
-				}
-				msg, ok := r.(string)
-				if !ok || msg != "SessionAbsoluteMaxAge must be greater than SessionIdleTimeout" {
-					t.Fatalf("panic message = %v; want %q", r, "SessionAbsoluteMaxAge must be greater than SessionIdleTimeout")
-				}
-			}()
-
-			_ = cfg.Validate()
+			err := cfg.Validate()
+			if !errors.Is(err, errors.ErrSessionAbsoluteMaxAgeInvalid) {
+				t.Fatalf("Validate() err = %v; want %v", err, errors.ErrSessionAbsoluteMaxAgeInvalid)
+			}
 		})
 	}
 }
@@ -829,7 +821,7 @@ func TestConfig_SessionCookieSecureFalse_Warns(t *testing.T) {
 	}
 }
 
-func TestConfig_RateLimitMax_Panics(t *testing.T) {
+func TestConfig_RateLimitMax_Error(t *testing.T) {
 	tests := []struct {
 		name   string
 		mutate func(*Config)
@@ -855,18 +847,10 @@ func TestConfig_RateLimitMax_Panics(t *testing.T) {
 			cfg.BaseURL = "https://example.com"
 			tt.mutate(&cfg)
 
-			defer func() {
-				r := recover()
-				if r == nil {
-					t.Fatal("expected panic when rate limit max < 1, got nil")
-				}
-				msg, ok := r.(string)
-				if !ok || msg != "rate limit max must be >= 1" {
-					t.Fatalf("panic message = %v; want %q", r, "rate limit max must be >= 1")
-				}
-			}()
-
-			_ = cfg.Validate()
+			err := cfg.Validate()
+			if !errors.Is(err, errors.ErrRateLimitMaxInvalid) {
+				t.Fatalf("Validate() err = %v; want %v", err, errors.ErrRateLimitMaxInvalid)
+			}
 		})
 	}
 }
@@ -893,27 +877,19 @@ func TestConfig_RateLimitMaxZero_Defaults(t *testing.T) {
 	}
 }
 
-func TestConfig_SessionIdleTimeoutNegative_Panics(t *testing.T) {
+func TestConfig_SessionIdleTimeoutNegative_Error(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
 	cfg.BaseURL = "https://example.com"
 	cfg.SessionIdleTimeout = -5 * time.Minute
 
-	defer func() {
-		r := recover()
-		if r == nil {
-			t.Fatal("expected panic on negative SessionIdleTimeout, got nil")
-		}
-		msg, ok := r.(string)
-		if !ok || msg != "SessionIdleTimeout must be greater than zero" {
-			t.Fatalf("panic message = %v; want %q", r, "SessionIdleTimeout must be greater than zero")
-		}
-	}()
-
-	_ = cfg.Validate()
+	err := cfg.Validate()
+	if !errors.Is(err, errors.ErrSessionIdleTimeoutInvalid) {
+		t.Fatalf("Validate() err = %v; want %v", err, errors.ErrSessionIdleTimeoutInvalid)
+	}
 }
 
-func TestConfig_RateLimitWindowNegative_Panics(t *testing.T) {
+func TestConfig_RateLimitWindowNegative_Error(t *testing.T) {
 	tests := []struct {
 		name   string
 		mutate func(*Config)
@@ -943,54 +919,25 @@ func TestConfig_RateLimitWindowNegative_Panics(t *testing.T) {
 			cfg.BaseURL = "https://example.com"
 			tt.mutate(&cfg)
 
-			defer func() {
-				r := recover()
-				if r == nil {
-					t.Fatalf("expected panic on %s, got nil", tt.name)
-				}
-				msg, ok := r.(string)
-				if !ok || msg != "rate limit window and cleanup tick must be greater than zero" {
-					t.Fatalf("panic message = %v; want %q", r, "rate limit window and cleanup tick must be greater than zero")
-				}
-			}()
-
-			_ = cfg.Validate()
+			err := cfg.Validate()
+			if !errors.Is(err, errors.ErrRateLimitWindowInvalid) {
+				t.Fatalf("Validate() err = %v; want %v", err, errors.ErrRateLimitWindowInvalid)
+			}
 		})
 	}
 }
 
-func TestConfig_SessionCookieSameSiteNoneWithoutSecure_Panics(t *testing.T) {
-	var buf bytes.Buffer
-	handler := slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})
-	logger := slog.New(handler)
-	prev := slog.Default()
-	slog.SetDefault(logger)
-	t.Cleanup(func() {
-		slog.SetDefault(prev)
-	})
-
+func TestConfig_SessionCookieSameSiteNoneWithoutSecure_Error(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
 	cfg.BaseURL = "https://example.com"
 	cfg.SessionCookieSameSite = http.SameSiteNoneMode
 	cfg.SessionCookieSecure = false
 
-	defer func() {
-		r := recover()
-		if r == nil {
-			t.Fatal("expected panic when SessionCookieSameSite=None without Secure, got nil")
-		}
-		msg, ok := r.(string)
-		if !ok || msg != "SessionCookieSameSite=None requires SessionCookieSecure=true" {
-			t.Fatalf("panic message = %v; want %q", r, "SessionCookieSameSite=None requires SessionCookieSecure=true")
-		}
-		output := buf.String()
-		if !strings.Contains(output, "SameSite=None cookies require Secure=true") {
-			t.Fatalf("expected warning log about SameSite=None requiring Secure=true, got %q", output)
-		}
-	}()
-
-	_ = cfg.Validate()
+	err := cfg.Validate()
+	if !errors.Is(err, errors.ErrSessionSameSiteNoneInsecure) {
+		t.Fatalf("Validate() err = %v; want %v", err, errors.ErrSessionSameSiteNoneInsecure)
+	}
 }
 
 func TestConfig_SessionCookieSameSiteNoneWithSecure_Valid(t *testing.T) {
