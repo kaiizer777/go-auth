@@ -166,7 +166,9 @@ func (h *Handler) registerRoutes() {
 		// Canonical routes:
 		h.mux.HandleFunc("POST /auth/signup", authH.Signup)
 		h.mux.HandleFunc("POST /auth/login", authH.Login)
-		h.mux.HandleFunc("POST /auth/logout", authH.Logout)
+		if h.sessHandler == nil || h.sessionSvc == nil {
+			h.mux.HandleFunc("POST /auth/logout", authH.Logout)
+		}
 		h.mux.HandleFunc("POST /auth/verify", authH.VerifyEmail)
 		h.mux.HandleFunc("POST /auth/password/reset-request", authH.RequestPasswordReset)
 		h.mux.HandleFunc("POST /auth/password/reset", authH.ResetPassword)
@@ -174,7 +176,9 @@ func (h *Handler) registerRoutes() {
 		// Aliases:
 		h.mux.HandleFunc("POST /api/auth/signup", authH.Signup)
 		h.mux.HandleFunc("POST /api/auth/login", authH.Login)
-		h.mux.HandleFunc("POST /api/auth/logout", authH.Logout)
+		if h.sessHandler == nil || h.sessionSvc == nil {
+			h.mux.HandleFunc("POST /api/auth/logout", authH.Logout)
+		}
 		h.mux.HandleFunc("POST /api/auth/verify-email", authH.VerifyEmail)
 		h.mux.HandleFunc("POST /api/auth/request-password-reset", authH.RequestPasswordReset)
 		h.mux.HandleFunc("POST /api/auth/reset-password", authH.ResetPassword)
@@ -190,6 +194,9 @@ func (h *Handler) registerRoutes() {
 		// Canonical session routes:
 		h.mux.Handle("GET /auth/session", sessionWrap(h.sessHandler.GetCurrentSession))
 		h.mux.Handle("DELETE /auth/session", sessionWrap(h.sessHandler.Logout))
+		if h.authSvc != nil {
+			h.mux.Handle("POST /auth/logout", sessionWrap(h.sessHandler.Logout))
+		}
 		h.mux.Handle("GET /auth/sessions", sessionWrap(h.sessHandler.ListSessions))
 		h.mux.Handle("DELETE /auth/sessions", sessionWrap(h.sessHandler.InvalidateAllSessions))
 		h.mux.Handle("POST /auth/session/rotate", sessionWrap(h.sessHandler.RotateSession))
@@ -197,6 +204,9 @@ func (h *Handler) registerRoutes() {
 		// Aliases:
 		h.mux.Handle("GET /api/auth/session", sessionWrap(h.sessHandler.GetCurrentSession))
 		h.mux.Handle("DELETE /api/auth/session", sessionWrap(h.sessHandler.Logout))
+		if h.authSvc != nil {
+			h.mux.Handle("POST /api/auth/logout", sessionWrap(h.sessHandler.Logout))
+		}
 		h.mux.Handle("GET /api/auth/sessions", sessionWrap(h.sessHandler.ListSessions))
 		h.mux.Handle("DELETE /api/auth/sessions", sessionWrap(h.sessHandler.InvalidateAllSessions))
 		h.mux.Handle("POST /api/auth/session/rotate", sessionWrap(h.sessHandler.RotateSession))
