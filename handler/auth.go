@@ -8,6 +8,7 @@ import (
 
 	"github.com/kaiizer777/go-auth/auth"
 	"github.com/kaiizer777/go-auth/config"
+	"github.com/kaiizer777/go-auth/csrf"
 	"github.com/kaiizer777/go-auth/db"
 	"github.com/kaiizer777/go-auth/errors"
 	"github.com/kaiizer777/go-auth/ratelimit"
@@ -181,6 +182,9 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 			cfg = &defaultCfg
 		}
 		session.SetSessionCookie(w, rawID, cfg)
+		if _, err := csrf.IssueCookie(w, cfg); err != nil {
+			slog.ErrorContext(r.Context(), "failed to issue csrf cookie on login", "err", err)
+		}
 		writeJSON(w, http.StatusOK, map[string]any{
 			"user_id": user.ID,
 			"message": "Login successful",

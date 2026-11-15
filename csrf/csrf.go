@@ -101,6 +101,26 @@ func Middleware(cfg *config.Config) func(http.Handler) http.Handler {
 	}
 }
 
+// GenerateToken creates a 32-byte (256-bit) CSPRNG token, hex-encoded to 64 chars.
+func GenerateToken() (string, error) {
+	return generateCSRFToken()
+}
+
+// SetCookie writes the CSRF token cookie to the response writer.
+func SetCookie(w http.ResponseWriter, token string, cfg *config.Config) {
+	setCSRFCookie(w, token, cfg)
+}
+
+// IssueCookie generates a new CSRF token and sets the CSRF cookie on w.
+func IssueCookie(w http.ResponseWriter, cfg *config.Config) (string, error) {
+	token, err := generateCSRFToken()
+	if err != nil {
+		return "", err
+	}
+	setCSRFCookie(w, token, cfg)
+	return token, nil
+}
+
 // setCSRFCookie writes the CSRF token cookie.
 // HttpOnly: false is intentional and mandatory so client JavaScript can read it to set X-CSRF-Token.
 // SameSite: Strict ensures maximum isolation.

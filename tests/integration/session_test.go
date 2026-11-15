@@ -496,3 +496,79 @@ func TestAbsoluteTimeoutEnforced_Integration(t *testing.T) {
 		t.Fatalf("expected 401 Unauthorized after absolute timeout, got %d", getRec.Code)
 	}
 }
+
+// TestLogin_SetsCSRFCookieAndEnablesImmediateRotation verifies that login attaches a CSRF cookie,
+// and state-changing endpoints can be accessed immediately with that token without an initial GET request.
+func TestLogin_SetsCSRFCookieAndEnablesImmediateRotation(t *testing.T) {
+	app, _, cfg := setupIntegrationApp(t)
+	email := "login_csrf_test@example.com"
+	pass := "SecurePassword123!"
+	signupUser(t, app, email, pass)
+
+	loginBody, _ := json.Marshal(db.LoginRequest{Email: email, Password: pass})
+	req := httptest.NewRequest(http.MethodPost, "/auth/login", bytes.NewReader(loginBody))
+	rec := httptest.NewRecorder()
+	app.Handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK on login, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var sidCookie, csrfCookie *http.Cookie
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == cfg.SessionCookieName {
+			sidCookie = c
+		} else if c.Name == cfg.CSRFCookieName {
+			csrfCookie = c
+		}
+	}
+	if sidCookie == nil {
+		t.Fatalf("expected session cookie %q in login response", cfg.SessionCookieName)
+	}
+	if csrfCookie == nil {
+		t.Fatalf("expected csrf cookie %q in login response", cfg.CSRFCookieName)
+	}
+	if len(csrfCookie.Value) != 64 {
+		t.Fatalf("expected 64-char hex CSRF token, got %q", csrfCookie.Value)
+	}
+
+	// Immediately rotate session without prior GET request
+	rotReq := httptest.NewRequest(http.MethodPost, "/auth/session/rotate", nil)
+	rotReq.AddCookie(sidCookie)
+	rotReq.AddCookie(csrfCookie)
+	rotReq.Header.Set(cfg.CSRFHeaderName, csrfCookie.Value)
+	rotRec := httptest.NewRecorder()
+	app.Handler.ServeHTTP(rotRec, rotReq)
+
+	if rotRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK on rotate session with login CSRF cookie, got %d: %s", rotRec.Code, rotRec.Body.String())
+	}
+}
+
+// TestCSRF_BootstrapOnUnauthenticatedSafeRequest verifies that GET /auth/session attaches a CSRF cookie
+// even when unauthenticated (401 response).
+func TestCSRF_BootstrapOnUnauthenticatedSafeRequest(t *testing.T) {
+	app, _, cfg := setupIntegrationApp(t)
+
+	getReq := httptest.NewRequest(http.MethodGet, "/auth/session", nil)
+	getRec := httptest.NewRecorder()
+	app.Handler.ServeHTTP(getRec, getReq)
+
+	if getRec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 Unauthorized on unauthenticated GET /auth/session, got %d", getRec.Code)
+	}
+
+	var csrfCookie *http.Cookie
+	for _, c := range getRec.Result().Cookies() {
+		if c.Name == cfg.CSRFCookieName {
+			csrfCookie = c
+			break
+		}
+	}
+	if csrfCookie == nil {
+		t.Fatalf("expected CSRF cookie to be bootstrapped on unauthenticated GET /auth/session")
+	}
+	if len(csrfCookie.Value) != 64 {
+		t.Fatalf("expected 64-char hex CSRF cookie, got %q", csrfCookie.Value)
+	}
+}

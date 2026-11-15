@@ -171,7 +171,7 @@ func (h *Handler) registerRoutes() {
 		authMw := RequireAuth(h.sessionSvc, &h.cfg)
 		csrfMw := csrf.Middleware(&h.cfg)
 		sessionWrap := func(hf http.HandlerFunc) http.Handler {
-			return authMw(csrfMw(hf))
+			return csrfMw(authMw(hf))
 		}
 
 		// Canonical session routes:
