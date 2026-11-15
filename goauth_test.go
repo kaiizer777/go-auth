@@ -402,7 +402,7 @@ func TestNewWithDB_ZeroCleanupTick(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewWithDB unexpected err = %v", err)
 	}
-	defer a.Close()
+	defer func() { _ = a.Close() }()
 	if a == nil {
 		t.Fatal("expected non-nil Auth")
 	}
