@@ -264,14 +264,21 @@ func TestGetSession_Valid(t *testing.T) {
 		t.Fatalf("expected UserID %s, got %s", userID, sess.UserID)
 	}
 
-	// Poll briefly for the asynchronous LastActiveAt update to finish
-	time.Sleep(50 * time.Millisecond)
+	// Poll with a bounded timeout for the asynchronous LastActiveAt update to finish
 	var row db.Session
-	if err := database.Where("id_hash = ?", sess.IDHash).First(&row).Error; err != nil {
-		t.Fatalf("failed to query row: %v", err)
+	var updated bool
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if err := database.Where("id_hash = ?", sess.IDHash).First(&row).Error; err == nil {
+			if row.LastActiveAt.After(initialLastActive) {
+				updated = true
+				break
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
-	if !row.LastActiveAt.After(initialLastActive) {
-		t.Fatalf("expected LastActiveAt to be updated past %v, got %v", initialLastActive, row.LastActiveAt)
+	if !updated {
+		t.Fatalf("expected LastActiveAt to be updated past %v within deadline, got %v", initialLastActive, row.LastActiveAt)
 	}
 }
 
