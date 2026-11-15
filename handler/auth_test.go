@@ -1446,3 +1446,13 @@ func TestAuthHandler_LoginSessionCreation_CookieAndBearer(t *testing.T) {
 	}
 }
 
+func TestNewAuthHandler_NilConfigDefaults(t *testing.T) {
+	h := NewAuthHandler(nil)
+	if h.cfg == nil {
+		t.Fatalf("expected default config when cfg is nil")
+	}
+	if h.cfg.SessionCookieName == "" {
+		t.Errorf("expected default SessionCookieName to be non-empty")
+	}
+}
+

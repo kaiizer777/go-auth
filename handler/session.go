@@ -8,6 +8,7 @@ import (
 
 	"gorm.io/gorm"
 
+	"github.com/google/uuid"
 	"github.com/kaiizer777/go-auth/config"
 	"github.com/kaiizer777/go-auth/db"
 	apperrors "github.com/kaiizer777/go-auth/errors"
@@ -23,6 +24,10 @@ type SessionHandler struct {
 
 // NewSessionHandler constructs a concrete SessionHandler.
 func NewSessionHandler(sessionSvc session.Service, gormDB *gorm.DB, cfg *config.Config) *SessionHandler {
+	if cfg == nil {
+		defaultCfg := config.DefaultConfig()
+		cfg = &defaultCfg
+	}
 	return &SessionHandler{
 		sessionSvc: sessionSvc,
 		db:         gormDB,
@@ -89,6 +94,10 @@ func (h *SessionHandler) Logout(w http.ResponseWriter, r *http.Request) {
 // ListSessions returns all active, non-expired sessions belonging to the authenticated user.
 func (h *SessionHandler) ListSessions(w http.ResponseWriter, r *http.Request) {
 	userID := userIDFromContext(r.Context())
+	if userID == uuid.Nil {
+		apperrors.WriteHTTP(w, apperrors.ErrSessionNotFound)
+		return
+	}
 	currentSess := sessionFromContext(r.Context())
 
 	if h.db == nil {
@@ -139,6 +148,10 @@ func (h *SessionHandler) ListSessions(w http.ResponseWriter, r *http.Request) {
 // InvalidateAllSessions revokes every session belonging to the user and clears the cookie.
 func (h *SessionHandler) InvalidateAllSessions(w http.ResponseWriter, r *http.Request) {
 	userID := userIDFromContext(r.Context())
+	if userID == uuid.Nil {
+		apperrors.WriteHTTP(w, apperrors.ErrSessionNotFound)
+		return
+	}
 	ip := realIP(r)
 
 	if h.sessionSvc != nil {

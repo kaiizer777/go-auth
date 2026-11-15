@@ -242,6 +242,21 @@ func TestSessionHandler_ListSessions(t *testing.T) {
 	}
 }
 
+func TestSessionHandler_ListSessions_MissingContext(t *testing.T) {
+	database := setupSessionTestDB(t)
+	cfg := testSessionConfig()
+	sessSvc := session.NewService(database, cfg)
+	h := NewSessionHandler(sessSvc, database, cfg)
+
+	req := httptest.NewRequest(http.MethodGet, "/auth/sessions", nil)
+	rec := httptest.NewRecorder()
+	h.ListSessions(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 Unauthorized on ListSessions without user context, got %d", rec.Code)
+	}
+}
+
 func TestSessionHandler_InvalidateAllSessions(t *testing.T) {
 	database := setupSessionTestDB(t)
 	cfg := testSessionConfig()
@@ -269,6 +284,34 @@ func TestSessionHandler_InvalidateAllSessions(t *testing.T) {
 	}
 	if _, err := sessSvc.GetSession(context.Background(), rawID2); err == nil {
 		t.Errorf("expected rawID2 to be invalidated")
+	}
+}
+
+func TestSessionHandler_InvalidateAllSessions_MissingContext(t *testing.T) {
+	database := setupSessionTestDB(t)
+	cfg := testSessionConfig()
+	sessSvc := session.NewService(database, cfg)
+	h := NewSessionHandler(sessSvc, database, cfg)
+
+	req := httptest.NewRequest(http.MethodDelete, "/auth/sessions", nil)
+	rec := httptest.NewRecorder()
+	h.InvalidateAllSessions(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 Unauthorized on InvalidateAllSessions without user context, got %d", rec.Code)
+	}
+}
+
+func TestSessionHandler_NewSessionHandler_NilConfigDefaults(t *testing.T) {
+	database := setupSessionTestDB(t)
+	sessSvc := session.NewService(database, nil)
+	h := NewSessionHandler(sessSvc, database, nil)
+
+	if h.cfg == nil {
+		t.Fatalf("expected default config to be set when cfg is nil")
+	}
+	if h.cfg.SessionIdleTimeout == 0 {
+		t.Errorf("expected positive SessionIdleTimeout from default config")
 	}
 }
 

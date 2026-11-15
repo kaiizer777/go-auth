@@ -56,6 +56,10 @@ func NewAuthHandler(svc auth.Service, opts ...AuthOption) *AuthHandler {
 	for _, opt := range opts {
 		opt(h)
 	}
+	if h.cfg == nil {
+		defaultCfg := config.DefaultConfig()
+		h.cfg = &defaultCfg
+	}
 	return h
 }
 
@@ -201,7 +205,7 @@ func (h *AuthHandler) Logout(w http.ResponseWriter, r *http.Request) {
 		sessionID = r.Header.Get("X-Session-ID")
 	}
 
-	if h.sessionSvc != nil && h.cfg != nil {
+	if h.sessionSvc != nil {
 		if rawID, err := session.ReadSessionCookie(r, h.cfg); err == nil {
 			_ = h.sessionSvc.InvalidateSession(r.Context(), rawID)
 		} else if rawID, err := session.ReadBearerToken(r); err == nil {
@@ -280,9 +284,7 @@ func (h *AuthHandler) ResetPassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if h.cfg != nil {
-		session.ClearSessionCookie(w, h.cfg)
-	}
+	session.ClearSessionCookie(w, h.cfg)
 
 	writeJSON(w, http.StatusOK, db.MessageResponse{
 		Message: "password reset successful",
