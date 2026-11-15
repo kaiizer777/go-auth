@@ -33,6 +33,13 @@ type service struct {
 
 // NewService constructs a concrete session Service.
 func NewService(gormDB *gorm.DB, cfg *config.Config) Service {
+	if gormDB == nil {
+		panic("session: nil gorm.DB")
+	}
+	if cfg == nil {
+		defaultCfg := config.DefaultConfig()
+		cfg = &defaultCfg
+	}
 	return &service{db: gormDB, cfg: cfg}
 }
 

@@ -109,6 +109,34 @@ func TestHashID_Deterministic(t *testing.T) {
 	}
 }
 
+func TestNewService_NilGuards(t *testing.T) {
+	database := setupTestDB(t)
+	cfg := testConfig()
+
+	t.Run("nil DB panics", func(t *testing.T) {
+		defer func() {
+			if r := recover(); r == nil {
+				t.Errorf("expected panic on NewService with nil DB, got none")
+			}
+		}()
+		_ = NewService(nil, cfg)
+	})
+
+	t.Run("nil cfg defaults", func(t *testing.T) {
+		svc := NewService(database, nil)
+		if svc == nil {
+			t.Fatalf("expected non-nil service")
+		}
+		sess, rawID, err := svc.CreateSession(context.Background(), uuid.New(), db.SessionTypeCookie, "127.0.0.1", "agent")
+		if err != nil {
+			t.Fatalf("CreateSession with defaulted config failed: %v", err)
+		}
+		if sess == nil || rawID == "" {
+			t.Fatalf("unexpected empty session or rawID")
+		}
+	})
+}
+
 func TestCreateSession_StoresHash(t *testing.T) {
 	database := setupTestDB(t)
 	cfg := testConfig()
