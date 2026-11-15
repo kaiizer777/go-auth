@@ -868,7 +868,7 @@ func Test500InternalErrorMasking(t *testing.T) {
 
 // Additional Routing & Alias Tests
 func TestRoutingAndAliases(t *testing.T) {
-	_, _, h, _ := setupTestEnv(t)
+	_, svc, h, _ := setupTestEnv(t)
 
 	// GET on POST-only route -> 405 Method Not Allowed
 	recMethodNotAllowed := executeRequest(t, h, http.MethodGet, "/auth/signup", nil)
@@ -906,19 +906,27 @@ func TestRoutingAndAliases(t *testing.T) {
 		t.Fatalf("expected status 400 for empty body, got %d", recEmptyBody.Code)
 	}
 
-	// Logout route -> 204 No Content
+	// Logout route under session protection rejects requests without CSRF / auth -> 403 Forbidden
 	recLogout := executeRequest(t, h, http.MethodPost, "/auth/logout", nil)
-	if recLogout.Code != http.StatusNoContent {
-		t.Fatalf("expected status 204, got %d", recLogout.Code)
-	}
-	if recLogout.Body.Len() != 0 {
-		t.Errorf("expected empty body for 204, got %q", recLogout.Body.String())
+	if recLogout.Code != http.StatusForbidden {
+		t.Fatalf("expected status 403 for unprotected logout, got %d", recLogout.Code)
 	}
 
-	// Alias route: POST /api/auth/logout -> 204 No Content
+	// Alias route: POST /api/auth/logout -> 403 Forbidden
 	recApiLogout := executeRequest(t, h, http.MethodPost, "/api/auth/logout", nil)
-	if recApiLogout.Code != http.StatusNoContent {
-		t.Fatalf("expected status 204 on alias, got %d", recApiLogout.Code)
+	if recApiLogout.Code != http.StatusForbidden {
+		t.Fatalf("expected status 403 on alias for unprotected logout, got %d", recApiLogout.Code)
+	}
+
+	// In legacy mode (nil session service), logout returns 204 No Content
+	legacyH := New(nil, testConfig(), svc)
+	recLegacyLogout := executeRequest(t, legacyH, http.MethodPost, "/auth/logout", nil)
+	if recLegacyLogout.Code != http.StatusNoContent {
+		t.Fatalf("expected status 204 on legacy logout, got %d", recLegacyLogout.Code)
+	}
+	recLegacyApiLogout := executeRequest(t, legacyH, http.MethodPost, "/api/auth/logout", nil)
+	if recLegacyApiLogout.Code != http.StatusNoContent {
+		t.Fatalf("expected status 204 on legacy alias logout, got %d", recLegacyApiLogout.Code)
 	}
 
 	// Alias routes: verify they accept identical requests
@@ -1818,4 +1826,70 @@ func TestAuthHandler_DualTierRateLimit_SignupMassRegistration(t *testing.T) {
 	if rec3.Code != http.StatusTooManyRequests {
 		t.Fatalf("signup 3: expected 429 Too Many Requests, got %d", rec3.Code)
 	}
+}
+
+func TestLogout_CSRFAndAuthProtection(t *testing.T) {
+	database := setupSessionTestDB(t)
+	cfg := config.DefaultConfig()
+	sessSvc := session.NewService(database, &cfg)
+
+	mockAuth := &mockAuthService{}
+	h := New(database, cfg, mockAuth, WithSessionService(sessSvc))
+
+	userID := uuid.New()
+	_, rawCookieID, err := sessSvc.CreateSession(context.Background(), userID, db.SessionTypeCookie, "127.0.0.1", "agent")
+	if err != nil {
+		t.Fatalf("failed to create cookie session: %v", err)
+	}
+	_, rawBearerID, err := sessSvc.CreateSession(context.Background(), userID, db.SessionTypeBearer, "127.0.0.1", "agent")
+	if err != nil {
+		t.Fatalf("failed to create bearer session: %v", err)
+	}
+
+	t.Run("cookie logout without CSRF token returns 403 Forbidden", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/auth/logout", nil)
+		req.AddCookie(&http.Cookie{Name: cfg.SessionCookieName, Value: rawCookieID})
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("expected 403 Forbidden on missing CSRF token, got %d", rec.Code)
+		}
+	})
+
+	t.Run("cookie logout with valid CSRF token returns 200 OK and revokes session", func(t *testing.T) {
+		csrfVal := "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+		req := httptest.NewRequest(http.MethodPost, "/auth/logout", nil)
+		req.AddCookie(&http.Cookie{Name: cfg.SessionCookieName, Value: rawCookieID})
+		req.AddCookie(&http.Cookie{Name: cfg.CSRFCookieName, Value: csrfVal})
+		req.Header.Set(cfg.CSRFHeaderName, csrfVal)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200 OK, got %d: %s", rec.Code, rec.Body.String())
+		}
+	})
+
+	t.Run("bearer logout bypasses CSRF and returns 200 OK", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/auth/logout", nil)
+		req.Header.Set("Authorization", "Bearer "+rawBearerID)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200 OK, got %d: %s", rec.Code, rec.Body.String())
+		}
+	})
+
+	t.Run("unauthenticated bearer logout returns 401 Unauthorized", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/auth/logout", nil)
+		req.Header.Set("Authorization", "Bearer 00000000000000000000000000000000")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("expected 401 Unauthorized, got %d", rec.Code)
+		}
+	})
 }
