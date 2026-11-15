@@ -856,3 +856,63 @@ func TestRotateSession_PreservesCreatedAt(t *testing.T) {
 		t.Fatalf("expected preserved DB CreatedAt %v, got %v", initialCreatedAt, dbRow.CreatedAt)
 	}
 }
+
+func TestRotateSession_ExpiryWindowGuard(t *testing.T) {
+	database := setupTestDB(t)
+	cfg := testConfig()
+	svc := NewService(database, cfg)
+
+	t.Run("fails when absolute timeout elapses right at rotation", func(t *testing.T) {
+		rawID, _ := generateRawID()
+		now := time.Now().UTC()
+		row := &db.Session{
+			ID:                uuid.New(),
+			UserID:            uuid.New(),
+			IDHash:            hashID(rawID),
+			SessionType:       db.SessionTypeCookie,
+			LastActiveAt:      now,
+			AbsoluteExpiresAt: now.Add(1 * time.Millisecond),
+			CreatedAt:         now.Add(-24 * time.Hour),
+		}
+		if err := database.Create(row).Error; err != nil {
+			t.Fatalf("failed to seed session: %v", err)
+		}
+
+		time.Sleep(5 * time.Millisecond)
+
+		sess, newRawID, err := svc.RotateSession(context.Background(), rawID, "1.1.1.1", "agent")
+		if sess != nil || newRawID != "" {
+			t.Fatalf("expected nil session and empty rawID, got sess=%+v, rawID=%q", sess, newRawID)
+		}
+		if !errors.Is(err, apperrors.ErrSessionExpired) {
+			t.Fatalf("expected ErrSessionExpired, got %v", err)
+		}
+	})
+
+	t.Run("fails when idle timeout elapses right at rotation", func(t *testing.T) {
+		rawID, _ := generateRawID()
+		now := time.Now().UTC()
+		row := &db.Session{
+			ID:                uuid.New(),
+			UserID:            uuid.New(),
+			IDHash:            hashID(rawID),
+			SessionType:       db.SessionTypeCookie,
+			LastActiveAt:      now.Add(-cfg.SessionIdleTimeout).Add(1 * time.Millisecond),
+			AbsoluteExpiresAt: now.Add(24 * time.Hour),
+			CreatedAt:         now.Add(-1 * time.Hour),
+		}
+		if err := database.Create(row).Error; err != nil {
+			t.Fatalf("failed to seed session: %v", err)
+		}
+
+		time.Sleep(5 * time.Millisecond)
+
+		sess, newRawID, err := svc.RotateSession(context.Background(), rawID, "1.1.1.1", "agent")
+		if sess != nil || newRawID != "" {
+			t.Fatalf("expected nil session and empty rawID, got sess=%+v, rawID=%q", sess, newRawID)
+		}
+		if !errors.Is(err, apperrors.ErrSessionExpired) {
+			t.Fatalf("expected ErrSessionExpired, got %v", err)
+		}
+	})
+}

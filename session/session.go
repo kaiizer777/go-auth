@@ -332,6 +332,15 @@ func (s *service) RotateSession(
 	}
 
 	now = time.Now().UTC()
+	if !oldRecord.AbsoluteExpiresAt.After(now) || !oldRecord.LastActiveAt.Add(s.cfg.SessionIdleTimeout).After(now) {
+		tx.Rollback()
+		slog.InfoContext(ctx, "session_expired",
+			"user_id", oldRecord.UserID.String(),
+			"reason", "rotate_expired",
+		)
+		return nil, "", apperrors.ErrSessionExpired
+	}
+
 	newRecord := &db.Session{
 		ID:                uuid.New(),
 		UserID:            oldRecord.UserID,
