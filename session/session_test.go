@@ -475,3 +475,43 @@ func TestRotateSession_Expired_AbsoluteTimeout(t *testing.T) {
 		t.Fatalf("expected expired session to be deleted, got err=%v", err)
 	}
 }
+
+func TestRotateSession_NotFound(t *testing.T) {
+	database := setupTestDB(t)
+	cfg := testConfig()
+	svc := NewService(database, cfg)
+
+	sess, newRawID, err := svc.RotateSession(context.Background(), "0123456789abcdef0123456789abcdef", "1.1.1.1", "agent")
+	if sess != nil || newRawID != "" {
+		t.Fatalf("expected nil session, got %+v", sess)
+	}
+	if !errors.Is(err, apperrors.ErrSessionNotFound) {
+		t.Fatalf("expected ErrSessionNotFound, got %v", err)
+	}
+}
+
+func TestRotateSession_ConcurrentOrDoubleRotate(t *testing.T) {
+	database := setupTestDB(t)
+	cfg := testConfig()
+	svc := NewService(database, cfg)
+
+	_, oldRawID, err := svc.CreateSession(context.Background(), uuid.New(), db.SessionTypeCookie, "1.1.1.1", "agent")
+	if err != nil {
+		t.Fatalf("CreateSession failed: %v", err)
+	}
+
+	// First rotation succeeds
+	sess1, newRawID1, err1 := svc.RotateSession(context.Background(), oldRawID, "2.2.2.2", "agent-2")
+	if err1 != nil || sess1 == nil || newRawID1 == "" {
+		t.Fatalf("first rotation failed: %v", err1)
+	}
+
+	// Double rotation with the already-deleted old token fails with ErrSessionNotFound
+	sess2, newRawID2, err2 := svc.RotateSession(context.Background(), oldRawID, "3.3.3.3", "agent-3")
+	if sess2 != nil || newRawID2 != "" {
+		t.Fatalf("second rotation should fail, got sess=%+v, newRawID=%q", sess2, newRawID2)
+	}
+	if !errors.Is(err2, apperrors.ErrSessionNotFound) {
+		t.Fatalf("expected ErrSessionNotFound for double-rotation, got %v", err2)
+	}
+}

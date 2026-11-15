@@ -202,9 +202,14 @@ func (s *service) RotateSession(
 		}
 	}()
 
-	if err := tx.Where("id_hash = ?", oldHash).Delete(&db.Session{}).Error; err != nil {
+	res := tx.Where("id_hash = ?", oldHash).Delete(&db.Session{})
+	if res.Error != nil {
 		tx.Rollback()
-		return nil, "", apperrors.New(apperrors.CodeInternalError, "failed to rotate session", err)
+		return nil, "", apperrors.New(apperrors.CodeInternalError, "failed to rotate session", res.Error)
+	}
+	if res.RowsAffected == 0 {
+		tx.Rollback()
+		return nil, "", apperrors.ErrSessionNotFound
 	}
 
 	rawID, err := generateRawID()
