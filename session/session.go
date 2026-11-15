@@ -24,6 +24,7 @@ type Service interface {
 	InvalidateSession(ctx context.Context, rawID string) error
 	InvalidateAllUserSessions(ctx context.Context, userID uuid.UUID) error
 	RotateSession(ctx context.Context, oldRawID string, ip, userAgent string) (*Session, string, error)
+	ListSessions(ctx context.Context, userID uuid.UUID) ([]*Session, error)
 }
 
 type service struct {
@@ -371,4 +372,30 @@ func (s *service) RotateSession(
 	}
 
 	return fromDB(newRecord), rawID, nil
+}
+
+func (s *service) ListSessions(ctx context.Context, userID uuid.UUID) ([]*Session, error) {
+	now := time.Now().UTC()
+	idleCutoff := now.Add(-s.cfg.SessionIdleTimeout)
+
+	// 1. Purge expired sessions for this user
+	_ = s.db.WithContext(ctx).
+		Where("user_id = ? AND (absolute_expires_at <= ? OR last_active_at <= ?)", userID, now, idleCutoff).
+		Delete(&db.Session{}).Error
+
+	// 2. Fetch active sessions with bounded limit
+	var records []db.Session
+	if err := s.db.WithContext(ctx).
+		Where("user_id = ?", userID).
+		Order("last_active_at DESC").
+		Limit(50).
+		Find(&records).Error; err != nil {
+		return nil, apperrors.New(apperrors.CodeInternalError, "failed to list sessions", err)
+	}
+
+	sessions := make([]*Session, len(records))
+	for i := range records {
+		sessions[i] = fromDB(&records[i])
+	}
+	return sessions, nil
 }

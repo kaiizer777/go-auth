@@ -43,6 +43,10 @@ func (m *mockSessionService) RotateSession(ctx context.Context, oldRawID string,
 	return nil, "", nil
 }
 
+func (m *mockSessionService) ListSessions(ctx context.Context, userID uuid.UUID) ([]*session.Session, error) {
+	return nil, nil
+}
+
 const validTestToken = "0123456789abcdef0123456789abcdef"
 
 func TestRequireAuth_CookieSession_Valid(t *testing.T) {
