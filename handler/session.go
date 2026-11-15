@@ -102,42 +102,32 @@ func (h *SessionHandler) ListSessions(w http.ResponseWriter, r *http.Request) {
 	}
 	currentSess := sessionFromContext(r.Context())
 
-	if h.db == nil {
-		apperrors.WriteHTTP(w, apperrors.New(apperrors.CodeInternalError, "database unavailable", nil))
+	if h.sessionSvc == nil {
+		apperrors.WriteHTTP(w, apperrors.New(apperrors.CodeInternalError, "session service unconfigured", nil))
 		return
 	}
 
-	var records []db.Session
-	if err := h.db.WithContext(r.Context()).
-		Where("user_id = ?", userID).
-		Order("last_active_at DESC").
-		Find(&records).Error; err != nil {
-		apperrors.WriteHTTP(w, apperrors.New(apperrors.CodeInternalError, "failed to list sessions", err))
+	sessions, err := h.sessionSvc.ListSessions(r.Context(), userID)
+	if err != nil {
+		apperrors.WriteHTTP(w, err)
 		return
 	}
 
-	now := time.Now().UTC()
 	type sessionListItem struct {
 		sessionWireResponse
 		IsCurrent bool `json:"is_current"`
 	}
 
-	results := make([]sessionListItem, 0, len(records))
-	for _, rec := range records {
-		if now.After(rec.AbsoluteExpiresAt) {
-			continue
-		}
-		if now.After(rec.LastActiveAt.Add(h.cfg.SessionIdleTimeout)) {
-			continue
-		}
-		isCurrent := currentSess != nil && rec.IDHash == currentSess.IDHash
+	results := make([]sessionListItem, 0, len(sessions))
+	for _, s := range sessions {
+		isCurrent := currentSess != nil && s.IDHash == currentSess.IDHash
 		results = append(results, sessionListItem{
 			sessionWireResponse: sessionWireResponse{
-				SessionID:    rec.IDHash,
-				CreatedAt:    rec.CreatedAt,
-				LastActiveAt: rec.LastActiveAt,
-				ExpiresAt:    rec.AbsoluteExpiresAt,
-				SessionType:  string(rec.SessionType),
+				SessionID:    s.IDHash,
+				CreatedAt:    s.CreatedAt,
+				LastActiveAt: s.LastActiveAt,
+				ExpiresAt:    s.AbsoluteExpiresAt,
+				SessionType:  string(s.Type),
 			},
 			IsCurrent: isCurrent,
 		})
