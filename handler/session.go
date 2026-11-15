@@ -176,8 +176,9 @@ func (h *SessionHandler) RotateSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if newSess.Type == db.SessionTypeBearer || r.Header.Get("X-Auth-Type") == "bearer" || r.URL.Query().Get("type") == "bearer" {
+	if newSess.Type == db.SessionTypeBearer {
 		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"token":      newRawID,
 			"expires_at": newSess.AbsoluteExpiresAt,
@@ -187,6 +188,7 @@ func (h *SessionHandler) RotateSession(w http.ResponseWriter, r *http.Request) {
 
 	session.SetSessionCookie(w, newRawID, h.cfg)
 	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(map[string]string{
 		"message": "Session rotated successfully",
 	})

@@ -323,3 +323,99 @@ func TestSessionHandler_RotateSession(t *testing.T) {
 		t.Fatalf("expected new session from cookie to be valid: %v", err)
 	}
 }
+
+func TestSessionHandler_RotateSession_CookieNoTokenLeakOnHeaderOrQuery(t *testing.T) {
+	database := setupSessionTestDB(t)
+	cfg := testSessionConfig()
+	sessSvc := session.NewService(database, cfg)
+	h := NewSessionHandler(sessSvc, database, cfg)
+
+	userID := uuid.New()
+	sess, rawID, err := sessSvc.CreateSession(context.Background(), userID, db.SessionTypeCookie, "127.0.0.1", "device-cookie")
+	if err != nil {
+		t.Fatalf("failed to create session: %v", err)
+	}
+
+	// Attacker tries to coerce raw token exposure via ?type=bearer and X-Auth-Type: bearer
+	req := httptest.NewRequest(http.MethodPost, "/auth/session/rotate?type=bearer", nil)
+	req.Header.Set("X-Auth-Type", "bearer")
+	ctx := context.WithValue(req.Context(), contextKeySession, sess)
+	ctx = context.WithValue(ctx, contextKeyRawID, rawID)
+	ctx = context.WithValue(ctx, contextKeyUserID, userID)
+	req = req.WithContext(ctx)
+
+	rec := httptest.NewRecorder()
+	h.RotateSession(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", rec.Code)
+	}
+
+	var respBody map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &respBody); err != nil {
+		t.Fatalf("failed to decode json body: %v", err)
+	}
+
+	// Must NOT contain "token"
+	if _, hasToken := respBody["token"]; hasToken {
+		t.Fatalf("security violation: raw session token was leaked in JSON response body for cookie session: %v", respBody)
+	}
+
+	if respBody["message"] != "Session rotated successfully" {
+		t.Errorf("expected 'Session rotated successfully', got %v", respBody["message"])
+	}
+
+	// Must set HttpOnly cookie
+	cookies := rec.Result().Cookies()
+	var newCookie *http.Cookie
+	for _, c := range cookies {
+		if c.Name == cfg.SessionCookieName {
+			newCookie = c
+			break
+		}
+	}
+	if newCookie == nil {
+		t.Fatalf("expected new session cookie to be set")
+	}
+}
+
+func TestSessionHandler_RotateSession_BearerReturnsToken(t *testing.T) {
+	database := setupSessionTestDB(t)
+	cfg := testSessionConfig()
+	sessSvc := session.NewService(database, cfg)
+	h := NewSessionHandler(sessSvc, database, cfg)
+
+	userID := uuid.New()
+	sess, rawID, err := sessSvc.CreateSession(context.Background(), userID, db.SessionTypeBearer, "127.0.0.1", "device-bearer")
+	if err != nil {
+		t.Fatalf("failed to create session: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/auth/session/rotate", nil)
+	ctx := context.WithValue(req.Context(), contextKeySession, sess)
+	ctx = context.WithValue(ctx, contextKeyRawID, rawID)
+	ctx = context.WithValue(ctx, contextKeyUserID, userID)
+	req = req.WithContext(ctx)
+
+	rec := httptest.NewRecorder()
+	h.RotateSession(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", rec.Code)
+	}
+
+	var respBody struct {
+		Token     string `json:"token"`
+		ExpiresAt string `json:"expires_at"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &respBody); err != nil {
+		t.Fatalf("failed to decode json body: %v", err)
+	}
+
+	if respBody.Token == "" {
+		t.Fatalf("expected bearer rotation to return new raw token in JSON body")
+	}
+	if respBody.Token == rawID {
+		t.Fatalf("expected new token to differ from old raw token")
+	}
+}
