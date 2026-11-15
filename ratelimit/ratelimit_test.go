@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -225,6 +226,43 @@ func TestLimiter_Prune_ConcurrentAllow(t *testing.T) {
 	}()
 
 	wg.Wait()
+}
+
+func TestLimiter_Allow_PruneHandoffRace(t *testing.T) {
+	const iterations = 50
+	for it := 0; it < iterations; it++ {
+		window := 50 * time.Millisecond
+		max := 3
+		limiter := NewLimiter(window, max)
+		key := fmt.Sprintf("race-key-%d", it)
+
+		var wg sync.WaitGroup
+		var allowedCount int64
+
+		for i := 0; i < 20; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				if limiter.Allow(key) {
+					atomic.AddInt64(&allowedCount, 1)
+				}
+			}()
+		}
+
+		for i := 0; i < 5; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				limiter.prune()
+			}()
+		}
+
+		wg.Wait()
+
+		if allowedCount > int64(max) {
+			t.Fatalf("iteration %d: allowed %d requests within window, exceeded max %d", it, allowedCount, max)
+		}
+	}
 }
 
 func TestClientIP(t *testing.T) {
