@@ -1095,7 +1095,7 @@ func TestAuthHandler_Logout_InvalidateSessionError(t *testing.T) {
 	)
 
 	req := httptest.NewRequest(http.MethodPost, "/auth/logout", nil)
-	req.AddCookie(&http.Cookie{Name: "sid", Value: "raw-session-id"})
+	req.AddCookie(&http.Cookie{Name: "sid", Value: "0123456789abcdef0123456789abcdef"})
 	rec := httptest.NewRecorder()
 
 	authH.Logout(rec, req)
@@ -1107,6 +1107,17 @@ func TestAuthHandler_Logout_InvalidateSessionError(t *testing.T) {
 		if c.Name == "sid" && c.MaxAge < 0 {
 			t.Fatal("expected session cookie NOT to be cleared on invalidation error")
 		}
+	}
+
+	// Also test bearer token invalidation failure
+	reqBearer := httptest.NewRequest(http.MethodPost, "/auth/logout", nil)
+	reqBearer.Header.Set("Authorization", "Bearer 0123456789abcdef0123456789abcdef")
+	recBearer := httptest.NewRecorder()
+
+	authH.Logout(recBearer, reqBearer)
+
+	if recBearer.Code != http.StatusInternalServerError {
+		t.Fatalf("expected status 500 on bearer InvalidateSession failure, got %d", recBearer.Code)
 	}
 }
 
