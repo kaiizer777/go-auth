@@ -28,7 +28,6 @@ ALTER TABLE sessions
 -- 5. Add new Phase 4 session columns
 ALTER TABLE sessions
     ADD COLUMN IF NOT EXISTS session_type       session_type NOT NULL DEFAULT 'cookie',
-    ADD COLUMN IF NOT EXISTS csrf_token         char(64)     NOT NULL DEFAULT '',
     ADD COLUMN IF NOT EXISTS ip_address         varchar(45)  NOT NULL DEFAULT '',
     ADD COLUMN IF NOT EXISTS user_agent         text         NOT NULL DEFAULT '',
     ADD COLUMN IF NOT EXISTS last_active_at     timestamptz  NOT NULL DEFAULT now(),

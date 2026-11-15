@@ -129,7 +129,6 @@ func setupTestDB(t *testing.T) *gorm.DB {
 		user_id TEXT NOT NULL,
 		id_hash CHAR(64) UNIQUE NOT NULL,
 		session_type VARCHAR(10) NOT NULL DEFAULT 'cookie',
-		csrf_token CHAR(64) NOT NULL DEFAULT '',
 		ip_address VARCHAR(45) NOT NULL DEFAULT '',
 		user_agent TEXT NOT NULL DEFAULT '',
 		last_active_at DATETIME NOT NULL,

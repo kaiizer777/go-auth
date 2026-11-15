@@ -143,16 +143,7 @@ func TestSessionModelTagsAndDeprecatedFields(t *testing.T) {
 		t.Errorf("Session SessionType tag = %q; want %q", tag, expectedSessionTypeTag)
 	}
 
-	field, ok = typ.FieldByName("CSRFToken")
-	if !ok {
-		t.Fatal("Session missing CSRFToken field")
-	}
-	expectedCSRFTag := "type:char(64);not null;default:''"
-	if tag := field.Tag.Get("gorm"); tag != expectedCSRFTag {
-		t.Errorf("Session CSRFToken tag = %q; want %q", tag, expectedCSRFTag)
-	}
-
-	deprecated := []string{"TokenHash", "ExpiresAt", "IdleExpiresAt", "UpdatedAt"}
+	deprecated := []string{"TokenHash", "ExpiresAt", "IdleExpiresAt", "UpdatedAt", "CSRFToken"}
 	for _, name := range deprecated {
 		if _, exists := typ.FieldByName(name); exists {
 			t.Errorf("Session must not have deprecated field %q", name)

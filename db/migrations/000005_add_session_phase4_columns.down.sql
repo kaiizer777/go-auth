@@ -17,7 +17,6 @@ ALTER TABLE sessions
 
 ALTER TABLE sessions
     DROP COLUMN IF EXISTS session_type,
-    DROP COLUMN IF EXISTS csrf_token,
     DROP COLUMN IF EXISTS ip_address,
     DROP COLUMN IF EXISTS user_agent,
     DROP COLUMN IF EXISTS last_active_at,
