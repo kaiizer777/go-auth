@@ -980,3 +980,100 @@ func TestRotateSession_ExpiryWindowGuard(t *testing.T) {
 		}
 	})
 }
+
+func TestService_ListSessions_PurgesExpired(t *testing.T) {
+	database := setupTestDB(t)
+	cfg := testConfig()
+	svc := NewService(database, cfg)
+	userID := uuid.New()
+	ctx := context.Background()
+
+	// 1 active session
+	sessActive, _, err := svc.CreateSession(ctx, userID, db.SessionTypeCookie, "127.0.0.1", "active")
+	if err != nil {
+		t.Fatalf("failed to create session: %v", err)
+	}
+
+	// 1 expired by absolute max age
+	rawIDExp1, _ := generateRawID()
+	expiredRow1 := &db.Session{
+		ID:                uuid.New(),
+		UserID:            userID,
+		IDHash:            hashID(rawIDExp1),
+		SessionType:       db.SessionTypeCookie,
+		LastActiveAt:      time.Now().UTC().Add(-2 * time.Hour),
+		AbsoluteExpiresAt: time.Now().UTC().Add(-1 * time.Hour),
+		CreatedAt:         time.Now().UTC().Add(-25 * time.Hour),
+	}
+	if err := database.Create(expiredRow1).Error; err != nil {
+		t.Fatalf("failed to seed expired row: %v", err)
+	}
+
+	// 1 expired by idle timeout
+	rawIDExp2, _ := generateRawID()
+	expiredRow2 := &db.Session{
+		ID:                uuid.New(),
+		UserID:            userID,
+		IDHash:            hashID(rawIDExp2),
+		SessionType:       db.SessionTypeBearer,
+		LastActiveAt:      time.Now().UTC().Add(-2 * cfg.SessionIdleTimeout),
+		AbsoluteExpiresAt: time.Now().UTC().Add(24 * time.Hour),
+		CreatedAt:         time.Now().UTC().Add(-1 * time.Hour),
+	}
+	if err := database.Create(expiredRow2).Error; err != nil {
+		t.Fatalf("failed to seed idle expired row: %v", err)
+	}
+
+	sessions, err := svc.ListSessions(ctx, userID)
+	if err != nil {
+		t.Fatalf("ListSessions failed: %v", err)
+	}
+
+	if len(sessions) != 1 {
+		t.Fatalf("expected 1 active session, got %d", len(sessions))
+	}
+	if sessions[0].ID != sessActive.ID {
+		t.Errorf("expected session %v, got %v", sessActive.ID, sessions[0].ID)
+	}
+
+	// Assert expired sessions were purged from DB
+	var remainingCount int64
+	database.Model(&db.Session{}).Where("user_id = ?", userID).Count(&remainingCount)
+	if remainingCount != 1 {
+		t.Fatalf("expected 1 row remaining in DB after purge, found %d", remainingCount)
+	}
+}
+
+func TestService_ListSessions_Limit50(t *testing.T) {
+	database := setupTestDB(t)
+	cfg := testConfig()
+	svc := NewService(database, cfg)
+	userID := uuid.New()
+	ctx := context.Background()
+
+	now := time.Now().UTC()
+	for i := 0; i < 60; i++ {
+		rawID, _ := generateRawID()
+		row := &db.Session{
+			ID:                uuid.New(),
+			UserID:            userID,
+			IDHash:            hashID(rawID),
+			SessionType:       db.SessionTypeCookie,
+			LastActiveAt:      now.Add(time.Duration(i) * time.Minute),
+			AbsoluteExpiresAt: now.Add(24 * time.Hour),
+			CreatedAt:         now,
+		}
+		if err := database.Create(row).Error; err != nil {
+			t.Fatalf("failed to seed session %d: %v", i, err)
+		}
+	}
+
+	sessions, err := svc.ListSessions(ctx, userID)
+	if err != nil {
+		t.Fatalf("ListSessions failed: %v", err)
+	}
+
+	if len(sessions) != 50 {
+		t.Fatalf("expected 50 sessions (capped by limit), got %d", len(sessions))
+	}
+}
