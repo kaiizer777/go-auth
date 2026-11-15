@@ -251,6 +251,16 @@ var (
 	ErrSessionSameSiteNoneInsecure     = New(CodeInvalidConfig, "SessionCookieSameSite=None requires SessionCookieSecure=true", nil)
 	ErrRateLimitWindowInvalid          = New(CodeInvalidConfig, "rate limit window and cleanup tick must be greater than zero", nil)
 	ErrRateLimitMaxInvalid             = New(CodeInvalidConfig, "rate limit max must be >= 1", nil)
+	ErrSessionCookieNameInvalid        = New(CodeInvalidConfig, "session cookie name is invalid", nil)
+	ErrSessionCookiePathInvalid        = New(CodeInvalidConfig, "session cookie path is invalid", nil)
+	ErrSessionCookieDomainInvalid      = New(CodeInvalidConfig, "session cookie domain is invalid", nil)
+	ErrCSRFCookieNameInvalid           = New(CodeInvalidConfig, "CSRF cookie name is invalid", nil)
+	ErrCSRFHeaderNameInvalid           = New(CodeInvalidConfig, "CSRF header name is invalid", nil)
+
+	// Aliases
+	ErrInvalidCookieName   = ErrSessionCookieNameInvalid
+	ErrInvalidCookiePath   = ErrSessionCookiePathInvalid
+	ErrInvalidCookieDomain = ErrSessionCookieDomainInvalid
 
 	// Predefined sentinel errors for Phase 4 Session, CSRF, and Rate Limiting.
 	ErrSessionNotFound   = New(CodeSessionNotFound, "Session is invalid or has expired", nil)
