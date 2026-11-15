@@ -141,10 +141,9 @@ func TestAuth_EmailDispatcher_Nil(t *testing.T) {
 }
 
 func TestNew_DatabaseConnectionError(t *testing.T) {
-	cfg := config.Config{
-		DatabaseURL: "postgres://invalid:invalid@127.0.0.1:54329/nonexistent?sslmode=disable&connect_timeout=1",
-		BaseURL:     "https://example.com",
-	}
+	cfg := config.DefaultConfig()
+	cfg.DatabaseURL = "postgres://invalid:invalid@127.0.0.1:54329/nonexistent?sslmode=disable&connect_timeout=1"
+	cfg.BaseURL = "https://example.com"
 
 	auth, err := New(cfg)
 	if err == nil {
@@ -241,18 +240,17 @@ func TestNew_SuccessAndWiring(t *testing.T) {
 	var verificationPayload email.VerificationEmailPayload
 	var resetPayload email.PasswordResetEmailPayload
 
-	cfg := config.Config{
-		DatabaseURL:               "postgres://user:pass@localhost:5432/testdb",
-		BaseURL:                   "https://auth.example.com",
-		DisableAsyncEmailDispatch: true,
-		SendVerificationEmail: func(ctx context.Context, payload email.VerificationEmailPayload) error {
-			verificationPayload = payload
-			return nil
-		},
-		SendPasswordResetEmail: func(ctx context.Context, payload email.PasswordResetEmailPayload) error {
-			resetPayload = payload
-			return nil
-		},
+	cfg := config.DefaultConfig()
+	cfg.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+	cfg.BaseURL = "https://auth.example.com"
+	cfg.DisableAsyncEmailDispatch = true
+	cfg.SendVerificationEmail = func(ctx context.Context, payload email.VerificationEmailPayload) error {
+		verificationPayload = payload
+		return nil
+	}
+	cfg.SendPasswordResetEmail = func(ctx context.Context, payload email.PasswordResetEmailPayload) error {
+		resetPayload = payload
+		return nil
 	}
 
 	a, err := New(cfg)
