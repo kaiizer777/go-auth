@@ -45,6 +45,7 @@ type Auth struct {
 	resetLimiter  *ratelimit.Limiter
 	signupLimiter *ratelimit.Limiter
 	limiterDone   chan struct{}
+	closeErr      error
 	closeOnce     sync.Once
 }
 
@@ -141,6 +142,7 @@ func New(cfg config.Config) (*Auth, error) {
 }
 
 // Close terminates the underlying database connection pool and background cleanups.
+// It is fully idempotent; subsequent calls return the result of the first close.
 func (a *Auth) Close() error {
 	a.closeOnce.Do(func() {
 		if a.limiterDone != nil {
@@ -155,19 +157,15 @@ func (a *Auth) Close() error {
 		if a.signupLimiter != nil {
 			a.signupLimiter.Close()
 		}
+		if a.db != nil {
+			if sqlDB, err := a.db.DB(); err != nil {
+				a.closeErr = errors.New(errors.CodeDatabaseError, "failed to get sql.DB", err)
+			} else if err := sqlDB.Close(); err != nil {
+				a.closeErr = errors.New(errors.CodeDatabaseError, "failed to close database", err)
+			}
+		}
 	})
-
-	if a.db == nil {
-		return nil
-	}
-	sqlDB, err := a.db.DB()
-	if err != nil {
-		return errors.New(errors.CodeDatabaseError, "failed to get sql.DB", err)
-	}
-	if err := sqlDB.Close(); err != nil {
-		return errors.New(errors.CodeDatabaseError, "failed to close database", err)
-	}
-	return nil
+	return a.closeErr
 }
 
 // RequireAuth returns middleware that validates session credentials from cookies or Bearer headers.

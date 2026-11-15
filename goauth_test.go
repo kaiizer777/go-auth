@@ -103,6 +103,53 @@ func TestAuth_Close_WithDB(t *testing.T) {
 	if err := auth.Close(); err != nil {
 		t.Fatalf("auth.Close() failed: %v", err)
 	}
+
+	// Repeated calls must be idempotent and safe
+	if err := auth.Close(); err != nil {
+		t.Fatalf("second auth.Close() failed: %v", err)
+	}
+}
+
+func TestAuth_Close_ConcurrentIdempotent(t *testing.T) {
+	registerMockOnce.Do(func() {
+		sql.Register("auth_mock_driver", &mockAuthDriver{})
+	})
+
+	sqlDB, err := sql.Open("auth_mock_driver", "mock")
+	if err != nil {
+		t.Fatalf("failed to open mock db: %v", err)
+	}
+
+	gormDB, err := gorm.Open(postgres.New(postgres.Config{Conn: sqlDB}), &gorm.Config{
+		DisableAutomaticPing: true,
+	})
+	if err != nil {
+		t.Fatalf("failed to open gorm db: %v", err)
+	}
+
+	auth := &Auth{
+		db:          gormDB,
+		limiterDone: make(chan struct{}),
+	}
+
+	const goroutines = 10
+	var wg sync.WaitGroup
+	errs := make([]error, goroutines)
+
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			errs[idx] = auth.Close()
+		}(i)
+	}
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("goroutine %d close error: %v", i, err)
+		}
+	}
 }
 
 func TestAuth_EmailDispatcher(t *testing.T) {
