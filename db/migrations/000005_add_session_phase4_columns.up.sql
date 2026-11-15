@@ -34,7 +34,8 @@ ALTER TABLE sessions
     ADD COLUMN IF NOT EXISTS last_active_at     timestamptz  NOT NULL DEFAULT now(),
     ADD COLUMN IF NOT EXISTS absolute_expires_at timestamptz  NOT NULL DEFAULT now();
 
--- 6. Ensure unique index on id_hash
+-- 6. Ensure exactly one unique index on id_hash: drop legacy constraint if present
+ALTER TABLE sessions DROP CONSTRAINT IF EXISTS sessions_token_hash_key;
 CREATE UNIQUE INDEX IF NOT EXISTS sessions_id_hash_idx ON sessions (id_hash);
 
 COMMIT;

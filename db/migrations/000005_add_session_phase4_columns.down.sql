@@ -28,4 +28,13 @@ DO $$ BEGIN
     END IF;
 END $$;
 
+-- Restore unique constraint on token_hash if not present
+DO $$ BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'sessions_token_hash_key'
+    ) THEN
+        ALTER TABLE sessions ADD CONSTRAINT sessions_token_hash_key UNIQUE (token_hash);
+    END IF;
+END $$;
+
 COMMIT;
