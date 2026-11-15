@@ -85,9 +85,13 @@ func NewWithDB(database *gorm.DB, cfg config.Config) (*Auth, error) {
 	signupLimiter := ratelimit.NewLimiter(cfg.RateLimitSignupWindow, cfg.RateLimitSignupMax)
 
 	limiterDone := make(chan struct{})
-	loginLimiter.StartCleanup(cfg.RateLimitCleanupTick, limiterDone)
-	resetLimiter.StartCleanup(cfg.RateLimitCleanupTick, limiterDone)
-	signupLimiter.StartCleanup(cfg.RateLimitCleanupTick, limiterDone)
+	cleanupTick := cfg.RateLimitCleanupTick
+	if cleanupTick <= 0 {
+		cleanupTick = config.DefaultConfig().RateLimitCleanupTick
+	}
+	loginLimiter.StartCleanup(cleanupTick, limiterDone)
+	resetLimiter.StartCleanup(cleanupTick, limiterDone)
+	signupLimiter.StartCleanup(cleanupTick, limiterDone)
 
 	sessHandler := handler.NewSessionHandler(sessionSvc, database, &cfg)
 
