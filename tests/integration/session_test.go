@@ -464,18 +464,28 @@ func TestAbsoluteTimeoutEnforced_Integration(t *testing.T) {
 	app.Handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/auth/login", bytes.NewReader(loginBody)))
 	c := readCookieFromResponse(rec.Result(), cfg.SessionCookieName)
 
-	// Keep session active before idle timeout expires
+	// Keep session active before idle timeout expires (first keep-alive at 50ms)
 	time.Sleep(50 * time.Millisecond)
 	keepAliveReq := httptest.NewRequest(http.MethodGet, "/auth/session", nil)
 	keepAliveReq.AddCookie(c)
 	keepAliveRec := httptest.NewRecorder()
 	app.Handler.ServeHTTP(keepAliveRec, keepAliveReq)
 	if keepAliveRec.Code != http.StatusOK {
-		t.Fatalf("expected 200 OK on keep-alive request, got %d", keepAliveRec.Code)
+		t.Fatalf("expected 200 OK on first keep-alive request, got %d", keepAliveRec.Code)
 	}
 
-	// Wait until absolute timeout elapses (total elapsed > 150ms)
-	time.Sleep(120 * time.Millisecond)
+	// Second keep-alive at 100ms to ensure idle timeout (80ms) never elapses before absolute timeout (150ms)
+	time.Sleep(50 * time.Millisecond)
+	keepAliveReq2 := httptest.NewRequest(http.MethodGet, "/auth/session", nil)
+	keepAliveReq2.AddCookie(c)
+	keepAliveRec2 := httptest.NewRecorder()
+	app.Handler.ServeHTTP(keepAliveRec2, keepAliveReq2)
+	if keepAliveRec2.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK on second keep-alive request, got %d", keepAliveRec2.Code)
+	}
+
+	// Wait until absolute timeout elapses (total elapsed: ~160ms > 150ms, but only 60ms since last keep-alive < 80ms idle)
+	time.Sleep(60 * time.Millisecond)
 
 	getReq := httptest.NewRequest(http.MethodGet, "/auth/session", nil)
 	getReq.AddCookie(c)
