@@ -2,8 +2,11 @@ package ratelimit
 
 import (
 	"fmt"
+	"math"
+	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -11,8 +14,8 @@ import (
 )
 
 type windowEntry struct {
-	timestamps []time.Time
 	mu         sync.Mutex
+	timestamps []time.Time
 }
 
 // Limiter is a concurrency-safe sliding-window in-memory rate limiter.
@@ -38,6 +41,19 @@ func NewLimiter(duration time.Duration, max int) *Limiter {
 // Key builds the composite IP and account rate limit key.
 func Key(ip, account string) string {
 	return fmt.Sprintf("%s|%s", ip, account)
+}
+
+// ClientIP extracts the client IP address from r.RemoteAddr, stripping the port.
+// Falls back to r.RemoteAddr if net.SplitHostPort encounters an error (e.g. no port present).
+func ClientIP(r *http.Request) string {
+	if r == nil {
+		return ""
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return strings.TrimSpace(r.RemoteAddr)
+	}
+	return host
 }
 
 // Allow evaluates whether an action is permitted within the sliding window.
@@ -145,13 +161,18 @@ func (l *Limiter) prune() {
 
 		if allExpired {
 			l.mu.Lock()
-			delete(l.windows, key)
+			entry.mu.Lock()
+			if len(entry.timestamps) == 0 && l.windows[key] == entry {
+				delete(l.windows, key)
+			}
+			entry.mu.Unlock()
 			l.mu.Unlock()
 		}
 	}
 }
 
 // RetryAfter returns the duration until the rate limit will permit a new attempt.
+// If the key has not reached the attempt limit, 0 is returned.
 func (l *Limiter) RetryAfter(key string) time.Duration {
 	l.mu.Lock()
 	entry, ok := l.windows[key]
@@ -165,13 +186,24 @@ func (l *Limiter) RetryAfter(key string) time.Duration {
 
 	now := time.Now()
 	cutoff := now.Add(-l.duration)
+	validCount := 0
+	var oldestValid time.Time
 	for _, t := range entry.timestamps {
 		if t.After(cutoff) {
-			rem := t.Add(l.duration).Sub(now)
-			if rem > 0 {
-				return rem
+			if oldestValid.IsZero() {
+				oldestValid = t
 			}
+			validCount++
 		}
+	}
+
+	if validCount < l.max {
+		return 0
+	}
+
+	rem := oldestValid.Add(l.duration).Sub(now)
+	if rem > 0 {
+		return rem
 	}
 	return 0
 }
@@ -179,7 +211,7 @@ func (l *Limiter) RetryAfter(key string) time.Duration {
 // WriteRateLimitError writes a 429 response using errors.WriteHTTP and sets the Retry-After header.
 func WriteRateLimitError(w http.ResponseWriter, retryAfter time.Duration) {
 	if retryAfter > 0 {
-		seconds := int(retryAfter.Seconds())
+		seconds := int(math.Ceil(retryAfter.Seconds()))
 		if seconds < 1 {
 			seconds = 1
 		}
