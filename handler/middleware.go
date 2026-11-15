@@ -11,13 +11,18 @@ import (
 	"github.com/kaiizer777/go-auth/session"
 )
 
-type contextKey string
+type (
+	ctxUserIDKey    struct{}
+	ctxSessionIDKey struct{}
+	ctxSessionKey   struct{}
+	ctxRawIDKey     struct{}
+)
 
-const (
-	contextKeyUserID    contextKey = "user_id"
-	contextKeySessionID contextKey = "session_id"
-	contextKeySession   contextKey = "session"
-	contextKeyRawID     contextKey = "session_raw_id"
+var (
+	contextKeyUserID    = ctxUserIDKey{}
+	contextKeySessionID = ctxSessionIDKey{}
+	contextKeySession   = ctxSessionKey{}
+	contextKeyRawID     = ctxRawIDKey{}
 )
 
 // Internal helpers (consumed by handler/session.go)
