@@ -286,6 +286,10 @@ func WriteJSON(w http.ResponseWriter, err error) {
 
 	if As(err, &appErr) && appErr != nil {
 		status = appErr.code.HTTPStatus()
+		code := appErr.code
+		if code == CodeSessionNotFound || code == CodeSessionExpired {
+			code = CodeSessionInvalid
+		}
 		msg := appErr.message
 		if msg == "" {
 			switch appErr.code {
@@ -306,7 +310,7 @@ func WriteJSON(w http.ResponseWriter, err error) {
 			}
 		}
 		resp = Response{
-			Code:    appErr.code,
+			Code:    code,
 			Message: msg,
 		}
 	} else {

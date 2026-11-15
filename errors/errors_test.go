@@ -376,22 +376,23 @@ func TestWriteJSON_EmptyMessageNon500(t *testing.T) {
 		code           Code
 		expectedStatus int
 		expectedMsg    string
+		expectedCode   Code
 	}{
-		{CodeValidationError, http.StatusBadRequest, "bad request"},
-		{CodeInvalidEmail, http.StatusBadRequest, "bad request"},
-		{CodeInvalidCredentials, http.StatusUnauthorized, "unauthorized"},
-		{CodeEmailNotVerified, http.StatusForbidden, "forbidden"},
-		{CodeNotFound, http.StatusNotFound, "not found"},
-		{CodeUserNotFound, http.StatusNotFound, "not found"},
-		{CodeMethodNotAllowed, http.StatusMethodNotAllowed, "method not allowed"},
-		{CodeUserAlreadyExists, http.StatusConflict, "conflict"},
-		{CodeDatabaseUnavailable, http.StatusServiceUnavailable, "service unavailable"},
-		{CodeSessionNotFound, http.StatusUnauthorized, "Session is invalid or has expired"},
-		{CodeSessionExpired, http.StatusUnauthorized, "Session is invalid or has expired"},
-		{CodeSessionInvalid, http.StatusUnauthorized, "Session is invalid or has expired"},
-		{CodeCSRFTokenMissing, http.StatusForbidden, "CSRF token is missing"},
-		{CodeCSRFTokenInvalid, http.StatusForbidden, "CSRF token is invalid"},
-		{CodeRateLimitExceeded, http.StatusTooManyRequests, "Too many requests, try again later"},
+		{CodeValidationError, http.StatusBadRequest, "bad request", ""},
+		{CodeInvalidEmail, http.StatusBadRequest, "bad request", ""},
+		{CodeInvalidCredentials, http.StatusUnauthorized, "unauthorized", ""},
+		{CodeEmailNotVerified, http.StatusForbidden, "forbidden", ""},
+		{CodeNotFound, http.StatusNotFound, "not found", ""},
+		{CodeUserNotFound, http.StatusNotFound, "not found", ""},
+		{CodeMethodNotAllowed, http.StatusMethodNotAllowed, "method not allowed", ""},
+		{CodeUserAlreadyExists, http.StatusConflict, "conflict", ""},
+		{CodeDatabaseUnavailable, http.StatusServiceUnavailable, "service unavailable", ""},
+		{CodeSessionNotFound, http.StatusUnauthorized, "Session is invalid or has expired", CodeSessionInvalid},
+		{CodeSessionExpired, http.StatusUnauthorized, "Session is invalid or has expired", CodeSessionInvalid},
+		{CodeSessionInvalid, http.StatusUnauthorized, "Session is invalid or has expired", ""},
+		{CodeCSRFTokenMissing, http.StatusForbidden, "CSRF token is missing", ""},
+		{CodeCSRFTokenInvalid, http.StatusForbidden, "CSRF token is invalid", ""},
+		{CodeRateLimitExceeded, http.StatusTooManyRequests, "Too many requests, try again later", ""},
 	}
 
 	for _, tt := range tests {
@@ -412,8 +413,12 @@ func TestWriteJSON_EmptyMessageNon500(t *testing.T) {
 			if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
 				t.Fatalf("failed to decode response: %v", err)
 			}
-			if resp.Code != tt.code {
-				t.Errorf("got code %q, want %q", resp.Code, tt.code)
+			wantCode := tt.code
+			if tt.expectedCode != "" {
+				wantCode = tt.expectedCode
+			}
+			if resp.Code != wantCode {
+				t.Errorf("got code %q, want %q", resp.Code, wantCode)
 			}
 			if resp.Message != tt.expectedMsg {
 				t.Errorf("got message %q, want %q", resp.Message, tt.expectedMsg)
@@ -646,8 +651,8 @@ func TestErrorCode_WireJSON_SessionExpired(t *testing.T) {
 	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
 		t.Fatalf("failed to decode response: %v", err)
 	}
-	if resp.Code != CodeSessionExpired {
-		t.Errorf("resp.Code = %q; want %q", resp.Code, CodeSessionExpired)
+	if resp.Code != CodeSessionInvalid {
+		t.Errorf("resp.Code = %q; want %q", resp.Code, CodeSessionInvalid)
 	}
 	if resp.Message != "Session is invalid or has expired" {
 		t.Errorf("resp.Message = %q; want %q", resp.Message, "Session is invalid or has expired")
@@ -673,8 +678,11 @@ func TestErrorCode_WireJSON_SessionNotFound(t *testing.T) {
 		t.Fatalf("failed to decode not-found response: %v", err)
 	}
 
-	if respNotFound.Code != CodeSessionNotFound {
-		t.Errorf("respNotFound.Code = %q; want %q", respNotFound.Code, CodeSessionNotFound)
+	if respNotFound.Code != CodeSessionInvalid {
+		t.Errorf("respNotFound.Code = %q; want %q", respNotFound.Code, CodeSessionInvalid)
+	}
+	if respNotFound.Code != respExpired.Code {
+		t.Fatalf("anti-enumeration code failure: respNotFound.Code %q != respExpired.Code %q", respNotFound.Code, respExpired.Code)
 	}
 	// Anti-enumeration invariant: exact same message as SESSION_EXPIRED
 	if respNotFound.Message != respExpired.Message {

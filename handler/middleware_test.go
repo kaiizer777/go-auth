@@ -184,8 +184,8 @@ func TestRequireAuth_NoCookieNoBearer(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &errResp); err != nil {
 		t.Fatalf("failed to decode error body: %v", err)
 	}
-	if errResp.Code != apperrors.CodeSessionNotFound {
-		t.Fatalf("expected Code=%s, got %s", apperrors.CodeSessionNotFound, errResp.Code)
+	if errResp.Code != apperrors.CodeSessionInvalid {
+		t.Fatalf("expected Code=%s, got %s", apperrors.CodeSessionInvalid, errResp.Code)
 	}
 }
 
@@ -220,8 +220,8 @@ func TestRequireAuth_ExpiredSession(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &errResp); err != nil {
 		t.Fatalf("failed to decode error body: %v", err)
 	}
-	if errResp.Code != apperrors.CodeSessionExpired {
-		t.Fatalf("expected Code=%s, got %s", apperrors.CodeSessionExpired, errResp.Code)
+	if errResp.Code != apperrors.CodeSessionInvalid {
+		t.Fatalf("expected Code=%s, got %s", apperrors.CodeSessionInvalid, errResp.Code)
 	}
 }
 
