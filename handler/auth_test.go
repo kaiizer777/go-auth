@@ -24,6 +24,8 @@ import (
 	"github.com/kaiizer777/go-auth/db"
 	"github.com/kaiizer777/go-auth/email"
 	"github.com/kaiizer777/go-auth/errors"
+	"github.com/kaiizer777/go-auth/ratelimit"
+	"github.com/kaiizer777/go-auth/session"
 )
 
 type emailCapture struct {
@@ -120,6 +122,18 @@ func setupTestDB(t *testing.T) *gorm.DB {
 		token_hash BLOB PRIMARY KEY,
 		user_id TEXT NOT NULL,
 		expires_at DATETIME NOT NULL,
+		created_at DATETIME
+	);
+	CREATE TABLE IF NOT EXISTS sessions (
+		id TEXT PRIMARY KEY,
+		user_id TEXT NOT NULL,
+		id_hash CHAR(64) UNIQUE NOT NULL,
+		session_type VARCHAR(10) NOT NULL DEFAULT 'cookie',
+		csrf_token CHAR(64) NOT NULL DEFAULT '',
+		ip_address VARCHAR(45) NOT NULL DEFAULT '',
+		user_agent TEXT NOT NULL DEFAULT '',
+		last_active_at DATETIME NOT NULL,
+		absolute_expires_at DATETIME NOT NULL,
 		created_at DATETIME
 	);
 	`
@@ -1260,3 +1274,175 @@ func TestBruteForceAccountLockout_RegressionPlaceholder(t *testing.T) {
 	// TODO: implement account lockout regression tests once brute-force/lockout feature is implemented
 	t.Skip("account lockout not yet implemented in service")
 }
+
+func TestAuthHandler_LoginRateLimiting(t *testing.T) {
+	database, svc, _, _ := setupTestEnv(t)
+	cfg := testConfig()
+	loginLimiter := ratelimit.NewLimiter(15*time.Minute, 3)
+	sessSvc := session.NewService(database, &cfg)
+
+	authH := NewAuthHandler(svc,
+		WithSessionService(sessSvc),
+		WithConfig(&cfg),
+		WithLimiters(loginLimiter, nil, nil),
+	)
+
+	email := "ratelimit_login@example.com"
+	reqBody := db.LoginRequest{
+		Email:    email,
+		Password: "wrongpassword",
+	}
+
+	for i := 0; i < 3; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/auth/login", nil)
+		req.RemoteAddr = "192.168.1.10:12345"
+		rec := httptest.NewRecorder()
+		// Inject valid body bytes
+		b, _ := json.Marshal(reqBody)
+		req.Body = io.NopCloser(bytes.NewReader(b))
+		authH.Login(rec, req)
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("attempt %d: expected 401 Unauthorized, got %d", i+1, rec.Code)
+		}
+	}
+
+	// 4th attempt should be blocked with 429
+	req := httptest.NewRequest(http.MethodPost, "/auth/login", nil)
+	req.RemoteAddr = "192.168.1.10:12345"
+	rec := httptest.NewRecorder()
+	b, _ := json.Marshal(reqBody)
+	req.Body = io.NopCloser(bytes.NewReader(b))
+	authH.Login(rec, req)
+
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected 429 Too Many Requests, got %d", rec.Code)
+	}
+	if retryAfter := rec.Header().Get("Retry-After"); retryAfter == "" {
+		t.Errorf("expected Retry-After header on 429 response")
+	}
+}
+
+func TestAuthHandler_RateLimitResetOnSuccess(t *testing.T) {
+	database, svc, _, _ := setupTestEnv(t)
+	cfg := testConfig()
+	loginLimiter := ratelimit.NewLimiter(15*time.Minute, 2)
+	sessSvc := session.NewService(database, &cfg)
+
+	authH := NewAuthHandler(svc,
+		WithSessionService(sessSvc),
+		WithConfig(&cfg),
+		WithLimiters(loginLimiter, nil, nil),
+	)
+
+	email := "rl_reset@example.com"
+	pass := "ValidPassword123!"
+
+	// Signup user
+	_, _, err := svc.Signup(context.Background(), db.SignupRequest{
+		Email:    email,
+		Password: pass,
+	})
+	if err != nil {
+		t.Fatalf("Signup failed: %v", err)
+	}
+
+	// 1 bad attempt
+	badReq := httptest.NewRequest(http.MethodPost, "/auth/login", nil)
+	badReq.RemoteAddr = "192.168.2.1:12345"
+	recBad := httptest.NewRecorder()
+	b, _ := json.Marshal(db.LoginRequest{Email: email, Password: "wrong"})
+	badReq.Body = io.NopCloser(bytes.NewReader(b))
+	authH.Login(recBad, badReq)
+
+	// Successful login should reset rate limiter
+	goodReq := httptest.NewRequest(http.MethodPost, "/auth/login", nil)
+	goodReq.RemoteAddr = "192.168.2.1:12345"
+	recGood := httptest.NewRecorder()
+	b, _ = json.Marshal(db.LoginRequest{Email: email, Password: pass})
+	goodReq.Body = io.NopCloser(bytes.NewReader(b))
+	authH.Login(recGood, goodReq)
+
+	if recGood.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK on valid credentials, got %d", recGood.Code)
+	}
+
+	// Limiter should have reset for this IP|email; another attempt allowed
+	anotherReq := httptest.NewRequest(http.MethodPost, "/auth/login", nil)
+	anotherReq.RemoteAddr = "192.168.2.1:12345"
+	recAnother := httptest.NewRecorder()
+	b, _ = json.Marshal(db.LoginRequest{Email: email, Password: pass})
+	anotherReq.Body = io.NopCloser(bytes.NewReader(b))
+	authH.Login(recAnother, anotherReq)
+
+	if recAnother.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK after reset, got %d", recAnother.Code)
+	}
+}
+
+func TestAuthHandler_LoginSessionCreation_CookieAndBearer(t *testing.T) {
+	database, svc, _, _ := setupTestEnv(t)
+	cfg := testConfig()
+	sessSvc := session.NewService(database, &cfg)
+
+	authH := NewAuthHandler(svc,
+		WithSessionService(sessSvc),
+		WithConfig(&cfg),
+	)
+
+	email := "sess_create@example.com"
+	pass := "ValidPassword123!"
+	_, _, err := svc.Signup(context.Background(), db.SignupRequest{
+		Email:    email,
+		Password: pass,
+	})
+	if err != nil {
+		t.Fatalf("Signup failed: %v", err)
+	}
+
+	// 1. Cookie login
+	cookieReq := httptest.NewRequest(http.MethodPost, "/auth/login", nil)
+	b, _ := json.Marshal(db.LoginRequest{Email: email, Password: pass})
+	cookieReq.Body = io.NopCloser(bytes.NewReader(b))
+	recCookie := httptest.NewRecorder()
+	authH.Login(recCookie, cookieReq)
+
+	if recCookie.Code != http.StatusOK {
+		t.Fatalf("cookie login failed: %d", recCookie.Code)
+	}
+	cookies := recCookie.Result().Cookies()
+	var sidCookie *http.Cookie
+	for _, c := range cookies {
+		if c.Name == cfg.SessionCookieName {
+			sidCookie = c
+			break
+		}
+	}
+	if sidCookie == nil {
+		t.Fatalf("expected cookie %q to be set", cfg.SessionCookieName)
+	}
+	if !sidCookie.HttpOnly {
+		t.Errorf("expected session cookie to have HttpOnly=true")
+	}
+
+	// 2. Bearer login
+	bearerReq := httptest.NewRequest(http.MethodPost, "/auth/login", nil)
+	bearerReq.Header.Set("X-Auth-Type", "bearer")
+	b, _ = json.Marshal(db.LoginRequest{Email: email, Password: pass})
+	bearerReq.Body = io.NopCloser(bytes.NewReader(b))
+	recBearer := httptest.NewRecorder()
+	authH.Login(recBearer, bearerReq)
+
+	if recBearer.Code != http.StatusOK {
+		t.Fatalf("bearer login failed: %d", recBearer.Code)
+	}
+	var bearerResp struct {
+		Token string `json:"token"`
+	}
+	if err := json.Unmarshal(recBearer.Body.Bytes(), &bearerResp); err != nil {
+		t.Fatalf("failed to decode bearer response: %v", err)
+	}
+	if len(bearerResp.Token) != 32 {
+		t.Errorf("expected 32-char hex token, got %q", bearerResp.Token)
+	}
+}
+
