@@ -980,3 +980,110 @@ func TestConfig_CookieDefaults_AppliedInValidate(t *testing.T) {
 		t.Errorf("CSRFHeaderName = %q; want %q", cfg.CSRFHeaderName, "X-CSRF-Token")
 	}
 }
+
+func TestConfig_CookieAndHeaderRFCValidation(t *testing.T) {
+	baseCfg := func() Config {
+		c := DefaultConfig()
+		c.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+		c.BaseURL = "https://example.com"
+		return c
+	}
+
+	t.Run("invalid session cookie name", func(t *testing.T) {
+		invalidNames := []string{"bad sid", "sid;name", "sid=val", "sid,name", "sid/name", "sid@domain", "sid{1}"}
+		for _, name := range invalidNames {
+			cfg := baseCfg()
+			cfg.SessionCookieName = name
+			err := cfg.Validate()
+			if !errors.Is(err, errors.ErrSessionCookieNameInvalid) {
+				t.Errorf("Validate(%q) err = %v; want ErrSessionCookieNameInvalid", name, err)
+			}
+			if !errors.Is(err, errors.ErrInvalidCookieName) {
+				t.Errorf("Validate(%q) err = %v; want ErrInvalidCookieName alias", name, err)
+			}
+		}
+	})
+
+	t.Run("valid custom session cookie name", func(t *testing.T) {
+		cfg := baseCfg()
+		cfg.SessionCookieName = "custom_session-id.v1"
+		if err := cfg.Validate(); err != nil {
+			t.Errorf("Validate() unexpected err = %v", err)
+		}
+	})
+
+	t.Run("invalid session cookie path", func(t *testing.T) {
+		invalidPaths := []string{"no-leading-slash", "/path;semicolon", "/path\x00null"}
+		for _, p := range invalidPaths {
+			cfg := baseCfg()
+			cfg.SessionCookiePath = p
+			err := cfg.Validate()
+			if !errors.Is(err, errors.ErrSessionCookiePathInvalid) {
+				t.Errorf("Validate(path=%q) err = %v; want ErrSessionCookiePathInvalid", p, err)
+			}
+			if !errors.Is(err, errors.ErrInvalidCookiePath) {
+				t.Errorf("Validate(path=%q) err = %v; want ErrInvalidCookiePath alias", p, err)
+			}
+		}
+	})
+
+	t.Run("valid custom session cookie path", func(t *testing.T) {
+		cfg := baseCfg()
+		cfg.SessionCookiePath = "/api/v1/auth"
+		if err := cfg.Validate(); err != nil {
+			t.Errorf("Validate() unexpected err = %v", err)
+		}
+	})
+
+	t.Run("invalid session cookie domain", func(t *testing.T) {
+		invalidDomains := []string{"example .com", "example;com", "example\x00.com"}
+		for _, d := range invalidDomains {
+			cfg := baseCfg()
+			cfg.SessionCookieDomain = d
+			err := cfg.Validate()
+			if !errors.Is(err, errors.ErrSessionCookieDomainInvalid) {
+				t.Errorf("Validate(domain=%q) err = %v; want ErrSessionCookieDomainInvalid", d, err)
+			}
+		}
+	})
+
+	t.Run("invalid CSRF cookie name", func(t *testing.T) {
+		invalidNames := []string{"csrf token", "csrf;tok", "csrf@tok", "csrf/token"}
+		for _, name := range invalidNames {
+			cfg := baseCfg()
+			cfg.CSRFCookieName = name
+			err := cfg.Validate()
+			if !errors.Is(err, errors.ErrCSRFCookieNameInvalid) {
+				t.Errorf("Validate(csrf_cookie=%q) err = %v; want ErrCSRFCookieNameInvalid", name, err)
+			}
+		}
+	})
+
+	t.Run("valid custom CSRF cookie name", func(t *testing.T) {
+		cfg := baseCfg()
+		cfg.CSRFCookieName = "my-csrf_token.v2"
+		if err := cfg.Validate(); err != nil {
+			t.Errorf("Validate() unexpected err = %v", err)
+		}
+	})
+
+	t.Run("invalid CSRF header name", func(t *testing.T) {
+		invalidHeaders := []string{"Bad Header", "Header:Name", "Header@Name", "Header/Name"}
+		for _, h := range invalidHeaders {
+			cfg := baseCfg()
+			cfg.CSRFHeaderName = h
+			err := cfg.Validate()
+			if !errors.Is(err, errors.ErrCSRFHeaderNameInvalid) {
+				t.Errorf("Validate(csrf_header=%q) err = %v; want ErrCSRFHeaderNameInvalid", h, err)
+			}
+		}
+	})
+
+	t.Run("valid custom CSRF header name", func(t *testing.T) {
+		cfg := baseCfg()
+		cfg.CSRFHeaderName = "X-App-CSRF-Token"
+		if err := cfg.Validate(); err != nil {
+			t.Errorf("Validate() unexpected err = %v", err)
+		}
+	})
+}
