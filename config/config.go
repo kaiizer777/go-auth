@@ -273,6 +273,22 @@ func (c *Config) Validate() error {
 		c.CSRFHeaderName = "X-CSRF-Token"
 	}
 
+	if !isToken(c.SessionCookieName) {
+		return errors.ErrSessionCookieNameInvalid
+	}
+	if !isCookiePath(c.SessionCookiePath) {
+		return errors.ErrSessionCookiePathInvalid
+	}
+	if !isCookieDomain(c.SessionCookieDomain) {
+		return errors.ErrSessionCookieDomainInvalid
+	}
+	if !isToken(c.CSRFCookieName) {
+		return errors.ErrCSRFCookieNameInvalid
+	}
+	if !isToken(c.CSRFHeaderName) {
+		return errors.ErrCSRFHeaderNameInvalid
+	}
+
 	if c.SessionIdleTimeout == 0 {
 		c.SessionIdleTimeout = 30 * time.Minute
 	}
@@ -322,4 +338,43 @@ func (c *Config) Validate() error {
 	}
 
 	return nil
+}
+
+func isToken(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		b := s[i]
+		if b < 33 || b > 126 || strings.IndexByte("()<>@,;:\"/[]?={}\\", b) >= 0 {
+			return false
+		}
+	}
+	return true
+}
+
+func isCookiePath(s string) bool {
+	if s == "" || s[0] != '/' {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		b := s[i]
+		if b < 32 || b >= 127 || b == ';' {
+			return false
+		}
+	}
+	return true
+}
+
+func isCookieDomain(s string) bool {
+	if s == "" {
+		return true
+	}
+	for i := 0; i < len(s); i++ {
+		b := s[i]
+		if b <= 32 || b >= 127 || b == ';' {
+			return false
+		}
+	}
+	return true
 }
