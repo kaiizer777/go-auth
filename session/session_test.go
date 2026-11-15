@@ -377,6 +377,46 @@ func TestGetSession_MonotonicLastActiveAtUpdate(t *testing.T) {
 	}
 }
 
+func TestRawIDValidation_MalformedInputs(t *testing.T) {
+	database := setupTestDB(t)
+	cfg := testConfig()
+	svc := NewService(database, cfg)
+
+	malformedIDs := []struct {
+		name  string
+		rawID string
+	}{
+		{"empty", ""},
+		{"too short (31 chars)", "0123456789abcdef0123456789abcde"},
+		{"too long (33 chars)", "0123456789abcdef0123456789abcdef0"},
+		{"non-hex character", "0123456789abcdef0123456789abcdeg"},
+	}
+
+	for _, tc := range malformedIDs {
+		t.Run(tc.name, func(t *testing.T) {
+			sess, err := svc.GetSession(context.Background(), tc.rawID)
+			if sess != nil {
+				t.Errorf("GetSession(%q): expected nil session, got %+v", tc.rawID, sess)
+			}
+			if !errors.Is(err, apperrors.ErrSessionInvalid) {
+				t.Errorf("GetSession(%q): expected ErrSessionInvalid, got %v", tc.rawID, err)
+			}
+
+			if err := svc.InvalidateSession(context.Background(), tc.rawID); !errors.Is(err, apperrors.ErrSessionInvalid) {
+				t.Errorf("InvalidateSession(%q): expected ErrSessionInvalid, got %v", tc.rawID, err)
+			}
+
+			rotSess, newRawID, err := svc.RotateSession(context.Background(), tc.rawID, "127.0.0.1", "agent")
+			if rotSess != nil || newRawID != "" {
+				t.Errorf("RotateSession(%q): expected nil session and empty rawID, got sess=%+v, newRawID=%q", tc.rawID, rotSess, newRawID)
+			}
+			if !errors.Is(err, apperrors.ErrSessionInvalid) {
+				t.Errorf("RotateSession(%q): expected ErrSessionInvalid, got %v", tc.rawID, err)
+			}
+		})
+	}
+}
+
 func TestGetSession_NotFound(t *testing.T) {
 	database := setupTestDB(t)
 	cfg := testConfig()

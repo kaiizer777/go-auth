@@ -46,6 +46,17 @@ func generateRawID() (string, error) {
 	return hex.EncodeToString(b), nil
 }
 
+// validateRawID validates that rawID is exactly a 32-character hexadecimal string.
+func validateRawID(rawID string) error {
+	if len(rawID) != 32 {
+		return apperrors.ErrSessionInvalid
+	}
+	if _, err := hex.DecodeString(rawID); err != nil {
+		return apperrors.ErrSessionInvalid
+	}
+	return nil
+}
+
 // hashID returns the SHA-256 hex digest of rawID.
 // Output is always exactly 64 hex characters.
 func hashID(rawID string) string {
@@ -91,6 +102,10 @@ func (s *service) CreateSession(
 }
 
 func (s *service) GetSession(ctx context.Context, rawID string) (*Session, error) {
+	if err := validateRawID(rawID); err != nil {
+		return nil, err
+	}
+
 	idHash := hashID(rawID)
 
 	var record db.Session
@@ -183,6 +198,10 @@ func (s *service) GetSession(ctx context.Context, rawID string) (*Session, error
 }
 
 func (s *service) InvalidateSession(ctx context.Context, rawID string) error {
+	if err := validateRawID(rawID); err != nil {
+		return err
+	}
+
 	idHash := hashID(rawID)
 	result := s.db.WithContext(ctx).
 		Where("id_hash = ?", idHash).
@@ -209,6 +228,10 @@ func (s *service) RotateSession(
 	oldRawID string,
 	ip, userAgent string,
 ) (*Session, string, error) {
+	if err := validateRawID(oldRawID); err != nil {
+		return nil, "", err
+	}
+
 	oldHash := hashID(oldRawID)
 	var oldRecord db.Session
 	if err := s.db.WithContext(ctx).
