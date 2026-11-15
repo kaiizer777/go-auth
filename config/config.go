@@ -1,6 +1,8 @@
 package config
 
 import (
+	"log/slog"
+	"net/http"
 	"net/url"
 	"strings"
 	"time"
@@ -78,6 +80,28 @@ type Config struct {
 
 	// EmailHooks holds optional callbacks for transactional email events.
 	EmailHooks email.Hooks
+
+	// Session settings
+	SessionIdleTimeout    time.Duration // max inactivity before session expires; default 30m
+	SessionAbsoluteMaxAge time.Duration // hard cap regardless of activity; default 24h
+	SessionCookieName     string        // cookie name; default "sid"
+	SessionCookieDomain   string        // cookie Domain attribute; default "" (omit -> current host)
+	SessionCookiePath     string        // cookie Path attribute; default "/"
+	SessionCookieSecure   bool          // must be true in prod; default true
+	SessionCookieSameSite http.SameSite // default http.SameSiteLaxMode
+
+	// CSRF
+	CSRFCookieName string // default "csrf_token"
+	CSRFHeaderName string // default "X-CSRF-Token"
+
+	// Rate limiting
+	RateLimitLoginWindow  time.Duration // sliding window duration; default 15m
+	RateLimitLoginMax     int           // max attempts in window; default 10
+	RateLimitResetWindow  time.Duration // for password reset requests; default 15m
+	RateLimitResetMax     int           // default 5
+	RateLimitSignupWindow time.Duration // for signup; default 15m
+	RateLimitSignupMax    int           // default 10
+	RateLimitCleanupTick  time.Duration // how often to prune expired entries; default 5m
 }
 
 // DefaultConfig returns safe default settings. AllowedOrigins is intentionally
@@ -104,6 +128,28 @@ func DefaultConfig() Config {
 		RequireEmailVerification: false,
 		VerificationTokenExpiry:  30 * time.Minute,
 		PasswordResetTokenExpiry: 30 * time.Minute,
+
+		// Session settings
+		SessionIdleTimeout:    30 * time.Minute,
+		SessionAbsoluteMaxAge: 24 * time.Hour,
+		SessionCookieName:     "sid",
+		SessionCookieDomain:   "",
+		SessionCookiePath:     "/",
+		SessionCookieSecure:   true,
+		SessionCookieSameSite: http.SameSiteLaxMode,
+
+		// CSRF
+		CSRFCookieName: "csrf_token",
+		CSRFHeaderName: "X-CSRF-Token",
+
+		// Rate limiting
+		RateLimitLoginWindow:  15 * time.Minute,
+		RateLimitLoginMax:     10,
+		RateLimitResetWindow:  15 * time.Minute,
+		RateLimitResetMax:     5,
+		RateLimitSignupWindow: 15 * time.Minute,
+		RateLimitSignupMax:    10,
+		RateLimitCleanupTick:  5 * time.Minute,
 	}
 }
 
@@ -213,5 +259,19 @@ func (c *Config) Validate() error {
 	} else if c.PasswordResetTokenExpiry < 15*time.Minute || c.PasswordResetTokenExpiry > 60*time.Minute {
 		return errors.ErrPasswordResetTokenExpiryInvalid
 	}
+
+	if c.SessionIdleTimeout == 0 {
+		panic("SessionIdleTimeout must be greater than zero")
+	}
+	if c.SessionAbsoluteMaxAge <= c.SessionIdleTimeout {
+		panic("SessionAbsoluteMaxAge must be greater than SessionIdleTimeout")
+	}
+	if !c.SessionCookieSecure {
+		slog.Warn("SessionCookieSecure is false — not safe for production")
+	}
+	if c.RateLimitLoginMax < 1 || c.RateLimitResetMax < 1 || c.RateLimitSignupMax < 1 {
+		panic("rate limit max must be >= 1")
+	}
+
 	return nil
 }
