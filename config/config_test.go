@@ -858,3 +858,69 @@ func TestConfig_RateLimitMax_Panics(t *testing.T) {
 		})
 	}
 }
+
+func TestConfig_SessionIdleTimeoutNegative_Panics(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+	cfg.BaseURL = "https://example.com"
+	cfg.SessionIdleTimeout = -5 * time.Minute
+
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("expected panic on negative SessionIdleTimeout, got nil")
+		}
+		msg, ok := r.(string)
+		if !ok || msg != "SessionIdleTimeout must be greater than zero" {
+			t.Fatalf("panic message = %v; want %q", r, "SessionIdleTimeout must be greater than zero")
+		}
+	}()
+
+	_ = cfg.Validate()
+}
+
+func TestConfig_RateLimitWindowNegative_Panics(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*Config)
+	}{
+		{
+			name:   "RateLimitLoginWindow negative",
+			mutate: func(c *Config) { c.RateLimitLoginWindow = -1 * time.Minute },
+		},
+		{
+			name:   "RateLimitResetWindow negative",
+			mutate: func(c *Config) { c.RateLimitResetWindow = -2 * time.Minute },
+		},
+		{
+			name:   "RateLimitSignupWindow negative",
+			mutate: func(c *Config) { c.RateLimitSignupWindow = -3 * time.Minute },
+		},
+		{
+			name:   "RateLimitCleanupTick negative",
+			mutate: func(c *Config) { c.RateLimitCleanupTick = -10 * time.Second },
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := DefaultConfig()
+			cfg.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+			cfg.BaseURL = "https://example.com"
+			tt.mutate(&cfg)
+
+			defer func() {
+				r := recover()
+				if r == nil {
+					t.Fatalf("expected panic on %s, got nil", tt.name)
+				}
+				msg, ok := r.(string)
+				if !ok || msg != "rate limit window and cleanup tick must be greater than zero" {
+					t.Fatalf("panic message = %v; want %q", r, "rate limit window and cleanup tick must be greater than zero")
+				}
+			}()
+
+			_ = cfg.Validate()
+		})
+	}
+}

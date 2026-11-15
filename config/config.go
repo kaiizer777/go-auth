@@ -260,7 +260,7 @@ func (c *Config) Validate() error {
 		return errors.ErrPasswordResetTokenExpiryInvalid
 	}
 
-	if c.SessionIdleTimeout == 0 {
+	if c.SessionIdleTimeout <= 0 {
 		panic("SessionIdleTimeout must be greater than zero")
 	}
 	if c.SessionAbsoluteMaxAge <= c.SessionIdleTimeout {
@@ -269,6 +269,23 @@ func (c *Config) Validate() error {
 	if !c.SessionCookieSecure {
 		slog.Warn("SessionCookieSecure is false — not safe for production")
 	}
+
+	if c.RateLimitLoginWindow < 0 || c.RateLimitResetWindow < 0 || c.RateLimitSignupWindow < 0 || c.RateLimitCleanupTick < 0 {
+		panic("rate limit window and cleanup tick must be greater than zero")
+	}
+	if c.RateLimitLoginWindow == 0 {
+		c.RateLimitLoginWindow = 15 * time.Minute
+	}
+	if c.RateLimitResetWindow == 0 {
+		c.RateLimitResetWindow = 15 * time.Minute
+	}
+	if c.RateLimitSignupWindow == 0 {
+		c.RateLimitSignupWindow = 15 * time.Minute
+	}
+	if c.RateLimitCleanupTick == 0 {
+		c.RateLimitCleanupTick = 5 * time.Minute
+	}
+
 	if c.RateLimitLoginMax < 1 || c.RateLimitResetMax < 1 || c.RateLimitSignupMax < 1 {
 		panic("rate limit max must be >= 1")
 	}
