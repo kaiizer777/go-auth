@@ -22,8 +22,6 @@ ALTER TABLE sessions
     DROP COLUMN IF EXISTS last_active_at,
     DROP COLUMN IF EXISTS absolute_expires_at;
 
-DROP TYPE IF EXISTS session_type;
-
 -- Rename id_hash back to token_hash if id_hash exists
 DO $$ BEGIN
     IF EXISTS (
