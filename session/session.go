@@ -181,6 +181,16 @@ func (s *service) RotateSession(
 		return nil, "", apperrors.New(apperrors.CodeInternalError, "failed to rotate session", err)
 	}
 
+	now := time.Now().UTC()
+	if now.After(oldRecord.LastActiveAt.Add(s.cfg.SessionIdleTimeout)) || now.After(oldRecord.AbsoluteExpiresAt) {
+		_ = s.db.WithContext(ctx).Where("id_hash = ?", oldHash).Delete(&db.Session{}).Error
+		slog.InfoContext(ctx, "session_expired",
+			"user_id", oldRecord.UserID.String(),
+			"reason", "rotate_expired",
+		)
+		return nil, "", apperrors.ErrSessionExpired
+	}
+
 	tx := s.db.WithContext(ctx).Begin()
 	if tx.Error != nil {
 		return nil, "", apperrors.New(apperrors.CodeInternalError, "failed to begin transaction", tx.Error)
@@ -210,7 +220,7 @@ func (s *service) RotateSession(
 		userAgent = oldRecord.UserAgent
 	}
 
-	now := time.Now().UTC()
+	now = time.Now().UTC()
 	newRecord := &db.Session{
 		ID:                uuid.New(),
 		UserID:            oldRecord.UserID,

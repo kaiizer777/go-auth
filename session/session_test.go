@@ -405,3 +405,73 @@ func TestRotateSession_Transaction(t *testing.T) {
 		t.Fatalf("expected IDHash %q, got %q", hashID(newRawID), validSess.IDHash)
 	}
 }
+
+func TestRotateSession_Expired_IdleTimeout(t *testing.T) {
+	database := setupTestDB(t)
+	cfg := testConfig()
+	svc := NewService(database, cfg)
+
+	rawID, _ := generateRawID()
+	now := time.Now().UTC()
+	row := &db.Session{
+		ID:                uuid.New(),
+		UserID:            uuid.New(),
+		IDHash:            hashID(rawID),
+		SessionType:       db.SessionTypeCookie,
+		LastActiveAt:      now.Add(-cfg.SessionIdleTimeout - 2*time.Second),
+		AbsoluteExpiresAt: now.Add(cfg.SessionAbsoluteMaxAge),
+		CreatedAt:         now.Add(-cfg.SessionIdleTimeout - 2*time.Second),
+	}
+	if err := database.Create(row).Error; err != nil {
+		t.Fatalf("failed to seed session: %v", err)
+	}
+
+	sess, newRawID, err := svc.RotateSession(context.Background(), rawID, "1.1.1.1", "agent")
+	if sess != nil || newRawID != "" {
+		t.Fatalf("expected nil session and empty rawID, got sess=%+v, rawID=%q", sess, newRawID)
+	}
+	if !errors.Is(err, apperrors.ErrSessionExpired) {
+		t.Fatalf("expected ErrSessionExpired, got %v", err)
+	}
+
+	var check db.Session
+	err = database.Where("id_hash = ?", row.IDHash).First(&check).Error
+	if !errors.Is(err, gorm.ErrRecordNotFound) {
+		t.Fatalf("expected expired session to be deleted, got err=%v", err)
+	}
+}
+
+func TestRotateSession_Expired_AbsoluteTimeout(t *testing.T) {
+	database := setupTestDB(t)
+	cfg := testConfig()
+	svc := NewService(database, cfg)
+
+	rawID, _ := generateRawID()
+	now := time.Now().UTC()
+	row := &db.Session{
+		ID:                uuid.New(),
+		UserID:            uuid.New(),
+		IDHash:            hashID(rawID),
+		SessionType:       db.SessionTypeCookie,
+		LastActiveAt:      now,
+		AbsoluteExpiresAt: now.Add(-2 * time.Second),
+		CreatedAt:         now.Add(-25 * time.Hour),
+	}
+	if err := database.Create(row).Error; err != nil {
+		t.Fatalf("failed to seed session: %v", err)
+	}
+
+	sess, newRawID, err := svc.RotateSession(context.Background(), rawID, "1.1.1.1", "agent")
+	if sess != nil || newRawID != "" {
+		t.Fatalf("expected nil session and empty rawID, got sess=%+v, rawID=%q", sess, newRawID)
+	}
+	if !errors.Is(err, apperrors.ErrSessionExpired) {
+		t.Fatalf("expected ErrSessionExpired, got %v", err)
+	}
+
+	var check db.Session
+	err = database.Where("id_hash = ?", row.IDHash).First(&check).Error
+	if !errors.Is(err, gorm.ErrRecordNotFound) {
+		t.Fatalf("expected expired session to be deleted, got err=%v", err)
+	}
+}
