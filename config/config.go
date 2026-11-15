@@ -97,10 +97,13 @@ type Config struct {
 	// Rate limiting
 	RateLimitLoginWindow  time.Duration // sliding window duration; default 15m
 	RateLimitLoginMax     int           // max attempts in window; default 10
+	RateLimitLoginIPMax   int           // max login attempts per IP in window; default 100
 	RateLimitResetWindow  time.Duration // for password reset requests; default 15m
 	RateLimitResetMax     int           // default 5
+	RateLimitResetIPMax   int           // max reset requests per IP in window; default 20
 	RateLimitSignupWindow time.Duration // for signup; default 15m
 	RateLimitSignupMax    int           // default 10
+	RateLimitSignupIPMax  int           // max signups per IP in window; default 50
 	RateLimitCleanupTick  time.Duration // how often to prune expired entries; default 5m
 }
 
@@ -145,10 +148,13 @@ func DefaultConfig() Config {
 		// Rate limiting
 		RateLimitLoginWindow:  15 * time.Minute,
 		RateLimitLoginMax:     10,
+		RateLimitLoginIPMax:   100,
 		RateLimitResetWindow:  15 * time.Minute,
 		RateLimitResetMax:     5,
+		RateLimitResetIPMax:   20,
 		RateLimitSignupWindow: 15 * time.Minute,
 		RateLimitSignupMax:    10,
+		RateLimitSignupIPMax:  50,
 		RateLimitCleanupTick:  5 * time.Minute,
 	}
 }
@@ -333,7 +339,17 @@ func (c *Config) Validate() error {
 	if c.RateLimitSignupMax == 0 {
 		c.RateLimitSignupMax = 10
 	}
-	if c.RateLimitLoginMax < 1 || c.RateLimitResetMax < 1 || c.RateLimitSignupMax < 1 {
+	if c.RateLimitLoginIPMax == 0 {
+		c.RateLimitLoginIPMax = c.RateLimitLoginMax * 10
+	}
+	if c.RateLimitResetIPMax == 0 {
+		c.RateLimitResetIPMax = c.RateLimitResetMax * 4
+	}
+	if c.RateLimitSignupIPMax == 0 {
+		c.RateLimitSignupIPMax = c.RateLimitSignupMax * 5
+	}
+	if c.RateLimitLoginMax < 1 || c.RateLimitResetMax < 1 || c.RateLimitSignupMax < 1 ||
+		c.RateLimitLoginIPMax < 1 || c.RateLimitResetIPMax < 1 || c.RateLimitSignupIPMax < 1 {
 		return errors.ErrRateLimitMaxInvalid
 	}
 
