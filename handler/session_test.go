@@ -30,6 +30,15 @@ func setupSessionTestDB(t *testing.T) *gorm.DB {
 	}
 
 	ddl := `
+	CREATE TABLE IF NOT EXISTS users (
+		id TEXT PRIMARY KEY,
+		email TEXT UNIQUE NOT NULL,
+		password_hash TEXT NOT NULL,
+		credential_version INTEGER NOT NULL DEFAULT 0,
+		email_verified INTEGER NOT NULL DEFAULT 0,
+		created_at DATETIME,
+		updated_at DATETIME
+	);
 	CREATE TABLE IF NOT EXISTS sessions (
 		id TEXT PRIMARY KEY,
 		user_id TEXT NOT NULL,
@@ -64,7 +73,7 @@ func TestSessionHandler_GetCurrentSession(t *testing.T) {
 	h := NewSessionHandler(sessSvc, database, cfg)
 
 	userID := uuid.New()
-	sess, rawID, err := sessSvc.CreateSession(context.Background(), userID, db.SessionTypeCookie, "127.0.0.1", "test-ua")
+	sess, rawID, err := sessSvc.CreateSession(context.Background(), userID, 0, db.SessionTypeCookie, "127.0.0.1", "test-ua")
 	if err != nil {
 		t.Fatalf("failed to create session: %v", err)
 	}
@@ -125,7 +134,7 @@ func TestSessionHandler_Logout(t *testing.T) {
 	h := NewSessionHandler(sessSvc, database, cfg)
 
 	userID := uuid.New()
-	sess, rawID, err := sessSvc.CreateSession(context.Background(), userID, db.SessionTypeCookie, "127.0.0.1", "test-ua")
+	sess, rawID, err := sessSvc.CreateSession(context.Background(), userID, 0, db.SessionTypeCookie, "127.0.0.1", "test-ua")
 	if err != nil {
 		t.Fatalf("failed to create session: %v", err)
 	}
@@ -173,11 +182,11 @@ func TestSessionHandler_ListSessions(t *testing.T) {
 	h := NewSessionHandler(sessSvc, database, cfg)
 
 	userID := uuid.New()
-	sess1, rawID1, err := sessSvc.CreateSession(context.Background(), userID, db.SessionTypeCookie, "127.0.0.1", "device-1")
+	sess1, rawID1, err := sessSvc.CreateSession(context.Background(), userID, 0, db.SessionTypeCookie, "127.0.0.1", "device-1")
 	if err != nil {
 		t.Fatalf("failed to create sess1: %v", err)
 	}
-	sess2, _, err := sessSvc.CreateSession(context.Background(), userID, db.SessionTypeBearer, "127.0.0.2", "device-2")
+	sess2, _, err := sessSvc.CreateSession(context.Background(), userID, 0, db.SessionTypeBearer, "127.0.0.2", "device-2")
 	if err != nil {
 		t.Fatalf("failed to create sess2: %v", err)
 	}
@@ -271,8 +280,8 @@ func TestSessionHandler_InvalidateAllSessions(t *testing.T) {
 	h := NewSessionHandler(sessSvc, database, cfg)
 
 	userID := uuid.New()
-	_, rawID1, _ := sessSvc.CreateSession(context.Background(), userID, db.SessionTypeCookie, "127.0.0.1", "device-1")
-	_, rawID2, _ := sessSvc.CreateSession(context.Background(), userID, db.SessionTypeBearer, "127.0.0.2", "device-2")
+	_, rawID1, _ := sessSvc.CreateSession(context.Background(), userID, 0, db.SessionTypeCookie, "127.0.0.1", "device-1")
+	_, rawID2, _ := sessSvc.CreateSession(context.Background(), userID, 0, db.SessionTypeBearer, "127.0.0.2", "device-2")
 
 	req := httptest.NewRequest(http.MethodDelete, "/auth/sessions", nil)
 	ctx := context.WithValue(req.Context(), contextKeyUserID, userID)
@@ -329,7 +338,7 @@ func TestSessionHandler_RotateSession(t *testing.T) {
 	h := NewSessionHandler(sessSvc, database, cfg)
 
 	userID := uuid.New()
-	sess, rawID, err := sessSvc.CreateSession(context.Background(), userID, db.SessionTypeCookie, "127.0.0.1", "device-1")
+	sess, rawID, err := sessSvc.CreateSession(context.Background(), userID, 0, db.SessionTypeCookie, "127.0.0.1", "device-1")
 	if err != nil {
 		t.Fatalf("failed to create session: %v", err)
 	}
@@ -381,7 +390,7 @@ func TestSessionHandler_RotateSession_CookieNoTokenLeakOnHeaderOrQuery(t *testin
 	h := NewSessionHandler(sessSvc, database, cfg)
 
 	userID := uuid.New()
-	sess, rawID, err := sessSvc.CreateSession(context.Background(), userID, db.SessionTypeCookie, "127.0.0.1", "device-cookie")
+	sess, rawID, err := sessSvc.CreateSession(context.Background(), userID, 0, db.SessionTypeCookie, "127.0.0.1", "device-cookie")
 	if err != nil {
 		t.Fatalf("failed to create session: %v", err)
 	}
@@ -436,7 +445,7 @@ func TestSessionHandler_RotateSession_BearerReturnsToken(t *testing.T) {
 	h := NewSessionHandler(sessSvc, database, cfg)
 
 	userID := uuid.New()
-	sess, rawID, err := sessSvc.CreateSession(context.Background(), userID, db.SessionTypeBearer, "127.0.0.1", "device-bearer")
+	sess, rawID, err := sessSvc.CreateSession(context.Background(), userID, 0, db.SessionTypeBearer, "127.0.0.1", "device-bearer")
 	if err != nil {
 		t.Fatalf("failed to create session: %v", err)
 	}
