@@ -288,6 +288,14 @@ func (h *AuthHandler) ResetPassword(w http.ResponseWriter, r *http.Request) {
 		errors.WriteJSON(w, err)
 		return
 	}
+
+	ip := realIP(r)
+	key := ratelimit.Key(ip, "reset-confirm")
+	if h.resetLimiter != nil && !h.resetLimiter.Allow(key) {
+		ratelimit.WriteRateLimitError(w, h.resetLimiter.RetryAfter(key))
+		return
+	}
+
 	if err := h.svc.ResetPassword(r.Context(), req); err != nil {
 		errors.WriteJSON(w, err)
 		return
