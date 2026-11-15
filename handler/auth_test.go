@@ -1322,6 +1322,39 @@ func TestAuthHandler_LoginRateLimiting(t *testing.T) {
 	}
 }
 
+func TestAuthHandler_RateLimitLogin_EmailCasingSharedBucket(t *testing.T) {
+	_, svc, _, _ := setupTestEnv(t)
+	cfg := testConfig()
+	loginLimiter := ratelimit.NewLimiter(15*time.Minute, 1)
+
+	authH := NewAuthHandler(svc,
+		WithAuthConfig(&cfg),
+		WithAuthLimiters(loginLimiter, nil, nil),
+	)
+
+	// Attempt 1 with lowercase email
+	req1 := httptest.NewRequest(http.MethodPost, "/auth/login", nil)
+	req1.RemoteAddr = "192.168.1.50:12345"
+	b1, _ := json.Marshal(db.LoginRequest{Email: "victim@example.com", Password: "wrongpassword"})
+	req1.Body = io.NopCloser(bytes.NewReader(b1))
+	rec1 := httptest.NewRecorder()
+	authH.Login(rec1, req1)
+	if rec1.Code != http.StatusUnauthorized {
+		t.Fatalf("attempt 1: expected 401, got %d", rec1.Code)
+	}
+
+	// Attempt 2 with uppercase/mixed case email from same IP should be blocked by rate limit (429)
+	req2 := httptest.NewRequest(http.MethodPost, "/auth/login", nil)
+	req2.RemoteAddr = "192.168.1.50:12345"
+	b2, _ := json.Marshal(db.LoginRequest{Email: "VICTIM@EXAMPLE.COM", Password: "wrongpassword"})
+	req2.Body = io.NopCloser(bytes.NewReader(b2))
+	rec2 := httptest.NewRecorder()
+	authH.Login(rec2, req2)
+	if rec2.Code != http.StatusTooManyRequests {
+		t.Fatalf("attempt 2 with case-variant email: expected 429 Too Many Requests, got %d", rec2.Code)
+	}
+}
+
 func TestAuthHandler_RateLimitResetOnSuccess(t *testing.T) {
 	database, svc, _, _ := setupTestEnv(t)
 	cfg := testConfig()
