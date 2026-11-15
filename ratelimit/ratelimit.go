@@ -65,9 +65,9 @@ func (l *Limiter) Allow(key string) bool {
 		entry = &windowEntry{}
 		l.windows[key] = entry
 	}
+	entry.mu.Lock()
 	l.mu.Unlock()
 
-	entry.mu.Lock()
 	defer entry.mu.Unlock()
 
 	now := time.Now()
@@ -179,12 +179,13 @@ func (l *Limiter) prune() {
 func (l *Limiter) RetryAfter(key string) time.Duration {
 	l.mu.Lock()
 	entry, ok := l.windows[key]
-	l.mu.Unlock()
 	if !ok {
+		l.mu.Unlock()
 		return 0
 	}
-
 	entry.mu.Lock()
+	l.mu.Unlock()
+
 	defer entry.mu.Unlock()
 
 	now := time.Now()
