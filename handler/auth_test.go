@@ -1470,7 +1470,7 @@ func TestAuthHandler_LoginSessionCreation_CookieAndBearer(t *testing.T) {
 
 	email := "sess_create@example.com"
 	pass := "ValidPassword123!"
-	_, _, err := svc.Signup(context.Background(), db.SignupRequest{
+	createdUser, _, err := svc.Signup(context.Background(), db.SignupRequest{
 		Email:    email,
 		Password: pass,
 	})
@@ -1515,10 +1515,14 @@ func TestAuthHandler_LoginSessionCreation_CookieAndBearer(t *testing.T) {
 		t.Fatalf("bearer login failed: %d", recBearer.Code)
 	}
 	var bearerResp struct {
-		Token string `json:"token"`
+		UserID uuid.UUID `json:"user_id"`
+		Token  string    `json:"token"`
 	}
 	if err := json.Unmarshal(recBearer.Body.Bytes(), &bearerResp); err != nil {
 		t.Fatalf("failed to decode bearer response: %v", err)
+	}
+	if bearerResp.UserID != createdUser.ID {
+		t.Errorf("expected bearer user_id %v, got %v", createdUser.ID, bearerResp.UserID)
 	}
 	if len(bearerResp.Token) != 32 {
 		t.Errorf("expected 32-char hex token, got %q", bearerResp.Token)

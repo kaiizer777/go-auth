@@ -203,6 +203,7 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 
 		if sessType == db.SessionTypeBearer {
 			writeJSON(w, http.StatusOK, map[string]any{
+				"user_id":    user.ID,
 				"token":      rawID,
 				"expires_at": sess.AbsoluteExpiresAt,
 			})

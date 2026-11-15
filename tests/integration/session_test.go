@@ -224,10 +224,14 @@ func TestLoginBearerFlow(t *testing.T) {
 	}
 
 	var bearerResp struct {
-		Token string `json:"token"`
+		UserID uuid.UUID `json:"user_id"`
+		Token  string    `json:"token"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &bearerResp); err != nil {
 		t.Fatalf("failed to decode response: %v", err)
+	}
+	if bearerResp.UserID == uuid.Nil {
+		t.Errorf("expected non-nil user_id in bearer login response")
 	}
 	if len(bearerResp.Token) != 32 {
 		t.Fatalf("expected 32-char token, got %q", bearerResp.Token)
