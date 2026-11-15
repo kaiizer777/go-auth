@@ -282,6 +282,50 @@ func TestGetSession_Valid(t *testing.T) {
 	}
 }
 
+func TestGetSession_MonotonicLastActiveAtUpdate(t *testing.T) {
+	database := setupTestDB(t)
+	cfg := testConfig()
+	svc := NewService(database, cfg)
+
+	userID := uuid.New()
+	rawID, err := generateRawID()
+	if err != nil {
+		t.Fatalf("generateRawID failed: %v", err)
+	}
+
+	now := time.Now().UTC()
+	futureActive := now.Add(10 * time.Minute).Truncate(time.Second)
+	seed := &db.Session{
+		ID:                uuid.New(),
+		UserID:            userID,
+		IDHash:            hashID(rawID),
+		SessionType:       db.SessionTypeCookie,
+		IPAddress:         "127.0.0.1",
+		UserAgent:         "agent",
+		LastActiveAt:      futureActive,
+		AbsoluteExpiresAt: now.Add(cfg.SessionAbsoluteMaxAge),
+		CreatedAt:         now.Add(-10 * time.Minute),
+	}
+	if err := database.Create(seed).Error; err != nil {
+		t.Fatalf("failed to seed session: %v", err)
+	}
+
+	if _, err := svc.GetSession(context.Background(), rawID); err != nil {
+		t.Fatalf("GetSession failed: %v", err)
+	}
+
+	// Wait briefly for background goroutine to complete
+	time.Sleep(50 * time.Millisecond)
+
+	var row db.Session
+	if err := database.Where("id_hash = ?", seed.IDHash).First(&row).Error; err != nil {
+		t.Fatalf("failed to query row: %v", err)
+	}
+	if row.LastActiveAt.Before(futureActive) {
+		t.Fatalf("expected LastActiveAt not to regress backward, got %v < %v", row.LastActiveAt, futureActive)
+	}
+}
+
 func TestGetSession_NotFound(t *testing.T) {
 	database := setupTestDB(t)
 	cfg := testConfig()
