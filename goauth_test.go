@@ -358,3 +358,52 @@ func TestNew_SuccessAndWiring(t *testing.T) {
 		t.Fatalf("a.Close() unexpected err = %v", err)
 	}
 }
+
+func TestNewWithDB_ZeroCleanupTick(t *testing.T) {
+	sqliteDB, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{
+		DisableAutomaticPing: true,
+	})
+	if err != nil {
+		t.Fatalf("failed to open sqlite: %v", err)
+	}
+
+	ddl := `
+	CREATE TABLE IF NOT EXISTS users (
+		id TEXT PRIMARY KEY,
+		email TEXT UNIQUE NOT NULL,
+		password_hash TEXT NOT NULL,
+		email_verified INTEGER NOT NULL DEFAULT 0,
+		created_at DATETIME,
+		updated_at DATETIME
+	);
+	CREATE TABLE IF NOT EXISTS sessions (
+		id TEXT PRIMARY KEY,
+		user_id TEXT NOT NULL,
+		id_hash CHAR(64) UNIQUE NOT NULL,
+		session_type VARCHAR(10) NOT NULL DEFAULT 'cookie',
+		csrf_token CHAR(64) NOT NULL DEFAULT '',
+		ip_address VARCHAR(45) NOT NULL DEFAULT '',
+		user_agent TEXT NOT NULL DEFAULT '',
+		last_active_at DATETIME NOT NULL,
+		absolute_expires_at DATETIME NOT NULL,
+		created_at DATETIME
+	);
+	`
+	if err := sqliteDB.Exec(ddl).Error; err != nil {
+		t.Fatalf("failed to execute sqlite ddl: %v", err)
+	}
+
+	cfg := config.DefaultConfig()
+	cfg.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+	cfg.BaseURL = "https://auth.example.com"
+	cfg.RateLimitCleanupTick = 0
+
+	a, err := NewWithDB(sqliteDB, cfg)
+	if err != nil {
+		t.Fatalf("NewWithDB unexpected err = %v", err)
+	}
+	defer a.Close()
+	if a == nil {
+		t.Fatal("expected non-nil Auth")
+	}
+}
