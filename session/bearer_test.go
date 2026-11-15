@@ -99,3 +99,18 @@ func TestReadBearerToken_InvalidHex(t *testing.T) {
 		t.Fatalf("expected ErrSessionInvalid, got %v", err)
 	}
 }
+
+func TestReadBearerToken_UppercaseHex(t *testing.T) {
+	upperToken := "0123456789ABCDEF0123456789ABCDEF"
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("Authorization", "Bearer "+upperToken)
+
+	extracted, err := ReadBearerToken(req)
+	if err != nil {
+		t.Fatalf("ReadBearerToken failed: %v", err)
+	}
+	expected := "0123456789abcdef0123456789abcdef"
+	if extracted != expected {
+		t.Fatalf("expected lowercase token %q, got %q", expected, extracted)
+	}
+}

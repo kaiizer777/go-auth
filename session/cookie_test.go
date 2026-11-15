@@ -93,6 +93,9 @@ func TestClearSessionCookie_MaxAge(t *testing.T) {
 	if cookie.MaxAge != -1 {
 		t.Fatalf("expected MaxAge -1, got %d", cookie.MaxAge)
 	}
+	if !cookie.Expires.Equal(time.Unix(1, 0)) {
+		t.Fatalf("expected Expires time.Unix(1, 0), got %v", cookie.Expires)
+	}
 	if !cookie.HttpOnly {
 		t.Fatal("expected HttpOnly to be preserved as true")
 	}
@@ -153,4 +156,56 @@ func TestReadSessionCookie_Absent(t *testing.T) {
 			t.Fatalf("expected ErrSessionNotFound, got %v", err)
 		}
 	})
+}
+
+func TestReadSessionCookie_UppercaseHex(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.SessionCookieName = "sid"
+
+	upperID := "0123456789ABCDEF0123456789ABCDEF"
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.AddCookie(&http.Cookie{
+		Name:  "sid",
+		Value: upperID,
+	})
+
+	extracted, err := ReadSessionCookie(req, &cfg)
+	if err != nil {
+		t.Fatalf("ReadSessionCookie failed: %v", err)
+	}
+	expected := "0123456789abcdef0123456789abcdef"
+	if extracted != expected {
+		t.Fatalf("expected lowercase ID %q, got %q", expected, extracted)
+	}
+}
+
+func TestReadSessionCookie_Invalid(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.SessionCookieName = "sid"
+
+	tests := []struct {
+		name  string
+		value string
+	}{
+		{name: "short token", value: "0123456789abcdef0123456789abcde"},
+		{name: "long token", value: "0123456789abcdef0123456789abcdef0"},
+		{name: "non-hex token", value: "0123456789abcdef0123456789abcdeg"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/", nil)
+			req.AddCookie(&http.Cookie{
+				Name:  "sid",
+				Value: tc.value,
+			})
+			val, err := ReadSessionCookie(req, &cfg)
+			if val != "" {
+				t.Fatalf("expected empty value, got %q", val)
+			}
+			if !errors.Is(err, apperrors.ErrSessionInvalid) {
+				t.Fatalf("expected ErrSessionInvalid, got %v", err)
+			}
+		})
+	}
 }

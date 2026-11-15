@@ -1,7 +1,9 @@
 package session
 
 import (
+	"encoding/hex"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/kaiizer777/go-auth/config"
@@ -34,6 +36,7 @@ func ClearSessionCookie(w http.ResponseWriter, cfg *config.Config) {
 		Path:     cfg.SessionCookiePath,
 		Domain:   cfg.SessionCookieDomain,
 		MaxAge:   -1, // -1 = delete immediately; 0 = session cookie (wrong for logout)
+		Expires:  time.Unix(1, 0),
 		HttpOnly: true,
 		Secure:   cfg.SessionCookieSecure,
 		SameSite: cfg.SessionCookieSameSite,
@@ -42,13 +45,21 @@ func ClearSessionCookie(w http.ResponseWriter, cfg *config.Config) {
 
 // ReadSessionCookie extracts the raw session ID from the cookie.
 // Returns apperrors.ErrSessionNotFound (wrapping http.ErrNoCookie) if the cookie is absent or empty.
+// Returns apperrors.ErrSessionInvalid if the cookie value is malformed (not 32 hex characters).
 func ReadSessionCookie(r *http.Request, cfg *config.Config) (string, error) {
 	c, err := r.Cookie(cfg.SessionCookieName)
 	if err != nil {
 		return "", apperrors.New(apperrors.CodeSessionNotFound, "Session is invalid or has expired", http.ErrNoCookie)
 	}
-	if c.Value == "" {
+	val := strings.TrimSpace(c.Value)
+	if val == "" {
 		return "", apperrors.New(apperrors.CodeSessionNotFound, "Session is invalid or has expired", http.ErrNoCookie)
 	}
-	return c.Value, nil
+	if len(val) != 32 {
+		return "", apperrors.ErrSessionInvalid
+	}
+	if _, err := hex.DecodeString(val); err != nil {
+		return "", apperrors.ErrSessionInvalid
+	}
+	return strings.ToLower(val), nil
 }

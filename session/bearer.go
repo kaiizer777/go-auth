@@ -36,5 +36,5 @@ func ReadBearerToken(r *http.Request) (string, error) {
 		return "", apperrors.ErrSessionInvalid
 	}
 
-	return rawID, nil
+	return strings.ToLower(rawID), nil
 }
