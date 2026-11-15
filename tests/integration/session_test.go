@@ -516,9 +516,10 @@ func TestLogin_SetsCSRFCookieAndEnablesImmediateRotation(t *testing.T) {
 
 	var sidCookie, csrfCookie *http.Cookie
 	for _, c := range rec.Result().Cookies() {
-		if c.Name == cfg.SessionCookieName {
+		switch c.Name {
+		case cfg.SessionCookieName:
 			sidCookie = c
-		} else if c.Name == cfg.CSRFCookieName {
+		case cfg.CSRFCookieName:
 			csrfCookie = c
 		}
 	}
