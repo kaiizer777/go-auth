@@ -186,24 +186,32 @@ func (s *service) GetSession(ctx context.Context, rawID string) (*Session, error
 		return nil, apperrors.ErrSessionExpired
 	}
 
-	// Capture record ID and construct domain Session prior to launching the detached background update.
+	// Capture record ID and construct domain Session.
 	sessionID := record.ID
 	domainSession := fromDB(&record)
 
-	// Update LastActiveAt asynchronously with a detached context without racing on record pointer.
-	go func() {
-		updateCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		defer cancel()
-		if err := s.db.WithContext(updateCtx).
+	// Throttle LastActiveAt touch updates to prevent unthrottled writes and goroutine churn.
+	// Only touch if time elapsed since LastActiveAt exceeds the threshold (1 minute or a fraction of idle timeout).
+	touchThreshold := 1 * time.Minute
+	if s.cfg != nil && s.cfg.SessionIdleTimeout > 0 {
+		if frac := s.cfg.SessionIdleTimeout / 10; frac > 0 && frac < touchThreshold {
+			touchThreshold = frac
+		}
+	}
+
+	if now.Sub(record.LastActiveAt) >= touchThreshold {
+		if err := s.db.WithContext(ctx).
 			Model(&db.Session{}).
 			Where("id = ? AND last_active_at < ?", sessionID, now).
 			Update("last_active_at", now).Error; err != nil {
-			slog.Error("failed to update session last_active_at",
+			slog.ErrorContext(ctx, "failed to update session last_active_at",
 				"session_id", sessionID.String(),
 				"error", err,
 			)
+		} else {
+			domainSession.LastActiveAt = now
 		}
-	}()
+	}
 
 	return domainSession, nil
 }

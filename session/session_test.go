@@ -431,6 +431,71 @@ func TestGetSession_MonotonicLastActiveAtUpdate(t *testing.T) {
 	}
 }
 
+func TestGetSession_LastActiveAtThrottling(t *testing.T) {
+	database := setupTestDB(t)
+	cfg := testConfig()
+	svc := NewService(database, cfg)
+
+	userID := uuid.New()
+	rawID, err := generateRawID()
+	if err != nil {
+		t.Fatalf("generateRawID failed: %v", err)
+	}
+
+	now := time.Now().UTC()
+	recentActive := now.Add(-10 * time.Second).Truncate(time.Second)
+	seed := &db.Session{
+		ID:                uuid.New(),
+		UserID:            userID,
+		IDHash:            hashID(rawID),
+		SessionType:       db.SessionTypeCookie,
+		IPAddress:         "127.0.0.1",
+		UserAgent:         "agent",
+		LastActiveAt:      recentActive,
+		AbsoluteExpiresAt: now.Add(cfg.SessionAbsoluteMaxAge),
+		CreatedAt:         now.Add(-10 * time.Minute),
+	}
+	if err := database.Create(seed).Error; err != nil {
+		t.Fatalf("failed to seed session: %v", err)
+	}
+
+	sess, err := svc.GetSession(context.Background(), rawID)
+	if err != nil {
+		t.Fatalf("GetSession failed: %v", err)
+	}
+	if sess == nil {
+		t.Fatal("expected non-nil session")
+	}
+
+	var row db.Session
+	if err := database.Where("id_hash = ?", seed.IDHash).First(&row).Error; err != nil {
+		t.Fatalf("failed to query row: %v", err)
+	}
+	if !row.LastActiveAt.Equal(recentActive) {
+		t.Fatalf("expected last_active_at to be unchanged (%v), got %v", recentActive, row.LastActiveAt)
+	}
+
+	staleActive := now.Add(-2 * time.Minute).Truncate(time.Second)
+	if err := database.Model(&db.Session{}).Where("id = ?", seed.ID).Update("last_active_at", staleActive).Error; err != nil {
+		t.Fatalf("failed to update row to staleActive: %v", err)
+	}
+
+	sess2, err := svc.GetSession(context.Background(), rawID)
+	if err != nil {
+		t.Fatalf("GetSession failed: %v", err)
+	}
+	if sess2 == nil {
+		t.Fatal("expected non-nil session")
+	}
+
+	if err := database.Where("id_hash = ?", seed.IDHash).First(&row).Error; err != nil {
+		t.Fatalf("failed to query row: %v", err)
+	}
+	if !row.LastActiveAt.After(staleActive) {
+		t.Fatalf("expected last_active_at to be updated past %v, got %v", staleActive, row.LastActiveAt)
+	}
+}
+
 func TestRawIDValidation_MalformedInputs(t *testing.T) {
 	database := setupTestDB(t)
 	cfg := testConfig()
