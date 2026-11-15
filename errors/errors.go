@@ -246,6 +246,11 @@ var (
 	ErrPasswordMaxLengthInvalid        = New(CodeInvalidConfig, "password max length must be greater than min length and at most 128", nil)
 	ErrVerificationTokenExpiryInvalid  = New(CodeInvalidConfig, "verification token expiry must be between 15m and 60m", nil)
 	ErrPasswordResetTokenExpiryInvalid = New(CodeInvalidConfig, "password reset token expiry must be between 15m and 60m", nil)
+	ErrSessionIdleTimeoutInvalid       = New(CodeInvalidConfig, "SessionIdleTimeout must be greater than zero", nil)
+	ErrSessionAbsoluteMaxAgeInvalid    = New(CodeInvalidConfig, "SessionAbsoluteMaxAge must be greater than SessionIdleTimeout", nil)
+	ErrSessionSameSiteNoneInsecure     = New(CodeInvalidConfig, "SessionCookieSameSite=None requires SessionCookieSecure=true", nil)
+	ErrRateLimitWindowInvalid          = New(CodeInvalidConfig, "rate limit window and cleanup tick must be greater than zero", nil)
+	ErrRateLimitMaxInvalid             = New(CodeInvalidConfig, "rate limit max must be >= 1", nil)
 
 	// Predefined sentinel errors for Phase 4 Session, CSRF, and Rate Limiting.
 	ErrSessionNotFound   = New(CodeSessionNotFound, "Session is invalid or has expired", nil)
