@@ -200,6 +200,29 @@ func TestLimiter_ConcurrentAccess(t *testing.T) {
 	wg.Wait()
 }
 
+func TestLimiter_ConcurrentAllowAndReset(t *testing.T) {
+	limiter := NewLimiter(500*time.Millisecond, 10)
+	key := "shared-hot-key"
+	concurrency := 50
+	iterations := 100
+
+	var wg sync.WaitGroup
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for j := 0; j < iterations; j++ {
+				if id%2 == 0 {
+					limiter.Allow(key)
+				} else {
+					limiter.Reset(key)
+				}
+			}
+		}(i)
+	}
+	wg.Wait()
+}
+
 func TestLimiter_RetryAfter(t *testing.T) {
 	window := 200 * time.Millisecond
 	limiter := NewLimiter(window, 2)
