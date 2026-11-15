@@ -38,6 +38,16 @@ func TestDefaultConfig(t *testing.T) {
 	if len(cfg.AllowedHeaders) == 0 {
 		t.Error("expected non-empty AllowedHeaders")
 	}
+	hasCSRFHeader := false
+	for _, h := range cfg.AllowedHeaders {
+		if h == "X-CSRF-Token" {
+			hasCSRFHeader = true
+			break
+		}
+	}
+	if !hasCSRFHeader {
+		t.Errorf("expected AllowedHeaders to contain X-CSRF-Token, got %v", cfg.AllowedHeaders)
+	}
 	if cfg.Argon2.Memory != 65536 {
 		t.Errorf("got %d, want 65536", cfg.Argon2.Memory)
 	}
