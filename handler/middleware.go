@@ -77,11 +77,17 @@ func RequireAuth(sessionSvc session.Service, cfg *config.Config) func(http.Handl
 			var rawID string
 			var err error
 
-			// 1. Try session cookie first
-			rawID, err = session.ReadSessionCookie(r, cfg)
-			if err != nil {
-				// 2. Fallback to Bearer token
+			if r.Header.Get("Authorization") != "" {
+				// If Authorization header is present, strictly authenticate via Bearer token.
+				// Never fall back to cookie authentication to prevent CSRF bypass via Bearer header spoofing.
 				rawID, err = session.ReadBearerToken(r)
+				if err != nil {
+					apperrors.WriteHTTP(w, err)
+					return
+				}
+			} else {
+				// No Authorization header: authenticate via session cookie.
+				rawID, err = session.ReadSessionCookie(r, cfg)
 				if err != nil {
 					apperrors.WriteHTTP(w, apperrors.ErrSessionNotFound)
 					return

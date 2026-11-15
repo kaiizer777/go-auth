@@ -240,6 +240,33 @@ func TestCSRFBypassAttempt_BearerEndpoint(t *testing.T) {
 	}
 }
 
+// Test 11b: TestCSRFBypassAttempt_BearerHeaderSpoofingWithCookie
+// An attacker provides a valid victim session cookie and a spoofed/dummy Bearer header to bypass CSRF.
+// RequireAuth must strictly validate the Bearer header and reject with 401, never falling back to cookie.
+func TestCSRFBypassAttempt_BearerHeaderSpoofingWithCookie(t *testing.T) {
+	app, _, cfg := setupSecurityApp(t)
+	email := "csrf_spoof@example.com"
+	pass := "Pass123456789!"
+	signupSecurityUser(t, app, email, pass)
+
+	// Login with cookie
+	loginBody, _ := json.Marshal(db.LoginRequest{Email: email, Password: pass})
+	rec := httptest.NewRecorder()
+	app.Handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/auth/login", bytes.NewReader(loginBody)))
+	sidCookie := readCookie(rec.Result(), cfg.SessionCookieName)
+
+	// State-changing DELETE /auth/session with valid cookie but dummy/invalid Bearer header
+	delReq := httptest.NewRequest(http.MethodDelete, "/auth/session", nil)
+	delReq.AddCookie(sidCookie)
+	delReq.Header.Set("Authorization", "Bearer dummy-spoofed-token")
+	delRec := httptest.NewRecorder()
+	app.Handler.ServeHTTP(delRec, delReq)
+
+	if delRec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 Unauthorized when Bearer header is spoofed, got %d", delRec.Code)
+	}
+}
+
 // Test 12: TestRateLimitTrigger_Login (ASVS V3.2.4)
 // Attempt MaxAttempts + 1 from same IP|email returns 429 RATE_LIMIT_EXCEEDED with Retry-After header
 func TestRateLimitTrigger_Login(t *testing.T) {

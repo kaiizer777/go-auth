@@ -318,3 +318,33 @@ func TestRequireAuth_NilSession_Returns401(t *testing.T) {
 		t.Fatalf("expected status 401, got %d", rec.Code)
 	}
 }
+
+func TestRequireAuth_AuthorizationHeaderSpoof_DoesNotFallbackToCookie(t *testing.T) {
+	cfg := config.DefaultConfig()
+	mockSvc := &mockSessionService{
+		getSessionFn: func(ctx context.Context, rawID string) (*session.Session, error) {
+			t.Fatalf("session service should not be called with spoofed bearer header")
+			return nil, nil
+		},
+	}
+
+	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("next handler must not be called when Authorization header is invalid")
+	})
+
+	mw := RequireAuth(mockSvc, &cfg)(next)
+
+	req := httptest.NewRequest(http.MethodPost, "/protected", nil)
+	req.AddCookie(&http.Cookie{
+		Name:  cfg.SessionCookieName,
+		Value: validTestToken,
+	})
+	req.Header.Set("Authorization", "Bearer invalid-dummy-token")
+	rec := httptest.NewRecorder()
+
+	mw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected status 401 Unauthorized, got %d", rec.Code)
+	}
+}
