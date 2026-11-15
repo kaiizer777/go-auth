@@ -189,6 +189,57 @@ func TestGetSession_IdleTimeout(t *testing.T) {
 	}
 }
 
+func TestGetSession_IdleCheckDoesNotEvictRefreshedSession(t *testing.T) {
+	database := setupTestDB(t)
+	cfg := testConfig()
+	svc := NewService(database, cfg)
+
+	userID := uuid.New()
+	rawID, err := generateRawID()
+	if err != nil {
+		t.Fatalf("generateRawID failed: %v", err)
+	}
+
+	now := time.Now().UTC()
+	staleActive := now.Add(-cfg.SessionIdleTimeout - 5*time.Minute)
+	seed := &db.Session{
+		ID:                uuid.New(),
+		UserID:            userID,
+		IDHash:            hashID(rawID),
+		SessionType:       db.SessionTypeCookie,
+		IPAddress:         "127.0.0.1",
+		UserAgent:         "agent",
+		LastActiveAt:      staleActive,
+		AbsoluteExpiresAt: now.Add(cfg.SessionAbsoluteMaxAge),
+		CreatedAt:         staleActive,
+	}
+	if err := database.Create(seed).Error; err != nil {
+		t.Fatalf("failed to seed session: %v", err)
+	}
+
+	var bumped bool
+	_ = database.Callback().Delete().Before("gorm:delete").Register("test:bump_activity_get", func(tx *gorm.DB) {
+		if !bumped {
+			bumped = true
+			rawDB, _ := tx.DB()
+			_, _ = rawDB.Exec("UPDATE sessions SET last_active_at = ? WHERE id = ?", time.Now().UTC(), seed.ID.String())
+		}
+	})
+
+	sess, err := svc.GetSession(context.Background(), rawID)
+	if err != nil {
+		t.Fatalf("expected active refreshed session, got error: %v", err)
+	}
+	if sess == nil || sess.IDHash != seed.IDHash {
+		t.Fatalf("expected valid session, got %+v", sess)
+	}
+
+	var row db.Session
+	if err := database.Where("id = ?", seed.ID).First(&row).Error; err != nil {
+		t.Fatalf("expected session row to be retained, got err: %v", err)
+	}
+}
+
 func TestGetSession_AbsoluteTimeout(t *testing.T) {
 	database := setupTestDB(t)
 	cfg := testConfig()
@@ -506,6 +557,52 @@ func TestRotateSession_Expired_IdleTimeout(t *testing.T) {
 	err = database.Where("id_hash = ?", row.IDHash).First(&check).Error
 	if !errors.Is(err, gorm.ErrRecordNotFound) {
 		t.Fatalf("expected expired session to be deleted, got err=%v", err)
+	}
+}
+
+func TestRotateSession_IdleCheckDoesNotEvictRefreshedSession(t *testing.T) {
+	database := setupTestDB(t)
+	cfg := testConfig()
+	svc := NewService(database, cfg)
+
+	userID := uuid.New()
+	rawID, err := generateRawID()
+	if err != nil {
+		t.Fatalf("generateRawID failed: %v", err)
+	}
+
+	now := time.Now().UTC()
+	staleActive := now.Add(-cfg.SessionIdleTimeout - 5*time.Minute)
+	seed := &db.Session{
+		ID:                uuid.New(),
+		UserID:            userID,
+		IDHash:            hashID(rawID),
+		SessionType:       db.SessionTypeCookie,
+		IPAddress:         "127.0.0.1",
+		UserAgent:         "agent-old",
+		LastActiveAt:      staleActive,
+		AbsoluteExpiresAt: now.Add(cfg.SessionAbsoluteMaxAge),
+		CreatedAt:         staleActive,
+	}
+	if err := database.Create(seed).Error; err != nil {
+		t.Fatalf("failed to seed session: %v", err)
+	}
+
+	var bumped bool
+	_ = database.Callback().Delete().Before("gorm:delete").Register("test:bump_activity_rotate", func(tx *gorm.DB) {
+		if !bumped {
+			bumped = true
+			rawDB, _ := tx.DB()
+			_, _ = rawDB.Exec("UPDATE sessions SET last_active_at = ? WHERE id_hash = ?", time.Now().UTC(), seed.IDHash)
+		}
+	})
+
+	newSess, newRawID, err := svc.RotateSession(context.Background(), rawID, "2.2.2.2", "agent-new")
+	if err != nil {
+		t.Fatalf("expected RotateSession to succeed on refreshed session, got error: %v", err)
+	}
+	if newSess == nil || newRawID == "" {
+		t.Fatalf("expected rotated session, got sess=%+v, rawID=%q", newSess, newRawID)
 	}
 }
 
