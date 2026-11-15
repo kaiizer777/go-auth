@@ -433,3 +433,43 @@ func TestRequireAuth_TransportBinding_BearerPresentedViaCookie(t *testing.T) {
 		t.Errorf("expected code %s, got %s", apperrors.CodeSessionInvalid, resp.Code)
 	}
 }
+
+func TestRequireAuth_NilConfig_DefaultsSafely(t *testing.T) {
+	mockSvc := &mockSessionService{}
+	mw := RequireAuth(mockSvc, nil)
+	if mw == nil {
+		t.Fatal("expected non-nil middleware")
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/protected", nil)
+	rec := httptest.NewRecorder()
+	mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {})).ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d", rec.Code)
+	}
+}
+
+func TestRequireAuth_NilSessionService_ReturnsInternalError(t *testing.T) {
+	cfg := config.DefaultConfig()
+	mw := RequireAuth(nil, &cfg)
+
+	req := httptest.NewRequest(http.MethodGet, "/protected", nil)
+	req.AddCookie(&http.Cookie{
+		Name:  cfg.SessionCookieName,
+		Value: validTestToken,
+	})
+	rec := httptest.NewRecorder()
+	mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {})).ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500 on nil session service, got %d", rec.Code)
+	}
+	var resp apperrors.Response
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if resp.Code != apperrors.CodeInternalError {
+		t.Errorf("expected code %s, got %s", apperrors.CodeInternalError, resp.Code)
+	}
+}

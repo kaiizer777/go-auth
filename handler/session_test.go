@@ -462,3 +462,17 @@ func TestSessionHandler_RotateSession_BearerReturnsToken(t *testing.T) {
 		t.Fatalf("expected new token to differ from old raw token")
 	}
 }
+
+func TestRotateSession_NilSessionService_ReturnsInternalError(t *testing.T) {
+	h := NewSessionHandler(nil, nil, nil)
+	req := httptest.NewRequest(http.MethodPost, "/auth/session/rotate", nil)
+	ctx := context.WithValue(req.Context(), contextKeyRawID, "0123456789abcdef0123456789abcdef")
+	req = req.WithContext(ctx)
+
+	rec := httptest.NewRecorder()
+	h.RotateSession(rec, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500 Internal Server Error on nil sessionSvc, got %d", rec.Code)
+	}
+}
