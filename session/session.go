@@ -134,12 +134,26 @@ func (s *service) GetSession(ctx context.Context, rawID string) (*Session, error
 	}
 
 	// Credential-version check: reject sessions minted under superseded credentials
-	// (e.g. after a password reset) and drop the stale row.
+	// (e.g. after a password reset) and drop the stale row. A missing user row is
+	// treated as version 0 for backward compatibility with orphaned/legacy rows.
 	var user db.User
-	if uerr := s.db.WithContext(ctx).
+	uerr := s.db.WithContext(ctx).
 		Select("credential_version").
 		Where("id = ?", record.UserID).
-		First(&user).Error; uerr != nil || user.CredentialVersion != record.CredentialVersion {
+		First(&user).Error
+	currentVersion := 0
+	if uerr != nil && !errors.Is(uerr, gorm.ErrRecordNotFound) {
+		_ = s.db.WithContext(ctx).Where("id = ?", record.ID).Delete(&db.Session{}).Error
+		slog.InfoContext(ctx, "session_invalidated",
+			"user_id", record.UserID.String(),
+			"reason", "credential_version_mismatch",
+		)
+		return nil, apperrors.ErrSessionInvalid
+	}
+	if uerr == nil {
+		currentVersion = user.CredentialVersion
+	}
+	if currentVersion != record.CredentialVersion {
 		_ = s.db.WithContext(ctx).Where("id = ?", record.ID).Delete(&db.Session{}).Error
 		slog.InfoContext(ctx, "session_invalidated",
 			"user_id", record.UserID.String(),
@@ -324,12 +338,16 @@ func (s *service) RotateSession(
 	}
 
 	// Re-check the user's current credential version so a rotation cannot mint
-	// a session under a superseded credential.
+	// a session under a superseded credential. A missing user row is tolerated.
 	var user db.User
-	if uerr := s.db.WithContext(ctx).
+	uerr := s.db.WithContext(ctx).
 		Select("credential_version").
 		Where("id = ?", oldRecord.UserID).
-		First(&user).Error; uerr != nil || user.CredentialVersion != oldRecord.CredentialVersion {
+		First(&user).Error
+	if uerr != nil && !errors.Is(uerr, gorm.ErrRecordNotFound) {
+		return nil, "", apperrors.ErrSessionInvalid
+	}
+	if uerr == nil && user.CredentialVersion != oldRecord.CredentialVersion {
 		return nil, "", apperrors.ErrSessionInvalid
 	}
 
