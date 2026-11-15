@@ -2,6 +2,19 @@ BEGIN;
 
 DROP INDEX IF EXISTS sessions_id_hash_idx;
 
+-- Restore obsolete columns and backfill timestamps from Phase 4 columns before dropping them
+ALTER TABLE sessions
+    ADD COLUMN IF NOT EXISTS expires_at      timestamptz,
+    ADD COLUMN IF NOT EXISTS idle_expires_at timestamptz;
+
+UPDATE sessions SET
+    expires_at = COALESCE(absolute_expires_at, now() + interval '24 hours'),
+    idle_expires_at = COALESCE(last_active_at + interval '30 minutes', now() + interval '30 minutes');
+
+ALTER TABLE sessions
+    ALTER COLUMN expires_at SET NOT NULL,
+    ALTER COLUMN idle_expires_at SET NOT NULL;
+
 ALTER TABLE sessions
     DROP COLUMN IF EXISTS session_type,
     DROP COLUMN IF EXISTS csrf_token,
@@ -11,11 +24,6 @@ ALTER TABLE sessions
     DROP COLUMN IF EXISTS absolute_expires_at;
 
 DROP TYPE IF EXISTS session_type;
-
--- Restore obsolete columns for Phase 1 rollback compatibility
-ALTER TABLE sessions
-    ADD COLUMN IF NOT EXISTS expires_at      timestamptz NOT NULL DEFAULT now(),
-    ADD COLUMN IF NOT EXISTS idle_expires_at timestamptz NOT NULL DEFAULT now();
 
 -- Rename id_hash back to token_hash if id_hash exists
 DO $$ BEGIN
