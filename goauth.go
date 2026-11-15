@@ -50,27 +50,8 @@ type Auth struct {
 
 var dbConnectFn = db.Connect
 
-// New validates runtime configuration, establishes database connectivity,
-// runs pending migrations, and initializes the HTTP handler chain.
-func New(cfg config.Config) (*Auth, error) {
-	if err := cfg.Validate(); err != nil {
-		return nil, errors.Wrap(err, errors.CodeInvalidConfig, "goauth: invalid configuration")
-	}
-
-	database, err := dbConnectFn(cfg)
-	if err != nil {
-		return nil, errors.Wrap(err, errors.CodeDatabaseError, "goauth: failed to connect to database")
-	}
-
-	success := false
-	defer func() {
-		if !success {
-			if sqlDB, dbErr := database.DB(); dbErr == nil {
-				_ = sqlDB.Close()
-			}
-		}
-	}()
-
+// NewWithDB initializes Auth using an existing GORM database connection.
+func NewWithDB(database *gorm.DB, cfg config.Config) (*Auth, error) {
 	emailHooks := cfg.EmailHooks
 	if emailHooks.SendVerificationEmail == nil && cfg.SendVerificationEmail != nil {
 		emailHooks.SendVerificationEmail = func(ctx context.Context, recipient, token string) error {
@@ -134,7 +115,28 @@ func New(cfg config.Config) (*Auth, error) {
 		signupLimiter:  signupLimiter,
 		limiterDone:    limiterDone,
 	}
-	success = true
+	return a, nil
+}
+
+// New validates runtime configuration, establishes database connectivity,
+// runs pending migrations, and initializes the HTTP handler chain.
+func New(cfg config.Config) (*Auth, error) {
+	if err := cfg.Validate(); err != nil {
+		return nil, errors.Wrap(err, errors.CodeInvalidConfig, "goauth: invalid configuration")
+	}
+
+	database, err := dbConnectFn(cfg)
+	if err != nil {
+		return nil, errors.Wrap(err, errors.CodeDatabaseError, "goauth: failed to connect to database")
+	}
+
+	a, err := NewWithDB(database, cfg)
+	if err != nil {
+		if sqlDB, dbErr := database.DB(); dbErr == nil {
+			_ = sqlDB.Close()
+		}
+		return nil, err
+	}
 	return a, nil
 }
 
