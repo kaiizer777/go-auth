@@ -17,12 +17,15 @@ import (
 
 // AuthHandler handles HTTP requests for user authentication and lifecycle operations.
 type AuthHandler struct {
-	svc           auth.Service
-	sessionSvc    session.Service
-	cfg           *config.Config
-	loginLimiter  *ratelimit.Limiter
-	signupLimiter *ratelimit.Limiter
-	resetLimiter  *ratelimit.Limiter
+	svc             auth.Service
+	sessionSvc      session.Service
+	cfg             *config.Config
+	loginLimiter    *ratelimit.Limiter
+	loginIPLimiter  *ratelimit.Limiter
+	signupLimiter   *ratelimit.Limiter
+	signupIPLimiter *ratelimit.Limiter
+	resetLimiter    *ratelimit.Limiter
+	resetIPLimiter  *ratelimit.Limiter
 }
 
 // AuthOption configures optional dependencies for AuthHandler.
@@ -42,12 +45,21 @@ func WithAuthConfig(cfg *config.Config) AuthOption {
 	}
 }
 
-// WithAuthLimiters configures in-memory rate limiters for AuthHandler.
+// WithAuthLimiters configures in-memory account-tier rate limiters for AuthHandler.
 func WithAuthLimiters(login, signup, reset *ratelimit.Limiter) AuthOption {
 	return func(h *AuthHandler) {
 		h.loginLimiter = login
 		h.signupLimiter = signup
 		h.resetLimiter = reset
+	}
+}
+
+// WithAuthIPLimiters configures in-memory IP-tier rate limiters for AuthHandler.
+func WithAuthIPLimiters(loginIP, signupIP, resetIP *ratelimit.Limiter) AuthOption {
+	return func(h *AuthHandler) {
+		h.loginIPLimiter = loginIP
+		h.signupIPLimiter = signupIP
+		h.resetIPLimiter = resetIP
 	}
 }
 
@@ -60,6 +72,15 @@ func NewAuthHandler(svc auth.Service, opts ...AuthOption) *AuthHandler {
 	if h.cfg == nil {
 		defaultCfg := config.DefaultConfig()
 		h.cfg = &defaultCfg
+	}
+	if h.loginIPLimiter == nil && h.cfg.RateLimitLoginIPMax > 0 {
+		h.loginIPLimiter = ratelimit.NewLimiter(h.cfg.RateLimitLoginWindow, h.cfg.RateLimitLoginIPMax)
+	}
+	if h.signupIPLimiter == nil && h.cfg.RateLimitSignupIPMax > 0 {
+		h.signupIPLimiter = ratelimit.NewLimiter(h.cfg.RateLimitSignupWindow, h.cfg.RateLimitSignupIPMax)
+	}
+	if h.resetIPLimiter == nil && h.cfg.RateLimitResetIPMax > 0 {
+		h.resetIPLimiter = ratelimit.NewLimiter(h.cfg.RateLimitResetWindow, h.cfg.RateLimitResetIPMax)
 	}
 	return h
 }
@@ -100,9 +121,15 @@ func (h *AuthHandler) Signup(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ip := realIP(r)
-	key := ratelimit.Key(ip, db.NormalizeEmail(req.Email))
-	if h.signupLimiter != nil && !h.signupLimiter.Allow(key) {
-		ratelimit.WriteRateLimitError(w, h.signupLimiter.RetryAfter(key))
+	ipKey := ratelimit.IPKey(ip)
+	if h.signupIPLimiter != nil && !h.signupIPLimiter.Allow(ipKey) {
+		ratelimit.WriteRateLimitError(w, h.signupIPLimiter.RetryAfter(ipKey))
+		return
+	}
+
+	accountKey := ratelimit.AccountKey(db.NormalizeEmail(req.Email))
+	if h.signupLimiter != nil && !h.signupLimiter.Allow(accountKey) {
+		ratelimit.WriteRateLimitError(w, h.signupLimiter.RetryAfter(accountKey))
 		return
 	}
 
@@ -127,9 +154,15 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ip := realIP(r)
-	key := ratelimit.Key(ip, db.NormalizeEmail(req.Email))
-	if h.loginLimiter != nil && !h.loginLimiter.Allow(key) {
-		ratelimit.WriteRateLimitError(w, h.loginLimiter.RetryAfter(key))
+	ipKey := ratelimit.IPKey(ip)
+	if h.loginIPLimiter != nil && !h.loginIPLimiter.Allow(ipKey) {
+		ratelimit.WriteRateLimitError(w, h.loginIPLimiter.RetryAfter(ipKey))
+		return
+	}
+
+	accountKey := ratelimit.AccountKey(db.NormalizeEmail(req.Email))
+	if h.loginLimiter != nil && !h.loginLimiter.Allow(accountKey) {
+		ratelimit.WriteRateLimitError(w, h.loginLimiter.RetryAfter(accountKey))
 		return
 	}
 
@@ -145,7 +178,7 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if h.loginLimiter != nil {
-		h.loginLimiter.Reset(key)
+		h.loginLimiter.Reset(accountKey)
 	}
 
 	if h.sessionSvc != nil {
@@ -263,9 +296,15 @@ func (h *AuthHandler) RequestPasswordReset(w http.ResponseWriter, r *http.Reques
 	}
 
 	ip := realIP(r)
-	key := ratelimit.Key(ip, db.NormalizeEmail(req.Email))
-	if h.resetLimiter != nil && !h.resetLimiter.Allow(key) {
-		ratelimit.WriteRateLimitError(w, h.resetLimiter.RetryAfter(key))
+	ipKey := ratelimit.IPKey(ip)
+	if h.resetIPLimiter != nil && !h.resetIPLimiter.Allow(ipKey) {
+		ratelimit.WriteRateLimitError(w, h.resetIPLimiter.RetryAfter(ipKey))
+		return
+	}
+
+	accountKey := ratelimit.AccountKey(db.NormalizeEmail(req.Email))
+	if h.resetLimiter != nil && !h.resetLimiter.Allow(accountKey) {
+		ratelimit.WriteRateLimitError(w, h.resetLimiter.RetryAfter(accountKey))
 		return
 	}
 
@@ -291,7 +330,15 @@ func (h *AuthHandler) ResetPassword(w http.ResponseWriter, r *http.Request) {
 
 	ip := realIP(r)
 	key := ratelimit.Key(ip, "reset-confirm")
-	if h.resetLimiter != nil && !h.resetLimiter.Allow(key) {
+	limiter := h.resetIPLimiter
+	if limiter == nil {
+		limiter = h.resetLimiter
+	}
+	if limiter != nil && !limiter.Allow(key) {
+		ratelimit.WriteRateLimitError(w, limiter.RetryAfter(key))
+		return
+	}
+	if h.resetLimiter != nil && limiter != h.resetLimiter && !h.resetLimiter.Allow(key) {
 		ratelimit.WriteRateLimitError(w, h.resetLimiter.RetryAfter(key))
 		return
 	}

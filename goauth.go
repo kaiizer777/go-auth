@@ -41,12 +41,15 @@ type Auth struct {
 	// SessionHandler is the HTTP handler for session management.
 	SessionHandler *handler.SessionHandler
 
-	loginLimiter  *ratelimit.Limiter
-	resetLimiter  *ratelimit.Limiter
-	signupLimiter *ratelimit.Limiter
-	limiterDone   chan struct{}
-	closeErr      error
-	closeOnce     sync.Once
+	loginLimiter    *ratelimit.Limiter
+	loginIPLimiter  *ratelimit.Limiter
+	resetLimiter    *ratelimit.Limiter
+	resetIPLimiter  *ratelimit.Limiter
+	signupLimiter   *ratelimit.Limiter
+	signupIPLimiter *ratelimit.Limiter
+	limiterDone     chan struct{}
+	closeErr        error
+	closeOnce       sync.Once
 }
 
 var dbConnectFn = db.Connect
@@ -85,8 +88,11 @@ func NewWithDB(database *gorm.DB, cfg config.Config) (*Auth, error) {
 	sessionSvc := session.NewService(database, &cfg)
 
 	loginLimiter := ratelimit.NewLimiter(cfg.RateLimitLoginWindow, cfg.RateLimitLoginMax)
+	loginIPLimiter := ratelimit.NewLimiter(cfg.RateLimitLoginWindow, cfg.RateLimitLoginIPMax)
 	resetLimiter := ratelimit.NewLimiter(cfg.RateLimitResetWindow, cfg.RateLimitResetMax)
+	resetIPLimiter := ratelimit.NewLimiter(cfg.RateLimitResetWindow, cfg.RateLimitResetIPMax)
 	signupLimiter := ratelimit.NewLimiter(cfg.RateLimitSignupWindow, cfg.RateLimitSignupMax)
+	signupIPLimiter := ratelimit.NewLimiter(cfg.RateLimitSignupWindow, cfg.RateLimitSignupIPMax)
 
 	limiterDone := make(chan struct{})
 	cleanupTick := cfg.RateLimitCleanupTick
@@ -94,8 +100,11 @@ func NewWithDB(database *gorm.DB, cfg config.Config) (*Auth, error) {
 		cleanupTick = config.DefaultConfig().RateLimitCleanupTick
 	}
 	loginLimiter.StartCleanup(cleanupTick, limiterDone)
+	loginIPLimiter.StartCleanup(cleanupTick, limiterDone)
 	resetLimiter.StartCleanup(cleanupTick, limiterDone)
+	resetIPLimiter.StartCleanup(cleanupTick, limiterDone)
 	signupLimiter.StartCleanup(cleanupTick, limiterDone)
+	signupIPLimiter.StartCleanup(cleanupTick, limiterDone)
 
 	sessHandler := handler.NewSessionHandler(sessionSvc, database, &cfg)
 
@@ -103,6 +112,7 @@ func NewWithDB(database *gorm.DB, cfg config.Config) (*Auth, error) {
 		handler.WithSessionService(sessionSvc),
 		handler.WithSessionHandler(sessHandler),
 		handler.WithRateLimiters(loginLimiter, resetLimiter, signupLimiter),
+		handler.WithIPRateLimiters(loginIPLimiter, resetIPLimiter, signupIPLimiter),
 	)
 
 	a := &Auth{
@@ -115,14 +125,17 @@ func NewWithDB(database *gorm.DB, cfg config.Config) (*Auth, error) {
 			SendVerificationEmail:     cfg.SendVerificationEmail,
 			SendPasswordResetEmail:    cfg.SendPasswordResetEmail,
 		}, slog.Default()),
-		Handler:        h,
-		Auth:           authSvc,
-		Session:        sessionSvc,
-		SessionHandler: sessHandler,
-		loginLimiter:   loginLimiter,
-		resetLimiter:   resetLimiter,
-		signupLimiter:  signupLimiter,
-		limiterDone:    limiterDone,
+		Handler:         h,
+		Auth:            authSvc,
+		Session:         sessionSvc,
+		SessionHandler:  sessHandler,
+		loginLimiter:    loginLimiter,
+		loginIPLimiter:  loginIPLimiter,
+		resetLimiter:    resetLimiter,
+		resetIPLimiter:  resetIPLimiter,
+		signupLimiter:   signupLimiter,
+		signupIPLimiter: signupIPLimiter,
+		limiterDone:     limiterDone,
 	}
 	return a, nil
 }
@@ -159,11 +172,20 @@ func (a *Auth) Close() error {
 		if a.loginLimiter != nil {
 			a.loginLimiter.Close()
 		}
+		if a.loginIPLimiter != nil {
+			a.loginIPLimiter.Close()
+		}
 		if a.resetLimiter != nil {
 			a.resetLimiter.Close()
 		}
+		if a.resetIPLimiter != nil {
+			a.resetIPLimiter.Close()
+		}
 		if a.signupLimiter != nil {
 			a.signupLimiter.Close()
+		}
+		if a.signupIPLimiter != nil {
+			a.signupIPLimiter.Close()
 		}
 		if a.db != nil {
 			if sqlDB, err := a.db.DB(); err != nil {

@@ -18,15 +18,18 @@ import (
 
 // Handler maintains the HTTP router, database connection, and configuration.
 type Handler struct {
-	mux           *http.ServeMux
-	db            *gorm.DB
-	cfg           config.Config
-	authSvc       auth.Service
-	sessionSvc    session.Service
-	sessHandler   *SessionHandler
-	loginLimiter  *ratelimit.Limiter
-	signupLimiter *ratelimit.Limiter
-	resetLimiter  *ratelimit.Limiter
+	mux             *http.ServeMux
+	db              *gorm.DB
+	cfg             config.Config
+	authSvc         auth.Service
+	sessionSvc      session.Service
+	sessHandler     *SessionHandler
+	loginLimiter    *ratelimit.Limiter
+	signupLimiter   *ratelimit.Limiter
+	resetLimiter    *ratelimit.Limiter
+	loginIPLimiter  *ratelimit.Limiter
+	signupIPLimiter *ratelimit.Limiter
+	resetIPLimiter  *ratelimit.Limiter
 }
 
 // Option configures optional dependencies for Handler.
@@ -52,6 +55,15 @@ func WithRateLimiters(login, reset, signup *ratelimit.Limiter) Option {
 		h.loginLimiter = login
 		h.resetLimiter = reset
 		h.signupLimiter = signup
+	}
+}
+
+// WithIPRateLimiters attaches custom in-memory IP-tier rate limiters to the Handler.
+func WithIPRateLimiters(loginIP, resetIP, signupIP *ratelimit.Limiter) Option {
+	return func(h *Handler) {
+		h.loginIPLimiter = loginIP
+		h.resetIPLimiter = resetIP
+		h.signupIPLimiter = signupIP
 	}
 }
 
@@ -149,6 +161,7 @@ func (h *Handler) registerRoutes() {
 			WithAuthSessionService(h.sessionSvc),
 			WithAuthConfig(&h.cfg),
 			WithAuthLimiters(h.loginLimiter, h.signupLimiter, h.resetLimiter),
+			WithAuthIPLimiters(h.loginIPLimiter, h.signupIPLimiter, h.resetIPLimiter),
 		)
 		// Canonical routes:
 		h.mux.HandleFunc("POST /auth/signup", authH.Signup)
