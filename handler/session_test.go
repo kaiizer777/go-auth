@@ -240,6 +240,12 @@ func TestSessionHandler_ListSessions(t *testing.T) {
 	if !foundCurrent || !foundOther {
 		t.Errorf("expected to find both sess1 and sess2 in output")
 	}
+
+	var expiredCount int64
+	database.Model(&db.Session{}).Where("id = ?", expiredSess.ID).Count(&expiredCount)
+	if expiredCount != 0 {
+		t.Errorf("expected expired session to be purged from database, found %d", expiredCount)
+	}
 }
 
 func TestSessionHandler_ListSessions_MissingContext(t *testing.T) {
@@ -471,6 +477,20 @@ func TestRotateSession_NilSessionService_ReturnsInternalError(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	h.RotateSession(rec, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500 Internal Server Error on nil sessionSvc, got %d", rec.Code)
+	}
+}
+
+func TestSessionHandler_ListSessions_NilSessionService_ReturnsInternalError(t *testing.T) {
+	h := NewSessionHandler(nil, nil, nil)
+	req := httptest.NewRequest(http.MethodGet, "/auth/sessions", nil)
+	ctx := context.WithValue(req.Context(), contextKeyUserID, uuid.New())
+	req = req.WithContext(ctx)
+
+	rec := httptest.NewRecorder()
+	h.ListSessions(rec, req)
 
 	if rec.Code != http.StatusInternalServerError {
 		t.Fatalf("expected 500 Internal Server Error on nil sessionSvc, got %d", rec.Code)
