@@ -99,6 +99,9 @@ func (l *Limiter) Reset(key string) {
 // StartCleanup runs a background eviction loop to prevent memory bloat.
 // It stops when either done receives/closes, or Close() is called.
 func (l *Limiter) StartCleanup(tick time.Duration, done <-chan struct{}) {
+	if tick <= 0 {
+		tick = 5 * time.Minute
+	}
 	go func() {
 		ticker := time.NewTicker(tick)
 		defer ticker.Stop()
