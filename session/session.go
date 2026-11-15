@@ -19,7 +19,7 @@ import (
 
 // Service defines session management operations.
 type Service interface {
-	CreateSession(ctx context.Context, userID uuid.UUID, sessionType db.SessionType, ip, userAgent string) (*Session, string, error)
+	CreateSession(ctx context.Context, userID uuid.UUID, credentialVersion int, sessionType db.SessionType, ip, userAgent string) (*Session, string, error)
 	GetSession(ctx context.Context, rawID string) (*Session, error)
 	InvalidateSession(ctx context.Context, rawID string) error
 	InvalidateAllUserSessions(ctx context.Context, userID uuid.UUID) error
@@ -75,6 +75,7 @@ func hashID(rawID string) string {
 func (s *service) CreateSession(
 	ctx context.Context,
 	userID uuid.UUID,
+	credentialVersion int,
 	sessionType db.SessionType,
 	ip, userAgent string,
 ) (*Session, string, error) {
@@ -95,6 +96,7 @@ func (s *service) CreateSession(
 		SessionType:       sessionType,
 		IPAddress:         ip,
 		UserAgent:         userAgent,
+		CredentialVersion: credentialVersion,
 		LastActiveAt:      now,
 		AbsoluteExpiresAt: now.Add(s.cfg.SessionAbsoluteMaxAge),
 		CreatedAt:         now,
@@ -129,6 +131,21 @@ func (s *service) GetSession(ctx context.Context, rawID string) (*Session, error
 			return nil, apperrors.ErrSessionNotFound
 		}
 		return nil, apperrors.New(apperrors.CodeInternalError, "failed to query session", err)
+	}
+
+	// Credential-version check: reject sessions minted under superseded credentials
+	// (e.g. after a password reset) and drop the stale row.
+	var user db.User
+	if uerr := s.db.WithContext(ctx).
+		Select("credential_version").
+		Where("id = ?", record.UserID).
+		First(&user).Error; uerr != nil || user.CredentialVersion != record.CredentialVersion {
+		_ = s.db.WithContext(ctx).Where("id = ?", record.ID).Delete(&db.Session{}).Error
+		slog.InfoContext(ctx, "session_invalidated",
+			"user_id", record.UserID.String(),
+			"reason", "credential_version_mismatch",
+		)
+		return nil, apperrors.ErrSessionInvalid
 	}
 
 	now := time.Now().UTC()
@@ -306,6 +323,16 @@ func (s *service) RotateSession(
 		}
 	}
 
+	// Re-check the user's current credential version so a rotation cannot mint
+	// a session under a superseded credential.
+	var user db.User
+	if uerr := s.db.WithContext(ctx).
+		Select("credential_version").
+		Where("id = ?", oldRecord.UserID).
+		First(&user).Error; uerr != nil || user.CredentialVersion != oldRecord.CredentialVersion {
+		return nil, "", apperrors.ErrSessionInvalid
+	}
+
 	tx := s.db.WithContext(ctx).Begin()
 	if tx.Error != nil {
 		return nil, "", apperrors.New(apperrors.CodeInternalError, "failed to begin transaction", tx.Error)
@@ -357,6 +384,7 @@ func (s *service) RotateSession(
 		SessionType:       oldRecord.SessionType,
 		IPAddress:         ip,
 		UserAgent:         userAgent,
+		CredentialVersion:  oldRecord.CredentialVersion,
 		LastActiveAt:      now,
 		AbsoluteExpiresAt: oldRecord.AbsoluteExpiresAt,
 		CreatedAt:         oldRecord.CreatedAt,
