@@ -7,6 +7,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kaiizer777/go-auth/config"
+	"github.com/kaiizer777/go-auth/db"
 	apperrors "github.com/kaiizer777/go-auth/errors"
 	"github.com/kaiizer777/go-auth/session"
 )
@@ -76,10 +77,12 @@ func RequireAuth(sessionSvc session.Service, cfg *config.Config) func(http.Handl
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			var rawID string
 			var err error
+			var isBearer bool
 
 			if r.Header.Get("Authorization") != "" {
 				// If Authorization header is present, strictly authenticate via Bearer token.
 				// Never fall back to cookie authentication to prevent CSRF bypass via Bearer header spoofing.
+				isBearer = true
 				rawID, err = session.ReadBearerToken(r)
 				if err != nil {
 					apperrors.WriteHTTP(w, err)
@@ -102,6 +105,17 @@ func RequireAuth(sessionSvc session.Service, cfg *config.Config) func(http.Handl
 			}
 			if sess == nil {
 				apperrors.WriteHTTP(w, apperrors.ErrSessionNotFound)
+				return
+			}
+
+			// Enforce transport binding: cookie sessions must be delivered via cookie;
+			// bearer sessions must be delivered via Authorization: Bearer.
+			if isBearer && sess.Type != db.SessionTypeBearer {
+				apperrors.WriteHTTP(w, apperrors.ErrSessionInvalid)
+				return
+			}
+			if !isBearer && sess.Type != db.SessionTypeCookie {
+				apperrors.WriteHTTP(w, apperrors.ErrSessionInvalid)
 				return
 			}
 
