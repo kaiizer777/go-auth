@@ -43,12 +43,13 @@ func TestSessions_PersistenceAndForeignKeyCascade(t *testing.T) {
 	sessionHashHex := hex.EncodeToString(sessionTokenHash[:])
 
 	session := db.Session{
-		ID:            uuid.New(),
-		UserID:        user.ID,
-		TokenHash:     sessionHashHex,
-		ExpiresAt:     time.Now().UTC().Add(24 * time.Hour),
-		IdleExpiresAt: time.Now().UTC().Add(2 * time.Hour),
-		CreatedAt:     time.Now().UTC(),
+		ID:                uuid.New(),
+		UserID:            user.ID,
+		IDHash:            sessionHashHex,
+		SessionType:       db.SessionTypeCookie,
+		LastActiveAt:      time.Now().UTC(),
+		AbsoluteExpiresAt: time.Now().UTC().Add(24 * time.Hour),
+		CreatedAt:         time.Now().UTC(),
 	}
 
 	if err := database.Create(&session).Error; err != nil {
@@ -57,24 +58,25 @@ func TestSessions_PersistenceAndForeignKeyCascade(t *testing.T) {
 
 	// 3. Query session back
 	var queriedSession db.Session
-	if err := database.Where("token_hash = ?", sessionHashHex).First(&queriedSession).Error; err != nil {
-		t.Fatalf("failed to query session by token_hash: %v", err)
+	if err := database.Where("id_hash = ?", sessionHashHex).First(&queriedSession).Error; err != nil {
+		t.Fatalf("failed to query session by id_hash: %v", err)
 	}
 	if queriedSession.UserID != user.ID {
 		t.Fatalf("expected user ID %s, got %s", user.ID, queriedSession.UserID)
 	}
 
-	// 4. Unique token_hash constraint check: inserting another session with identical token_hash must fail
+	// 4. Unique id_hash constraint check: inserting another session with identical id_hash must fail
 	duplicateSession := db.Session{
-		ID:            uuid.New(),
-		UserID:        user.ID,
-		TokenHash:     sessionHashHex,
-		ExpiresAt:     time.Now().UTC().Add(24 * time.Hour),
-		IdleExpiresAt: time.Now().UTC().Add(2 * time.Hour),
-		CreatedAt:     time.Now().UTC(),
+		ID:                uuid.New(),
+		UserID:            user.ID,
+		IDHash:            sessionHashHex,
+		SessionType:       db.SessionTypeCookie,
+		LastActiveAt:      time.Now().UTC(),
+		AbsoluteExpiresAt: time.Now().UTC().Add(24 * time.Hour),
+		CreatedAt:         time.Now().UTC(),
 	}
 	if err := database.Create(&duplicateSession).Error; err == nil {
-		t.Fatal("expected duplicate session token_hash insertion to fail unique constraint, got nil")
+		t.Fatal("expected duplicate session id_hash insertion to fail unique constraint, got nil")
 	}
 
 	// 5. Foreign Key CASCADE deletion: deleting user must automatically delete dependent sessions

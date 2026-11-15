@@ -24,6 +24,8 @@ import (
 	"github.com/kaiizer777/go-auth/db"
 	"github.com/kaiizer777/go-auth/email"
 	"github.com/kaiizer777/go-auth/errors"
+	"github.com/kaiizer777/go-auth/ratelimit"
+	"github.com/kaiizer777/go-auth/session"
 )
 
 type emailCapture struct {
@@ -120,6 +122,17 @@ func setupTestDB(t *testing.T) *gorm.DB {
 		token_hash BLOB PRIMARY KEY,
 		user_id TEXT NOT NULL,
 		expires_at DATETIME NOT NULL,
+		created_at DATETIME
+	);
+	CREATE TABLE IF NOT EXISTS sessions (
+		id TEXT PRIMARY KEY,
+		user_id TEXT NOT NULL,
+		id_hash CHAR(64) UNIQUE NOT NULL,
+		session_type VARCHAR(10) NOT NULL DEFAULT 'cookie',
+		ip_address VARCHAR(45) NOT NULL DEFAULT '',
+		user_agent TEXT NOT NULL DEFAULT '',
+		last_active_at DATETIME NOT NULL,
+		absolute_expires_at DATETIME NOT NULL,
 		created_at DATETIME
 	);
 	`
@@ -855,7 +868,7 @@ func Test500InternalErrorMasking(t *testing.T) {
 
 // Additional Routing & Alias Tests
 func TestRoutingAndAliases(t *testing.T) {
-	_, _, h, _ := setupTestEnv(t)
+	_, svc, h, _ := setupTestEnv(t)
 
 	// GET on POST-only route -> 405 Method Not Allowed
 	recMethodNotAllowed := executeRequest(t, h, http.MethodGet, "/auth/signup", nil)
@@ -893,19 +906,27 @@ func TestRoutingAndAliases(t *testing.T) {
 		t.Fatalf("expected status 400 for empty body, got %d", recEmptyBody.Code)
 	}
 
-	// Logout route -> 204 No Content
+	// Logout route under session protection rejects requests without CSRF / auth -> 403 Forbidden
 	recLogout := executeRequest(t, h, http.MethodPost, "/auth/logout", nil)
-	if recLogout.Code != http.StatusNoContent {
-		t.Fatalf("expected status 204, got %d", recLogout.Code)
-	}
-	if recLogout.Body.Len() != 0 {
-		t.Errorf("expected empty body for 204, got %q", recLogout.Body.String())
+	if recLogout.Code != http.StatusForbidden {
+		t.Fatalf("expected status 403 for unprotected logout, got %d", recLogout.Code)
 	}
 
-	// Alias route: POST /api/auth/logout -> 204 No Content
+	// Alias route: POST /api/auth/logout -> 403 Forbidden
 	recApiLogout := executeRequest(t, h, http.MethodPost, "/api/auth/logout", nil)
-	if recApiLogout.Code != http.StatusNoContent {
-		t.Fatalf("expected status 204 on alias, got %d", recApiLogout.Code)
+	if recApiLogout.Code != http.StatusForbidden {
+		t.Fatalf("expected status 403 on alias for unprotected logout, got %d", recApiLogout.Code)
+	}
+
+	// In legacy mode (nil session service), logout returns 204 No Content
+	legacyH := New(nil, testConfig(), svc)
+	recLegacyLogout := executeRequest(t, legacyH, http.MethodPost, "/auth/logout", nil)
+	if recLegacyLogout.Code != http.StatusNoContent {
+		t.Fatalf("expected status 204 on legacy logout, got %d", recLegacyLogout.Code)
+	}
+	recLegacyApiLogout := executeRequest(t, legacyH, http.MethodPost, "/api/auth/logout", nil)
+	if recLegacyApiLogout.Code != http.StatusNoContent {
+		t.Fatalf("expected status 204 on legacy alias logout, got %d", recLegacyApiLogout.Code)
 	}
 
 	// Alias routes: verify they accept identical requests
@@ -1058,6 +1079,53 @@ func TestLogoutInvokesService(t *testing.T) {
 			t.Fatalf("expected 204 on nil service, got %d", rec.Code)
 		}
 	})
+}
+
+type mockFailingSessionService struct {
+	session.Service
+	invalidateErr error
+}
+
+func (m *mockFailingSessionService) InvalidateSession(ctx context.Context, rawID string) error {
+	return m.invalidateErr
+}
+
+func TestAuthHandler_Logout_InvalidateSessionError(t *testing.T) {
+	mockSvc := &mockAuthService{}
+	cfg := testConfig()
+	expectedErr := errors.New(errors.CodeInternalError, "database query failed", nil)
+	failingSessSvc := &mockFailingSessionService{invalidateErr: expectedErr}
+
+	authH := NewAuthHandler(mockSvc,
+		WithAuthConfig(&cfg),
+		WithAuthSessionService(failingSessSvc),
+	)
+
+	req := httptest.NewRequest(http.MethodPost, "/auth/logout", nil)
+	req.AddCookie(&http.Cookie{Name: "sid", Value: "0123456789abcdef0123456789abcdef"})
+	rec := httptest.NewRecorder()
+
+	authH.Logout(rec, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("expected status 500 on InvalidateSession failure, got %d", rec.Code)
+	}
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == "sid" && c.MaxAge < 0 {
+			t.Fatal("expected session cookie NOT to be cleared on invalidation error")
+		}
+	}
+
+	// Also test bearer token invalidation failure
+	reqBearer := httptest.NewRequest(http.MethodPost, "/auth/logout", nil)
+	reqBearer.Header.Set("Authorization", "Bearer 0123456789abcdef0123456789abcdef")
+	recBearer := httptest.NewRecorder()
+
+	authH.Logout(recBearer, reqBearer)
+
+	if recBearer.Code != http.StatusInternalServerError {
+		t.Fatalf("expected status 500 on bearer InvalidateSession failure, got %d", recBearer.Code)
+	}
 }
 
 func TestDecodeJSON_NilBody(t *testing.T) {
@@ -1259,4 +1327,569 @@ func TestAdversarialPayloadResilience_JSONEndpoints(t *testing.T) {
 func TestBruteForceAccountLockout_RegressionPlaceholder(t *testing.T) {
 	// TODO: implement account lockout regression tests once brute-force/lockout feature is implemented
 	t.Skip("account lockout not yet implemented in service")
+}
+
+func TestAuthHandler_LoginRateLimiting(t *testing.T) {
+	database, svc, _, _ := setupTestEnv(t)
+	cfg := testConfig()
+	loginLimiter := ratelimit.NewLimiter(15*time.Minute, 3)
+	sessSvc := session.NewService(database, &cfg)
+
+	authH := NewAuthHandler(svc,
+		WithAuthSessionService(sessSvc),
+		WithAuthConfig(&cfg),
+		WithAuthLimiters(loginLimiter, nil, nil),
+	)
+
+	email := "ratelimit_login@example.com"
+	reqBody := db.LoginRequest{
+		Email:    email,
+		Password: "wrongpassword",
+	}
+
+	for i := 0; i < 3; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/auth/login", nil)
+		req.RemoteAddr = "192.168.1.10:12345"
+		rec := httptest.NewRecorder()
+		// Inject valid body bytes
+		b, _ := json.Marshal(reqBody)
+		req.Body = io.NopCloser(bytes.NewReader(b))
+		authH.Login(rec, req)
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("attempt %d: expected 401 Unauthorized, got %d", i+1, rec.Code)
+		}
+	}
+
+	// 4th attempt should be blocked with 429
+	req := httptest.NewRequest(http.MethodPost, "/auth/login", nil)
+	req.RemoteAddr = "192.168.1.10:12345"
+	rec := httptest.NewRecorder()
+	b, _ := json.Marshal(reqBody)
+	req.Body = io.NopCloser(bytes.NewReader(b))
+	authH.Login(rec, req)
+
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected 429 Too Many Requests, got %d", rec.Code)
+	}
+	if retryAfter := rec.Header().Get("Retry-After"); retryAfter == "" {
+		t.Errorf("expected Retry-After header on 429 response")
+	}
+}
+
+func TestAuthHandler_RateLimitLogin_EmailCasingSharedBucket(t *testing.T) {
+	_, svc, _, _ := setupTestEnv(t)
+	cfg := testConfig()
+	loginLimiter := ratelimit.NewLimiter(15*time.Minute, 1)
+
+	authH := NewAuthHandler(svc,
+		WithAuthConfig(&cfg),
+		WithAuthLimiters(loginLimiter, nil, nil),
+	)
+
+	// Attempt 1 with lowercase email
+	req1 := httptest.NewRequest(http.MethodPost, "/auth/login", nil)
+	req1.RemoteAddr = "192.168.1.50:12345"
+	b1, _ := json.Marshal(db.LoginRequest{Email: "victim@example.com", Password: "wrongpassword"})
+	req1.Body = io.NopCloser(bytes.NewReader(b1))
+	rec1 := httptest.NewRecorder()
+	authH.Login(rec1, req1)
+	if rec1.Code != http.StatusUnauthorized {
+		t.Fatalf("attempt 1: expected 401, got %d", rec1.Code)
+	}
+
+	// Attempt 2 with uppercase/mixed case email from same IP should be blocked by rate limit (429)
+	req2 := httptest.NewRequest(http.MethodPost, "/auth/login", nil)
+	req2.RemoteAddr = "192.168.1.50:12345"
+	b2, _ := json.Marshal(db.LoginRequest{Email: "VICTIM@EXAMPLE.COM", Password: "wrongpassword"})
+	req2.Body = io.NopCloser(bytes.NewReader(b2))
+	rec2 := httptest.NewRecorder()
+	authH.Login(rec2, req2)
+	if rec2.Code != http.StatusTooManyRequests {
+		t.Fatalf("attempt 2 with case-variant email: expected 429 Too Many Requests, got %d", rec2.Code)
+	}
+}
+
+func TestAuthHandler_RateLimitResetOnSuccess(t *testing.T) {
+	database, svc, _, _ := setupTestEnv(t)
+	cfg := testConfig()
+	loginLimiter := ratelimit.NewLimiter(15*time.Minute, 2)
+	sessSvc := session.NewService(database, &cfg)
+
+	authH := NewAuthHandler(svc,
+		WithAuthSessionService(sessSvc),
+		WithAuthConfig(&cfg),
+		WithAuthLimiters(loginLimiter, nil, nil),
+	)
+
+	email := "rl_reset@example.com"
+	pass := "ValidPassword123!"
+
+	// Signup user
+	_, _, err := svc.Signup(context.Background(), db.SignupRequest{
+		Email:    email,
+		Password: pass,
+	})
+	if err != nil {
+		t.Fatalf("Signup failed: %v", err)
+	}
+
+	// 1 bad attempt
+	badReq := httptest.NewRequest(http.MethodPost, "/auth/login", nil)
+	badReq.RemoteAddr = "192.168.2.1:12345"
+	recBad := httptest.NewRecorder()
+	b, _ := json.Marshal(db.LoginRequest{Email: email, Password: "wrong"})
+	badReq.Body = io.NopCloser(bytes.NewReader(b))
+	authH.Login(recBad, badReq)
+
+	// Successful login should reset rate limiter
+	goodReq := httptest.NewRequest(http.MethodPost, "/auth/login", nil)
+	goodReq.RemoteAddr = "192.168.2.1:12345"
+	recGood := httptest.NewRecorder()
+	b, _ = json.Marshal(db.LoginRequest{Email: email, Password: pass})
+	goodReq.Body = io.NopCloser(bytes.NewReader(b))
+	authH.Login(recGood, goodReq)
+
+	if recGood.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK on valid credentials, got %d", recGood.Code)
+	}
+
+	// Limiter should have reset for this IP|email; another attempt allowed
+	anotherReq := httptest.NewRequest(http.MethodPost, "/auth/login", nil)
+	anotherReq.RemoteAddr = "192.168.2.1:12345"
+	recAnother := httptest.NewRecorder()
+	b, _ = json.Marshal(db.LoginRequest{Email: email, Password: pass})
+	anotherReq.Body = io.NopCloser(bytes.NewReader(b))
+	authH.Login(recAnother, anotherReq)
+
+	if recAnother.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK after reset, got %d", recAnother.Code)
+	}
+}
+
+func TestAuthHandler_LoginSessionCreation_CookieAndBearer(t *testing.T) {
+	database, svc, _, _ := setupTestEnv(t)
+	cfg := testConfig()
+	sessSvc := session.NewService(database, &cfg)
+
+	authH := NewAuthHandler(svc,
+		WithAuthSessionService(sessSvc),
+		WithAuthConfig(&cfg),
+	)
+
+	email := "sess_create@example.com"
+	pass := "ValidPassword123!"
+	createdUser, _, err := svc.Signup(context.Background(), db.SignupRequest{
+		Email:    email,
+		Password: pass,
+	})
+	if err != nil {
+		t.Fatalf("Signup failed: %v", err)
+	}
+
+	// 1. Cookie login
+	cookieReq := httptest.NewRequest(http.MethodPost, "/auth/login", nil)
+	b, _ := json.Marshal(db.LoginRequest{Email: email, Password: pass})
+	cookieReq.Body = io.NopCloser(bytes.NewReader(b))
+	recCookie := httptest.NewRecorder()
+	authH.Login(recCookie, cookieReq)
+
+	if recCookie.Code != http.StatusOK {
+		t.Fatalf("cookie login failed: %d", recCookie.Code)
+	}
+	cookies := recCookie.Result().Cookies()
+	var sidCookie *http.Cookie
+	for _, c := range cookies {
+		if c.Name == cfg.SessionCookieName {
+			sidCookie = c
+			break
+		}
+	}
+	if sidCookie == nil {
+		t.Fatalf("expected cookie %q to be set", cfg.SessionCookieName)
+	}
+	if !sidCookie.HttpOnly {
+		t.Errorf("expected session cookie to have HttpOnly=true")
+	}
+
+	// 2. Bearer login
+	bearerReq := httptest.NewRequest(http.MethodPost, "/auth/login", nil)
+	bearerReq.Header.Set("X-Auth-Type", "bearer")
+	b, _ = json.Marshal(db.LoginRequest{Email: email, Password: pass})
+	bearerReq.Body = io.NopCloser(bytes.NewReader(b))
+	recBearer := httptest.NewRecorder()
+	authH.Login(recBearer, bearerReq)
+
+	if recBearer.Code != http.StatusOK {
+		t.Fatalf("bearer login failed: %d", recBearer.Code)
+	}
+	var bearerResp struct {
+		UserID uuid.UUID `json:"user_id"`
+		Token  string    `json:"token"`
+	}
+	if err := json.Unmarshal(recBearer.Body.Bytes(), &bearerResp); err != nil {
+		t.Fatalf("failed to decode bearer response: %v", err)
+	}
+	if bearerResp.UserID != createdUser.ID {
+		t.Errorf("expected bearer user_id %v, got %v", createdUser.ID, bearerResp.UserID)
+	}
+	if len(bearerResp.Token) != 32 {
+		t.Errorf("expected 32-char hex token, got %q", bearerResp.Token)
+	}
+}
+
+func TestNewAuthHandler_NilConfigDefaults(t *testing.T) {
+	h := NewAuthHandler(nil)
+	if h.cfg == nil {
+		t.Fatalf("expected default config when cfg is nil")
+	}
+	if h.cfg.SessionCookieName == "" {
+		t.Errorf("expected default SessionCookieName to be non-empty")
+	}
+}
+
+func TestAuthHandler_RateLimitResetPassword(t *testing.T) {
+	_, svc, _, _ := setupTestEnv(t)
+	cfg := testConfig()
+	resetLimiter := ratelimit.NewLimiter(15*time.Minute, 2)
+
+	authH := NewAuthHandler(svc,
+		WithAuthConfig(&cfg),
+		WithAuthLimiters(nil, nil, resetLimiter),
+	)
+
+	reqBody := db.PasswordResetConfirmRequest{
+		Token:       strings.Repeat("a", 64),
+		NewPassword: "NewValidPassword123!",
+	}
+	b, _ := json.Marshal(reqBody)
+
+	// Attempts 1 and 2 should reach svc and fail with token invalid (400 or 401)
+	for i := 0; i < 2; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/auth/password/reset", bytes.NewReader(b))
+		req.RemoteAddr = "192.168.10.1:12345"
+		rec := httptest.NewRecorder()
+		authH.ResetPassword(rec, req)
+
+		if rec.Code == http.StatusTooManyRequests {
+			t.Fatalf("attempt %d should not be rate limited", i+1)
+		}
+	}
+
+	// Attempt 3 from same IP should be blocked with 429
+	req3 := httptest.NewRequest(http.MethodPost, "/auth/password/reset", bytes.NewReader(b))
+	req3.RemoteAddr = "192.168.10.1:12345"
+	rec3 := httptest.NewRecorder()
+	authH.ResetPassword(rec3, req3)
+
+	if rec3.Code != http.StatusTooManyRequests {
+		t.Fatalf("attempt 3: expected 429 Too Many Requests, got %d", rec3.Code)
+	}
+	if retryAfter := rec3.Header().Get("Retry-After"); retryAfter == "" {
+		t.Errorf("expected Retry-After header on 429 response")
+	}
+
+	// Attempt from a different IP should be allowed
+	reqOther := httptest.NewRequest(http.MethodPost, "/auth/password/reset", bytes.NewReader(b))
+	reqOther.RemoteAddr = "192.168.10.2:12345"
+	recOther := httptest.NewRecorder()
+	authH.ResetPassword(recOther, reqOther)
+
+	if recOther.Code == http.StatusTooManyRequests {
+		t.Fatalf("attempt from different IP should not be rate limited")
+	}
+}
+
+func TestAuthHandler_DualTierRateLimit_HorizontalPasswordSpraying(t *testing.T) {
+	_, svc, _, _ := setupTestEnv(t)
+	cfg := testConfig()
+	// Allow 2 attempts per IP, 5 attempts per account
+	ipLimiter := ratelimit.NewLimiter(15*time.Minute, 2)
+	accountLimiter := ratelimit.NewLimiter(15*time.Minute, 5)
+
+	authH := NewAuthHandler(svc,
+		WithAuthConfig(&cfg),
+		WithAuthLimiters(accountLimiter, nil, nil),
+		WithAuthIPLimiters(ipLimiter, nil, nil),
+	)
+
+	ip := "198.51.100.1:54321"
+
+	// Attempt 1: email A from IP
+	req1 := httptest.NewRequest(http.MethodPost, "/auth/login", nil)
+	req1.RemoteAddr = ip
+	b1, _ := json.Marshal(db.LoginRequest{Email: "user1@example.com", Password: "wrongpassword"})
+	req1.Body = io.NopCloser(bytes.NewReader(b1))
+	rec1 := httptest.NewRecorder()
+	authH.Login(rec1, req1)
+	if rec1.Code != http.StatusUnauthorized {
+		t.Fatalf("attempt 1: expected 401, got %d", rec1.Code)
+	}
+
+	// Attempt 2: email B from same IP
+	req2 := httptest.NewRequest(http.MethodPost, "/auth/login", nil)
+	req2.RemoteAddr = ip
+	b2, _ := json.Marshal(db.LoginRequest{Email: "user2@example.com", Password: "wrongpassword"})
+	req2.Body = io.NopCloser(bytes.NewReader(b2))
+	rec2 := httptest.NewRecorder()
+	authH.Login(rec2, req2)
+	if rec2.Code != http.StatusUnauthorized {
+		t.Fatalf("attempt 2: expected 401, got %d", rec2.Code)
+	}
+
+	// Attempt 3: email C from same IP — must be blocked by IP-level limiter
+	req3 := httptest.NewRequest(http.MethodPost, "/auth/login", nil)
+	req3.RemoteAddr = ip
+	b3, _ := json.Marshal(db.LoginRequest{Email: "user3@example.com", Password: "wrongpassword"})
+	req3.Body = io.NopCloser(bytes.NewReader(b3))
+	rec3 := httptest.NewRecorder()
+	authH.Login(rec3, req3)
+	if rec3.Code != http.StatusTooManyRequests {
+		t.Fatalf("attempt 3 (spraying from same IP): expected 429, got %d", rec3.Code)
+	}
+	if rec3.Header().Get("Retry-After") == "" {
+		t.Errorf("expected Retry-After header on 429 response")
+	}
+
+	// Attempt 4 from a different IP targeting user3 should be allowed by IP limiter
+	req4 := httptest.NewRequest(http.MethodPost, "/auth/login", nil)
+	req4.RemoteAddr = "198.51.100.2:54321"
+	b4, _ := json.Marshal(db.LoginRequest{Email: "user3@example.com", Password: "wrongpassword"})
+	req4.Body = io.NopCloser(bytes.NewReader(b4))
+	rec4 := httptest.NewRecorder()
+	authH.Login(rec4, req4)
+	if rec4.Code != http.StatusUnauthorized {
+		t.Fatalf("attempt 4 from different IP: expected 401, got %d", rec4.Code)
+	}
+}
+
+func TestAuthHandler_DualTierRateLimit_DistributedBruteForce(t *testing.T) {
+	_, svc, _, _ := setupTestEnv(t)
+	cfg := testConfig()
+	// Allow 10 attempts per IP, but only 2 attempts per account
+	ipLimiter := ratelimit.NewLimiter(15*time.Minute, 10)
+	accountLimiter := ratelimit.NewLimiter(15*time.Minute, 2)
+
+	authH := NewAuthHandler(svc,
+		WithAuthConfig(&cfg),
+		WithAuthLimiters(accountLimiter, nil, nil),
+		WithAuthIPLimiters(ipLimiter, nil, nil),
+	)
+
+	targetEmail := "admin@targetcorp.com"
+
+	// Attempt 1 from IP 1
+	req1 := httptest.NewRequest(http.MethodPost, "/auth/login", nil)
+	req1.RemoteAddr = "10.0.0.1:12345"
+	b1, _ := json.Marshal(db.LoginRequest{Email: targetEmail, Password: "badpassword1"})
+	req1.Body = io.NopCloser(bytes.NewReader(b1))
+	rec1 := httptest.NewRecorder()
+	authH.Login(rec1, req1)
+	if rec1.Code != http.StatusUnauthorized {
+		t.Fatalf("attempt 1: expected 401, got %d", rec1.Code)
+	}
+
+	// Attempt 2 from IP 2 (rotating IP)
+	req2 := httptest.NewRequest(http.MethodPost, "/auth/login", nil)
+	req2.RemoteAddr = "10.0.0.2:12345"
+	b2, _ := json.Marshal(db.LoginRequest{Email: targetEmail, Password: "badpassword2"})
+	req2.Body = io.NopCloser(bytes.NewReader(b2))
+	rec2 := httptest.NewRecorder()
+	authH.Login(rec2, req2)
+	if rec2.Code != http.StatusUnauthorized {
+		t.Fatalf("attempt 2: expected 401, got %d", rec2.Code)
+	}
+
+	// Attempt 3 from IP 3 (fresh rotating IP) — must be blocked by account limiter
+	req3 := httptest.NewRequest(http.MethodPost, "/auth/login", nil)
+	req3.RemoteAddr = "10.0.0.3:12345"
+	b3, _ := json.Marshal(db.LoginRequest{Email: targetEmail, Password: "badpassword3"})
+	req3.Body = io.NopCloser(bytes.NewReader(b3))
+	rec3 := httptest.NewRecorder()
+	authH.Login(rec3, req3)
+	if rec3.Code != http.StatusTooManyRequests {
+		t.Fatalf("attempt 3 (distributed attack on same account): expected 429, got %d", rec3.Code)
+	}
+}
+
+func TestAuthHandler_DualTierRateLimit_ResetAccountOnlyOnSuccess(t *testing.T) {
+	database, svc, _, _ := setupTestEnv(t)
+	cfg := testConfig()
+	sessSvc := session.NewService(database, &cfg)
+
+	// IP limiter max: 2, Account limiter max: 2
+	ipLimiter := ratelimit.NewLimiter(15*time.Minute, 2)
+	accountLimiter := ratelimit.NewLimiter(15*time.Minute, 2)
+
+	authH := NewAuthHandler(svc,
+		WithAuthSessionService(sessSvc),
+		WithAuthConfig(&cfg),
+		WithAuthLimiters(accountLimiter, nil, nil),
+		WithAuthIPLimiters(ipLimiter, nil, nil),
+	)
+
+	email := "dual_reset@example.com"
+	pass := "SecurePassword123!"
+
+	_, _, err := svc.Signup(context.Background(), db.SignupRequest{Email: email, Password: pass})
+	if err != nil {
+		t.Fatalf("Signup failed: %v", err)
+	}
+
+	ip := "192.0.2.100:1111"
+
+	// Attempt 1: failed login
+	reqBad := httptest.NewRequest(http.MethodPost, "/auth/login", nil)
+	reqBad.RemoteAddr = ip
+	bBad, _ := json.Marshal(db.LoginRequest{Email: email, Password: "wrong"})
+	reqBad.Body = io.NopCloser(bytes.NewReader(bBad))
+	recBad := httptest.NewRecorder()
+	authH.Login(recBad, reqBad)
+	if recBad.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d", recBad.Code)
+	}
+
+	// Attempt 2: successful login (uses up 2nd attempt on IP limiter)
+	reqGood := httptest.NewRequest(http.MethodPost, "/auth/login", nil)
+	reqGood.RemoteAddr = ip
+	bGood, _ := json.Marshal(db.LoginRequest{Email: email, Password: pass})
+	reqGood.Body = io.NopCloser(bytes.NewReader(bGood))
+	recGood := httptest.NewRecorder()
+	authH.Login(recGood, reqGood)
+	if recGood.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", recGood.Code)
+	}
+
+	// Attempt 3 from same IP: IP limiter must NOT have been reset by success, so 3rd attempt is blocked
+	reqBlocked := httptest.NewRequest(http.MethodPost, "/auth/login", nil)
+	reqBlocked.RemoteAddr = ip
+	bBlocked, _ := json.Marshal(db.LoginRequest{Email: email, Password: pass})
+	reqBlocked.Body = io.NopCloser(bytes.NewReader(bBlocked))
+	recBlocked := httptest.NewRecorder()
+	authH.Login(recBlocked, reqBlocked)
+	if recBlocked.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected 429 because IP limiter was not reset, got %d", recBlocked.Code)
+	}
+
+	// Attempt 4 from a DIFFERENT IP for the same account should succeed (account limiter was reset)
+	reqOtherIP := httptest.NewRequest(http.MethodPost, "/auth/login", nil)
+	reqOtherIP.RemoteAddr = "192.0.2.101:1111"
+	bOtherIP, _ := json.Marshal(db.LoginRequest{Email: email, Password: pass})
+	reqOtherIP.Body = io.NopCloser(bytes.NewReader(bOtherIP))
+	recOtherIP := httptest.NewRecorder()
+	authH.Login(recOtherIP, reqOtherIP)
+	if recOtherIP.Code != http.StatusOK {
+		t.Fatalf("expected 200 from different IP because account counter was reset, got %d", recOtherIP.Code)
+	}
+}
+
+func TestAuthHandler_DualTierRateLimit_SignupMassRegistration(t *testing.T) {
+	_, svc, _, _ := setupTestEnv(t)
+	cfg := testConfig()
+	// Allow 2 signups per IP
+	signupIPLimiter := ratelimit.NewLimiter(15*time.Minute, 2)
+	signupLimiter := ratelimit.NewLimiter(15*time.Minute, 10)
+
+	authH := NewAuthHandler(svc,
+		WithAuthConfig(&cfg),
+		WithAuthLimiters(nil, signupLimiter, nil),
+		WithAuthIPLimiters(nil, signupIPLimiter, nil),
+	)
+
+	ip := "203.0.113.50:4321"
+
+	for i := 1; i <= 2; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/auth/signup", nil)
+		req.RemoteAddr = ip
+		b, _ := json.Marshal(db.SignupRequest{
+			Email:    fmt.Sprintf("mass_reg_%d@example.com", i),
+			Password: "StrongPassword123!",
+		})
+		req.Body = io.NopCloser(bytes.NewReader(b))
+		rec := httptest.NewRecorder()
+		authH.Signup(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("signup %d: expected 200, got %d", i, rec.Code)
+		}
+	}
+
+	// 3rd signup from same IP must be blocked by IP rate limiter
+	req3 := httptest.NewRequest(http.MethodPost, "/auth/signup", nil)
+	req3.RemoteAddr = ip
+	b3, _ := json.Marshal(db.SignupRequest{
+		Email:    "mass_reg_3@example.com",
+		Password: "StrongPassword123!",
+	})
+	req3.Body = io.NopCloser(bytes.NewReader(b3))
+	rec3 := httptest.NewRecorder()
+	authH.Signup(rec3, req3)
+
+	if rec3.Code != http.StatusTooManyRequests {
+		t.Fatalf("signup 3: expected 429 Too Many Requests, got %d", rec3.Code)
+	}
+}
+
+func TestLogout_CSRFAndAuthProtection(t *testing.T) {
+	database := setupSessionTestDB(t)
+	cfg := config.DefaultConfig()
+	sessSvc := session.NewService(database, &cfg)
+
+	mockAuth := &mockAuthService{}
+	h := New(database, cfg, mockAuth, WithSessionService(sessSvc))
+
+	userID := uuid.New()
+	_, rawCookieID, err := sessSvc.CreateSession(context.Background(), userID, db.SessionTypeCookie, "127.0.0.1", "agent")
+	if err != nil {
+		t.Fatalf("failed to create cookie session: %v", err)
+	}
+	_, rawBearerID, err := sessSvc.CreateSession(context.Background(), userID, db.SessionTypeBearer, "127.0.0.1", "agent")
+	if err != nil {
+		t.Fatalf("failed to create bearer session: %v", err)
+	}
+
+	t.Run("cookie logout without CSRF token returns 403 Forbidden", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/auth/logout", nil)
+		req.AddCookie(&http.Cookie{Name: cfg.SessionCookieName, Value: rawCookieID})
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("expected 403 Forbidden on missing CSRF token, got %d", rec.Code)
+		}
+	})
+
+	t.Run("cookie logout with valid CSRF token returns 200 OK and revokes session", func(t *testing.T) {
+		csrfVal := "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+		req := httptest.NewRequest(http.MethodPost, "/auth/logout", nil)
+		req.AddCookie(&http.Cookie{Name: cfg.SessionCookieName, Value: rawCookieID})
+		req.AddCookie(&http.Cookie{Name: cfg.CSRFCookieName, Value: csrfVal})
+		req.Header.Set(cfg.CSRFHeaderName, csrfVal)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200 OK, got %d: %s", rec.Code, rec.Body.String())
+		}
+	})
+
+	t.Run("bearer logout bypasses CSRF and returns 200 OK", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/auth/logout", nil)
+		req.Header.Set("Authorization", "Bearer "+rawBearerID)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200 OK, got %d: %s", rec.Code, rec.Body.String())
+		}
+	})
+
+	t.Run("unauthenticated bearer logout returns 401 Unauthorized", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/auth/logout", nil)
+		req.Header.Set("Authorization", "Bearer 00000000000000000000000000000000")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("expected 401 Unauthorized, got %d", rec.Code)
+		}
+	})
 }

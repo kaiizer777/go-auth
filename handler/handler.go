@@ -10,25 +10,83 @@ import (
 
 	"github.com/kaiizer777/go-auth/auth"
 	"github.com/kaiizer777/go-auth/config"
+	"github.com/kaiizer777/go-auth/csrf"
 	"github.com/kaiizer777/go-auth/errors"
+	"github.com/kaiizer777/go-auth/ratelimit"
+	"github.com/kaiizer777/go-auth/session"
 )
 
 // Handler maintains the HTTP router, database connection, and configuration.
 type Handler struct {
-	mux     *http.ServeMux
-	db      *gorm.DB
-	cfg     config.Config
-	authSvc auth.Service
+	mux             *http.ServeMux
+	db              *gorm.DB
+	cfg             config.Config
+	authSvc         auth.Service
+	sessionSvc      session.Service
+	sessHandler     *SessionHandler
+	loginLimiter    *ratelimit.Limiter
+	signupLimiter   *ratelimit.Limiter
+	resetLimiter    *ratelimit.Limiter
+	loginIPLimiter  *ratelimit.Limiter
+	signupIPLimiter *ratelimit.Limiter
+	resetIPLimiter  *ratelimit.Limiter
+}
+
+// Option configures optional dependencies for Handler.
+type Option func(*Handler)
+
+// WithSessionService attaches a session service to the Handler.
+func WithSessionService(svc session.Service) Option {
+	return func(h *Handler) {
+		h.sessionSvc = svc
+	}
+}
+
+// WithSessionHandler attaches a pre-configured SessionHandler.
+func WithSessionHandler(sh *SessionHandler) Option {
+	return func(h *Handler) {
+		h.sessHandler = sh
+	}
+}
+
+// WithRateLimiters attaches custom in-memory rate limiters to the Handler.
+func WithRateLimiters(login, reset, signup *ratelimit.Limiter) Option {
+	return func(h *Handler) {
+		h.loginLimiter = login
+		h.resetLimiter = reset
+		h.signupLimiter = signup
+	}
+}
+
+// WithIPRateLimiters attaches custom in-memory IP-tier rate limiters to the Handler.
+func WithIPRateLimiters(loginIP, resetIP, signupIP *ratelimit.Limiter) Option {
+	return func(h *Handler) {
+		h.loginIPLimiter = loginIP
+		h.resetIPLimiter = resetIP
+		h.signupIPLimiter = signupIP
+	}
 }
 
 // New initializes the handler scaffold, registers routes, and applies CORS middleware.
-func New(db *gorm.DB, cfg config.Config, authSvc auth.Service) http.Handler {
+func New(db *gorm.DB, cfg config.Config, authSvc auth.Service, opts ...Option) http.Handler {
 	h := &Handler{
 		mux:     http.NewServeMux(),
 		db:      db,
 		cfg:     cfg,
 		authSvc: authSvc,
 	}
+	for _, opt := range opts {
+		opt(h)
+	}
+
+	if h.sessionSvc == nil && db != nil {
+		h.sessionSvc = session.NewService(db, &cfg)
+	}
+
+	if h.sessHandler == nil && h.sessionSvc != nil {
+		h.sessHandler = NewSessionHandler(h.sessionSvc, db, &cfg)
+	}
+
 	h.registerRoutes()
 	return CORS(cfg)(h)
 }
@@ -99,11 +157,18 @@ func (h *Handler) registerRoutes() {
 	})
 
 	if h.authSvc != nil {
-		authH := NewAuthHandler(h.authSvc)
+		authH := NewAuthHandler(h.authSvc,
+			WithAuthSessionService(h.sessionSvc),
+			WithAuthConfig(&h.cfg),
+			WithAuthLimiters(h.loginLimiter, h.signupLimiter, h.resetLimiter),
+			WithAuthIPLimiters(h.loginIPLimiter, h.signupIPLimiter, h.resetIPLimiter),
+		)
 		// Canonical routes:
 		h.mux.HandleFunc("POST /auth/signup", authH.Signup)
 		h.mux.HandleFunc("POST /auth/login", authH.Login)
-		h.mux.HandleFunc("POST /auth/logout", authH.Logout)
+		if h.sessHandler == nil || h.sessionSvc == nil {
+			h.mux.HandleFunc("POST /auth/logout", authH.Logout)
+		}
 		h.mux.HandleFunc("POST /auth/verify", authH.VerifyEmail)
 		h.mux.HandleFunc("POST /auth/password/reset-request", authH.RequestPasswordReset)
 		h.mux.HandleFunc("POST /auth/password/reset", authH.ResetPassword)
@@ -111,10 +176,46 @@ func (h *Handler) registerRoutes() {
 		// Aliases:
 		h.mux.HandleFunc("POST /api/auth/signup", authH.Signup)
 		h.mux.HandleFunc("POST /api/auth/login", authH.Login)
-		h.mux.HandleFunc("POST /api/auth/logout", authH.Logout)
+		if h.sessHandler == nil || h.sessionSvc == nil {
+			h.mux.HandleFunc("POST /api/auth/logout", authH.Logout)
+		}
 		h.mux.HandleFunc("POST /api/auth/verify-email", authH.VerifyEmail)
 		h.mux.HandleFunc("POST /api/auth/request-password-reset", authH.RequestPasswordReset)
 		h.mux.HandleFunc("POST /api/auth/reset-password", authH.ResetPassword)
+	}
+
+	if h.sessHandler != nil && h.sessionSvc != nil {
+		authMw := RequireAuth(h.sessionSvc, &h.cfg)
+		csrfMw := csrf.Middleware(&h.cfg)
+		sessionWrap := func(hf http.HandlerFunc) http.Handler {
+			return csrfMw(authMw(hf))
+		}
+
+		// Canonical session routes:
+		h.mux.Handle("GET /auth/session", sessionWrap(h.sessHandler.GetCurrentSession))
+		h.mux.Handle("DELETE /auth/session", sessionWrap(h.sessHandler.Logout))
+		if h.authSvc != nil {
+			h.mux.Handle("POST /auth/logout", sessionWrap(h.sessHandler.Logout))
+		}
+		h.mux.Handle("GET /auth/sessions", sessionWrap(h.sessHandler.ListSessions))
+		h.mux.Handle("DELETE /auth/sessions", sessionWrap(h.sessHandler.InvalidateAllSessions))
+		h.mux.Handle("POST /auth/session/rotate", sessionWrap(h.sessHandler.RotateSession))
+
+		// Aliases:
+		h.mux.Handle("GET /api/auth/session", sessionWrap(h.sessHandler.GetCurrentSession))
+		h.mux.Handle("DELETE /api/auth/session", sessionWrap(h.sessHandler.Logout))
+		if h.authSvc != nil {
+			h.mux.Handle("POST /api/auth/logout", sessionWrap(h.sessHandler.Logout))
+		}
+		h.mux.Handle("GET /api/auth/sessions", sessionWrap(h.sessHandler.ListSessions))
+		h.mux.Handle("DELETE /api/auth/sessions", sessionWrap(h.sessHandler.InvalidateAllSessions))
+		h.mux.Handle("POST /api/auth/session/rotate", sessionWrap(h.sessHandler.RotateSession))
+
+		h.mux.Handle("GET /sessions/me", sessionWrap(h.sessHandler.GetCurrentSession))
+		h.mux.Handle("DELETE /sessions/me", sessionWrap(h.sessHandler.Logout))
+		h.mux.Handle("GET /sessions", sessionWrap(h.sessHandler.ListSessions))
+		h.mux.Handle("DELETE /sessions", sessionWrap(h.sessHandler.InvalidateAllSessions))
+		h.mux.Handle("POST /sessions/rotate", sessionWrap(h.sessHandler.RotateSession))
 	}
 }
 

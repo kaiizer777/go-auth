@@ -38,6 +38,18 @@ const (
 	CodeUserAlreadyExists  Code = "USER_ALREADY_EXISTS"
 	CodeUserNotFound       Code = "USER_NOT_FOUND"
 
+	// Phase 4 Session errors
+	CodeSessionNotFound Code = "SESSION_NOT_FOUND" // 401
+	CodeSessionExpired  Code = "SESSION_EXPIRED"   // 401
+	CodeSessionInvalid  Code = "SESSION_INVALID"   // 401
+
+	// Phase 4 CSRF errors
+	CodeCSRFTokenMissing Code = "CSRF_TOKEN_MISSING" // 403
+	CodeCSRFTokenInvalid Code = "CSRF_TOKEN_INVALID" // 403
+
+	// Phase 4 Rate limiting
+	CodeRateLimitExceeded Code = "RATE_LIMIT_EXCEEDED" // 429
+
 	// Aliases
 	INVALID_CONFIG       = CodeInvalidConfig
 	DATABASE_ERROR       = CodeDatabaseError
@@ -50,6 +62,13 @@ const (
 	EMAIL_HOOK_NIL         = CodeEmailHookNil
 	EMAIL_DISPATCH_FAILED  = CodeEmailDispatchFailed
 	EMAIL_DISPATCH_TIMEOUT = CodeEmailDispatchTimeout
+
+	SESSION_NOT_FOUND   = CodeSessionNotFound
+	SESSION_EXPIRED     = CodeSessionExpired
+	SESSION_INVALID     = CodeSessionInvalid
+	CSRF_TOKEN_MISSING  = CodeCSRFTokenMissing
+	CSRF_TOKEN_INVALID  = CodeCSRFTokenInvalid
+	RATE_LIMIT_EXCEEDED = CodeRateLimitExceeded
 )
 
 // HTTPStatus maps error codes deterministically to HTTP response status codes.
@@ -58,10 +77,13 @@ func (c Code) HTTPStatus() int {
 	case CodePasswordTooShort, CodePasswordTooLong, CodePasswordTooCommon,
 		CodeInvalidEmail, CodeValidationError, CodeInvalidToken, CodeTokenExpired:
 		return http.StatusBadRequest
-	case CodeInvalidCredentials, CodeUnauthenticated:
+	case CodeInvalidCredentials, CodeUnauthenticated,
+		CodeSessionNotFound, CodeSessionExpired, CodeSessionInvalid:
 		return http.StatusUnauthorized
-	case CodeEmailNotVerified:
+	case CodeEmailNotVerified, CodeCSRFTokenMissing, CodeCSRFTokenInvalid:
 		return http.StatusForbidden
+	case CodeRateLimitExceeded:
+		return http.StatusTooManyRequests
 	case CodeNotFound, CodeUserNotFound:
 		return http.StatusNotFound
 	case CodeUserAlreadyExists:
@@ -224,6 +246,29 @@ var (
 	ErrPasswordMaxLengthInvalid        = New(CodeInvalidConfig, "password max length must be greater than min length and at most 128", nil)
 	ErrVerificationTokenExpiryInvalid  = New(CodeInvalidConfig, "verification token expiry must be between 15m and 60m", nil)
 	ErrPasswordResetTokenExpiryInvalid = New(CodeInvalidConfig, "password reset token expiry must be between 15m and 60m", nil)
+	ErrSessionIdleTimeoutInvalid       = New(CodeInvalidConfig, "SessionIdleTimeout must be greater than zero", nil)
+	ErrSessionAbsoluteMaxAgeInvalid    = New(CodeInvalidConfig, "SessionAbsoluteMaxAge must be greater than SessionIdleTimeout", nil)
+	ErrSessionSameSiteNoneInsecure     = New(CodeInvalidConfig, "SessionCookieSameSite=None requires SessionCookieSecure=true", nil)
+	ErrRateLimitWindowInvalid          = New(CodeInvalidConfig, "rate limit window and cleanup tick must be greater than zero", nil)
+	ErrRateLimitMaxInvalid             = New(CodeInvalidConfig, "rate limit max must be >= 1", nil)
+	ErrSessionCookieNameInvalid        = New(CodeInvalidConfig, "session cookie name is invalid", nil)
+	ErrSessionCookiePathInvalid        = New(CodeInvalidConfig, "session cookie path is invalid", nil)
+	ErrSessionCookieDomainInvalid      = New(CodeInvalidConfig, "session cookie domain is invalid", nil)
+	ErrCSRFCookieNameInvalid           = New(CodeInvalidConfig, "CSRF cookie name is invalid", nil)
+	ErrCSRFHeaderNameInvalid           = New(CodeInvalidConfig, "CSRF header name is invalid", nil)
+
+	// Aliases
+	ErrInvalidCookieName   = ErrSessionCookieNameInvalid
+	ErrInvalidCookiePath   = ErrSessionCookiePathInvalid
+	ErrInvalidCookieDomain = ErrSessionCookieDomainInvalid
+
+	// Predefined sentinel errors for Phase 4 Session, CSRF, and Rate Limiting.
+	ErrSessionNotFound   = New(CodeSessionNotFound, "Session is invalid or has expired", nil)
+	ErrSessionExpired    = New(CodeSessionExpired, "Session is invalid or has expired", nil)
+	ErrSessionInvalid    = New(CodeSessionInvalid, "Session is invalid or has expired", nil)
+	ErrCSRFTokenMissing  = New(CodeCSRFTokenMissing, "CSRF token is missing", nil)
+	ErrCSRFTokenInvalid  = New(CodeCSRFTokenInvalid, "CSRF token is invalid", nil)
+	ErrRateLimitExceeded = New(CodeRateLimitExceeded, "Too many requests, try again later", nil)
 )
 
 // WriteJSON writes an error response envelope to the response writer with the appropriate HTTP status.
@@ -241,16 +286,31 @@ func WriteJSON(w http.ResponseWriter, err error) {
 
 	if As(err, &appErr) && appErr != nil {
 		status = appErr.code.HTTPStatus()
+		code := appErr.code
+		if code == CodeSessionNotFound || code == CodeSessionExpired {
+			code = CodeSessionInvalid
+		}
 		msg := appErr.message
 		if msg == "" {
-			if status == http.StatusInternalServerError {
-				msg = "internal server error"
-			} else {
-				msg = strings.ToLower(http.StatusText(status))
+			switch appErr.code {
+			case CodeSessionNotFound, CodeSessionExpired, CodeSessionInvalid:
+				msg = "Session is invalid or has expired"
+			case CodeCSRFTokenMissing:
+				msg = "CSRF token is missing"
+			case CodeCSRFTokenInvalid:
+				msg = "CSRF token is invalid"
+			case CodeRateLimitExceeded:
+				msg = "Too many requests, try again later"
+			default:
+				if status == http.StatusInternalServerError {
+					msg = "internal server error"
+				} else {
+					msg = strings.ToLower(http.StatusText(status))
+				}
 			}
 		}
 		resp = Response{
-			Code:    appErr.code,
+			Code:    code,
 			Message: msg,
 		}
 	} else {
@@ -271,3 +331,6 @@ func WriteJSON(w http.ResponseWriter, err error) {
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(resp)
 }
+
+// WriteHTTP is an alias for WriteJSON conforming to wire response standards.
+var WriteHTTP = WriteJSON

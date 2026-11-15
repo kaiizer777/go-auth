@@ -370,7 +370,14 @@ func (s *authService) ResetPassword(ctx context.Context, req db.PasswordResetCon
 			return err
 		}
 
-		return tx.Where("user_id = ?", tok.UserID).Delete(&db.PasswordResetToken{}).Error
+		if err := tx.Where("user_id = ?", tok.UserID).Delete(&db.PasswordResetToken{}).Error; err != nil {
+			return err
+		}
+
+		if err := tx.Where("user_id = ?", tok.UserID).Delete(&db.Session{}).Error; err != nil {
+			return err
+		}
+		return nil
 	})
 	if err != nil {
 		var appErr *errors.Error

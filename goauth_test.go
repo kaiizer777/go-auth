@@ -5,9 +5,11 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	stderrors "errors"
+	"net/http"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/glebarez/sqlite"
 	"gorm.io/driver/postgres"
@@ -102,6 +104,53 @@ func TestAuth_Close_WithDB(t *testing.T) {
 	if err := auth.Close(); err != nil {
 		t.Fatalf("auth.Close() failed: %v", err)
 	}
+
+	// Repeated calls must be idempotent and safe
+	if err := auth.Close(); err != nil {
+		t.Fatalf("second auth.Close() failed: %v", err)
+	}
+}
+
+func TestAuth_Close_ConcurrentIdempotent(t *testing.T) {
+	registerMockOnce.Do(func() {
+		sql.Register("auth_mock_driver", &mockAuthDriver{})
+	})
+
+	sqlDB, err := sql.Open("auth_mock_driver", "mock")
+	if err != nil {
+		t.Fatalf("failed to open mock db: %v", err)
+	}
+
+	gormDB, err := gorm.Open(postgres.New(postgres.Config{Conn: sqlDB}), &gorm.Config{
+		DisableAutomaticPing: true,
+	})
+	if err != nil {
+		t.Fatalf("failed to open gorm db: %v", err)
+	}
+
+	auth := &Auth{
+		db:          gormDB,
+		limiterDone: make(chan struct{}),
+	}
+
+	const goroutines = 10
+	var wg sync.WaitGroup
+	errs := make([]error, goroutines)
+
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			errs[idx] = auth.Close()
+		}(i)
+	}
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("goroutine %d close error: %v", i, err)
+		}
+	}
 }
 
 func TestAuth_EmailDispatcher(t *testing.T) {
@@ -141,10 +190,9 @@ func TestAuth_EmailDispatcher_Nil(t *testing.T) {
 }
 
 func TestNew_DatabaseConnectionError(t *testing.T) {
-	cfg := config.Config{
-		DatabaseURL: "postgres://invalid:invalid@127.0.0.1:54329/nonexistent?sslmode=disable&connect_timeout=1",
-		BaseURL:     "https://example.com",
-	}
+	cfg := config.DefaultConfig()
+	cfg.DatabaseURL = "postgres://invalid:invalid@127.0.0.1:54329/nonexistent?sslmode=disable&connect_timeout=1"
+	cfg.BaseURL = "https://example.com"
 
 	auth, err := New(cfg)
 	if err == nil {
@@ -226,7 +274,12 @@ func TestNew_SuccessAndWiring(t *testing.T) {
 	CREATE TABLE IF NOT EXISTS sessions (
 		id TEXT PRIMARY KEY,
 		user_id TEXT NOT NULL,
-		expires_at DATETIME NOT NULL,
+		id_hash CHAR(64) UNIQUE NOT NULL,
+		session_type VARCHAR(10) NOT NULL DEFAULT 'cookie',
+		ip_address VARCHAR(45) NOT NULL DEFAULT '',
+		user_agent TEXT NOT NULL DEFAULT '',
+		last_active_at DATETIME NOT NULL,
+		absolute_expires_at DATETIME NOT NULL,
 		created_at DATETIME
 	);
 	`
@@ -241,18 +294,17 @@ func TestNew_SuccessAndWiring(t *testing.T) {
 	var verificationPayload email.VerificationEmailPayload
 	var resetPayload email.PasswordResetEmailPayload
 
-	cfg := config.Config{
-		DatabaseURL:               "postgres://user:pass@localhost:5432/testdb",
-		BaseURL:                   "https://auth.example.com",
-		DisableAsyncEmailDispatch: true,
-		SendVerificationEmail: func(ctx context.Context, payload email.VerificationEmailPayload) error {
-			verificationPayload = payload
-			return nil
-		},
-		SendPasswordResetEmail: func(ctx context.Context, payload email.PasswordResetEmailPayload) error {
-			resetPayload = payload
-			return nil
-		},
+	cfg := config.DefaultConfig()
+	cfg.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+	cfg.BaseURL = "https://auth.example.com"
+	cfg.DisableAsyncEmailDispatch = true
+	cfg.SendVerificationEmail = func(ctx context.Context, payload email.VerificationEmailPayload) error {
+		verificationPayload = payload
+		return nil
+	}
+	cfg.SendPasswordResetEmail = func(ctx context.Context, payload email.PasswordResetEmailPayload) error {
+		resetPayload = payload
+		return nil
 	}
 
 	a, err := New(cfg)
@@ -291,8 +343,137 @@ func TestNew_SuccessAndWiring(t *testing.T) {
 		t.Fatalf("resetPayload.To = %q; want 'user@example.com'", resetPayload.To)
 	}
 
+	if a.SessionService() == nil {
+		t.Fatal("expected a.SessionService() to not be nil")
+	}
+	if a.RequireAuth(http.NotFoundHandler()) == nil {
+		t.Fatal("expected a.RequireAuth middleware to not be nil")
+	}
+	if a.CSRF(http.NotFoundHandler()) == nil {
+		t.Fatal("expected a.CSRF middleware to not be nil")
+	}
+
 	// Verify Close cleans up cleanly
 	if err := a.Close(); err != nil {
 		t.Fatalf("a.Close() unexpected err = %v", err)
+	}
+}
+
+func TestNewWithDB_ZeroCleanupTick(t *testing.T) {
+	sqliteDB, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{
+		DisableAutomaticPing: true,
+	})
+	if err != nil {
+		t.Fatalf("failed to open sqlite: %v", err)
+	}
+
+	ddl := `
+	CREATE TABLE IF NOT EXISTS users (
+		id TEXT PRIMARY KEY,
+		email TEXT UNIQUE NOT NULL,
+		password_hash TEXT NOT NULL,
+		email_verified INTEGER NOT NULL DEFAULT 0,
+		created_at DATETIME,
+		updated_at DATETIME
+	);
+	CREATE TABLE IF NOT EXISTS sessions (
+		id TEXT PRIMARY KEY,
+		user_id TEXT NOT NULL,
+		id_hash CHAR(64) UNIQUE NOT NULL,
+		session_type VARCHAR(10) NOT NULL DEFAULT 'cookie',
+		ip_address VARCHAR(45) NOT NULL DEFAULT '',
+		user_agent TEXT NOT NULL DEFAULT '',
+		last_active_at DATETIME NOT NULL,
+		absolute_expires_at DATETIME NOT NULL,
+		created_at DATETIME
+	);
+	`
+	if err := sqliteDB.Exec(ddl).Error; err != nil {
+		t.Fatalf("failed to execute sqlite ddl: %v", err)
+	}
+
+	cfg := config.DefaultConfig()
+	cfg.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+	cfg.BaseURL = "https://auth.example.com"
+	cfg.RateLimitCleanupTick = 0
+
+	a, err := NewWithDB(sqliteDB, cfg)
+	if err != nil {
+		t.Fatalf("NewWithDB unexpected err = %v", err)
+	}
+	defer func() { _ = a.Close() }()
+	if a == nil {
+		t.Fatal("expected non-nil Auth")
+	}
+}
+
+func TestNewWithDB_InvalidConfig(t *testing.T) {
+	sqliteDB, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{
+		DisableAutomaticPing: true,
+	})
+	if err != nil {
+		t.Fatalf("failed to open sqlite: %v", err)
+	}
+
+	// Empty config missing DatabaseURL and BaseURL
+	_, err = NewWithDB(sqliteDB, config.Config{})
+	if err == nil {
+		t.Fatal("expected NewWithDB to fail validation on empty config, got nil")
+	}
+	var appErr *errors.Error
+	if !errors.As(err, &appErr) || appErr.Code() != errors.CodeInvalidConfig {
+		t.Fatalf("expected CodeInvalidConfig, got %v", err)
+	}
+}
+
+func TestNewWithDB_AppliesDefaults(t *testing.T) {
+	sqliteDB, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{
+		DisableAutomaticPing: true,
+	})
+	if err != nil {
+		t.Fatalf("failed to open sqlite: %v", err)
+	}
+
+	ddl := `
+	CREATE TABLE IF NOT EXISTS users (
+		id TEXT PRIMARY KEY,
+		email TEXT UNIQUE NOT NULL,
+		password_hash TEXT NOT NULL,
+		email_verified INTEGER NOT NULL DEFAULT 0,
+		created_at DATETIME,
+		updated_at DATETIME
+	);
+	CREATE TABLE IF NOT EXISTS sessions (
+		id TEXT PRIMARY KEY,
+		user_id TEXT NOT NULL,
+		id_hash CHAR(64) UNIQUE NOT NULL,
+		session_type VARCHAR(10) NOT NULL DEFAULT 'cookie',
+		ip_address VARCHAR(45) NOT NULL DEFAULT '',
+		user_agent TEXT NOT NULL DEFAULT '',
+		last_active_at DATETIME NOT NULL,
+		absolute_expires_at DATETIME NOT NULL,
+		created_at DATETIME
+	);
+	`
+	if err := sqliteDB.Exec(ddl).Error; err != nil {
+		t.Fatalf("failed to execute sqlite ddl: %v", err)
+	}
+
+	cfg := config.Config{
+		DatabaseURL: "postgres://user:pass@localhost:5432/testdb",
+		BaseURL:     "https://auth.example.com",
+	}
+
+	a, err := NewWithDB(sqliteDB, cfg)
+	if err != nil {
+		t.Fatalf("NewWithDB unexpected err = %v", err)
+	}
+	defer func() { _ = a.Close() }()
+
+	if a.cfg.CSRFCookieName != "csrf_token" {
+		t.Errorf("CSRFCookieName = %q; want %q", a.cfg.CSRFCookieName, "csrf_token")
+	}
+	if a.cfg.SessionIdleTimeout != 30*time.Minute {
+		t.Errorf("SessionIdleTimeout = %v; want 30m", a.cfg.SessionIdleTimeout)
 	}
 }

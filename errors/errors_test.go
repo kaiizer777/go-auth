@@ -142,6 +142,12 @@ func TestCode_HTTPStatus(t *testing.T) {
 		{CodeTokenExpired, http.StatusBadRequest},
 		{CodeUserAlreadyExists, http.StatusConflict},
 		{CodeUserNotFound, http.StatusNotFound},
+		{CodeSessionNotFound, http.StatusUnauthorized},
+		{CodeSessionExpired, http.StatusUnauthorized},
+		{CodeSessionInvalid, http.StatusUnauthorized},
+		{CodeCSRFTokenMissing, http.StatusForbidden},
+		{CodeCSRFTokenInvalid, http.StatusForbidden},
+		{CodeRateLimitExceeded, http.StatusTooManyRequests},
 		{Code("CUSTOM_UNKNOWN"), http.StatusInternalServerError},
 	}
 
@@ -370,16 +376,23 @@ func TestWriteJSON_EmptyMessageNon500(t *testing.T) {
 		code           Code
 		expectedStatus int
 		expectedMsg    string
+		expectedCode   Code
 	}{
-		{CodeValidationError, http.StatusBadRequest, "bad request"},
-		{CodeInvalidEmail, http.StatusBadRequest, "bad request"},
-		{CodeInvalidCredentials, http.StatusUnauthorized, "unauthorized"},
-		{CodeEmailNotVerified, http.StatusForbidden, "forbidden"},
-		{CodeNotFound, http.StatusNotFound, "not found"},
-		{CodeUserNotFound, http.StatusNotFound, "not found"},
-		{CodeMethodNotAllowed, http.StatusMethodNotAllowed, "method not allowed"},
-		{CodeUserAlreadyExists, http.StatusConflict, "conflict"},
-		{CodeDatabaseUnavailable, http.StatusServiceUnavailable, "service unavailable"},
+		{CodeValidationError, http.StatusBadRequest, "bad request", ""},
+		{CodeInvalidEmail, http.StatusBadRequest, "bad request", ""},
+		{CodeInvalidCredentials, http.StatusUnauthorized, "unauthorized", ""},
+		{CodeEmailNotVerified, http.StatusForbidden, "forbidden", ""},
+		{CodeNotFound, http.StatusNotFound, "not found", ""},
+		{CodeUserNotFound, http.StatusNotFound, "not found", ""},
+		{CodeMethodNotAllowed, http.StatusMethodNotAllowed, "method not allowed", ""},
+		{CodeUserAlreadyExists, http.StatusConflict, "conflict", ""},
+		{CodeDatabaseUnavailable, http.StatusServiceUnavailable, "service unavailable", ""},
+		{CodeSessionNotFound, http.StatusUnauthorized, "Session is invalid or has expired", CodeSessionInvalid},
+		{CodeSessionExpired, http.StatusUnauthorized, "Session is invalid or has expired", CodeSessionInvalid},
+		{CodeSessionInvalid, http.StatusUnauthorized, "Session is invalid or has expired", ""},
+		{CodeCSRFTokenMissing, http.StatusForbidden, "CSRF token is missing", ""},
+		{CodeCSRFTokenInvalid, http.StatusForbidden, "CSRF token is invalid", ""},
+		{CodeRateLimitExceeded, http.StatusTooManyRequests, "Too many requests, try again later", ""},
 	}
 
 	for _, tt := range tests {
@@ -400,8 +413,12 @@ func TestWriteJSON_EmptyMessageNon500(t *testing.T) {
 			if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
 				t.Fatalf("failed to decode response: %v", err)
 			}
-			if resp.Code != tt.code {
-				t.Errorf("got code %q, want %q", resp.Code, tt.code)
+			wantCode := tt.code
+			if tt.expectedCode != "" {
+				wantCode = tt.expectedCode
+			}
+			if resp.Code != wantCode {
+				t.Errorf("got code %q, want %q", resp.Code, wantCode)
 			}
 			if resp.Message != tt.expectedMsg {
 				t.Errorf("got message %q, want %q", resp.Message, tt.expectedMsg)
@@ -584,4 +601,135 @@ func TestError_Is_EdgeCases(t *testing.T) {
 			t.Errorf("expected WriteJSON to extract 404 from joined root, got %d", rec.Code)
 		}
 	})
+}
+
+func TestErrorCode_SessionNotFound_HTTPStatus(t *testing.T) {
+	if got := CodeSessionNotFound.HTTPStatus(); got != http.StatusUnauthorized {
+		t.Fatalf("CodeSessionNotFound.HTTPStatus() = %d; want %d", got, http.StatusUnauthorized)
+	}
+}
+
+func TestErrorCode_SessionExpired_HTTPStatus(t *testing.T) {
+	if got := CodeSessionExpired.HTTPStatus(); got != http.StatusUnauthorized {
+		t.Fatalf("CodeSessionExpired.HTTPStatus() = %d; want %d", got, http.StatusUnauthorized)
+	}
+}
+
+func TestErrorCode_SessionInvalid_HTTPStatus(t *testing.T) {
+	if got := CodeSessionInvalid.HTTPStatus(); got != http.StatusUnauthorized {
+		t.Fatalf("CodeSessionInvalid.HTTPStatus() = %d; want %d", got, http.StatusUnauthorized)
+	}
+}
+
+func TestErrorCode_CSRFMissing_HTTPStatus(t *testing.T) {
+	if got := CodeCSRFTokenMissing.HTTPStatus(); got != http.StatusForbidden {
+		t.Fatalf("CodeCSRFTokenMissing.HTTPStatus() = %d; want %d", got, http.StatusForbidden)
+	}
+}
+
+func TestErrorCode_CSRFInvalid_HTTPStatus(t *testing.T) {
+	if got := CodeCSRFTokenInvalid.HTTPStatus(); got != http.StatusForbidden {
+		t.Fatalf("CodeCSRFTokenInvalid.HTTPStatus() = %d; want %d", got, http.StatusForbidden)
+	}
+}
+
+func TestErrorCode_RateLimitExceeded_HTTPStatus(t *testing.T) {
+	if got := CodeRateLimitExceeded.HTTPStatus(); got != http.StatusTooManyRequests {
+		t.Fatalf("CodeRateLimitExceeded.HTTPStatus() = %d; want %d", got, http.StatusTooManyRequests)
+	}
+}
+
+func TestErrorCode_WireJSON_SessionExpired(t *testing.T) {
+	rec := httptest.NewRecorder()
+	WriteHTTP(rec, ErrSessionExpired)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected status %d, got %d", http.StatusUnauthorized, rec.Code)
+	}
+
+	var resp Response
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if resp.Code != CodeSessionInvalid {
+		t.Errorf("resp.Code = %q; want %q", resp.Code, CodeSessionInvalid)
+	}
+	if resp.Message != "Session is invalid or has expired" {
+		t.Errorf("resp.Message = %q; want %q", resp.Message, "Session is invalid or has expired")
+	}
+}
+
+func TestErrorCode_WireJSON_SessionNotFound(t *testing.T) {
+	recExpired := httptest.NewRecorder()
+	WriteHTTP(recExpired, ErrSessionExpired)
+
+	recNotFound := httptest.NewRecorder()
+	WriteHTTP(recNotFound, ErrSessionNotFound)
+
+	if recNotFound.Code != http.StatusUnauthorized {
+		t.Fatalf("expected status %d, got %d", http.StatusUnauthorized, recNotFound.Code)
+	}
+
+	var respExpired, respNotFound Response
+	if err := json.NewDecoder(recExpired.Body).Decode(&respExpired); err != nil {
+		t.Fatalf("failed to decode expired response: %v", err)
+	}
+	if err := json.NewDecoder(recNotFound.Body).Decode(&respNotFound); err != nil {
+		t.Fatalf("failed to decode not-found response: %v", err)
+	}
+
+	if respNotFound.Code != CodeSessionInvalid {
+		t.Errorf("respNotFound.Code = %q; want %q", respNotFound.Code, CodeSessionInvalid)
+	}
+	if respNotFound.Code != respExpired.Code {
+		t.Fatalf("anti-enumeration code failure: respNotFound.Code %q != respExpired.Code %q", respNotFound.Code, respExpired.Code)
+	}
+	// Anti-enumeration invariant: exact same message as SESSION_EXPIRED
+	if respNotFound.Message != respExpired.Message {
+		t.Fatalf("anti-enumeration failure: respNotFound.Message %q != respExpired.Message %q", respNotFound.Message, respExpired.Message)
+	}
+	if respNotFound.Message != "Session is invalid or has expired" {
+		t.Errorf("respNotFound.Message = %q; want %q", respNotFound.Message, "Session is invalid or has expired")
+	}
+}
+
+func TestWriteHTTP_Alias(t *testing.T) {
+	rec1 := httptest.NewRecorder()
+	WriteJSON(rec1, ErrCSRFTokenInvalid)
+
+	rec2 := httptest.NewRecorder()
+	WriteHTTP(rec2, ErrCSRFTokenInvalid)
+
+	if rec1.Code != rec2.Code {
+		t.Errorf("status mismatch: WriteJSON=%d vs WriteHTTP=%d", rec1.Code, rec2.Code)
+	}
+	if rec1.Body.String() != rec2.Body.String() {
+		t.Errorf("body mismatch: WriteJSON=%s vs WriteHTTP=%s", rec1.Body.String(), rec2.Body.String())
+	}
+}
+
+func TestSentinels_Phase4(t *testing.T) {
+	tests := []struct {
+		err         *Error
+		wantCode    Code
+		wantMessage string
+	}{
+		{ErrSessionNotFound, CodeSessionNotFound, "Session is invalid or has expired"},
+		{ErrSessionExpired, CodeSessionExpired, "Session is invalid or has expired"},
+		{ErrSessionInvalid, CodeSessionInvalid, "Session is invalid or has expired"},
+		{ErrCSRFTokenMissing, CodeCSRFTokenMissing, "CSRF token is missing"},
+		{ErrCSRFTokenInvalid, CodeCSRFTokenInvalid, "CSRF token is invalid"},
+		{ErrRateLimitExceeded, CodeRateLimitExceeded, "Too many requests, try again later"},
+	}
+
+	for _, tt := range tests {
+		t.Run(string(tt.wantCode), func(t *testing.T) {
+			if tt.err.Code() != tt.wantCode {
+				t.Errorf("Code() = %q; want %q", tt.err.Code(), tt.wantCode)
+			}
+			if tt.err.Message() != tt.wantMessage {
+				t.Errorf("Message() = %q; want %q", tt.err.Message(), tt.wantMessage)
+			}
+		})
+	}
 }

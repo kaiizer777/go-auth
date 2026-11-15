@@ -19,14 +19,25 @@ type User struct {
 // TableName returns the table name for User.
 func (User) TableName() string { return "users" }
 
+// SessionType represents the session transport type enum.
+type SessionType string
+
+const (
+	SessionTypeCookie SessionType = "cookie"
+	SessionTypeBearer SessionType = "bearer"
+)
+
 // Session represents an active authenticated user session.
 type Session struct {
-	ID            uuid.UUID `gorm:"primaryKey;type:uuid;default:uuid_generate_v4()"`
-	UserID        uuid.UUID `gorm:"type:uuid;not null;index:idx_sessions_user_id"`
-	TokenHash     string    `gorm:"column:token_hash;type:text;uniqueIndex;not null"` // raw token is never persisted
-	ExpiresAt     time.Time `gorm:"not null"`
-	IdleExpiresAt time.Time `gorm:"not null"`
-	CreatedAt     time.Time
+	ID                uuid.UUID   `gorm:"primaryKey;type:uuid;default:uuid_generate_v4()"`
+	UserID            uuid.UUID   `gorm:"type:uuid;not null;index:idx_sessions_user_id"`
+	IDHash            string      `gorm:"column:id_hash;type:char(64);uniqueIndex;not null"`
+	SessionType       SessionType `gorm:"type:varchar(10);not null;default:'cookie'"`
+	IPAddress         string      `gorm:"type:varchar(45);not null;default:''"`
+	UserAgent         string      `gorm:"type:text;not null;default:''"`
+	LastActiveAt      time.Time   `gorm:"not null"`
+	AbsoluteExpiresAt time.Time   `gorm:"not null"`
+	CreatedAt         time.Time   `gorm:"autoCreateTime"`
 }
 
 // TableName returns the table name for Session.

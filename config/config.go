@@ -1,6 +1,8 @@
 package config
 
 import (
+	"log/slog"
+	"net/http"
 	"net/url"
 	"strings"
 	"time"
@@ -78,6 +80,31 @@ type Config struct {
 
 	// EmailHooks holds optional callbacks for transactional email events.
 	EmailHooks email.Hooks
+
+	// Session settings
+	SessionIdleTimeout    time.Duration // max inactivity before session expires; default 30m
+	SessionAbsoluteMaxAge time.Duration // hard cap regardless of activity; default 24h
+	SessionCookieName     string        // cookie name; default "sid"
+	SessionCookieDomain   string        // cookie Domain attribute; default "" (omit -> current host)
+	SessionCookiePath     string        // cookie Path attribute; default "/"
+	SessionCookieSecure   bool          // must be true in prod; default true
+	SessionCookieSameSite http.SameSite // default http.SameSiteLaxMode
+
+	// CSRF
+	CSRFCookieName string // default "csrf_token"
+	CSRFHeaderName string // default "X-CSRF-Token"
+
+	// Rate limiting
+	RateLimitLoginWindow  time.Duration // sliding window duration; default 15m
+	RateLimitLoginMax     int           // max attempts in window; default 10
+	RateLimitLoginIPMax   int           // max login attempts per IP in window; default 100
+	RateLimitResetWindow  time.Duration // for password reset requests; default 15m
+	RateLimitResetMax     int           // default 5
+	RateLimitResetIPMax   int           // max reset requests per IP in window; default 20
+	RateLimitSignupWindow time.Duration // for signup; default 15m
+	RateLimitSignupMax    int           // default 10
+	RateLimitSignupIPMax  int           // max signups per IP in window; default 50
+	RateLimitCleanupTick  time.Duration // how often to prune expired entries; default 5m
 }
 
 // DefaultConfig returns safe default settings. AllowedOrigins is intentionally
@@ -90,7 +117,7 @@ func DefaultConfig() Config {
 		ConnMaxLifetime:      time.Hour,
 		ConnMaxIdleTime:      30 * time.Minute,
 		AllowedMethods:       []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
-		AllowedHeaders:       []string{"Authorization", "Content-Type"},
+		AllowedHeaders:       []string{"Authorization", "Content-Type", "X-CSRF-Token"},
 		EmailDispatchTimeout: 10 * time.Second,
 		Argon2: Argon2Config{
 			Memory:      65536,
@@ -104,6 +131,31 @@ func DefaultConfig() Config {
 		RequireEmailVerification: false,
 		VerificationTokenExpiry:  30 * time.Minute,
 		PasswordResetTokenExpiry: 30 * time.Minute,
+
+		// Session settings
+		SessionIdleTimeout:    30 * time.Minute,
+		SessionAbsoluteMaxAge: 24 * time.Hour,
+		SessionCookieName:     "sid",
+		SessionCookieDomain:   "",
+		SessionCookiePath:     "/",
+		SessionCookieSecure:   true,
+		SessionCookieSameSite: http.SameSiteLaxMode,
+
+		// CSRF
+		CSRFCookieName: "csrf_token",
+		CSRFHeaderName: "X-CSRF-Token",
+
+		// Rate limiting
+		RateLimitLoginWindow:  15 * time.Minute,
+		RateLimitLoginMax:     10,
+		RateLimitLoginIPMax:   100,
+		RateLimitResetWindow:  15 * time.Minute,
+		RateLimitResetMax:     5,
+		RateLimitResetIPMax:   20,
+		RateLimitSignupWindow: 15 * time.Minute,
+		RateLimitSignupMax:    10,
+		RateLimitSignupIPMax:  50,
+		RateLimitCleanupTick:  5 * time.Minute,
 	}
 }
 
@@ -213,5 +265,135 @@ func (c *Config) Validate() error {
 	} else if c.PasswordResetTokenExpiry < 15*time.Minute || c.PasswordResetTokenExpiry > 60*time.Minute {
 		return errors.ErrPasswordResetTokenExpiryInvalid
 	}
+
+	if c.SessionCookieName == "" {
+		c.SessionCookieName = "sid"
+	}
+	if c.SessionCookiePath == "" {
+		c.SessionCookiePath = "/"
+	}
+	if c.CSRFCookieName == "" {
+		c.CSRFCookieName = "csrf_token"
+	}
+	if c.CSRFHeaderName == "" {
+		c.CSRFHeaderName = "X-CSRF-Token"
+	}
+
+	if !isToken(c.SessionCookieName) {
+		return errors.ErrSessionCookieNameInvalid
+	}
+	if !isCookiePath(c.SessionCookiePath) {
+		return errors.ErrSessionCookiePathInvalid
+	}
+	if !isCookieDomain(c.SessionCookieDomain) {
+		return errors.ErrSessionCookieDomainInvalid
+	}
+	if !isToken(c.CSRFCookieName) {
+		return errors.ErrCSRFCookieNameInvalid
+	}
+	if !isToken(c.CSRFHeaderName) {
+		return errors.ErrCSRFHeaderNameInvalid
+	}
+
+	if c.SessionIdleTimeout == 0 {
+		c.SessionIdleTimeout = 30 * time.Minute
+	}
+	if c.SessionAbsoluteMaxAge == 0 {
+		c.SessionAbsoluteMaxAge = 24 * time.Hour
+	}
+	if c.SessionIdleTimeout <= 0 {
+		return errors.ErrSessionIdleTimeoutInvalid
+	}
+	if c.SessionAbsoluteMaxAge <= c.SessionIdleTimeout {
+		return errors.ErrSessionAbsoluteMaxAgeInvalid
+	}
+	if c.SessionCookieSameSite == 0 {
+		c.SessionCookieSameSite = http.SameSiteLaxMode
+	}
+	if c.SessionCookieSameSite == http.SameSiteNoneMode && !c.SessionCookieSecure {
+		return errors.ErrSessionSameSiteNoneInsecure
+	}
+	if !c.SessionCookieSecure {
+		slog.Warn("SessionCookieSecure is false — not safe for production")
+	}
+
+	if c.RateLimitLoginWindow < 0 || c.RateLimitResetWindow < 0 || c.RateLimitSignupWindow < 0 || c.RateLimitCleanupTick < 0 {
+		return errors.ErrRateLimitWindowInvalid
+	}
+	if c.RateLimitLoginWindow == 0 {
+		c.RateLimitLoginWindow = 15 * time.Minute
+	}
+	if c.RateLimitResetWindow == 0 {
+		c.RateLimitResetWindow = 15 * time.Minute
+	}
+	if c.RateLimitSignupWindow == 0 {
+		c.RateLimitSignupWindow = 15 * time.Minute
+	}
+	if c.RateLimitCleanupTick == 0 {
+		c.RateLimitCleanupTick = 5 * time.Minute
+	}
+
+	if c.RateLimitLoginMax == 0 {
+		c.RateLimitLoginMax = 10
+	}
+	if c.RateLimitResetMax == 0 {
+		c.RateLimitResetMax = 5
+	}
+	if c.RateLimitSignupMax == 0 {
+		c.RateLimitSignupMax = 10
+	}
+	if c.RateLimitLoginIPMax == 0 {
+		c.RateLimitLoginIPMax = c.RateLimitLoginMax * 10
+	}
+	if c.RateLimitResetIPMax == 0 {
+		c.RateLimitResetIPMax = c.RateLimitResetMax * 4
+	}
+	if c.RateLimitSignupIPMax == 0 {
+		c.RateLimitSignupIPMax = c.RateLimitSignupMax * 5
+	}
+	if c.RateLimitLoginMax < 1 || c.RateLimitResetMax < 1 || c.RateLimitSignupMax < 1 ||
+		c.RateLimitLoginIPMax < 1 || c.RateLimitResetIPMax < 1 || c.RateLimitSignupIPMax < 1 {
+		return errors.ErrRateLimitMaxInvalid
+	}
+
 	return nil
+}
+
+func isToken(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		b := s[i]
+		if b < 33 || b > 126 || strings.IndexByte("()<>@,;:\"/[]?={}\\", b) >= 0 {
+			return false
+		}
+	}
+	return true
+}
+
+func isCookiePath(s string) bool {
+	if s == "" || s[0] != '/' {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		b := s[i]
+		if b < 32 || b >= 127 || b == ';' {
+			return false
+		}
+	}
+	return true
+}
+
+func isCookieDomain(s string) bool {
+	if s == "" {
+		return true
+	}
+	for i := 0; i < len(s); i++ {
+		b := s[i]
+		if b <= 32 || b >= 127 || b == ';' {
+			return false
+		}
+	}
+	return true
 }

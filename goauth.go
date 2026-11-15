@@ -8,15 +8,19 @@ import (
 	"context"
 	"log/slog"
 	"net/http"
+	"sync"
 
 	"gorm.io/gorm"
 
 	"github.com/kaiizer777/go-auth/auth"
 	"github.com/kaiizer777/go-auth/config"
+	"github.com/kaiizer777/go-auth/csrf"
 	"github.com/kaiizer777/go-auth/db"
 	"github.com/kaiizer777/go-auth/email"
 	"github.com/kaiizer777/go-auth/errors"
 	"github.com/kaiizer777/go-auth/handler"
+	"github.com/kaiizer777/go-auth/ratelimit"
+	"github.com/kaiizer777/go-auth/session"
 )
 
 // Auth is the main entry point for the authentication library.
@@ -30,30 +34,31 @@ type Auth struct {
 
 	// Auth is the core authentication service.
 	Auth auth.Service
+
+	// Session is the session management service.
+	Session session.Service
+
+	// SessionHandler is the HTTP handler for session management.
+	SessionHandler *handler.SessionHandler
+
+	loginLimiter    *ratelimit.Limiter
+	loginIPLimiter  *ratelimit.Limiter
+	resetLimiter    *ratelimit.Limiter
+	resetIPLimiter  *ratelimit.Limiter
+	signupLimiter   *ratelimit.Limiter
+	signupIPLimiter *ratelimit.Limiter
+	limiterDone     chan struct{}
+	closeErr        error
+	closeOnce       sync.Once
 }
 
 var dbConnectFn = db.Connect
 
-// New validates runtime configuration, establishes database connectivity,
-// runs pending migrations, and initializes the HTTP handler chain.
-func New(cfg config.Config) (*Auth, error) {
+// NewWithDB initializes Auth using an existing GORM database connection.
+func NewWithDB(database *gorm.DB, cfg config.Config) (*Auth, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, errors.Wrap(err, errors.CodeInvalidConfig, "goauth: invalid configuration")
 	}
-
-	database, err := dbConnectFn(cfg)
-	if err != nil {
-		return nil, errors.Wrap(err, errors.CodeDatabaseError, "goauth: failed to connect to database")
-	}
-
-	success := false
-	defer func() {
-		if !success {
-			if sqlDB, dbErr := database.DB(); dbErr == nil {
-				_ = sqlDB.Close()
-			}
-		}
-	}()
 
 	emailHooks := cfg.EmailHooks
 	if emailHooks.SendVerificationEmail == nil && cfg.SendVerificationEmail != nil {
@@ -80,7 +85,36 @@ func New(cfg config.Config) (*Auth, error) {
 		return nil, err
 	}
 
-	h := handler.New(database, cfg, authSvc)
+	sessionSvc := session.NewService(database, &cfg)
+
+	loginLimiter := ratelimit.NewLimiter(cfg.RateLimitLoginWindow, cfg.RateLimitLoginMax)
+	loginIPLimiter := ratelimit.NewLimiter(cfg.RateLimitLoginWindow, cfg.RateLimitLoginIPMax)
+	resetLimiter := ratelimit.NewLimiter(cfg.RateLimitResetWindow, cfg.RateLimitResetMax)
+	resetIPLimiter := ratelimit.NewLimiter(cfg.RateLimitResetWindow, cfg.RateLimitResetIPMax)
+	signupLimiter := ratelimit.NewLimiter(cfg.RateLimitSignupWindow, cfg.RateLimitSignupMax)
+	signupIPLimiter := ratelimit.NewLimiter(cfg.RateLimitSignupWindow, cfg.RateLimitSignupIPMax)
+
+	limiterDone := make(chan struct{})
+	cleanupTick := cfg.RateLimitCleanupTick
+	if cleanupTick <= 0 {
+		cleanupTick = config.DefaultConfig().RateLimitCleanupTick
+	}
+	loginLimiter.StartCleanup(cleanupTick, limiterDone)
+	loginIPLimiter.StartCleanup(cleanupTick, limiterDone)
+	resetLimiter.StartCleanup(cleanupTick, limiterDone)
+	resetIPLimiter.StartCleanup(cleanupTick, limiterDone)
+	signupLimiter.StartCleanup(cleanupTick, limiterDone)
+	signupIPLimiter.StartCleanup(cleanupTick, limiterDone)
+
+	sessHandler := handler.NewSessionHandler(sessionSvc, database, &cfg)
+
+	h := handler.New(database, cfg, authSvc,
+		handler.WithSessionService(sessionSvc),
+		handler.WithSessionHandler(sessHandler),
+		handler.WithRateLimiters(loginLimiter, resetLimiter, signupLimiter),
+		handler.WithIPRateLimiters(loginIPLimiter, resetIPLimiter, signupIPLimiter),
+	)
+
 	a := &Auth{
 		db:  database,
 		cfg: cfg,
@@ -91,26 +125,92 @@ func New(cfg config.Config) (*Auth, error) {
 			SendVerificationEmail:     cfg.SendVerificationEmail,
 			SendPasswordResetEmail:    cfg.SendPasswordResetEmail,
 		}, slog.Default()),
-		Handler: h,
-		Auth:    authSvc,
+		Handler:         h,
+		Auth:            authSvc,
+		Session:         sessionSvc,
+		SessionHandler:  sessHandler,
+		loginLimiter:    loginLimiter,
+		loginIPLimiter:  loginIPLimiter,
+		resetLimiter:    resetLimiter,
+		resetIPLimiter:  resetIPLimiter,
+		signupLimiter:   signupLimiter,
+		signupIPLimiter: signupIPLimiter,
+		limiterDone:     limiterDone,
 	}
-	success = true
 	return a, nil
 }
 
-// Close terminates the underlying database connection pool.
-func (a *Auth) Close() error {
-	if a.db == nil {
-		return nil
+// New validates runtime configuration, establishes database connectivity,
+// runs pending migrations, and initializes the HTTP handler chain.
+func New(cfg config.Config) (*Auth, error) {
+	if err := cfg.Validate(); err != nil {
+		return nil, errors.Wrap(err, errors.CodeInvalidConfig, "goauth: invalid configuration")
 	}
-	sqlDB, err := a.db.DB()
+
+	database, err := dbConnectFn(cfg)
 	if err != nil {
-		return errors.New(errors.CodeDatabaseError, "failed to get sql.DB", err)
+		return nil, errors.Wrap(err, errors.CodeDatabaseError, "goauth: failed to connect to database")
 	}
-	if err := sqlDB.Close(); err != nil {
-		return errors.New(errors.CodeDatabaseError, "failed to close database", err)
+
+	a, err := NewWithDB(database, cfg)
+	if err != nil {
+		if sqlDB, dbErr := database.DB(); dbErr == nil {
+			_ = sqlDB.Close()
+		}
+		return nil, err
 	}
-	return nil
+	return a, nil
+}
+
+// Close terminates the underlying database connection pool and background cleanups.
+// It is fully idempotent; subsequent calls return the result of the first close.
+func (a *Auth) Close() error {
+	a.closeOnce.Do(func() {
+		if a.limiterDone != nil {
+			close(a.limiterDone)
+		}
+		if a.loginLimiter != nil {
+			a.loginLimiter.Close()
+		}
+		if a.loginIPLimiter != nil {
+			a.loginIPLimiter.Close()
+		}
+		if a.resetLimiter != nil {
+			a.resetLimiter.Close()
+		}
+		if a.resetIPLimiter != nil {
+			a.resetIPLimiter.Close()
+		}
+		if a.signupLimiter != nil {
+			a.signupLimiter.Close()
+		}
+		if a.signupIPLimiter != nil {
+			a.signupIPLimiter.Close()
+		}
+		if a.db != nil {
+			if sqlDB, err := a.db.DB(); err != nil {
+				a.closeErr = errors.New(errors.CodeDatabaseError, "failed to get sql.DB", err)
+			} else if err := sqlDB.Close(); err != nil {
+				a.closeErr = errors.New(errors.CodeDatabaseError, "failed to close database", err)
+			}
+		}
+	})
+	return a.closeErr
+}
+
+// RequireAuth returns middleware that validates session credentials from cookies or Bearer headers.
+func (a *Auth) RequireAuth(next http.Handler) http.Handler {
+	return handler.RequireAuth(a.Session, &a.cfg)(next)
+}
+
+// CSRF returns middleware that enforces Double Submit Cookie CSRF protection.
+func (a *Auth) CSRF(next http.Handler) http.Handler {
+	return csrf.Middleware(&a.cfg)(next)
+}
+
+// SessionService returns the configured session service.
+func (a *Auth) SessionService() session.Service {
+	return a.Session
 }
 
 // EmailDispatcher returns the configured email dispatcher.

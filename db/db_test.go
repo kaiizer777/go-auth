@@ -291,3 +291,31 @@ func TestCustomMigrationsFS_DuplicateVersion(t *testing.T) {
 		t.Fatal("expected error for duplicate migration version, got nil")
 	}
 }
+
+func TestMigration000005_TimestampBackfillAndDialectParity(t *testing.T) {
+	data, err := defaultMigrationsFS.ReadFile("migrations/000005_add_session_phase4_columns.up.sql")
+	if err != nil {
+		t.Fatalf("failed to read migration 5 up: %v", err)
+	}
+	content := string(data)
+
+	if strings.Contains(content, "CREATE TYPE session_type AS ENUM") {
+		t.Error("migration 5 must not create custom enum session_type")
+	}
+
+	if strings.Contains(content, "csrf_token") {
+		t.Error("migration 5 must not reference dead csrf_token column")
+	}
+
+	backfillIdx := strings.Index(content, "UPDATE sessions SET absolute_expires_at = COALESCE(expires_at")
+	dropIdx := strings.Index(content, "DROP COLUMN IF EXISTS expires_at")
+	if backfillIdx == -1 {
+		t.Fatal("migration 5 missing backfill for absolute_expires_at from expires_at")
+	}
+	if dropIdx == -1 {
+		t.Fatal("migration 5 missing DROP COLUMN IF EXISTS expires_at")
+	}
+	if backfillIdx > dropIdx {
+		t.Errorf("migration 5 backfill (idx %d) must occur before drop (idx %d)", backfillIdx, dropIdx)
+	}
+}

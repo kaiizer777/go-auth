@@ -1,6 +1,10 @@
 package config
 
 import (
+	"bytes"
+	"log/slog"
+	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -33,6 +37,16 @@ func TestDefaultConfig(t *testing.T) {
 	}
 	if len(cfg.AllowedHeaders) == 0 {
 		t.Error("expected non-empty AllowedHeaders")
+	}
+	hasCSRFHeader := false
+	for _, h := range cfg.AllowedHeaders {
+		if h == "X-CSRF-Token" {
+			hasCSRFHeader = true
+			break
+		}
+	}
+	if !hasCSRFHeader {
+		t.Errorf("expected AllowedHeaders to contain X-CSRF-Token, got %v", cfg.AllowedHeaders)
 	}
 	if cfg.Argon2.Memory != 65536 {
 		t.Errorf("got %d, want 65536", cfg.Argon2.Memory)
@@ -76,6 +90,31 @@ func TestConfigValidate_ZeroValueUsesAsyncEmailDispatch(t *testing.T) {
 	}
 	if cfg.DisableAsyncEmailDispatch {
 		t.Fatal("zero-value config disabled async email dispatch")
+	}
+}
+
+func TestConfigValidate_MinimalStructLiteralDefaults(t *testing.T) {
+	cfg := Config{
+		DatabaseURL: "postgres://user:pass@localhost:5432/testdb",
+		BaseURL:     "https://example.com",
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() unexpected err = %v", err)
+	}
+	if cfg.SessionIdleTimeout != 30*time.Minute {
+		t.Errorf("got SessionIdleTimeout %v, want 30m", cfg.SessionIdleTimeout)
+	}
+	if cfg.SessionAbsoluteMaxAge != 24*time.Hour {
+		t.Errorf("got SessionAbsoluteMaxAge %v, want 24h", cfg.SessionAbsoluteMaxAge)
+	}
+	if cfg.RateLimitLoginMax != 10 {
+		t.Errorf("got RateLimitLoginMax %d, want 10", cfg.RateLimitLoginMax)
+	}
+	if cfg.RateLimitResetMax != 5 {
+		t.Errorf("got RateLimitResetMax %d, want 5", cfg.RateLimitResetMax)
+	}
+	if cfg.RateLimitSignupMax != 10 {
+		t.Errorf("got RateLimitSignupMax %d, want 10", cfg.RateLimitSignupMax)
 	}
 }
 
@@ -266,8 +305,13 @@ func TestConfigValidate(t *testing.T) {
 			name: "zero value struct defaults all phase 3 settings",
 			mutate: func(c *Config) {
 				*c = Config{
-					DatabaseURL: "postgres://user:pass@localhost:5432/testdb",
-					BaseURL:     "https://example.com",
+					DatabaseURL:           "postgres://user:pass@localhost:5432/testdb",
+					BaseURL:               "https://example.com",
+					SessionIdleTimeout:    30 * time.Minute,
+					SessionAbsoluteMaxAge: 24 * time.Hour,
+					RateLimitLoginMax:     10,
+					RateLimitResetMax:     5,
+					RateLimitSignupMax:    10,
 				}
 			},
 			wantErr:            nil,
@@ -556,8 +600,13 @@ func TestConfigValidate(t *testing.T) {
 
 func TestConfigValidate_PartialArgon2Overrides(t *testing.T) {
 	cfg := Config{
-		DatabaseURL: "postgres://user:pass@localhost:5432/testdb",
-		BaseURL:     "https://example.com",
+		DatabaseURL:           "postgres://user:pass@localhost:5432/testdb",
+		BaseURL:               "https://example.com",
+		SessionIdleTimeout:    30 * time.Minute,
+		SessionAbsoluteMaxAge: 24 * time.Hour,
+		RateLimitLoginMax:     10,
+		RateLimitResetMax:     5,
+		RateLimitSignupMax:    10,
 		Argon2: Argon2Config{
 			Memory: 32768,
 		},
@@ -584,10 +633,15 @@ func TestConfigValidate_PartialArgon2Overrides(t *testing.T) {
 
 func TestConfigValidate_MaxOpenConnsZeroUnlimited(t *testing.T) {
 	cfg := Config{
-		DatabaseURL:  "postgres://user:pass@localhost:5432/testdb",
-		BaseURL:      "https://example.com",
-		MaxOpenConns: 0,
-		MaxIdleConns: 50,
+		DatabaseURL:           "postgres://user:pass@localhost:5432/testdb",
+		BaseURL:               "https://example.com",
+		SessionIdleTimeout:    30 * time.Minute,
+		SessionAbsoluteMaxAge: 24 * time.Hour,
+		RateLimitLoginMax:     10,
+		RateLimitResetMax:     5,
+		RateLimitSignupMax:    10,
+		MaxOpenConns:          0,
+		MaxIdleConns:          50,
 	}
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("Validate() unexpected err for MaxOpenConns=0 and MaxIdleConns=50: %v", err)
@@ -602,9 +656,14 @@ func TestConfigValidate_MaxOpenConnsZeroUnlimited(t *testing.T) {
 
 func TestConfigValidate_EmailDispatchTimeoutRetention(t *testing.T) {
 	cfg := Config{
-		DatabaseURL:          "postgres://user:pass@localhost:5432/testdb",
-		BaseURL:              "https://example.com",
-		EmailDispatchTimeout: 5 * time.Second,
+		DatabaseURL:           "postgres://user:pass@localhost:5432/testdb",
+		BaseURL:               "https://example.com",
+		SessionIdleTimeout:    30 * time.Minute,
+		SessionAbsoluteMaxAge: 24 * time.Hour,
+		RateLimitLoginMax:     10,
+		RateLimitResetMax:     5,
+		RateLimitSignupMax:    10,
+		EmailDispatchTimeout:  5 * time.Second,
 	}
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("Validate() unexpected err = %v", err)
@@ -616,9 +675,14 @@ func TestConfigValidate_EmailDispatchTimeoutRetention(t *testing.T) {
 
 func TestConfigValidate_EmailDispatchTimeoutDefault(t *testing.T) {
 	cfg := Config{
-		DatabaseURL:          "postgres://user:pass@localhost:5432/testdb",
-		BaseURL:              "https://example.com",
-		EmailDispatchTimeout: 0,
+		DatabaseURL:           "postgres://user:pass@localhost:5432/testdb",
+		BaseURL:               "https://example.com",
+		SessionIdleTimeout:    30 * time.Minute,
+		SessionAbsoluteMaxAge: 24 * time.Hour,
+		RateLimitLoginMax:     10,
+		RateLimitResetMax:     5,
+		RateLimitSignupMax:    10,
+		EmailDispatchTimeout:  0,
 	}
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("Validate() unexpected err = %v", err)
@@ -626,4 +690,403 @@ func TestConfigValidate_EmailDispatchTimeoutDefault(t *testing.T) {
 	if cfg.EmailDispatchTimeout != 10*time.Second {
 		t.Fatalf("EmailDispatchTimeout = %v; want 10s", cfg.EmailDispatchTimeout)
 	}
+}
+
+func TestConfig_SessionDefaults(t *testing.T) {
+	cfg := DefaultConfig()
+
+	if cfg.SessionIdleTimeout != 30*time.Minute {
+		t.Errorf("SessionIdleTimeout = %v; want 30m", cfg.SessionIdleTimeout)
+	}
+	if cfg.SessionAbsoluteMaxAge != 24*time.Hour {
+		t.Errorf("SessionAbsoluteMaxAge = %v; want 24h", cfg.SessionAbsoluteMaxAge)
+	}
+	if cfg.SessionCookieName != "sid" {
+		t.Errorf("SessionCookieName = %q; want %q", cfg.SessionCookieName, "sid")
+	}
+	if cfg.SessionCookieDomain != "" {
+		t.Errorf("SessionCookieDomain = %q; want empty string", cfg.SessionCookieDomain)
+	}
+	if cfg.SessionCookiePath != "/" {
+		t.Errorf("SessionCookiePath = %q; want %q", cfg.SessionCookiePath, "/")
+	}
+	if !cfg.SessionCookieSecure {
+		t.Errorf("SessionCookieSecure = %v; want true", cfg.SessionCookieSecure)
+	}
+	if cfg.SessionCookieSameSite != http.SameSiteLaxMode {
+		t.Errorf("SessionCookieSameSite = %v; want %v", cfg.SessionCookieSameSite, http.SameSiteLaxMode)
+	}
+	if cfg.CSRFCookieName != "csrf_token" {
+		t.Errorf("CSRFCookieName = %q; want %q", cfg.CSRFCookieName, "csrf_token")
+	}
+	if cfg.CSRFHeaderName != "X-CSRF-Token" {
+		t.Errorf("CSRFHeaderName = %q; want %q", cfg.CSRFHeaderName, "X-CSRF-Token")
+	}
+	if cfg.RateLimitLoginWindow != 15*time.Minute {
+		t.Errorf("RateLimitLoginWindow = %v; want 15m", cfg.RateLimitLoginWindow)
+	}
+	if cfg.RateLimitLoginMax != 10 {
+		t.Errorf("RateLimitLoginMax = %d; want 10", cfg.RateLimitLoginMax)
+	}
+	if cfg.RateLimitResetWindow != 15*time.Minute {
+		t.Errorf("RateLimitResetWindow = %v; want 15m", cfg.RateLimitResetWindow)
+	}
+	if cfg.RateLimitResetMax != 5 {
+		t.Errorf("RateLimitResetMax = %d; want 5", cfg.RateLimitResetMax)
+	}
+	if cfg.RateLimitSignupWindow != 15*time.Minute {
+		t.Errorf("RateLimitSignupWindow = %v; want 15m", cfg.RateLimitSignupWindow)
+	}
+	if cfg.RateLimitSignupMax != 10 {
+		t.Errorf("RateLimitSignupMax = %d; want 10", cfg.RateLimitSignupMax)
+	}
+	if cfg.RateLimitCleanupTick != 5*time.Minute {
+		t.Errorf("RateLimitCleanupTick = %v; want 5m", cfg.RateLimitCleanupTick)
+	}
+}
+
+func TestConfig_SessionIdleTimeoutZero_Defaults(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+	cfg.BaseURL = "https://example.com"
+	cfg.SessionIdleTimeout = 0
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("unexpected validation error: %v", err)
+	}
+	if cfg.SessionIdleTimeout != 30*time.Minute {
+		t.Fatalf("SessionIdleTimeout = %v; want 30m", cfg.SessionIdleTimeout)
+	}
+}
+
+func TestConfig_AbsoluteLessThanIdle_Error(t *testing.T) {
+	tests := []struct {
+		name        string
+		idleTimeout time.Duration
+		absoluteAge time.Duration
+	}{
+		{
+			name:        "absolute age strictly less than idle timeout",
+			idleTimeout: 30 * time.Minute,
+			absoluteAge: 15 * time.Minute,
+		},
+		{
+			name:        "absolute age equal to idle timeout",
+			idleTimeout: 30 * time.Minute,
+			absoluteAge: 30 * time.Minute,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := DefaultConfig()
+			cfg.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+			cfg.BaseURL = "https://example.com"
+			cfg.SessionIdleTimeout = tt.idleTimeout
+			cfg.SessionAbsoluteMaxAge = tt.absoluteAge
+
+			err := cfg.Validate()
+			if !errors.Is(err, errors.ErrSessionAbsoluteMaxAgeInvalid) {
+				t.Fatalf("Validate() err = %v; want %v", err, errors.ErrSessionAbsoluteMaxAgeInvalid)
+			}
+		})
+	}
+}
+
+func TestConfig_SessionCookieSecureFalse_Warns(t *testing.T) {
+	var buf bytes.Buffer
+	handler := slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})
+	logger := slog.New(handler)
+	prev := slog.Default()
+	slog.SetDefault(logger)
+	t.Cleanup(func() {
+		slog.SetDefault(prev)
+	})
+
+	cfg := DefaultConfig()
+	cfg.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+	cfg.BaseURL = "https://example.com"
+	cfg.SessionCookieSecure = false
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("unexpected validation error: %v", err)
+	}
+
+	output := buf.String()
+	if !strings.Contains(output, "SessionCookieSecure is false — not safe for production") {
+		t.Fatalf("expected warning log in output, got %q", output)
+	}
+	if !strings.Contains(output, "level=WARN") {
+		t.Fatalf("expected level=WARN in log output, got %q", output)
+	}
+}
+
+func TestConfig_RateLimitMax_Error(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*Config)
+	}{
+		{
+			name:   "RateLimitLoginMax negative",
+			mutate: func(c *Config) { c.RateLimitLoginMax = -1 },
+		},
+		{
+			name:   "RateLimitResetMax negative",
+			mutate: func(c *Config) { c.RateLimitResetMax = -2 },
+		},
+		{
+			name:   "RateLimitSignupMax negative",
+			mutate: func(c *Config) { c.RateLimitSignupMax = -5 },
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := DefaultConfig()
+			cfg.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+			cfg.BaseURL = "https://example.com"
+			tt.mutate(&cfg)
+
+			err := cfg.Validate()
+			if !errors.Is(err, errors.ErrRateLimitMaxInvalid) {
+				t.Fatalf("Validate() err = %v; want %v", err, errors.ErrRateLimitMaxInvalid)
+			}
+		})
+	}
+}
+
+func TestConfig_RateLimitMaxZero_Defaults(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+	cfg.BaseURL = "https://example.com"
+	cfg.RateLimitLoginMax = 0
+	cfg.RateLimitResetMax = 0
+	cfg.RateLimitSignupMax = 0
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("unexpected validation error: %v", err)
+	}
+	if cfg.RateLimitLoginMax != 10 {
+		t.Errorf("got RateLimitLoginMax %d, want 10", cfg.RateLimitLoginMax)
+	}
+	if cfg.RateLimitResetMax != 5 {
+		t.Errorf("got RateLimitResetMax %d, want 5", cfg.RateLimitResetMax)
+	}
+	if cfg.RateLimitSignupMax != 10 {
+		t.Errorf("got RateLimitSignupMax %d, want 10", cfg.RateLimitSignupMax)
+	}
+}
+
+func TestConfig_SessionIdleTimeoutNegative_Error(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+	cfg.BaseURL = "https://example.com"
+	cfg.SessionIdleTimeout = -5 * time.Minute
+
+	err := cfg.Validate()
+	if !errors.Is(err, errors.ErrSessionIdleTimeoutInvalid) {
+		t.Fatalf("Validate() err = %v; want %v", err, errors.ErrSessionIdleTimeoutInvalid)
+	}
+}
+
+func TestConfig_RateLimitWindowNegative_Error(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*Config)
+	}{
+		{
+			name:   "RateLimitLoginWindow negative",
+			mutate: func(c *Config) { c.RateLimitLoginWindow = -1 * time.Minute },
+		},
+		{
+			name:   "RateLimitResetWindow negative",
+			mutate: func(c *Config) { c.RateLimitResetWindow = -2 * time.Minute },
+		},
+		{
+			name:   "RateLimitSignupWindow negative",
+			mutate: func(c *Config) { c.RateLimitSignupWindow = -3 * time.Minute },
+		},
+		{
+			name:   "RateLimitCleanupTick negative",
+			mutate: func(c *Config) { c.RateLimitCleanupTick = -10 * time.Second },
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := DefaultConfig()
+			cfg.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+			cfg.BaseURL = "https://example.com"
+			tt.mutate(&cfg)
+
+			err := cfg.Validate()
+			if !errors.Is(err, errors.ErrRateLimitWindowInvalid) {
+				t.Fatalf("Validate() err = %v; want %v", err, errors.ErrRateLimitWindowInvalid)
+			}
+		})
+	}
+}
+
+func TestConfig_SessionCookieSameSiteNoneWithoutSecure_Error(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+	cfg.BaseURL = "https://example.com"
+	cfg.SessionCookieSameSite = http.SameSiteNoneMode
+	cfg.SessionCookieSecure = false
+
+	err := cfg.Validate()
+	if !errors.Is(err, errors.ErrSessionSameSiteNoneInsecure) {
+		t.Fatalf("Validate() err = %v; want %v", err, errors.ErrSessionSameSiteNoneInsecure)
+	}
+}
+
+func TestConfig_SessionCookieSameSiteNoneWithSecure_Valid(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+	cfg.BaseURL = "https://example.com"
+	cfg.SessionCookieSameSite = http.SameSiteNoneMode
+	cfg.SessionCookieSecure = true
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() unexpected err = %v", err)
+	}
+}
+
+func TestConfig_CookieDefaults_AppliedInValidate(t *testing.T) {
+	cfg := Config{
+		DatabaseURL:           "postgres://user:pass@localhost:5432/testdb",
+		BaseURL:               "https://example.com",
+		SessionIdleTimeout:    30 * time.Minute,
+		SessionAbsoluteMaxAge: 24 * time.Hour,
+		RateLimitLoginMax:     10,
+		RateLimitResetMax:     5,
+		RateLimitSignupMax:    10,
+	}
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() unexpected err = %v", err)
+	}
+
+	if cfg.SessionCookieName != "sid" {
+		t.Errorf("SessionCookieName = %q; want %q", cfg.SessionCookieName, "sid")
+	}
+	if cfg.SessionCookiePath != "/" {
+		t.Errorf("SessionCookiePath = %q; want %q", cfg.SessionCookiePath, "/")
+	}
+	if cfg.CSRFCookieName != "csrf_token" {
+		t.Errorf("CSRFCookieName = %q; want %q", cfg.CSRFCookieName, "csrf_token")
+	}
+	if cfg.CSRFHeaderName != "X-CSRF-Token" {
+		t.Errorf("CSRFHeaderName = %q; want %q", cfg.CSRFHeaderName, "X-CSRF-Token")
+	}
+	if cfg.SessionCookieSameSite != http.SameSiteLaxMode {
+		t.Errorf("SessionCookieSameSite = %v; want %v", cfg.SessionCookieSameSite, http.SameSiteLaxMode)
+	}
+}
+
+func TestConfig_CookieAndHeaderRFCValidation(t *testing.T) {
+	baseCfg := func() Config {
+		c := DefaultConfig()
+		c.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+		c.BaseURL = "https://example.com"
+		return c
+	}
+
+	t.Run("invalid session cookie name", func(t *testing.T) {
+		invalidNames := []string{"bad sid", "sid;name", "sid=val", "sid,name", "sid/name", "sid@domain", "sid{1}"}
+		for _, name := range invalidNames {
+			cfg := baseCfg()
+			cfg.SessionCookieName = name
+			err := cfg.Validate()
+			if !errors.Is(err, errors.ErrSessionCookieNameInvalid) {
+				t.Errorf("Validate(%q) err = %v; want ErrSessionCookieNameInvalid", name, err)
+			}
+			if !errors.Is(err, errors.ErrInvalidCookieName) {
+				t.Errorf("Validate(%q) err = %v; want ErrInvalidCookieName alias", name, err)
+			}
+		}
+	})
+
+	t.Run("valid custom session cookie name", func(t *testing.T) {
+		cfg := baseCfg()
+		cfg.SessionCookieName = "custom_session-id.v1"
+		if err := cfg.Validate(); err != nil {
+			t.Errorf("Validate() unexpected err = %v", err)
+		}
+	})
+
+	t.Run("invalid session cookie path", func(t *testing.T) {
+		invalidPaths := []string{"no-leading-slash", "/path;semicolon", "/path\x00null"}
+		for _, p := range invalidPaths {
+			cfg := baseCfg()
+			cfg.SessionCookiePath = p
+			err := cfg.Validate()
+			if !errors.Is(err, errors.ErrSessionCookiePathInvalid) {
+				t.Errorf("Validate(path=%q) err = %v; want ErrSessionCookiePathInvalid", p, err)
+			}
+			if !errors.Is(err, errors.ErrInvalidCookiePath) {
+				t.Errorf("Validate(path=%q) err = %v; want ErrInvalidCookiePath alias", p, err)
+			}
+		}
+	})
+
+	t.Run("valid custom session cookie path", func(t *testing.T) {
+		cfg := baseCfg()
+		cfg.SessionCookiePath = "/api/v1/auth"
+		if err := cfg.Validate(); err != nil {
+			t.Errorf("Validate() unexpected err = %v", err)
+		}
+	})
+
+	t.Run("invalid session cookie domain", func(t *testing.T) {
+		invalidDomains := []string{"example .com", "example;com", "example\x00.com"}
+		for _, d := range invalidDomains {
+			cfg := baseCfg()
+			cfg.SessionCookieDomain = d
+			err := cfg.Validate()
+			if !errors.Is(err, errors.ErrSessionCookieDomainInvalid) {
+				t.Errorf("Validate(domain=%q) err = %v; want ErrSessionCookieDomainInvalid", d, err)
+			}
+		}
+	})
+
+	t.Run("invalid CSRF cookie name", func(t *testing.T) {
+		invalidNames := []string{"csrf token", "csrf;tok", "csrf@tok", "csrf/token"}
+		for _, name := range invalidNames {
+			cfg := baseCfg()
+			cfg.CSRFCookieName = name
+			err := cfg.Validate()
+			if !errors.Is(err, errors.ErrCSRFCookieNameInvalid) {
+				t.Errorf("Validate(csrf_cookie=%q) err = %v; want ErrCSRFCookieNameInvalid", name, err)
+			}
+		}
+	})
+
+	t.Run("valid custom CSRF cookie name", func(t *testing.T) {
+		cfg := baseCfg()
+		cfg.CSRFCookieName = "my-csrf_token.v2"
+		if err := cfg.Validate(); err != nil {
+			t.Errorf("Validate() unexpected err = %v", err)
+		}
+	})
+
+	t.Run("invalid CSRF header name", func(t *testing.T) {
+		invalidHeaders := []string{"Bad Header", "Header:Name", "Header@Name", "Header/Name"}
+		for _, h := range invalidHeaders {
+			cfg := baseCfg()
+			cfg.CSRFHeaderName = h
+			err := cfg.Validate()
+			if !errors.Is(err, errors.ErrCSRFHeaderNameInvalid) {
+				t.Errorf("Validate(csrf_header=%q) err = %v; want ErrCSRFHeaderNameInvalid", h, err)
+			}
+		}
+	})
+
+	t.Run("valid custom CSRF header name", func(t *testing.T) {
+		cfg := baseCfg()
+		cfg.CSRFHeaderName = "X-App-CSRF-Token"
+		if err := cfg.Validate(); err != nil {
+			t.Errorf("Validate() unexpected err = %v", err)
+		}
+	})
 }

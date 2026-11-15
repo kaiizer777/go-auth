@@ -121,3 +121,32 @@ func TestModelUserIDIndexTags(t *testing.T) {
 		})
 	}
 }
+
+func TestSessionModelTagsAndDeprecatedFields(t *testing.T) {
+	typ := reflect.TypeOf(Session{})
+
+	field, ok := typ.FieldByName("IDHash")
+	if !ok {
+		t.Fatal("Session missing IDHash field")
+	}
+	expectedIDHashTag := "column:id_hash;type:char(64);uniqueIndex;not null"
+	if tag := field.Tag.Get("gorm"); tag != expectedIDHashTag {
+		t.Errorf("Session IDHash tag = %q; want %q", tag, expectedIDHashTag)
+	}
+
+	field, ok = typ.FieldByName("SessionType")
+	if !ok {
+		t.Fatal("Session missing SessionType field")
+	}
+	expectedSessionTypeTag := "type:varchar(10);not null;default:'cookie'"
+	if tag := field.Tag.Get("gorm"); tag != expectedSessionTypeTag {
+		t.Errorf("Session SessionType tag = %q; want %q", tag, expectedSessionTypeTag)
+	}
+
+	deprecated := []string{"TokenHash", "ExpiresAt", "IdleExpiresAt", "UpdatedAt", "CSRFToken"}
+	for _, name := range deprecated {
+		if _, exists := typ.FieldByName(name); exists {
+			t.Errorf("Session must not have deprecated field %q", name)
+		}
+	}
+}
