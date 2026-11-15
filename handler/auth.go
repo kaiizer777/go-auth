@@ -206,10 +206,15 @@ func (h *AuthHandler) Logout(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if h.sessionSvc != nil {
+		var invalidateErr error
 		if rawID, err := session.ReadSessionCookie(r, h.cfg); err == nil {
-			_ = h.sessionSvc.InvalidateSession(r.Context(), rawID)
+			invalidateErr = h.sessionSvc.InvalidateSession(r.Context(), rawID)
 		} else if rawID, err := session.ReadBearerToken(r); err == nil {
-			_ = h.sessionSvc.InvalidateSession(r.Context(), rawID)
+			invalidateErr = h.sessionSvc.InvalidateSession(r.Context(), rawID)
+		}
+		if invalidateErr != nil {
+			errors.WriteJSON(w, invalidateErr)
+			return
 		}
 		session.ClearSessionCookie(w, h.cfg)
 	}
