@@ -979,6 +979,9 @@ func TestConfig_CookieDefaults_AppliedInValidate(t *testing.T) {
 	if cfg.CSRFHeaderName != "X-CSRF-Token" {
 		t.Errorf("CSRFHeaderName = %q; want %q", cfg.CSRFHeaderName, "X-CSRF-Token")
 	}
+	if cfg.SessionCookieSameSite != http.SameSiteLaxMode {
+		t.Errorf("SessionCookieSameSite = %v; want %v", cfg.SessionCookieSameSite, http.SameSiteLaxMode)
+	}
 }
 
 func TestConfig_CookieAndHeaderRFCValidation(t *testing.T) {

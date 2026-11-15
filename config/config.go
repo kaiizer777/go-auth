@@ -307,6 +307,9 @@ func (c *Config) Validate() error {
 	if c.SessionAbsoluteMaxAge <= c.SessionIdleTimeout {
 		return errors.ErrSessionAbsoluteMaxAgeInvalid
 	}
+	if c.SessionCookieSameSite == 0 {
+		c.SessionCookieSameSite = http.SameSiteLaxMode
+	}
 	if c.SessionCookieSameSite == http.SameSiteNoneMode && !c.SessionCookieSecure {
 		return errors.ErrSessionSameSiteNoneInsecure
 	}
