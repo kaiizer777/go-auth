@@ -348,3 +348,88 @@ func TestRequireAuth_AuthorizationHeaderSpoof_DoesNotFallbackToCookie(t *testing
 		t.Fatalf("expected status 401 Unauthorized, got %d", rec.Code)
 	}
 }
+
+func TestRequireAuth_TransportBinding_CookiePresentedViaBearer(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cookieSession := &session.Session{
+		ID:                uuid.New(),
+		UserID:            uuid.New(),
+		IDHash:            "cookiehash",
+		Type:              db.SessionTypeCookie,
+		LastActiveAt:      time.Now().UTC(),
+		AbsoluteExpiresAt: time.Now().UTC().Add(24 * time.Hour),
+	}
+
+	mockSvc := &mockSessionService{
+		getSessionFn: func(ctx context.Context, rawID string) (*session.Session, error) {
+			return cookieSession, nil
+		},
+	}
+
+	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("next handler must not be called on transport mismatch")
+	})
+
+	mw := RequireAuth(mockSvc, &cfg)(next)
+
+	req := httptest.NewRequest(http.MethodGet, "/protected", nil)
+	req.Header.Set("Authorization", "Bearer "+validTestToken)
+	rec := httptest.NewRecorder()
+
+	mw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected status 401, got %d", rec.Code)
+	}
+	var resp apperrors.Response
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if resp.Code != apperrors.CodeSessionInvalid {
+		t.Errorf("expected code %s, got %s", apperrors.CodeSessionInvalid, resp.Code)
+	}
+}
+
+func TestRequireAuth_TransportBinding_BearerPresentedViaCookie(t *testing.T) {
+	cfg := config.DefaultConfig()
+	bearerSession := &session.Session{
+		ID:                uuid.New(),
+		UserID:            uuid.New(),
+		IDHash:            "bearerhash",
+		Type:              db.SessionTypeBearer,
+		LastActiveAt:      time.Now().UTC(),
+		AbsoluteExpiresAt: time.Now().UTC().Add(24 * time.Hour),
+	}
+
+	mockSvc := &mockSessionService{
+		getSessionFn: func(ctx context.Context, rawID string) (*session.Session, error) {
+			return bearerSession, nil
+		},
+	}
+
+	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("next handler must not be called on transport mismatch")
+	})
+
+	mw := RequireAuth(mockSvc, &cfg)(next)
+
+	req := httptest.NewRequest(http.MethodGet, "/protected", nil)
+	req.AddCookie(&http.Cookie{
+		Name:  cfg.SessionCookieName,
+		Value: validTestToken,
+	})
+	rec := httptest.NewRecorder()
+
+	mw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected status 401, got %d", rec.Code)
+	}
+	var resp apperrors.Response
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if resp.Code != apperrors.CodeSessionInvalid {
+		t.Errorf("expected code %s, got %s", apperrors.CodeSessionInvalid, resp.Code)
+	}
+}
