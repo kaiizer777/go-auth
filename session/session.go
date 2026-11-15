@@ -108,12 +108,46 @@ func (s *service) GetSession(ctx context.Context, rawID string) (*Session, error
 
 	// Check idle timeout: now > LastActiveAt + IdleTimeout
 	if now.After(record.LastActiveAt.Add(s.cfg.SessionIdleTimeout)) {
-		_ = s.db.WithContext(ctx).Delete(&record).Error
-		slog.InfoContext(ctx, "session_expired",
-			"user_id", record.UserID.String(),
-			"reason", "idle_timeout",
-		)
-		return nil, apperrors.ErrSessionExpired
+		res := s.db.WithContext(ctx).
+			Where("id = ? AND last_active_at <= ?", record.ID, record.LastActiveAt).
+			Delete(&db.Session{})
+		if res.Error != nil {
+			return nil, apperrors.New(apperrors.CodeInternalError, "failed to delete expired session", res.Error)
+		}
+		if res.RowsAffected == 0 {
+			var reloaded db.Session
+			if err := s.db.WithContext(ctx).Where("id = ?", record.ID).First(&reloaded).Error; err != nil {
+				if errors.Is(err, gorm.ErrRecordNotFound) {
+					return nil, apperrors.ErrSessionExpired
+				}
+				return nil, apperrors.New(apperrors.CodeInternalError, "failed to reload session", err)
+			}
+			record = reloaded
+			if now.After(record.LastActiveAt.Add(s.cfg.SessionIdleTimeout)) {
+				_ = s.db.WithContext(ctx).
+					Where("id = ? AND last_active_at <= ?", record.ID, record.LastActiveAt).
+					Delete(&db.Session{}).Error
+				slog.InfoContext(ctx, "session_expired",
+					"user_id", record.UserID.String(),
+					"reason", "idle_timeout",
+				)
+				return nil, apperrors.ErrSessionExpired
+			}
+			if now.After(record.AbsoluteExpiresAt) {
+				_ = s.db.WithContext(ctx).Delete(&record).Error
+				slog.InfoContext(ctx, "session_expired",
+					"user_id", record.UserID.String(),
+					"reason", "absolute_timeout",
+				)
+				return nil, apperrors.ErrSessionExpired
+			}
+		} else {
+			slog.InfoContext(ctx, "session_expired",
+				"user_id", record.UserID.String(),
+				"reason", "idle_timeout",
+			)
+			return nil, apperrors.ErrSessionExpired
+		}
 	}
 
 	// Check absolute timeout: now > AbsoluteExpiresAt
@@ -188,12 +222,45 @@ func (s *service) RotateSession(
 
 	now := time.Now().UTC()
 	if now.After(oldRecord.LastActiveAt.Add(s.cfg.SessionIdleTimeout)) || now.After(oldRecord.AbsoluteExpiresAt) {
-		_ = s.db.WithContext(ctx).Where("id_hash = ?", oldHash).Delete(&db.Session{}).Error
-		slog.InfoContext(ctx, "session_expired",
-			"user_id", oldRecord.UserID.String(),
-			"reason", "rotate_expired",
-		)
-		return nil, "", apperrors.ErrSessionExpired
+		if now.After(oldRecord.AbsoluteExpiresAt) {
+			_ = s.db.WithContext(ctx).Where("id_hash = ?", oldHash).Delete(&db.Session{}).Error
+			slog.InfoContext(ctx, "session_expired",
+				"user_id", oldRecord.UserID.String(),
+				"reason", "rotate_expired",
+			)
+			return nil, "", apperrors.ErrSessionExpired
+		}
+
+		res := s.db.WithContext(ctx).
+			Where("id_hash = ? AND last_active_at <= ?", oldHash, oldRecord.LastActiveAt).
+			Delete(&db.Session{})
+		if res.Error != nil {
+			return nil, "", apperrors.New(apperrors.CodeInternalError, "failed to delete expired session", res.Error)
+		}
+		if res.RowsAffected == 0 {
+			var reloaded db.Session
+			if err := s.db.WithContext(ctx).Where("id_hash = ?", oldHash).First(&reloaded).Error; err != nil {
+				if errors.Is(err, gorm.ErrRecordNotFound) {
+					return nil, "", apperrors.ErrSessionExpired
+				}
+				return nil, "", apperrors.New(apperrors.CodeInternalError, "failed to reload session", err)
+			}
+			oldRecord = reloaded
+			if now.After(oldRecord.LastActiveAt.Add(s.cfg.SessionIdleTimeout)) || now.After(oldRecord.AbsoluteExpiresAt) {
+				_ = s.db.WithContext(ctx).Where("id_hash = ?", oldHash).Delete(&db.Session{}).Error
+				slog.InfoContext(ctx, "session_expired",
+					"user_id", oldRecord.UserID.String(),
+					"reason", "rotate_expired",
+				)
+				return nil, "", apperrors.ErrSessionExpired
+			}
+		} else {
+			slog.InfoContext(ctx, "session_expired",
+				"user_id", oldRecord.UserID.String(),
+				"reason", "rotate_expired",
+			)
+			return nil, "", apperrors.ErrSessionExpired
+		}
 	}
 
 	tx := s.db.WithContext(ctx).Begin()
