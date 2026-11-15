@@ -68,6 +68,17 @@ func setupTestDB(t *testing.T) *gorm.DB {
 		expires_at DATETIME NOT NULL,
 		created_at DATETIME
 	);
+	CREATE TABLE IF NOT EXISTS sessions (
+		id TEXT PRIMARY KEY,
+		user_id TEXT NOT NULL,
+		id_hash CHAR(64) UNIQUE NOT NULL,
+		session_type VARCHAR(10) NOT NULL DEFAULT 'cookie',
+		ip_address VARCHAR(45) NOT NULL DEFAULT '',
+		user_agent TEXT NOT NULL DEFAULT '',
+		last_active_at DATETIME NOT NULL,
+		absolute_expires_at DATETIME NOT NULL,
+		created_at DATETIME
+	);
 	`
 	if err := database.Exec(ddl).Error; err != nil {
 		t.Fatalf("failed to create schema: %v", err)
@@ -674,6 +685,55 @@ func TestService_PasswordReset(t *testing.T) {
 			if !errors.As(err, &appErr) || appErr.Code() != errors.CodeInvalidToken {
 				t.Fatalf("expected CodeInvalidToken for token %s, got %v", tok, err)
 			}
+		}
+	})
+
+	t.Run("revokes all active user sessions on password reset (ASVS V3.3.1)", func(t *testing.T) {
+		tok, err := svc.RequestPasswordReset(ctx, db.PasswordResetRequest{Email: "reset@example.com"})
+		if err != nil {
+			t.Fatalf("reset request failed: %v", err)
+		}
+
+		sess1 := db.Session{
+			ID:                uuid.New(),
+			UserID:            user.ID,
+			IDHash:            "session_hash_11111111111111111111111111111111111111111111111111111111",
+			SessionType:       db.SessionTypeCookie,
+			LastActiveAt:      time.Now().UTC(),
+			AbsoluteExpiresAt: time.Now().UTC().Add(24 * time.Hour),
+			CreatedAt:         time.Now().UTC(),
+		}
+		sess2 := db.Session{
+			ID:                uuid.New(),
+			UserID:            user.ID,
+			IDHash:            "session_hash_22222222222222222222222222222222222222222222222222222222",
+			SessionType:       db.SessionTypeBearer,
+			LastActiveAt:      time.Now().UTC(),
+			AbsoluteExpiresAt: time.Now().UTC().Add(24 * time.Hour),
+			CreatedAt:         time.Now().UTC(),
+		}
+		if err := database.Create(&sess1).Error; err != nil {
+			t.Fatalf("failed to seed sess1: %v", err)
+		}
+		if err := database.Create(&sess2).Error; err != nil {
+			t.Fatalf("failed to seed sess2: %v", err)
+		}
+
+		var countBefore int64
+		database.Model(&db.Session{}).Where("user_id = ?", user.ID).Count(&countBefore)
+		if countBefore < 2 {
+			t.Fatalf("expected at least 2 sessions before reset, got %d", countBefore)
+		}
+
+		err = svc.ResetPassword(ctx, db.PasswordResetConfirmRequest{Token: tok, NewPassword: "SuperNewPassword#2026!"})
+		if err != nil {
+			t.Fatalf("reset password failed: %v", err)
+		}
+
+		var countAfter int64
+		database.Model(&db.Session{}).Where("user_id = ?", user.ID).Count(&countAfter)
+		if countAfter != 0 {
+			t.Fatalf("expected 0 sessions after password reset, got %d", countAfter)
 		}
 	})
 }
