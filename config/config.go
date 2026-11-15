@@ -260,6 +260,19 @@ func (c *Config) Validate() error {
 		return errors.ErrPasswordResetTokenExpiryInvalid
 	}
 
+	if c.SessionCookieName == "" {
+		c.SessionCookieName = "sid"
+	}
+	if c.SessionCookiePath == "" {
+		c.SessionCookiePath = "/"
+	}
+	if c.CSRFCookieName == "" {
+		c.CSRFCookieName = "csrf_token"
+	}
+	if c.CSRFHeaderName == "" {
+		c.CSRFHeaderName = "X-CSRF-Token"
+	}
+
 	if c.SessionIdleTimeout <= 0 {
 		panic("SessionIdleTimeout must be greater than zero")
 	}

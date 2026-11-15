@@ -970,3 +970,32 @@ func TestConfig_SessionCookieSameSiteNoneWithSecure_Valid(t *testing.T) {
 		t.Fatalf("Validate() unexpected err = %v", err)
 	}
 }
+
+func TestConfig_CookieDefaults_AppliedInValidate(t *testing.T) {
+	cfg := Config{
+		DatabaseURL:           "postgres://user:pass@localhost:5432/testdb",
+		BaseURL:               "https://example.com",
+		SessionIdleTimeout:    30 * time.Minute,
+		SessionAbsoluteMaxAge: 24 * time.Hour,
+		RateLimitLoginMax:     10,
+		RateLimitResetMax:     5,
+		RateLimitSignupMax:    10,
+	}
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() unexpected err = %v", err)
+	}
+
+	if cfg.SessionCookieName != "sid" {
+		t.Errorf("SessionCookieName = %q; want %q", cfg.SessionCookieName, "sid")
+	}
+	if cfg.SessionCookiePath != "/" {
+		t.Errorf("SessionCookiePath = %q; want %q", cfg.SessionCookiePath, "/")
+	}
+	if cfg.CSRFCookieName != "csrf_token" {
+		t.Errorf("CSRFCookieName = %q; want %q", cfg.CSRFCookieName, "csrf_token")
+	}
+	if cfg.CSRFHeaderName != "X-CSRF-Token" {
+		t.Errorf("CSRFHeaderName = %q; want %q", cfg.CSRFHeaderName, "X-CSRF-Token")
+	}
+}
