@@ -82,19 +82,39 @@ func TestDefaultConfig(t *testing.T) {
 
 func TestConfigValidate_ZeroValueUsesAsyncEmailDispatch(t *testing.T) {
 	cfg := Config{
-		DatabaseURL:           "postgres://user:pass@localhost:5432/testdb",
-		BaseURL:               "https://example.com",
-		SessionIdleTimeout:    30 * time.Minute,
-		SessionAbsoluteMaxAge: 24 * time.Hour,
-		RateLimitLoginMax:     10,
-		RateLimitResetMax:     5,
-		RateLimitSignupMax:    10,
+		DatabaseURL: "postgres://user:pass@localhost:5432/testdb",
+		BaseURL:     "https://example.com",
 	}
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("Validate() unexpected err = %v", err)
 	}
 	if cfg.DisableAsyncEmailDispatch {
 		t.Fatal("zero-value config disabled async email dispatch")
+	}
+}
+
+func TestConfigValidate_MinimalStructLiteralDefaults(t *testing.T) {
+	cfg := Config{
+		DatabaseURL: "postgres://user:pass@localhost:5432/testdb",
+		BaseURL:     "https://example.com",
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() unexpected err = %v", err)
+	}
+	if cfg.SessionIdleTimeout != 30*time.Minute {
+		t.Errorf("got SessionIdleTimeout %v, want 30m", cfg.SessionIdleTimeout)
+	}
+	if cfg.SessionAbsoluteMaxAge != 24*time.Hour {
+		t.Errorf("got SessionAbsoluteMaxAge %v, want 24h", cfg.SessionAbsoluteMaxAge)
+	}
+	if cfg.RateLimitLoginMax != 10 {
+		t.Errorf("got RateLimitLoginMax %d, want 10", cfg.RateLimitLoginMax)
+	}
+	if cfg.RateLimitResetMax != 5 {
+		t.Errorf("got RateLimitResetMax %d, want 5", cfg.RateLimitResetMax)
+	}
+	if cfg.RateLimitSignupMax != 10 {
+		t.Errorf("got RateLimitSignupMax %d, want 10", cfg.RateLimitSignupMax)
 	}
 }
 
@@ -725,24 +745,18 @@ func TestConfig_SessionDefaults(t *testing.T) {
 	}
 }
 
-func TestConfig_SessionIdleTimeoutZero_Panics(t *testing.T) {
+func TestConfig_SessionIdleTimeoutZero_Defaults(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
 	cfg.BaseURL = "https://example.com"
 	cfg.SessionIdleTimeout = 0
 
-	defer func() {
-		r := recover()
-		if r == nil {
-			t.Fatal("expected panic on zero SessionIdleTimeout, got nil")
-		}
-		msg, ok := r.(string)
-		if !ok || msg != "SessionIdleTimeout must be greater than zero" {
-			t.Fatalf("panic message = %v; want %q", r, "SessionIdleTimeout must be greater than zero")
-		}
-	}()
-
-	_ = cfg.Validate()
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("unexpected validation error: %v", err)
+	}
+	if cfg.SessionIdleTimeout != 30*time.Minute {
+		t.Fatalf("SessionIdleTimeout = %v; want 30m", cfg.SessionIdleTimeout)
+	}
 }
 
 func TestConfig_AbsoluteLessThanIdle_Panics(t *testing.T) {
@@ -821,24 +835,12 @@ func TestConfig_RateLimitMax_Panics(t *testing.T) {
 		mutate func(*Config)
 	}{
 		{
-			name:   "RateLimitLoginMax zero",
-			mutate: func(c *Config) { c.RateLimitLoginMax = 0 },
-		},
-		{
 			name:   "RateLimitLoginMax negative",
 			mutate: func(c *Config) { c.RateLimitLoginMax = -1 },
 		},
 		{
-			name:   "RateLimitResetMax zero",
-			mutate: func(c *Config) { c.RateLimitResetMax = 0 },
-		},
-		{
 			name:   "RateLimitResetMax negative",
 			mutate: func(c *Config) { c.RateLimitResetMax = -2 },
-		},
-		{
-			name:   "RateLimitSignupMax zero",
-			mutate: func(c *Config) { c.RateLimitSignupMax = 0 },
 		},
 		{
 			name:   "RateLimitSignupMax negative",
@@ -866,6 +868,28 @@ func TestConfig_RateLimitMax_Panics(t *testing.T) {
 
 			_ = cfg.Validate()
 		})
+	}
+}
+
+func TestConfig_RateLimitMaxZero_Defaults(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+	cfg.BaseURL = "https://example.com"
+	cfg.RateLimitLoginMax = 0
+	cfg.RateLimitResetMax = 0
+	cfg.RateLimitSignupMax = 0
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("unexpected validation error: %v", err)
+	}
+	if cfg.RateLimitLoginMax != 10 {
+		t.Errorf("got RateLimitLoginMax %d, want 10", cfg.RateLimitLoginMax)
+	}
+	if cfg.RateLimitResetMax != 5 {
+		t.Errorf("got RateLimitResetMax %d, want 5", cfg.RateLimitResetMax)
+	}
+	if cfg.RateLimitSignupMax != 10 {
+		t.Errorf("got RateLimitSignupMax %d, want 10", cfg.RateLimitSignupMax)
 	}
 }
 
