@@ -121,7 +121,10 @@ func (s *authService) Signup(ctx context.Context, req db.SignupRequest) (*db.Use
 				}
 				now := time.Now().UTC()
 				if terr := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-					if err := tx.Model(&db.User{}).Where("id = ?", existing.ID).Update("password_hash", passwordHash).Error; err != nil {
+					if err := tx.Model(&db.User{}).Where("id = ?", existing.ID).Updates(map[string]any{
+						"password_hash":      passwordHash,
+						"credential_version": gorm.Expr("credential_version + 1"),
+					}).Error; err != nil {
 						return err
 					}
 					if err := tx.Where("user_id = ?", existing.ID).Delete(&db.VerificationToken{}).Error; err != nil {
@@ -366,7 +369,10 @@ func (s *authService) ResetPassword(ctx context.Context, req db.PasswordResetCon
 			return errors.New(errors.CodeInvalidToken, "invalid or consumed password reset token", nil)
 		}
 
-		if err := tx.Model(&db.User{}).Where("id = ?", tok.UserID).Update("password_hash", newHash).Error; err != nil {
+		if err := tx.Model(&db.User{}).Where("id = ?", tok.UserID).Updates(map[string]any{
+			"password_hash":      newHash,
+			"credential_version": gorm.Expr("credential_version + 1"),
+		}).Error; err != nil {
 			return err
 		}
 
