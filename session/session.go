@@ -136,7 +136,7 @@ func (s *service) GetSession(ctx context.Context, rawID string) (*Session, error
 		defer cancel()
 		if err := s.db.WithContext(updateCtx).
 			Model(&db.Session{}).
-			Where("id = ?", sessionID).
+			Where("id = ? AND last_active_at < ?", sessionID, now).
 			Update("last_active_at", now).Error; err != nil {
 			slog.Error("failed to update session last_active_at",
 				"session_id", sessionID.String(),
