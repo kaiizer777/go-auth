@@ -273,6 +273,12 @@ func (c *Config) Validate() error {
 		c.CSRFHeaderName = "X-CSRF-Token"
 	}
 
+	if c.SessionIdleTimeout == 0 {
+		c.SessionIdleTimeout = 30 * time.Minute
+	}
+	if c.SessionAbsoluteMaxAge == 0 {
+		c.SessionAbsoluteMaxAge = 24 * time.Hour
+	}
 	if c.SessionIdleTimeout <= 0 {
 		panic("SessionIdleTimeout must be greater than zero")
 	}
@@ -303,6 +309,15 @@ func (c *Config) Validate() error {
 		c.RateLimitCleanupTick = 5 * time.Minute
 	}
 
+	if c.RateLimitLoginMax == 0 {
+		c.RateLimitLoginMax = 10
+	}
+	if c.RateLimitResetMax == 0 {
+		c.RateLimitResetMax = 5
+	}
+	if c.RateLimitSignupMax == 0 {
+		c.RateLimitSignupMax = 10
+	}
 	if c.RateLimitLoginMax < 1 || c.RateLimitResetMax < 1 || c.RateLimitSignupMax < 1 {
 		panic("rate limit max must be >= 1")
 	}
