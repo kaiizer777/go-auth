@@ -53,6 +53,10 @@ var dbConnectFn = db.Connect
 
 // NewWithDB initializes Auth using an existing GORM database connection.
 func NewWithDB(database *gorm.DB, cfg config.Config) (*Auth, error) {
+	if err := cfg.Validate(); err != nil {
+		return nil, errors.Wrap(err, errors.CodeInvalidConfig, "goauth: invalid configuration")
+	}
+
 	emailHooks := cfg.EmailHooks
 	if emailHooks.SendVerificationEmail == nil && cfg.SendVerificationEmail != nil {
 		emailHooks.SendVerificationEmail = func(ctx context.Context, recipient, token string) error {

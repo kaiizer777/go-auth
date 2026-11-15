@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/glebarez/sqlite"
 	"gorm.io/driver/postgres"
@@ -405,5 +406,77 @@ func TestNewWithDB_ZeroCleanupTick(t *testing.T) {
 	defer func() { _ = a.Close() }()
 	if a == nil {
 		t.Fatal("expected non-nil Auth")
+	}
+}
+
+func TestNewWithDB_InvalidConfig(t *testing.T) {
+	sqliteDB, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{
+		DisableAutomaticPing: true,
+	})
+	if err != nil {
+		t.Fatalf("failed to open sqlite: %v", err)
+	}
+
+	// Empty config missing DatabaseURL and BaseURL
+	_, err = NewWithDB(sqliteDB, config.Config{})
+	if err == nil {
+		t.Fatal("expected NewWithDB to fail validation on empty config, got nil")
+	}
+	var appErr *errors.Error
+	if !errors.As(err, &appErr) || appErr.Code() != errors.CodeInvalidConfig {
+		t.Fatalf("expected CodeInvalidConfig, got %v", err)
+	}
+}
+
+func TestNewWithDB_AppliesDefaults(t *testing.T) {
+	sqliteDB, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{
+		DisableAutomaticPing: true,
+	})
+	if err != nil {
+		t.Fatalf("failed to open sqlite: %v", err)
+	}
+
+	ddl := `
+	CREATE TABLE IF NOT EXISTS users (
+		id TEXT PRIMARY KEY,
+		email TEXT UNIQUE NOT NULL,
+		password_hash TEXT NOT NULL,
+		email_verified INTEGER NOT NULL DEFAULT 0,
+		created_at DATETIME,
+		updated_at DATETIME
+	);
+	CREATE TABLE IF NOT EXISTS sessions (
+		id TEXT PRIMARY KEY,
+		user_id TEXT NOT NULL,
+		id_hash CHAR(64) UNIQUE NOT NULL,
+		session_type VARCHAR(10) NOT NULL DEFAULT 'cookie',
+		csrf_token CHAR(64) NOT NULL DEFAULT '',
+		ip_address VARCHAR(45) NOT NULL DEFAULT '',
+		user_agent TEXT NOT NULL DEFAULT '',
+		last_active_at DATETIME NOT NULL,
+		absolute_expires_at DATETIME NOT NULL,
+		created_at DATETIME
+	);
+	`
+	if err := sqliteDB.Exec(ddl).Error; err != nil {
+		t.Fatalf("failed to execute sqlite ddl: %v", err)
+	}
+
+	cfg := config.Config{
+		DatabaseURL: "postgres://user:pass@localhost:5432/testdb",
+		BaseURL:     "https://auth.example.com",
+	}
+
+	a, err := NewWithDB(sqliteDB, cfg)
+	if err != nil {
+		t.Fatalf("NewWithDB unexpected err = %v", err)
+	}
+	defer func() { _ = a.Close() }()
+
+	if a.cfg.CSRFCookieName != "csrf_token" {
+		t.Errorf("CSRFCookieName = %q; want %q", a.cfg.CSRFCookieName, "csrf_token")
+	}
+	if a.cfg.SessionIdleTimeout != 30*time.Minute {
+		t.Errorf("SessionIdleTimeout = %v; want 30m", a.cfg.SessionIdleTimeout)
 	}
 }
