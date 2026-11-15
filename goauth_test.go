@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	stderrors "errors"
+	"net/http"
 	"strings"
 	"sync"
 	"testing"
@@ -225,7 +226,13 @@ func TestNew_SuccessAndWiring(t *testing.T) {
 	CREATE TABLE IF NOT EXISTS sessions (
 		id TEXT PRIMARY KEY,
 		user_id TEXT NOT NULL,
-		expires_at DATETIME NOT NULL,
+		id_hash CHAR(64) UNIQUE NOT NULL,
+		session_type VARCHAR(10) NOT NULL DEFAULT 'cookie',
+		csrf_token CHAR(64) NOT NULL DEFAULT '',
+		ip_address VARCHAR(45) NOT NULL DEFAULT '',
+		user_agent TEXT NOT NULL DEFAULT '',
+		last_active_at DATETIME NOT NULL,
+		absolute_expires_at DATETIME NOT NULL,
 		created_at DATETIME
 	);
 	`
@@ -287,6 +294,16 @@ func TestNew_SuccessAndWiring(t *testing.T) {
 	})
 	if resetPayload.To != "user@example.com" {
 		t.Fatalf("resetPayload.To = %q; want 'user@example.com'", resetPayload.To)
+	}
+
+	if a.SessionService() == nil {
+		t.Fatal("expected a.SessionService() to not be nil")
+	}
+	if a.RequireAuth(http.NotFoundHandler()) == nil {
+		t.Fatal("expected a.RequireAuth middleware to not be nil")
+	}
+	if a.CSRF(http.NotFoundHandler()) == nil {
+		t.Fatal("expected a.CSRF middleware to not be nil")
 	}
 
 	// Verify Close cleans up cleanly

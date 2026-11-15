@@ -27,22 +27,22 @@ type AuthHandler struct {
 // AuthOption configures optional dependencies for AuthHandler.
 type AuthOption func(*AuthHandler)
 
-// WithSessionService configures the session service for AuthHandler.
-func WithSessionService(sessionSvc session.Service) AuthOption {
+// WithAuthSessionService configures the session service for AuthHandler.
+func WithAuthSessionService(sessionSvc session.Service) AuthOption {
 	return func(h *AuthHandler) {
 		h.sessionSvc = sessionSvc
 	}
 }
 
-// WithConfig configures the runtime configuration for AuthHandler.
-func WithConfig(cfg *config.Config) AuthOption {
+// WithAuthConfig configures the runtime configuration for AuthHandler.
+func WithAuthConfig(cfg *config.Config) AuthOption {
 	return func(h *AuthHandler) {
 		h.cfg = cfg
 	}
 }
 
-// WithLimiters configures in-memory rate limiters for AuthHandler.
-func WithLimiters(login, signup, reset *ratelimit.Limiter) AuthOption {
+// WithAuthLimiters configures in-memory rate limiters for AuthHandler.
+func WithAuthLimiters(login, signup, reset *ratelimit.Limiter) AuthOption {
 	return func(h *AuthHandler) {
 		h.loginLimiter = login
 		h.signupLimiter = signup

@@ -8,15 +8,19 @@ import (
 	"context"
 	"log/slog"
 	"net/http"
+	"sync"
 
 	"gorm.io/gorm"
 
 	"github.com/kaiizer777/go-auth/auth"
 	"github.com/kaiizer777/go-auth/config"
+	"github.com/kaiizer777/go-auth/csrf"
 	"github.com/kaiizer777/go-auth/db"
 	"github.com/kaiizer777/go-auth/email"
 	"github.com/kaiizer777/go-auth/errors"
 	"github.com/kaiizer777/go-auth/handler"
+	"github.com/kaiizer777/go-auth/ratelimit"
+	"github.com/kaiizer777/go-auth/session"
 )
 
 // Auth is the main entry point for the authentication library.
@@ -30,6 +34,18 @@ type Auth struct {
 
 	// Auth is the core authentication service.
 	Auth auth.Service
+
+	// Session is the session management service.
+	Session session.Service
+
+	// SessionHandler is the HTTP handler for session management.
+	SessionHandler *handler.SessionHandler
+
+	loginLimiter  *ratelimit.Limiter
+	resetLimiter  *ratelimit.Limiter
+	signupLimiter *ratelimit.Limiter
+	limiterDone   chan struct{}
+	closeOnce     sync.Once
 }
 
 var dbConnectFn = db.Connect
@@ -80,7 +96,25 @@ func New(cfg config.Config) (*Auth, error) {
 		return nil, err
 	}
 
-	h := handler.New(database, cfg, authSvc)
+	sessionSvc := session.NewService(database, &cfg)
+
+	loginLimiter := ratelimit.NewLimiter(cfg.RateLimitLoginWindow, cfg.RateLimitLoginMax)
+	resetLimiter := ratelimit.NewLimiter(cfg.RateLimitResetWindow, cfg.RateLimitResetMax)
+	signupLimiter := ratelimit.NewLimiter(cfg.RateLimitSignupWindow, cfg.RateLimitSignupMax)
+
+	limiterDone := make(chan struct{})
+	loginLimiter.StartCleanup(cfg.RateLimitCleanupTick, limiterDone)
+	resetLimiter.StartCleanup(cfg.RateLimitCleanupTick, limiterDone)
+	signupLimiter.StartCleanup(cfg.RateLimitCleanupTick, limiterDone)
+
+	sessHandler := handler.NewSessionHandler(sessionSvc, database, &cfg)
+
+	h := handler.New(database, cfg, authSvc,
+		handler.WithSessionService(sessionSvc),
+		handler.WithSessionHandler(sessHandler),
+		handler.WithRateLimiters(loginLimiter, resetLimiter, signupLimiter),
+	)
+
 	a := &Auth{
 		db:  database,
 		cfg: cfg,
@@ -91,15 +125,36 @@ func New(cfg config.Config) (*Auth, error) {
 			SendVerificationEmail:     cfg.SendVerificationEmail,
 			SendPasswordResetEmail:    cfg.SendPasswordResetEmail,
 		}, slog.Default()),
-		Handler: h,
-		Auth:    authSvc,
+		Handler:        h,
+		Auth:           authSvc,
+		Session:        sessionSvc,
+		SessionHandler: sessHandler,
+		loginLimiter:   loginLimiter,
+		resetLimiter:   resetLimiter,
+		signupLimiter:  signupLimiter,
+		limiterDone:    limiterDone,
 	}
 	success = true
 	return a, nil
 }
 
-// Close terminates the underlying database connection pool.
+// Close terminates the underlying database connection pool and background cleanups.
 func (a *Auth) Close() error {
+	a.closeOnce.Do(func() {
+		if a.limiterDone != nil {
+			close(a.limiterDone)
+		}
+		if a.loginLimiter != nil {
+			a.loginLimiter.Close()
+		}
+		if a.resetLimiter != nil {
+			a.resetLimiter.Close()
+		}
+		if a.signupLimiter != nil {
+			a.signupLimiter.Close()
+		}
+	})
+
 	if a.db == nil {
 		return nil
 	}
@@ -111,6 +166,21 @@ func (a *Auth) Close() error {
 		return errors.New(errors.CodeDatabaseError, "failed to close database", err)
 	}
 	return nil
+}
+
+// RequireAuth returns middleware that validates session credentials from cookies or Bearer headers.
+func (a *Auth) RequireAuth(next http.Handler) http.Handler {
+	return handler.RequireAuth(a.Session, &a.cfg)(next)
+}
+
+// CSRF returns middleware that enforces Double Submit Cookie CSRF protection.
+func (a *Auth) CSRF(next http.Handler) http.Handler {
+	return csrf.Middleware(&a.cfg)(next)
+}
+
+// SessionService returns the configured session service.
+func (a *Auth) SessionService() session.Service {
+	return a.Session
 }
 
 // EmailDispatcher returns the configured email dispatcher.

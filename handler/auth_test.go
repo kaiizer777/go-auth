@@ -1282,9 +1282,9 @@ func TestAuthHandler_LoginRateLimiting(t *testing.T) {
 	sessSvc := session.NewService(database, &cfg)
 
 	authH := NewAuthHandler(svc,
-		WithSessionService(sessSvc),
-		WithConfig(&cfg),
-		WithLimiters(loginLimiter, nil, nil),
+		WithAuthSessionService(sessSvc),
+		WithAuthConfig(&cfg),
+		WithAuthLimiters(loginLimiter, nil, nil),
 	)
 
 	email := "ratelimit_login@example.com"
@@ -1329,9 +1329,9 @@ func TestAuthHandler_RateLimitResetOnSuccess(t *testing.T) {
 	sessSvc := session.NewService(database, &cfg)
 
 	authH := NewAuthHandler(svc,
-		WithSessionService(sessSvc),
-		WithConfig(&cfg),
-		WithLimiters(loginLimiter, nil, nil),
+		WithAuthSessionService(sessSvc),
+		WithAuthConfig(&cfg),
+		WithAuthLimiters(loginLimiter, nil, nil),
 	)
 
 	email := "rl_reset@example.com"
@@ -1385,8 +1385,8 @@ func TestAuthHandler_LoginSessionCreation_CookieAndBearer(t *testing.T) {
 	sessSvc := session.NewService(database, &cfg)
 
 	authH := NewAuthHandler(svc,
-		WithSessionService(sessSvc),
-		WithConfig(&cfg),
+		WithAuthSessionService(sessSvc),
+		WithAuthConfig(&cfg),
 	)
 
 	email := "sess_create@example.com"
