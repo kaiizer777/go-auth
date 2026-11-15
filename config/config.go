@@ -114,7 +114,7 @@ func DefaultConfig() Config {
 		ConnMaxLifetime:      time.Hour,
 		ConnMaxIdleTime:      30 * time.Minute,
 		AllowedMethods:       []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
-		AllowedHeaders:       []string{"Authorization", "Content-Type"},
+		AllowedHeaders:       []string{"Authorization", "Content-Type", "X-CSRF-Token"},
 		EmailDispatchTimeout: 10 * time.Second,
 		Argon2: Argon2Config{
 			Memory:      65536,
