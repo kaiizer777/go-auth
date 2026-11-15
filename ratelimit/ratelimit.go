@@ -102,7 +102,12 @@ func (l *Limiter) Allow(key string) bool {
 // Reset clears the counter for key on successful authentication.
 func (l *Limiter) Reset(key string) {
 	l.mu.Lock()
-	delete(l.windows, key)
+	if entry, ok := l.windows[key]; ok {
+		entry.mu.Lock()
+		delete(l.windows, key)
+		entry.timestamps = nil
+		entry.mu.Unlock()
+	}
 	l.mu.Unlock()
 }
 
