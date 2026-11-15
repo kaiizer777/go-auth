@@ -20,7 +20,7 @@ type mockSessionService struct {
 	getSessionFn func(ctx context.Context, rawID string) (*session.Session, error)
 }
 
-func (m *mockSessionService) CreateSession(ctx context.Context, userID uuid.UUID, sessionType db.SessionType, ip, userAgent string) (*session.Session, string, error) {
+func (m *mockSessionService) CreateSession(ctx context.Context, userID uuid.UUID, credentialVersion int, sessionType db.SessionType, ip, userAgent string) (*session.Session, string, error) {
 	return nil, "", nil
 }
 
