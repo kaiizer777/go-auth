@@ -315,4 +315,3 @@ func WriteJSON(w http.ResponseWriter, err error) {
 
 // WriteHTTP is an alias for WriteJSON conforming to wire response standards.
 var WriteHTTP = WriteJSON
-

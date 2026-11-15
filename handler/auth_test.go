@@ -1455,4 +1455,3 @@ func TestNewAuthHandler_NilConfigDefaults(t *testing.T) {
 		t.Errorf("expected default SessionCookieName to be non-empty")
 	}
 }
-

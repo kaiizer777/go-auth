@@ -633,7 +633,7 @@ func TestConfigValidate_EmailDispatchTimeoutRetention(t *testing.T) {
 		RateLimitLoginMax:     10,
 		RateLimitResetMax:     5,
 		RateLimitSignupMax:    10,
-		EmailDispatchTimeout: 5 * time.Second,
+		EmailDispatchTimeout:  5 * time.Second,
 	}
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("Validate() unexpected err = %v", err)
@@ -652,7 +652,7 @@ func TestConfigValidate_EmailDispatchTimeoutDefault(t *testing.T) {
 		RateLimitLoginMax:     10,
 		RateLimitResetMax:     5,
 		RateLimitSignupMax:    10,
-		EmailDispatchTimeout: 0,
+		EmailDispatchTimeout:  0,
 	}
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("Validate() unexpected err = %v", err)

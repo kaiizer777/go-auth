@@ -109,7 +109,7 @@ func setCSRFCookie(w http.ResponseWriter, token string, cfg *config.Config) {
 		Name:     cfg.CSRFCookieName,
 		Value:    token,
 		Path:     "/",
-		HttpOnly: false,                   // Mandatory false for Double Submit Cookie pattern
+		HttpOnly: false, // Mandatory false for Double Submit Cookie pattern
 		Secure:   cfg.SessionCookieSecure,
 		SameSite: http.SameSiteStrictMode, // Strict for CSRF cookie
 	})
