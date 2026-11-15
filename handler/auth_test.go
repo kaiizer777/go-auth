@@ -1074,6 +1074,42 @@ func TestLogoutInvokesService(t *testing.T) {
 	})
 }
 
+type mockFailingSessionService struct {
+	session.Service
+	invalidateErr error
+}
+
+func (m *mockFailingSessionService) InvalidateSession(ctx context.Context, rawID string) error {
+	return m.invalidateErr
+}
+
+func TestAuthHandler_Logout_InvalidateSessionError(t *testing.T) {
+	mockSvc := &mockAuthService{}
+	cfg := testConfig()
+	expectedErr := errors.New(errors.CodeInternalError, "database query failed", nil)
+	failingSessSvc := &mockFailingSessionService{invalidateErr: expectedErr}
+
+	authH := NewAuthHandler(mockSvc,
+		WithAuthConfig(&cfg),
+		WithAuthSessionService(failingSessSvc),
+	)
+
+	req := httptest.NewRequest(http.MethodPost, "/auth/logout", nil)
+	req.AddCookie(&http.Cookie{Name: "sid", Value: "raw-session-id"})
+	rec := httptest.NewRecorder()
+
+	authH.Logout(rec, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("expected status 500 on InvalidateSession failure, got %d", rec.Code)
+	}
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == "sid" && c.MaxAge < 0 {
+			t.Fatal("expected session cookie NOT to be cleared on invalidation error")
+		}
+	}
+}
+
 func TestDecodeJSON_NilBody(t *testing.T) {
 	mockSvc := &mockAuthService{}
 	authH := NewAuthHandler(mockSvc)
