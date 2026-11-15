@@ -1,9 +1,59 @@
 package session
 
 import (
+	"context"
 	"encoding/hex"
+	"errors"
+	"fmt"
 	"testing"
+	"time"
+
+	"github.com/glebarez/sqlite"
+	"github.com/google/uuid"
+	"github.com/kaiizer777/go-auth/config"
+	"github.com/kaiizer777/go-auth/db"
+	apperrors "github.com/kaiizer777/go-auth/errors"
+	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
 )
+
+func setupTestDB(t *testing.T) *gorm.DB {
+	t.Helper()
+	dbName := fmt.Sprintf("file:mem_%d_%s?mode=memory&cache=shared", time.Now().UnixNano(), uuid.New().String())
+	database, err := gorm.Open(sqlite.Open(dbName), &gorm.Config{
+		Logger: logger.Discard,
+	})
+	if err != nil {
+		t.Fatalf("failed to open sqlite db: %v", err)
+	}
+
+	ddl := `
+	CREATE TABLE IF NOT EXISTS sessions (
+		id TEXT PRIMARY KEY,
+		user_id TEXT NOT NULL,
+		id_hash CHAR(64) UNIQUE NOT NULL,
+		session_type VARCHAR(10) NOT NULL DEFAULT 'cookie',
+		csrf_token CHAR(64) NOT NULL DEFAULT '',
+		ip_address VARCHAR(45) NOT NULL DEFAULT '',
+		user_agent TEXT NOT NULL DEFAULT '',
+		last_active_at DATETIME NOT NULL,
+		absolute_expires_at DATETIME NOT NULL,
+		created_at DATETIME
+	);
+	`
+	if err := database.Exec(ddl).Error; err != nil {
+		t.Fatalf("failed to create schema: %v", err)
+	}
+
+	return database
+}
+
+func testConfig() *config.Config {
+	cfg := config.DefaultConfig()
+	cfg.SessionIdleTimeout = 30 * time.Minute
+	cfg.SessionAbsoluteMaxAge = 24 * time.Hour
+	return &cfg
+}
 
 func TestGenerateRawID_Entropy(t *testing.T) {
 	const count = 1000
@@ -56,5 +106,302 @@ func TestHashID_Deterministic(t *testing.T) {
 
 	if _, err := hex.DecodeString(h1); err != nil {
 		t.Fatalf("expected valid hex hash, got %v", err)
+	}
+}
+
+func TestCreateSession_StoresHash(t *testing.T) {
+	database := setupTestDB(t)
+	cfg := testConfig()
+	svc := NewService(database, cfg)
+
+	userID := uuid.New()
+	sess, rawID, err := svc.CreateSession(context.Background(), userID, db.SessionTypeCookie, "127.0.0.1", "test-agent")
+	if err != nil {
+		t.Fatalf("CreateSession failed: %v", err)
+	}
+
+	if len(rawID) != 32 {
+		t.Fatalf("expected rawID len 32, got %d", len(rawID))
+	}
+
+	expectedHash := hashID(rawID)
+	if sess.IDHash != expectedHash {
+		t.Fatalf("expected domain IDHash %q, got %q", expectedHash, sess.IDHash)
+	}
+
+	var row db.Session
+	if err := database.Where("id_hash = ?", expectedHash).First(&row).Error; err != nil {
+		t.Fatalf("failed to query session by hash: %v", err)
+	}
+
+	if row.IDHash != expectedHash {
+		t.Fatalf("expected DB id_hash %q, got %q", expectedHash, row.IDHash)
+	}
+	if row.UserID != userID {
+		t.Fatalf("expected DB user_id %s, got %s", userID, row.UserID)
+	}
+	if row.IPAddress != "127.0.0.1" || row.UserAgent != "test-agent" {
+		t.Fatalf("unexpected metadata: ip=%q, ua=%q", row.IPAddress, row.UserAgent)
+	}
+
+	now := time.Now().UTC()
+	if row.LastActiveAt.Before(now.Add(-2*time.Second)) || row.LastActiveAt.After(now.Add(2*time.Second)) {
+		t.Fatalf("unexpected LastActiveAt: %v", row.LastActiveAt)
+	}
+	expectedExpiry := now.Add(cfg.SessionAbsoluteMaxAge)
+	if row.AbsoluteExpiresAt.Before(expectedExpiry.Add(-2*time.Second)) || row.AbsoluteExpiresAt.After(expectedExpiry.Add(2*time.Second)) {
+		t.Fatalf("unexpected AbsoluteExpiresAt: %v", row.AbsoluteExpiresAt)
+	}
+}
+
+func TestGetSession_IdleTimeout(t *testing.T) {
+	database := setupTestDB(t)
+	cfg := testConfig()
+	svc := NewService(database, cfg)
+
+	rawID, _ := generateRawID()
+	now := time.Now().UTC()
+	row := &db.Session{
+		ID:                uuid.New(),
+		UserID:            uuid.New(),
+		IDHash:            hashID(rawID),
+		SessionType:       db.SessionTypeCookie,
+		LastActiveAt:      now.Add(-cfg.SessionIdleTimeout - 2*time.Second),
+		AbsoluteExpiresAt: now.Add(cfg.SessionAbsoluteMaxAge),
+		CreatedAt:         now.Add(-cfg.SessionIdleTimeout - 2*time.Second),
+	}
+	if err := database.Create(row).Error; err != nil {
+		t.Fatalf("failed to seed session: %v", err)
+	}
+
+	sess, err := svc.GetSession(context.Background(), rawID)
+	if sess != nil {
+		t.Fatalf("expected nil session, got %+v", sess)
+	}
+	if !errors.Is(err, apperrors.ErrSessionExpired) {
+		t.Fatalf("expected ErrSessionExpired, got %v", err)
+	}
+
+	var check db.Session
+	err = database.Where("id_hash = ?", row.IDHash).First(&check).Error
+	if !errors.Is(err, gorm.ErrRecordNotFound) {
+		t.Fatalf("expected expired session to be deleted, got err=%v", err)
+	}
+}
+
+func TestGetSession_AbsoluteTimeout(t *testing.T) {
+	database := setupTestDB(t)
+	cfg := testConfig()
+	svc := NewService(database, cfg)
+
+	rawID, _ := generateRawID()
+	now := time.Now().UTC()
+	row := &db.Session{
+		ID:                uuid.New(),
+		UserID:            uuid.New(),
+		IDHash:            hashID(rawID),
+		SessionType:       db.SessionTypeCookie,
+		LastActiveAt:      now,
+		AbsoluteExpiresAt: now.Add(-2 * time.Second),
+		CreatedAt:         now.Add(-25 * time.Hour),
+	}
+	if err := database.Create(row).Error; err != nil {
+		t.Fatalf("failed to seed session: %v", err)
+	}
+
+	sess, err := svc.GetSession(context.Background(), rawID)
+	if sess != nil {
+		t.Fatalf("expected nil session, got %+v", sess)
+	}
+	if !errors.Is(err, apperrors.ErrSessionExpired) {
+		t.Fatalf("expected ErrSessionExpired, got %v", err)
+	}
+
+	var check db.Session
+	err = database.Where("id_hash = ?", row.IDHash).First(&check).Error
+	if !errors.Is(err, gorm.ErrRecordNotFound) {
+		t.Fatalf("expected absolute-expired session to be deleted, got err=%v", err)
+	}
+}
+
+func TestGetSession_Valid(t *testing.T) {
+	database := setupTestDB(t)
+	cfg := testConfig()
+	svc := NewService(database, cfg)
+
+	userID := uuid.New()
+	sessCreated, rawID, err := svc.CreateSession(context.Background(), userID, db.SessionTypeCookie, "127.0.0.1", "agent")
+	if err != nil {
+		t.Fatalf("CreateSession failed: %v", err)
+	}
+
+	sess, err := svc.GetSession(context.Background(), rawID)
+	if err != nil {
+		t.Fatalf("GetSession failed: %v", err)
+	}
+
+	if sess.IDHash != sessCreated.IDHash {
+		t.Fatalf("expected IDHash %q, got %q", sessCreated.IDHash, sess.IDHash)
+	}
+	if sess.UserID != userID {
+		t.Fatalf("expected UserID %s, got %s", userID, sess.UserID)
+	}
+
+	// Poll briefly for the asynchronous LastActiveAt update to finish
+	time.Sleep(50 * time.Millisecond)
+	var row db.Session
+	if err := database.Where("id_hash = ?", sess.IDHash).First(&row).Error; err != nil {
+		t.Fatalf("failed to query row: %v", err)
+	}
+	if row.LastActiveAt.IsZero() {
+		t.Fatal("expected LastActiveAt to be non-zero")
+	}
+}
+
+func TestGetSession_NotFound(t *testing.T) {
+	database := setupTestDB(t)
+	cfg := testConfig()
+	svc := NewService(database, cfg)
+
+	sess, err := svc.GetSession(context.Background(), "0123456789abcdef0123456789abcdef")
+	if sess != nil {
+		t.Fatalf("expected nil session, got %+v", sess)
+	}
+	if !errors.Is(err, apperrors.ErrSessionNotFound) {
+		t.Fatalf("expected ErrSessionNotFound, got %v", err)
+	}
+}
+
+func TestInvalidateSession_DeletesRow(t *testing.T) {
+	database := setupTestDB(t)
+	cfg := testConfig()
+	svc := NewService(database, cfg)
+
+	_, rawID, err := svc.CreateSession(context.Background(), uuid.New(), db.SessionTypeCookie, "127.0.0.1", "agent")
+	if err != nil {
+		t.Fatalf("CreateSession failed: %v", err)
+	}
+
+	if err := svc.InvalidateSession(context.Background(), rawID); err != nil {
+		t.Fatalf("InvalidateSession failed: %v", err)
+	}
+
+	sess, err := svc.GetSession(context.Background(), rawID)
+	if sess != nil {
+		t.Fatalf("expected nil session after invalidation, got %+v", sess)
+	}
+	if !errors.Is(err, apperrors.ErrSessionNotFound) {
+		t.Fatalf("expected ErrSessionNotFound, got %v", err)
+	}
+}
+
+func TestInvalidateSession_Idempotent(t *testing.T) {
+	database := setupTestDB(t)
+	cfg := testConfig()
+	svc := NewService(database, cfg)
+
+	_, rawID, err := svc.CreateSession(context.Background(), uuid.New(), db.SessionTypeCookie, "127.0.0.1", "agent")
+	if err != nil {
+		t.Fatalf("CreateSession failed: %v", err)
+	}
+
+	if err := svc.InvalidateSession(context.Background(), rawID); err != nil {
+		t.Fatalf("first InvalidateSession failed: %v", err)
+	}
+	if err := svc.InvalidateSession(context.Background(), rawID); err != nil {
+		t.Fatalf("second InvalidateSession failed (must be idempotent): %v", err)
+	}
+}
+
+func TestInvalidateAllUserSessions(t *testing.T) {
+	database := setupTestDB(t)
+	cfg := testConfig()
+	svc := NewService(database, cfg)
+
+	userA := uuid.New()
+	userB := uuid.New()
+
+	var tokensA []string
+	for i := 0; i < 3; i++ {
+		_, rawID, err := svc.CreateSession(context.Background(), userA, db.SessionTypeCookie, "127.0.0.1", "agent")
+		if err != nil {
+			t.Fatalf("CreateSession userA failed: %v", err)
+		}
+		tokensA = append(tokensA, rawID)
+	}
+
+	var tokensB []string
+	for i := 0; i < 2; i++ {
+		_, rawID, err := svc.CreateSession(context.Background(), userB, db.SessionTypeCookie, "127.0.0.1", "agent")
+		if err != nil {
+			t.Fatalf("CreateSession userB failed: %v", err)
+		}
+		tokensB = append(tokensB, rawID)
+	}
+
+	if err := svc.InvalidateAllUserSessions(context.Background(), userA); err != nil {
+		t.Fatalf("InvalidateAllUserSessions failed: %v", err)
+	}
+
+	for _, token := range tokensA {
+		_, err := svc.GetSession(context.Background(), token)
+		if !errors.Is(err, apperrors.ErrSessionNotFound) {
+			t.Fatalf("expected ErrSessionNotFound for invalidated userA session, got %v", err)
+		}
+	}
+
+	for _, token := range tokensB {
+		sess, err := svc.GetSession(context.Background(), token)
+		if err != nil || sess == nil {
+			t.Fatalf("expected userB session to remain valid, got err=%v", err)
+		}
+	}
+}
+
+func TestRotateSession_Transaction(t *testing.T) {
+	database := setupTestDB(t)
+	cfg := testConfig()
+	svc := NewService(database, cfg)
+
+	userID := uuid.New()
+	_, oldRawID, err := svc.CreateSession(context.Background(), userID, db.SessionTypeCookie, "1.1.1.1", "agent-old")
+	if err != nil {
+		t.Fatalf("CreateSession failed: %v", err)
+	}
+
+	newSess, newRawID, err := svc.RotateSession(context.Background(), oldRawID, "2.2.2.2", "agent-new")
+	if err != nil {
+		t.Fatalf("RotateSession failed: %v", err)
+	}
+
+	if newRawID == oldRawID {
+		t.Fatal("expected newRawID to differ from oldRawID")
+	}
+	if len(newRawID) != 32 {
+		t.Fatalf("expected newRawID len 32, got %d", len(newRawID))
+	}
+	if newSess.UserID != userID {
+		t.Fatalf("expected preserved UserID %s, got %s", userID, newSess.UserID)
+	}
+	if newSess.IPAddress != "2.2.2.2" || newSess.UserAgent != "agent-new" {
+		t.Fatalf("unexpected rotated metadata: ip=%q, ua=%q", newSess.IPAddress, newSess.UserAgent)
+	}
+
+	// Old raw ID must now return ErrSessionNotFound
+	oldSess, err := svc.GetSession(context.Background(), oldRawID)
+	if oldSess != nil {
+		t.Fatalf("expected nil session for oldRawID, got %+v", oldSess)
+	}
+	if !errors.Is(err, apperrors.ErrSessionNotFound) {
+		t.Fatalf("expected ErrSessionNotFound for oldRawID, got %v", err)
+	}
+
+	// New raw ID must be valid
+	validSess, err := svc.GetSession(context.Background(), newRawID)
+	if err != nil || validSess == nil {
+		t.Fatalf("expected newRawID to be valid, got err=%v", err)
+	}
+	if validSess.IDHash != hashID(newRawID) {
+		t.Fatalf("expected IDHash %q, got %q", hashID(newRawID), validSess.IDHash)
 	}
 }
