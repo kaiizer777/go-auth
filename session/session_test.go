@@ -817,3 +817,42 @@ func TestRotateSession_PreservesAbsoluteExpiresAt(t *testing.T) {
 		t.Fatalf("expected DB AbsoluteExpiresAt %v, got %v", initialAbsoluteExpiry, dbRow.AbsoluteExpiresAt)
 	}
 }
+
+func TestRotateSession_PreservesCreatedAt(t *testing.T) {
+	database := setupTestDB(t)
+	cfg := testConfig()
+	svc := NewService(database, cfg)
+
+	rawID, _ := generateRawID()
+	now := time.Now().UTC()
+	initialCreatedAt := now.Add(-5 * time.Hour).Truncate(time.Second)
+	row := &db.Session{
+		ID:                uuid.New(),
+		UserID:            uuid.New(),
+		IDHash:            hashID(rawID),
+		SessionType:       db.SessionTypeCookie,
+		LastActiveAt:      now,
+		AbsoluteExpiresAt: now.Add(24 * time.Hour),
+		CreatedAt:         initialCreatedAt,
+	}
+	if err := database.Create(row).Error; err != nil {
+		t.Fatalf("failed to seed session: %v", err)
+	}
+
+	newSess, newRawID, err := svc.RotateSession(context.Background(), rawID, "2.2.2.2", "agent-rot")
+	if err != nil {
+		t.Fatalf("RotateSession failed: %v", err)
+	}
+
+	if !newSess.CreatedAt.Equal(initialCreatedAt) {
+		t.Fatalf("expected preserved domain CreatedAt %v, got %v", initialCreatedAt, newSess.CreatedAt)
+	}
+
+	var dbRow db.Session
+	if err := database.Where("id_hash = ?", hashID(newRawID)).First(&dbRow).Error; err != nil {
+		t.Fatalf("failed to query new session: %v", err)
+	}
+	if !dbRow.CreatedAt.Equal(initialCreatedAt) {
+		t.Fatalf("expected preserved DB CreatedAt %v, got %v", initialCreatedAt, dbRow.CreatedAt)
+	}
+}

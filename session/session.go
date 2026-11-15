@@ -341,7 +341,7 @@ func (s *service) RotateSession(
 		UserAgent:         userAgent,
 		LastActiveAt:      now,
 		AbsoluteExpiresAt: oldRecord.AbsoluteExpiresAt,
-		CreatedAt:         now,
+		CreatedAt:         oldRecord.CreatedAt,
 	}
 
 	if err := tx.Create(newRecord).Error; err != nil {
