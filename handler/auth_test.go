@@ -1535,3 +1535,55 @@ func TestNewAuthHandler_NilConfigDefaults(t *testing.T) {
 		t.Errorf("expected default SessionCookieName to be non-empty")
 	}
 }
+
+func TestAuthHandler_RateLimitResetPassword(t *testing.T) {
+	_, svc, _, _ := setupTestEnv(t)
+	cfg := testConfig()
+	resetLimiter := ratelimit.NewLimiter(15*time.Minute, 2)
+
+	authH := NewAuthHandler(svc,
+		WithAuthConfig(&cfg),
+		WithAuthLimiters(nil, nil, resetLimiter),
+	)
+
+	reqBody := db.PasswordResetConfirmRequest{
+		Token:       strings.Repeat("a", 64),
+		NewPassword: "NewValidPassword123!",
+	}
+	b, _ := json.Marshal(reqBody)
+
+	// Attempts 1 and 2 should reach svc and fail with token invalid (400 or 401)
+	for i := 0; i < 2; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/auth/password/reset", bytes.NewReader(b))
+		req.RemoteAddr = "192.168.10.1:12345"
+		rec := httptest.NewRecorder()
+		authH.ResetPassword(rec, req)
+
+		if rec.Code == http.StatusTooManyRequests {
+			t.Fatalf("attempt %d should not be rate limited", i+1)
+		}
+	}
+
+	// Attempt 3 from same IP should be blocked with 429
+	req3 := httptest.NewRequest(http.MethodPost, "/auth/password/reset", bytes.NewReader(b))
+	req3.RemoteAddr = "192.168.10.1:12345"
+	rec3 := httptest.NewRecorder()
+	authH.ResetPassword(rec3, req3)
+
+	if rec3.Code != http.StatusTooManyRequests {
+		t.Fatalf("attempt 3: expected 429 Too Many Requests, got %d", rec3.Code)
+	}
+	if retryAfter := rec3.Header().Get("Retry-After"); retryAfter == "" {
+		t.Errorf("expected Retry-After header on 429 response")
+	}
+
+	// Attempt from a different IP should be allowed
+	reqOther := httptest.NewRequest(http.MethodPost, "/auth/password/reset", bytes.NewReader(b))
+	reqOther.RemoteAddr = "192.168.10.2:12345"
+	recOther := httptest.NewRecorder()
+	authH.ResetPassword(recOther, reqOther)
+
+	if recOther.Code == http.StatusTooManyRequests {
+		t.Fatalf("attempt from different IP should not be rate limited")
+	}
+}
