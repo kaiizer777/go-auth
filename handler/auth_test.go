@@ -1587,3 +1587,232 @@ func TestAuthHandler_RateLimitResetPassword(t *testing.T) {
 		t.Fatalf("attempt from different IP should not be rate limited")
 	}
 }
+
+func TestAuthHandler_DualTierRateLimit_HorizontalPasswordSpraying(t *testing.T) {
+	_, svc, _, _ := setupTestEnv(t)
+	cfg := testConfig()
+	// Allow 2 attempts per IP, 5 attempts per account
+	ipLimiter := ratelimit.NewLimiter(15*time.Minute, 2)
+	accountLimiter := ratelimit.NewLimiter(15*time.Minute, 5)
+
+	authH := NewAuthHandler(svc,
+		WithAuthConfig(&cfg),
+		WithAuthLimiters(accountLimiter, nil, nil),
+		WithAuthIPLimiters(ipLimiter, nil, nil),
+	)
+
+	ip := "198.51.100.1:54321"
+
+	// Attempt 1: email A from IP
+	req1 := httptest.NewRequest(http.MethodPost, "/auth/login", nil)
+	req1.RemoteAddr = ip
+	b1, _ := json.Marshal(db.LoginRequest{Email: "user1@example.com", Password: "wrongpassword"})
+	req1.Body = io.NopCloser(bytes.NewReader(b1))
+	rec1 := httptest.NewRecorder()
+	authH.Login(rec1, req1)
+	if rec1.Code != http.StatusUnauthorized {
+		t.Fatalf("attempt 1: expected 401, got %d", rec1.Code)
+	}
+
+	// Attempt 2: email B from same IP
+	req2 := httptest.NewRequest(http.MethodPost, "/auth/login", nil)
+	req2.RemoteAddr = ip
+	b2, _ := json.Marshal(db.LoginRequest{Email: "user2@example.com", Password: "wrongpassword"})
+	req2.Body = io.NopCloser(bytes.NewReader(b2))
+	rec2 := httptest.NewRecorder()
+	authH.Login(rec2, req2)
+	if rec2.Code != http.StatusUnauthorized {
+		t.Fatalf("attempt 2: expected 401, got %d", rec2.Code)
+	}
+
+	// Attempt 3: email C from same IP — must be blocked by IP-level limiter
+	req3 := httptest.NewRequest(http.MethodPost, "/auth/login", nil)
+	req3.RemoteAddr = ip
+	b3, _ := json.Marshal(db.LoginRequest{Email: "user3@example.com", Password: "wrongpassword"})
+	req3.Body = io.NopCloser(bytes.NewReader(b3))
+	rec3 := httptest.NewRecorder()
+	authH.Login(rec3, req3)
+	if rec3.Code != http.StatusTooManyRequests {
+		t.Fatalf("attempt 3 (spraying from same IP): expected 429, got %d", rec3.Code)
+	}
+	if rec3.Header().Get("Retry-After") == "" {
+		t.Errorf("expected Retry-After header on 429 response")
+	}
+
+	// Attempt 4 from a different IP targeting user3 should be allowed by IP limiter
+	req4 := httptest.NewRequest(http.MethodPost, "/auth/login", nil)
+	req4.RemoteAddr = "198.51.100.2:54321"
+	b4, _ := json.Marshal(db.LoginRequest{Email: "user3@example.com", Password: "wrongpassword"})
+	req4.Body = io.NopCloser(bytes.NewReader(b4))
+	rec4 := httptest.NewRecorder()
+	authH.Login(rec4, req4)
+	if rec4.Code != http.StatusUnauthorized {
+		t.Fatalf("attempt 4 from different IP: expected 401, got %d", rec4.Code)
+	}
+}
+
+func TestAuthHandler_DualTierRateLimit_DistributedBruteForce(t *testing.T) {
+	_, svc, _, _ := setupTestEnv(t)
+	cfg := testConfig()
+	// Allow 10 attempts per IP, but only 2 attempts per account
+	ipLimiter := ratelimit.NewLimiter(15*time.Minute, 10)
+	accountLimiter := ratelimit.NewLimiter(15*time.Minute, 2)
+
+	authH := NewAuthHandler(svc,
+		WithAuthConfig(&cfg),
+		WithAuthLimiters(accountLimiter, nil, nil),
+		WithAuthIPLimiters(ipLimiter, nil, nil),
+	)
+
+	targetEmail := "admin@targetcorp.com"
+
+	// Attempt 1 from IP 1
+	req1 := httptest.NewRequest(http.MethodPost, "/auth/login", nil)
+	req1.RemoteAddr = "10.0.0.1:12345"
+	b1, _ := json.Marshal(db.LoginRequest{Email: targetEmail, Password: "badpassword1"})
+	req1.Body = io.NopCloser(bytes.NewReader(b1))
+	rec1 := httptest.NewRecorder()
+	authH.Login(rec1, req1)
+	if rec1.Code != http.StatusUnauthorized {
+		t.Fatalf("attempt 1: expected 401, got %d", rec1.Code)
+	}
+
+	// Attempt 2 from IP 2 (rotating IP)
+	req2 := httptest.NewRequest(http.MethodPost, "/auth/login", nil)
+	req2.RemoteAddr = "10.0.0.2:12345"
+	b2, _ := json.Marshal(db.LoginRequest{Email: targetEmail, Password: "badpassword2"})
+	req2.Body = io.NopCloser(bytes.NewReader(b2))
+	rec2 := httptest.NewRecorder()
+	authH.Login(rec2, req2)
+	if rec2.Code != http.StatusUnauthorized {
+		t.Fatalf("attempt 2: expected 401, got %d", rec2.Code)
+	}
+
+	// Attempt 3 from IP 3 (fresh rotating IP) — must be blocked by account limiter
+	req3 := httptest.NewRequest(http.MethodPost, "/auth/login", nil)
+	req3.RemoteAddr = "10.0.0.3:12345"
+	b3, _ := json.Marshal(db.LoginRequest{Email: targetEmail, Password: "badpassword3"})
+	req3.Body = io.NopCloser(bytes.NewReader(b3))
+	rec3 := httptest.NewRecorder()
+	authH.Login(rec3, req3)
+	if rec3.Code != http.StatusTooManyRequests {
+		t.Fatalf("attempt 3 (distributed attack on same account): expected 429, got %d", rec3.Code)
+	}
+}
+
+func TestAuthHandler_DualTierRateLimit_ResetAccountOnlyOnSuccess(t *testing.T) {
+	database, svc, _, _ := setupTestEnv(t)
+	cfg := testConfig()
+	sessSvc := session.NewService(database, &cfg)
+
+	// IP limiter max: 2, Account limiter max: 2
+	ipLimiter := ratelimit.NewLimiter(15*time.Minute, 2)
+	accountLimiter := ratelimit.NewLimiter(15*time.Minute, 2)
+
+	authH := NewAuthHandler(svc,
+		WithAuthSessionService(sessSvc),
+		WithAuthConfig(&cfg),
+		WithAuthLimiters(accountLimiter, nil, nil),
+		WithAuthIPLimiters(ipLimiter, nil, nil),
+	)
+
+	email := "dual_reset@example.com"
+	pass := "SecurePassword123!"
+
+	_, _, err := svc.Signup(context.Background(), db.SignupRequest{Email: email, Password: pass})
+	if err != nil {
+		t.Fatalf("Signup failed: %v", err)
+	}
+
+	ip := "192.0.2.100:1111"
+
+	// Attempt 1: failed login
+	reqBad := httptest.NewRequest(http.MethodPost, "/auth/login", nil)
+	reqBad.RemoteAddr = ip
+	bBad, _ := json.Marshal(db.LoginRequest{Email: email, Password: "wrong"})
+	reqBad.Body = io.NopCloser(bytes.NewReader(bBad))
+	recBad := httptest.NewRecorder()
+	authH.Login(recBad, reqBad)
+	if recBad.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d", recBad.Code)
+	}
+
+	// Attempt 2: successful login (uses up 2nd attempt on IP limiter)
+	reqGood := httptest.NewRequest(http.MethodPost, "/auth/login", nil)
+	reqGood.RemoteAddr = ip
+	bGood, _ := json.Marshal(db.LoginRequest{Email: email, Password: pass})
+	reqGood.Body = io.NopCloser(bytes.NewReader(bGood))
+	recGood := httptest.NewRecorder()
+	authH.Login(recGood, reqGood)
+	if recGood.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", recGood.Code)
+	}
+
+	// Attempt 3 from same IP: IP limiter must NOT have been reset by success, so 3rd attempt is blocked
+	reqBlocked := httptest.NewRequest(http.MethodPost, "/auth/login", nil)
+	reqBlocked.RemoteAddr = ip
+	bBlocked, _ := json.Marshal(db.LoginRequest{Email: email, Password: pass})
+	reqBlocked.Body = io.NopCloser(bytes.NewReader(bBlocked))
+	recBlocked := httptest.NewRecorder()
+	authH.Login(recBlocked, reqBlocked)
+	if recBlocked.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected 429 because IP limiter was not reset, got %d", recBlocked.Code)
+	}
+
+	// Attempt 4 from a DIFFERENT IP for the same account should succeed (account limiter was reset)
+	reqOtherIP := httptest.NewRequest(http.MethodPost, "/auth/login", nil)
+	reqOtherIP.RemoteAddr = "192.0.2.101:1111"
+	bOtherIP, _ := json.Marshal(db.LoginRequest{Email: email, Password: pass})
+	reqOtherIP.Body = io.NopCloser(bytes.NewReader(bOtherIP))
+	recOtherIP := httptest.NewRecorder()
+	authH.Login(recOtherIP, reqOtherIP)
+	if recOtherIP.Code != http.StatusOK {
+		t.Fatalf("expected 200 from different IP because account counter was reset, got %d", recOtherIP.Code)
+	}
+}
+
+func TestAuthHandler_DualTierRateLimit_SignupMassRegistration(t *testing.T) {
+	_, svc, _, _ := setupTestEnv(t)
+	cfg := testConfig()
+	// Allow 2 signups per IP
+	signupIPLimiter := ratelimit.NewLimiter(15*time.Minute, 2)
+	signupLimiter := ratelimit.NewLimiter(15*time.Minute, 10)
+
+	authH := NewAuthHandler(svc,
+		WithAuthConfig(&cfg),
+		WithAuthLimiters(nil, signupLimiter, nil),
+		WithAuthIPLimiters(nil, signupIPLimiter, nil),
+	)
+
+	ip := "203.0.113.50:4321"
+
+	for i := 1; i <= 2; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/auth/signup", nil)
+		req.RemoteAddr = ip
+		b, _ := json.Marshal(db.SignupRequest{
+			Email:    fmt.Sprintf("mass_reg_%d@example.com", i),
+			Password: "StrongPassword123!",
+		})
+		req.Body = io.NopCloser(bytes.NewReader(b))
+		rec := httptest.NewRecorder()
+		authH.Signup(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("signup %d: expected 200, got %d", i, rec.Code)
+		}
+	}
+
+	// 3rd signup from same IP must be blocked by IP rate limiter
+	req3 := httptest.NewRequest(http.MethodPost, "/auth/signup", nil)
+	req3.RemoteAddr = ip
+	b3, _ := json.Marshal(db.SignupRequest{
+		Email:    "mass_reg_3@example.com",
+		Password: "StrongPassword123!",
+	})
+	req3.Body = io.NopCloser(bytes.NewReader(b3))
+	rec3 := httptest.NewRecorder()
+	authH.Signup(rec3, req3)
+
+	if rec3.Code != http.StatusTooManyRequests {
+		t.Fatalf("signup 3: expected 429 Too Many Requests, got %d", rec3.Code)
+	}
+}
