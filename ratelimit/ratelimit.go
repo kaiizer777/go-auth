@@ -43,6 +43,16 @@ func Key(ip, account string) string {
 	return fmt.Sprintf("%s|%s", ip, account)
 }
 
+// IPKey returns a rate limit key scoped to the client IP address.
+func IPKey(ip string) string {
+	return "ip:" + ip
+}
+
+// AccountKey returns a rate limit key scoped to the account identifier (e.g. normalized email).
+func AccountKey(account string) string {
+	return "account:" + account
+}
+
 // ClientIP extracts the client IP address from r.RemoteAddr, stripping the port.
 // Falls back to r.RemoteAddr if net.SplitHostPort encounters an error (e.g. no port present).
 func ClientIP(r *http.Request) string {

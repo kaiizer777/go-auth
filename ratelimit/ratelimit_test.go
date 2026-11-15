@@ -110,6 +110,43 @@ func TestLimiter_Key_CompositeKey(t *testing.T) {
 	}
 }
 
+func TestLimiter_IPKey_And_AccountKey(t *testing.T) {
+	ip1 := "192.168.1.1"
+	ip2 := "192.168.1.2"
+	acc1 := "user1@example.com"
+	acc2 := "user2@example.com"
+
+	kIP1 := IPKey(ip1)
+	kIP2 := IPKey(ip2)
+	kAcc1 := AccountKey(acc1)
+	kAcc2 := AccountKey(acc2)
+
+	if kIP1 != "ip:192.168.1.1" || kIP2 != "ip:192.168.1.2" {
+		t.Fatalf("unexpected IPKey values: %s, %s", kIP1, kIP2)
+	}
+	if kAcc1 != "account:user1@example.com" || kAcc2 != "account:user2@example.com" {
+		t.Fatalf("unexpected AccountKey values: %s, %s", kAcc1, kAcc2)
+	}
+	if kIP1 == kAcc1 || kIP1 == kIP2 || kAcc1 == kAcc2 {
+		t.Fatalf("IP and Account keys must be mutually distinct")
+	}
+
+	limiter := NewLimiter(1*time.Minute, 1)
+	if !limiter.Allow(kIP1) {
+		t.Fatalf("kIP1 should be allowed")
+	}
+	if limiter.Allow(kIP1) {
+		t.Fatalf("kIP1 should be blocked")
+	}
+
+	if !limiter.Allow(kAcc1) {
+		t.Fatalf("kAcc1 should be independent from kIP1")
+	}
+	if limiter.Allow(kAcc1) {
+		t.Fatalf("kAcc1 should be blocked on second attempt")
+	}
+}
+
 func TestLimiter_Prune_RemovesExpired(t *testing.T) {
 	window := 50 * time.Millisecond
 	limiter := NewLimiter(window, 2)
