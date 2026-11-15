@@ -73,8 +73,17 @@ func RawIDFromContext(ctx context.Context) (string, bool) {
 
 // RequireAuth validates session credentials from cookies or Bearer headers.
 func RequireAuth(sessionSvc session.Service, cfg *config.Config) func(http.Handler) http.Handler {
+	if cfg == nil {
+		defaultCfg := config.DefaultConfig()
+		cfg = &defaultCfg
+	}
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if sessionSvc == nil {
+				apperrors.WriteHTTP(w, apperrors.New(apperrors.CodeInternalError, "session service unconfigured", nil))
+				return
+			}
+
 			var rawID string
 			var err error
 			var isBearer bool

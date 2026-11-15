@@ -184,6 +184,11 @@ func (h *SessionHandler) RotateSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if h.sessionSvc == nil {
+		apperrors.WriteHTTP(w, apperrors.New(apperrors.CodeInternalError, "session service unconfigured", nil))
+		return
+	}
+
 	ip := realIP(r)
 	ua := r.UserAgent()
 
