@@ -150,3 +150,29 @@ func TestSessionModelTagsAndDeprecatedFields(t *testing.T) {
 		}
 	}
 }
+
+func TestCredentialVersionModelTags(t *testing.T) {
+	models := []struct {
+		name        string
+		model       any
+		expectedTag string
+	}{
+		{name: "User", model: User{}, expectedTag: "not null;default:0"},
+		{name: "Session", model: Session{}, expectedTag: "not null;default:0"},
+	}
+
+	for _, tc := range models {
+		t.Run(tc.name, func(t *testing.T) {
+			field, ok := reflect.TypeOf(tc.model).FieldByName("CredentialVersion")
+			if !ok {
+				t.Fatalf("model %s missing CredentialVersion field", tc.name)
+			}
+			if field.Type.Kind() != reflect.Int {
+				t.Fatalf("model %s CredentialVersion type = %v; want int", tc.name, field.Type)
+			}
+			if tag := field.Tag.Get("gorm"); tag != tc.expectedTag {
+				t.Errorf("model %s CredentialVersion gorm tag = %q; want %q", tc.name, tag, tc.expectedTag)
+			}
+		})
+	}
+}
