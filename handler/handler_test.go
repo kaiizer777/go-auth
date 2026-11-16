@@ -480,3 +480,27 @@ func TestNewHandler_NilAuthService_RoutesIsolated(t *testing.T) {
 		})
 	}
 }
+
+type mockFlusherRecorder struct {
+	*httptest.ResponseRecorder
+	flushed bool
+}
+
+func (m *mockFlusherRecorder) Flush() {
+	m.flushed = true
+	m.ResponseRecorder.Flush()
+}
+
+func TestResponseInterceptor_UnwrapAndFlush(t *testing.T) {
+	rec := &mockFlusherRecorder{ResponseRecorder: httptest.NewRecorder()}
+	ri := &responseInterceptor{ResponseWriter: rec}
+
+	if unwrapped := ri.Unwrap(); unwrapped != rec {
+		t.Fatalf("expected Unwrap to return underlying writer %v, got %v", rec, unwrapped)
+	}
+
+	ri.Flush()
+	if !rec.flushed {
+		t.Fatalf("expected Flush() to call underlying flusher Flush()")
+	}
+}

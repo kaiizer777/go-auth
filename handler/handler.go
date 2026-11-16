@@ -266,3 +266,13 @@ func (rw *responseInterceptor) Write(b []byte) (int, error) {
 	}
 	return rw.ResponseWriter.Write(b)
 }
+
+func (rw *responseInterceptor) Unwrap() http.ResponseWriter {
+	return rw.ResponseWriter
+}
+
+func (rw *responseInterceptor) Flush() {
+	if flusher, ok := rw.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
