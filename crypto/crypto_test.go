@@ -3,8 +3,10 @@ package crypto
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"io"
 	"strings"
 	"testing"
+	"testing/iotest"
 	"unicode/utf8"
 
 	"github.com/kaiizer777/go-auth/errors"
@@ -215,6 +217,32 @@ func TestHashToken(t *testing.T) {
 	}
 	if !errors.Is(err, errors.New(errors.CodeInvalidToken, "", nil)) {
 		t.Errorf("expected CodeInvalidToken, got %v", err)
+	}
+}
+
+func TestGenerateToken_EntropyFailure(t *testing.T) {
+	origRand := randReader
+	defer func() { randReader = origRand }()
+
+	randReader = iotest.ErrReader(io.ErrUnexpectedEOF)
+	_, _, err := GenerateToken()
+	if err == nil {
+		t.Fatal("expected error on entropy read failure, got nil")
+	}
+	if !errors.Is(err, ErrEntropyReadFailed) {
+		t.Errorf("expected ErrEntropyReadFailed, got %v", err)
+	}
+}
+
+func TestHashToken_SentinelErrors(t *testing.T) {
+	_, err := HashToken("short")
+	if !errors.Is(err, ErrInvalidTokenLength) {
+		t.Errorf("expected ErrInvalidTokenLength, got %v", err)
+	}
+
+	_, err = HashToken(strings.Repeat("z", 64))
+	if !errors.Is(err, ErrInvalidTokenEncoding) {
+		t.Errorf("expected ErrInvalidTokenEncoding, got %v", err)
 	}
 }
 
