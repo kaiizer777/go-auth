@@ -1325,6 +1325,84 @@ func TestService_ListSessions_PurgesExpired(t *testing.T) {
 	}
 }
 
+func TestInvalidateAllUserSessions_BumpsCredentialVersion(t *testing.T) {
+	database := setupTestDB(t)
+	cfg := testConfig()
+	svc := NewService(database, cfg)
+
+	userID := uuid.New()
+	seedTestUser(t, database, userID)
+
+	for i := 0; i < 2; i++ {
+		_, _, err := svc.CreateSession(context.Background(), userID, 0, db.SessionTypeCookie, "127.0.0.1", "agent")
+		if err != nil {
+			t.Fatalf("CreateSession failed: %v", err)
+		}
+	}
+
+	if err := svc.InvalidateAllUserSessions(context.Background(), userID); err != nil {
+		t.Fatalf("InvalidateAllUserSessions failed: %v", err)
+	}
+
+	var count int64
+	if err := database.Model(&db.Session{}).Where("user_id = ?", userID).Count(&count).Error; err != nil {
+		t.Fatalf("failed to count sessions: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("expected sessions deleted, found %d", count)
+	}
+
+	var user db.User
+	if err := database.Where("id = ?", userID).First(&user).Error; err != nil {
+		t.Fatalf("failed to load user: %v", err)
+	}
+	if user.CredentialVersion != 1 {
+		t.Fatalf("expected credential_version 1 after revoke, got %d", user.CredentialVersion)
+	}
+
+	// Read-time backstop: an escaped stale-version row is rejected.
+	rawID, _ := generateRawID()
+	now := time.Now().UTC()
+	if err := database.Create(&db.Session{
+		ID:                uuid.New(),
+		UserID:            userID,
+		IDHash:            hashID(rawID),
+		SessionType:       db.SessionTypeCookie,
+		CredentialVersion: 0,
+		LastActiveAt:      now,
+		AbsoluteExpiresAt: now.Add(cfg.SessionAbsoluteMaxAge),
+		CreatedAt:         now,
+	}).Error; err != nil {
+		t.Fatalf("failed to seed escaped session: %v", err)
+	}
+	sess, err := svc.GetSession(context.Background(), rawID)
+	if sess != nil {
+		t.Fatalf("expected escaped stale session rejected, got %+v", sess)
+	}
+	if !errors.Is(err, apperrors.ErrSessionInvalid) {
+		t.Fatalf("expected ErrSessionInvalid, got %v", err)
+	}
+}
+
+func TestInvalidateAllUserSessions_MissingUserNoOp(t *testing.T) {
+	database := setupTestDB(t)
+	cfg := testConfig()
+	svc := NewService(database, cfg)
+
+	missingID := uuid.New()
+	if err := svc.InvalidateAllUserSessions(context.Background(), missingID); err != nil {
+		t.Fatalf("expected no-op success for missing user, got %v", err)
+	}
+
+	var count int64
+	if err := database.Model(&db.User{}).Where("id = ?", missingID).Count(&count).Error; err != nil {
+		t.Fatalf("failed to count users: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("expected no user row created, found %d", count)
+	}
+}
+
 func TestService_ListSessions_Limit50(t *testing.T) {
 	database := setupTestDB(t)
 	cfg := testConfig()
