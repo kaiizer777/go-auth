@@ -1,6 +1,7 @@
 package db
 
 import (
+	"context"
 	"database/sql"
 	stderrors "errors"
 	"os"
@@ -134,7 +135,9 @@ func TestConnect_PingFailureAndPoolSettings(t *testing.T) {
 
 	var capturedStats sql.DBStats
 	var capturedDB *sql.DB
-	sqlDBPingFn = func(db *sql.DB) error {
+	var capturedCtx context.Context
+	sqlDBPingFn = func(ctx context.Context, db *sql.DB) error {
+		capturedCtx = ctx
 		capturedDB = db
 		capturedStats = db.Stats()
 		return stderrors.New("ping connection refused")
@@ -169,6 +172,13 @@ func TestConnect_PingFailureAndPoolSettings(t *testing.T) {
 	// Verify pool settings were applied before Ping was called
 	if capturedStats.MaxOpenConnections != 42 {
 		t.Fatalf("capturedStats.MaxOpenConnections = %d; want 42", capturedStats.MaxOpenConnections)
+	}
+
+	if capturedCtx == nil {
+		t.Fatal("expected non-nil context passed to sqlDBPingFn")
+	}
+	if _, ok := capturedCtx.Deadline(); !ok {
+		t.Fatal("expected bounded context deadline on sqlDBPingFn")
 	}
 
 	// Verify deferred cleanup closed the *sql.DB on ping failure

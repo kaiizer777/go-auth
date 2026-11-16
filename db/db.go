@@ -26,10 +26,15 @@ import (
 //go:embed migrations/*.sql
 var defaultMigrationsFS embed.FS
 
+const (
+	defaultPingTimeout      = 5 * time.Second
+	defaultMigrationTimeout = 30 * time.Second
+)
+
 var (
 	runMigrationsFn = runMigrations
 	getSQLDBFn      = func(db *gorm.DB) (*sql.DB, error) { return db.DB() }
-	sqlDBPingFn     = func(db *sql.DB) error { return db.Ping() }
+	sqlDBPingFn     = func(ctx context.Context, db *sql.DB) error { return db.PingContext(ctx) }
 )
 
 // Connect runs pending migrations, initializes the GORM PostgreSQL connection,
@@ -83,7 +88,10 @@ func Connect(cfg config.Config) (*gorm.DB, error) {
 	sqlDB.SetConnMaxLifetime(cfg.ConnMaxLifetime)
 	sqlDB.SetConnMaxIdleTime(cfg.ConnMaxIdleTime)
 
-	if err := sqlDBPingFn(sqlDB); err != nil {
+	pingCtx, pingCancel := context.WithTimeout(context.Background(), defaultPingTimeout)
+	defer pingCancel()
+
+	if err := sqlDBPingFn(pingCtx, sqlDB); err != nil {
 		return nil, errors.New(errors.CodeDatabaseUnavailable, "db ping failed", err)
 	}
 
@@ -94,13 +102,16 @@ func Connect(cfg config.Config) (*gorm.DB, error) {
 // runMigrations executes database migrations using either embedded migration files
 // or a custom filesystem directory.
 func runMigrations(databaseURL, migrationsPath string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), defaultMigrationTimeout)
+	defer cancel()
+
 	db, err := sql.Open("pgx", databaseURL)
 	if err != nil {
 		return errors.New(errors.CodeDatabaseError, "open database connection failed", err)
 	}
 
 	// validate connection before passing to migrate
-	if err := db.Ping(); err != nil {
+	if err := db.PingContext(ctx); err != nil {
 		_ = db.Close()
 		return errors.New(errors.CodeDatabaseUnavailable, "ping database failed", err)
 	}
@@ -109,13 +120,13 @@ func runMigrations(databaseURL, migrationsPath string) error {
 	// the checked-out *sql.Conn when its internal WithConnection call fails, so
 	// the conn lifecycle is owned here instead. WithConnection leaves the driver
 	// without a pool reference, so the pool is closed explicitly below.
-	conn, err := db.Conn(context.Background())
+	conn, err := db.Conn(ctx)
 	if err != nil {
 		_ = db.Close()
 		return errors.New(errors.CodeDatabaseError, "checkout migration connection failed", err)
 	}
 
-	driver, err := pgmigrate.WithConnection(context.Background(), conn, &pgmigrate.Config{})
+	driver, err := pgmigrate.WithConnection(ctx, conn, &pgmigrate.Config{})
 	if err != nil {
 		_ = conn.Close()
 		_ = db.Close()
