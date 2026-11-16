@@ -10,6 +10,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/kaiizer777/go-auth/config"
+	"github.com/kaiizer777/go-auth/csrf"
 	"github.com/kaiizer777/go-auth/db"
 	apperrors "github.com/kaiizer777/go-auth/errors"
 	"github.com/kaiizer777/go-auth/session"
@@ -82,6 +83,16 @@ func (h *SessionHandler) Logout(w http.ResponseWriter, r *http.Request) {
 	}
 
 	session.ClearSessionCookie(w, h.cfg)
+	http.SetCookie(w, &http.Cookie{
+		Name:     h.cfg.CSRFCookieName,
+		Value:    "",
+		Path:     "/",
+		MaxAge:   -1,
+		Expires:  time.Unix(1, 0),
+		HttpOnly: false,
+		Secure:   h.cfg.SessionCookieSecure,
+		SameSite: http.SameSiteStrictMode,
+	})
 
 	slog.InfoContext(r.Context(), "logout",
 		"user_id", userID.String(),
@@ -155,6 +166,16 @@ func (h *SessionHandler) InvalidateAllSessions(w http.ResponseWriter, r *http.Re
 	}
 
 	session.ClearSessionCookie(w, h.cfg)
+	http.SetCookie(w, &http.Cookie{
+		Name:     h.cfg.CSRFCookieName,
+		Value:    "",
+		Path:     "/",
+		MaxAge:   -1,
+		Expires:  time.Unix(1, 0),
+		HttpOnly: false,
+		Secure:   h.cfg.SessionCookieSecure,
+		SameSite: http.SameSiteStrictMode,
+	})
 
 	slog.InfoContext(r.Context(), "all_sessions_invalidated",
 		"user_id", userID.String(),
@@ -198,7 +219,8 @@ func (h *SessionHandler) RotateSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	session.SetSessionCookie(w, newRawID, h.cfg)
+	session.SetSessionCookieWithExpiry(w, newRawID, newSess.AbsoluteExpiresAt, h.cfg)
+	_, _ = csrf.IssueCookie(w, h.cfg)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(map[string]string{

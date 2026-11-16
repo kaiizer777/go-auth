@@ -174,11 +174,13 @@ func TestSessionHandler_Logout(t *testing.T) {
 
 	// Verify cookie clearing
 	cookies := rec.Result().Cookies()
-	var clearedCookie *http.Cookie
+	var clearedCookie, clearedCSRFCookie *http.Cookie
 	for _, c := range cookies {
 		if c.Name == cfg.SessionCookieName {
 			clearedCookie = c
-			break
+		}
+		if c.Name == cfg.CSRFCookieName {
+			clearedCSRFCookie = c
 		}
 	}
 	if clearedCookie == nil {
@@ -186,6 +188,12 @@ func TestSessionHandler_Logout(t *testing.T) {
 	}
 	if clearedCookie.MaxAge != -1 {
 		t.Errorf("expected cookie MaxAge -1, got %d", clearedCookie.MaxAge)
+	}
+	if clearedCSRFCookie == nil {
+		t.Fatalf("expected CSRF cookie %q in response", cfg.CSRFCookieName)
+	}
+	if clearedCSRFCookie.MaxAge != -1 {
+		t.Errorf("expected CSRF cookie MaxAge -1, got %d", clearedCSRFCookie.MaxAge)
 	}
 }
 
@@ -378,13 +386,15 @@ func TestSessionHandler_RotateSession(t *testing.T) {
 		t.Fatalf("expected old session to be invalidated after rotation")
 	}
 
-	// Cookie must be set with new session ID
+	// Cookie must be set with new session ID and dynamic MaxAge
 	cookies := rec.Result().Cookies()
-	var newCookie *http.Cookie
+	var newCookie, newCSRFCookie *http.Cookie
 	for _, c := range cookies {
 		if c.Name == cfg.SessionCookieName {
 			newCookie = c
-			break
+		}
+		if c.Name == cfg.CSRFCookieName {
+			newCSRFCookie = c
 		}
 	}
 	if newCookie == nil {
@@ -392,6 +402,15 @@ func TestSessionHandler_RotateSession(t *testing.T) {
 	}
 	if newCookie.Value == rawID {
 		t.Errorf("expected cookie value to differ from old rawID")
+	}
+	if newCookie.MaxAge <= 0 || newCookie.MaxAge > int(cfg.SessionAbsoluteMaxAge/time.Second) {
+		t.Errorf("expected dynamic MaxAge matching absolute expiry, got %d", newCookie.MaxAge)
+	}
+	if newCSRFCookie == nil {
+		t.Fatalf("expected fresh CSRF cookie in rotation response")
+	}
+	if len(newCSRFCookie.Value) != 64 {
+		t.Errorf("expected 64-char CSRF token, got %q", newCSRFCookie.Value)
 	}
 
 	// Verify new session is valid
