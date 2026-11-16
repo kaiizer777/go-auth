@@ -793,7 +793,7 @@ func TestRawIDValidation_MalformedInputs(t *testing.T) {
 	}
 }
 
-func TestGetSession_NotFound(t *testing.T) {
+func TestGetSession_UnknownToken(t *testing.T) {
 	database := setupTestDB(t)
 	cfg := testConfig()
 	svc := NewService(database, cfg)
@@ -802,8 +802,8 @@ func TestGetSession_NotFound(t *testing.T) {
 	if sess != nil {
 		t.Fatalf("expected nil session, got %+v", sess)
 	}
-	if !errors.Is(err, apperrors.ErrSessionNotFound) {
-		t.Fatalf("expected ErrSessionNotFound, got %v", err)
+	if !errors.Is(err, apperrors.ErrSessionInvalid) {
+		t.Fatalf("expected ErrSessionInvalid, got %v", err)
 	}
 }
 
@@ -827,8 +827,8 @@ func TestInvalidateSession_DeletesRow(t *testing.T) {
 	if sess != nil {
 		t.Fatalf("expected nil session after invalidation, got %+v", sess)
 	}
-	if !errors.Is(err, apperrors.ErrSessionNotFound) {
-		t.Fatalf("expected ErrSessionNotFound, got %v", err)
+	if !errors.Is(err, apperrors.ErrSessionInvalid) {
+		t.Fatalf("expected ErrSessionInvalid, got %v", err)
 	}
 }
 
@@ -886,8 +886,8 @@ func TestInvalidateAllUserSessions(t *testing.T) {
 
 	for _, token := range tokensA {
 		_, err := svc.GetSession(context.Background(), token)
-		if !errors.Is(err, apperrors.ErrSessionNotFound) {
-			t.Fatalf("expected ErrSessionNotFound for invalidated userA session, got %v", err)
+		if !errors.Is(err, apperrors.ErrSessionInvalid) {
+			t.Fatalf("expected ErrSessionInvalid for invalidated userA session, got %v", err)
 		}
 	}
 
@@ -929,13 +929,13 @@ func TestRotateSession_Transaction(t *testing.T) {
 		t.Fatalf("unexpected rotated metadata: ip=%q, ua=%q", newSess.IPAddress, newSess.UserAgent)
 	}
 
-	// Old raw ID must now return ErrSessionNotFound
+	// Old raw ID must now return ErrSessionInvalid
 	oldSess, err := svc.GetSession(context.Background(), oldRawID)
 	if oldSess != nil {
 		t.Fatalf("expected nil session for oldRawID, got %+v", oldSess)
 	}
-	if !errors.Is(err, apperrors.ErrSessionNotFound) {
-		t.Fatalf("expected ErrSessionNotFound for oldRawID, got %v", err)
+	if !errors.Is(err, apperrors.ErrSessionInvalid) {
+		t.Fatalf("expected ErrSessionInvalid for oldRawID, got %v", err)
 	}
 
 	// New raw ID must be valid
@@ -1069,7 +1069,7 @@ func TestRotateSession_Expired_AbsoluteTimeout(t *testing.T) {
 	}
 }
 
-func TestRotateSession_NotFound(t *testing.T) {
+func TestRotateSession_UnknownToken(t *testing.T) {
 	database := setupTestDB(t)
 	cfg := testConfig()
 	svc := NewService(database, cfg)
@@ -1078,8 +1078,8 @@ func TestRotateSession_NotFound(t *testing.T) {
 	if sess != nil || newRawID != "" {
 		t.Fatalf("expected nil session, got %+v", sess)
 	}
-	if !errors.Is(err, apperrors.ErrSessionNotFound) {
-		t.Fatalf("expected ErrSessionNotFound, got %v", err)
+	if !errors.Is(err, apperrors.ErrSessionInvalid) {
+		t.Fatalf("expected ErrSessionInvalid, got %v", err)
 	}
 }
 
@@ -1101,13 +1101,13 @@ func TestRotateSession_ConcurrentOrDoubleRotate(t *testing.T) {
 		t.Fatalf("first rotation failed: %v", err1)
 	}
 
-	// Double rotation with the already-deleted old token fails with ErrSessionNotFound
+	// Double rotation with the already-deleted old token fails with ErrSessionInvalid
 	sess2, newRawID2, err2 := svc.RotateSession(context.Background(), oldRawID, "3.3.3.3", "agent-3")
 	if sess2 != nil || newRawID2 != "" {
 		t.Fatalf("second rotation should fail, got sess=%+v, newRawID=%q", sess2, newRawID2)
 	}
-	if !errors.Is(err2, apperrors.ErrSessionNotFound) {
-		t.Fatalf("expected ErrSessionNotFound for double-rotation, got %v", err2)
+	if !errors.Is(err2, apperrors.ErrSessionInvalid) {
+		t.Fatalf("expected ErrSessionInvalid for double-rotation, got %v", err2)
 	}
 }
 

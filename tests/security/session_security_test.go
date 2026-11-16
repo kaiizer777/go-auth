@@ -117,7 +117,7 @@ func readCookie(res *http.Response, name string) *http.Cookie {
 }
 
 // Test 8: TestReplayDeletedSession (ASVS V3.3.1)
-// Replaying logged-out raw session ID returns 401 SESSION_NOT_FOUND (confirms server-side invalidation)
+// Replaying logged-out raw session ID returns 401 SESSION_INVALID (confirms server-side invalidation)
 func TestReplayDeletedSession(t *testing.T) {
 	app, _, cfg := setupSecurityApp(t)
 	email := "replay_del@example.com"
@@ -554,7 +554,7 @@ func TestBearerTokenEntropy(t *testing.T) {
 }
 
 // Test 19: TestRotateSession_OldIDRejected (ASVS V3.2.1)
-// After rotation, old session ID returns 401 SESSION_NOT_FOUND while new session ID succeeds
+// After rotation, old session ID returns 401 SESSION_INVALID while new session ID succeeds
 func TestRotateSession_OldIDRejected(t *testing.T) {
 	app, _, cfg := setupSecurityApp(t)
 	email := "rotate_test@example.com"

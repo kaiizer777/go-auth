@@ -185,7 +185,8 @@ func (s *service) GetSession(ctx context.Context, rawID string) (*Session, error
 		First(&record).Error
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return nil, apperrors.ErrSessionNotFound
+			// Unknown token rejects as invalid so errors.Is cannot oracle stale-vs-nonexistent.
+			return nil, apperrors.ErrSessionInvalid
 		}
 		return nil, apperrors.New(apperrors.CodeInternalError, "failed to query session", err)
 	}
@@ -366,7 +367,8 @@ func (s *service) RotateSession(
 		Where("id_hash = ?", oldHash).
 		First(&oldRecord).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return nil, "", apperrors.ErrSessionNotFound
+			// Unknown token rejects as invalid so errors.Is cannot oracle stale-vs-nonexistent.
+			return nil, "", apperrors.ErrSessionInvalid
 		}
 		return nil, "", apperrors.New(apperrors.CodeInternalError, "failed to rotate session", err)
 	}
@@ -468,7 +470,7 @@ func (s *service) RotateSession(
 	}
 	if res.RowsAffected == 0 {
 		tx.Rollback()
-		return nil, "", apperrors.ErrSessionNotFound
+		return nil, "", apperrors.ErrSessionInvalid
 	}
 
 	rawID, err := generateRawID()
