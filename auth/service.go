@@ -130,6 +130,9 @@ func (s *authService) Signup(ctx context.Context, req db.SignupRequest) (*db.Use
 					if err := tx.Where("user_id = ?", existing.ID).Delete(&db.VerificationToken{}).Error; err != nil {
 						return err
 					}
+					if err := tx.Where("user_id = ?", existing.ID).Delete(&db.Session{}).Error; err != nil {
+						return err
+					}
 					tok := db.VerificationToken{
 						TokenHash: tokenHash[:],
 						UserID:    existing.ID,

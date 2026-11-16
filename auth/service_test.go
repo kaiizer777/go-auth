@@ -651,6 +651,11 @@ func TestService_PasswordReset(t *testing.T) {
 			t.Fatalf("expected at least 2 tokens before reset, got %d", countBefore)
 		}
 
+		var userBefore db.User
+		if err := database.Where("id = ?", user.ID).First(&userBefore).Error; err != nil {
+			t.Fatalf("failed to query user before reset: %v", err)
+		}
+
 		// Reset password using tok1
 		newPassword := "BrandNewPassword#2026!"
 		err = svc.ResetPassword(ctx, db.PasswordResetConfirmRequest{Token: tok1, NewPassword: newPassword})
@@ -678,6 +683,14 @@ func TestService_PasswordReset(t *testing.T) {
 		database.Model(&db.PasswordResetToken{}).Where("user_id = ?", user.ID).Count(&countAfter)
 		if countAfter != 0 {
 			t.Fatalf("expected 0 reset tokens after reset (ASVS L1 purge), got %d", countAfter)
+		}
+
+		var userAfter db.User
+		if err := database.Where("id = ?", user.ID).First(&userAfter).Error; err != nil {
+			t.Fatalf("failed to query user after reset: %v", err)
+		}
+		if userAfter.CredentialVersion != userBefore.CredentialVersion+1 {
+			t.Fatalf("expected credential version %d after reset bump, got %d", userBefore.CredentialVersion+1, userAfter.CredentialVersion)
 		}
 
 		// Both tok1 (consumed) and tok2 (purged) must now fail on replay
@@ -727,6 +740,11 @@ func TestService_PasswordReset(t *testing.T) {
 			t.Fatalf("expected at least 2 sessions before reset, got %d", countBefore)
 		}
 
+		var userBefore db.User
+		if err := database.Where("id = ?", user.ID).First(&userBefore).Error; err != nil {
+			t.Fatalf("failed to query user before reset: %v", err)
+		}
+
 		err = svc.ResetPassword(ctx, db.PasswordResetConfirmRequest{Token: tok, NewPassword: "SuperNewPassword#2026!"})
 		if err != nil {
 			t.Fatalf("reset password failed: %v", err)
@@ -736,6 +754,14 @@ func TestService_PasswordReset(t *testing.T) {
 		database.Model(&db.Session{}).Where("user_id = ?", user.ID).Count(&countAfter)
 		if countAfter != 0 {
 			t.Fatalf("expected 0 sessions after password reset, got %d", countAfter)
+		}
+
+		var userAfter db.User
+		if err := database.Where("id = ?", user.ID).First(&userAfter).Error; err != nil {
+			t.Fatalf("failed to query user after reset: %v", err)
+		}
+		if userAfter.CredentialVersion != userBefore.CredentialVersion+1 {
+			t.Fatalf("expected credential version %d after reset bump, got %d", userBefore.CredentialVersion+1, userAfter.CredentialVersion)
 		}
 	})
 }
@@ -1115,6 +1141,19 @@ func TestService_Signup_UnverifiedAccountRecovery(t *testing.T) {
 	oldHash := dbUserBefore.PasswordHash
 	beforeVersion := dbUserBefore.CredentialVersion
 
+	seeded := db.Session{
+		ID:                uuid.New(),
+		UserID:            user.ID,
+		IDHash:            "session_hash_recovery_11111111111111111111111111111111111111111111111111",
+		SessionType:       db.SessionTypeCookie,
+		LastActiveAt:      time.Now().UTC(),
+		AbsoluteExpiresAt: time.Now().UTC().Add(24 * time.Hour),
+		CreatedAt:         time.Now().UTC(),
+	}
+	if err := database.Create(&seeded).Error; err != nil {
+		t.Fatalf("failed to seed session before recovery: %v", err)
+	}
+
 	newPass := "RecoveredPass#67890"
 	recUser, recToken, err := svc.Signup(ctx, db.SignupRequest{Email: "recover@example.com", Password: newPass})
 	if err != nil {
@@ -1166,6 +1205,12 @@ func TestService_Signup_UnverifiedAccountRecovery(t *testing.T) {
 	}
 	if dbUserAfter.CredentialVersion != beforeVersion+1 {
 		t.Fatalf("expected credential version %d after recovery bump, got %d", beforeVersion+1, dbUserAfter.CredentialVersion)
+	}
+
+	var sessAfter int64
+	database.Model(&db.Session{}).Where("user_id = ?", user.ID).Count(&sessAfter)
+	if sessAfter != 0 {
+		t.Fatalf("expected 0 sessions after unverified recovery, got %d", sessAfter)
 	}
 
 	if err := svc.VerifyEmail(ctx, db.VerifyEmailRequest{Token: origToken}); err == nil {
