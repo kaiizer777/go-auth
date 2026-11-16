@@ -399,3 +399,36 @@ func TestMigration000006_DownRefusesVersionedDB(t *testing.T) {
 		}
 	}
 }
+
+func TestMigrations_AtomicTransactionWrappers(t *testing.T) {
+	files := []string{
+		"migrations/000001_create_users.up.sql",
+		"migrations/000001_create_users.down.sql",
+		"migrations/000002_create_sessions.up.sql",
+		"migrations/000002_create_sessions.down.sql",
+		"migrations/000003_create_verification_tokens.up.sql",
+		"migrations/000003_create_verification_tokens.down.sql",
+		"migrations/000004_create_password_reset_tokens.up.sql",
+		"migrations/000004_create_password_reset_tokens.down.sql",
+		"migrations/000005_add_session_phase4_columns.up.sql",
+		"migrations/000005_add_session_phase4_columns.down.sql",
+		"migrations/000006_add_credential_version.up.sql",
+		"migrations/000006_add_credential_version.down.sql",
+	}
+
+	for _, file := range files {
+		t.Run(file, func(t *testing.T) {
+			data, err := defaultMigrationsFS.ReadFile(file)
+			if err != nil {
+				t.Fatalf("failed to read migration file %s: %v", file, err)
+			}
+			content := strings.TrimSpace(string(data))
+			if !strings.HasPrefix(content, "BEGIN;") {
+				t.Errorf("migration file %s must begin with 'BEGIN;'", file)
+			}
+			if !strings.HasSuffix(content, "COMMIT;") {
+				t.Errorf("migration file %s must end with 'COMMIT;'", file)
+			}
+		})
+	}
+}

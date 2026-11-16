@@ -1,3 +1,5 @@
+BEGIN;
+
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
 CREATE TABLE users (
@@ -10,3 +12,5 @@ CREATE TABLE users (
 );
 
 CREATE UNIQUE INDEX idx_users_email_lower ON users (LOWER(email));
+
+COMMIT;
