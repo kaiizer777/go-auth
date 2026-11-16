@@ -69,6 +69,48 @@ func TestIsAllowedOrigin(t *testing.T) {
 			allowed: []string{"https://app.example.com/subpath"},
 			want:    false,
 		},
+		{
+			name:    "subdomain suffix attack rejected",
+			origin:  "https://app.example.com.evil.com",
+			allowed: []string{"https://app.example.com"},
+			want:    false,
+		},
+		{
+			name:    "subdomain prefix collision rejected",
+			origin:  "https://evil-app.example.com",
+			allowed: []string{"https://app.example.com"},
+			want:    false,
+		},
+		{
+			name:    "unlisted subdomain rejected",
+			origin:  "https://sub.example.com",
+			allowed: []string{"https://example.com"},
+			want:    false,
+		},
+		{
+			name:    "mismatched port rejected",
+			origin:  "https://app.example.com:8443",
+			allowed: []string{"https://app.example.com"},
+			want:    false,
+		},
+		{
+			name:    "mismatched port with explicit port allowed list rejected",
+			origin:  "https://app.example.com:8443",
+			allowed: []string{"https://app.example.com:443"},
+			want:    false,
+		},
+		{
+			name:    "null origin rejected",
+			origin:  "null",
+			allowed: []string{"https://app.example.com"},
+			want:    false,
+		},
+		{
+			name:    "scheme mismatch http vs https rejected",
+			origin:  "http://app.example.com",
+			allowed: []string{"https://app.example.com"},
+			want:    false,
+		},
 	}
 
 	for _, tc := range tests {
@@ -127,6 +169,34 @@ func TestCheckOrigin(t *testing.T) {
 		{
 			name:                 "unicode homoglyph rejected",
 			origin:               "https://APP.EXAMPL\u212A.COM",
+			allowed:              []string{"https://app.example.com"},
+			wantOrigin:           "",
+			wantAllowCredentials: false,
+		},
+		{
+			name:                 "adversarial suffix hijack rejected",
+			origin:               "https://app.example.com.attacker.com",
+			allowed:              []string{"https://app.example.com"},
+			wantOrigin:           "",
+			wantAllowCredentials: false,
+		},
+		{
+			name:                 "adversarial prefix variation rejected",
+			origin:               "https://attacker-app.example.com",
+			allowed:              []string{"https://app.example.com"},
+			wantOrigin:           "",
+			wantAllowCredentials: false,
+		},
+		{
+			name:                 "null origin rejected",
+			origin:               "null",
+			allowed:              []string{"https://app.example.com"},
+			wantOrigin:           "",
+			wantAllowCredentials: false,
+		},
+		{
+			name:                 "mismatched port rejected",
+			origin:               "https://app.example.com:8443",
 			allowed:              []string{"https://app.example.com"},
 			wantOrigin:           "",
 			wantAllowCredentials: false,
