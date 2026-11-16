@@ -598,6 +598,107 @@ func TestRecover_DefaultLogger(t *testing.T) {
 	}
 }
 
+func TestRecovery_RePanicsWhenResponseCommitted_WriteHeader(t *testing.T) {
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, nil))
+
+	mw := Recovery(logger)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		panic("panic after WriteHeader")
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/committed-header", nil)
+	rec := httptest.NewRecorder()
+
+	var panickedVal any
+	func() {
+		defer func() {
+			panickedVal = recover()
+		}()
+		mw.ServeHTTP(rec, req)
+	}()
+
+	if panickedVal != http.ErrAbortHandler {
+		t.Fatalf("expected re-panic with http.ErrAbortHandler, got: %v", panickedVal)
+	}
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected original status code 200, got %d", rec.Code)
+	}
+
+	if !strings.Contains(logBuf.String(), "panic recovered in http handler") {
+		t.Errorf("expected recovery message in log, got: %s", logBuf.String())
+	}
+}
+
+func TestRecovery_RePanicsWhenResponseCommitted_Write(t *testing.T) {
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, nil))
+
+	mw := Recovery(logger)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("early payload"))
+		panic("panic after Write")
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/committed-body", nil)
+	rec := httptest.NewRecorder()
+
+	var panickedVal any
+	func() {
+		defer func() {
+			panickedVal = recover()
+		}()
+		mw.ServeHTTP(rec, req)
+	}()
+
+	if panickedVal != http.ErrAbortHandler {
+		t.Fatalf("expected re-panic with http.ErrAbortHandler, got: %v", panickedVal)
+	}
+
+	if rec.Body.String() != "early payload" {
+		t.Fatalf("expected body %q, got %q", "early payload", rec.Body.String())
+	}
+
+	if !strings.Contains(logBuf.String(), "panic recovered in http handler") {
+		t.Errorf("expected recovery message in log, got: %s", logBuf.String())
+	}
+}
+
+func TestRecovery_RePanicsWhenResponseCommitted_Interceptor(t *testing.T) {
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, nil))
+
+	mw := Recovery(logger)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		panic("panic after interceptor write")
+	}))
+
+	req := httptest.NewRequest(http.MethodPost, "/interceptor", nil)
+	rec := httptest.NewRecorder()
+	interceptor := &responseInterceptor{ResponseWriter: rec}
+
+	var panickedVal any
+	func() {
+		defer func() {
+			panickedVal = recover()
+		}()
+		mw.ServeHTTP(interceptor, req)
+	}()
+
+	if panickedVal != http.ErrAbortHandler {
+		t.Fatalf("expected re-panic with http.ErrAbortHandler, got: %v", panickedVal)
+	}
+
+	if !interceptor.headerWritten {
+		t.Fatal("expected interceptor.headerWritten to be true")
+	}
+
+	if !strings.Contains(logBuf.String(), "panic recovered in http handler") {
+		t.Errorf("expected recovery message in log, got: %s", logBuf.String())
+	}
+}
+
 func TestRequireAuth_PreservesTypedCookieError(t *testing.T) {
 	cfg := config.DefaultConfig()
 	mockSvc := &mockSessionService{}

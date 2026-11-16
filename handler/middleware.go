@@ -110,6 +110,63 @@ func SecurityHeaders(cfg *config.Config) func(http.Handler) http.Handler {
 	}
 }
 
+type recoveryResponseWriter struct {
+	http.ResponseWriter
+	committed bool
+}
+
+func (rw *recoveryResponseWriter) WriteHeader(statusCode int) {
+	rw.committed = true
+	rw.ResponseWriter.WriteHeader(statusCode)
+}
+
+func (rw *recoveryResponseWriter) Write(b []byte) (int, error) {
+	rw.committed = true
+	return rw.ResponseWriter.Write(b)
+}
+
+func (rw *recoveryResponseWriter) Unwrap() http.ResponseWriter {
+	return rw.ResponseWriter
+}
+
+func (rw *recoveryResponseWriter) Flush() {
+	rw.committed = true
+	if flusher, ok := rw.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
+func isResponseCommitted(w http.ResponseWriter) bool {
+	for w != nil {
+		switch tw := w.(type) {
+		case *recoveryResponseWriter:
+			if tw.committed {
+				return true
+			}
+			w = tw.ResponseWriter
+		case *responseInterceptor:
+			if tw.headerWritten {
+				return true
+			}
+			w = tw.ResponseWriter
+		case interface{ Committed() bool }:
+			if tw.Committed() {
+				return true
+			}
+			if u, ok := w.(interface{ Unwrap() http.ResponseWriter }); ok {
+				w = u.Unwrap()
+			} else {
+				return false
+			}
+		case interface{ Unwrap() http.ResponseWriter }:
+			w = tw.Unwrap()
+		default:
+			return false
+		}
+	}
+	return false
+}
+
 // Recovery returns HTTP middleware that recovers from panics and emits an INTERNAL_ERROR response.
 func Recovery(logger *slog.Logger) func(http.Handler) http.Handler {
 	if logger == nil {
@@ -117,6 +174,7 @@ func Recovery(logger *slog.Logger) func(http.Handler) http.Handler {
 	}
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			rw := &recoveryResponseWriter{ResponseWriter: w}
 			defer func() {
 				if rec := recover(); rec != nil {
 					if rec == http.ErrAbortHandler {
@@ -127,10 +185,13 @@ func Recovery(logger *slog.Logger) func(http.Handler) http.Handler {
 						"method", r.Method,
 						"path", r.URL.Path,
 					)
+					if isResponseCommitted(rw) {
+						panic(http.ErrAbortHandler)
+					}
 					apperrors.WriteHTTP(w, apperrors.New(apperrors.CodeInternalError, "internal server error", nil))
 				}
 			}()
-			next.ServeHTTP(w, r)
+			next.ServeHTTP(rw, r)
 		})
 	}
 }
