@@ -51,6 +51,24 @@ func TestIsAllowedOrigin(t *testing.T) {
 			allowed: []string{},
 			want:    false,
 		},
+		{
+			name:    "unicode case folding homoglyph rejected",
+			origin:  "https://APP.EXAMPL\u212A.COM",
+			allowed: []string{"https://app.example.com"},
+			want:    false,
+		},
+		{
+			name:    "allowed origin with trailing slash matches",
+			origin:  "https://app.example.com",
+			allowed: []string{"https://app.example.com/"},
+			want:    true,
+		},
+		{
+			name:    "allowed origin with subpath does not match",
+			origin:  "https://app.example.com",
+			allowed: []string{"https://app.example.com/subpath"},
+			want:    false,
+		},
 	}
 
 	for _, tc := range tests {
@@ -103,6 +121,13 @@ func TestCheckOrigin(t *testing.T) {
 			name:                 "empty origin",
 			origin:               "",
 			allowed:              []string{"*"},
+			wantOrigin:           "",
+			wantAllowCredentials: false,
+		},
+		{
+			name:                 "unicode homoglyph rejected",
+			origin:               "https://APP.EXAMPL\u212A.COM",
+			allowed:              []string{"https://app.example.com"},
 			wantOrigin:           "",
 			wantAllowCredentials: false,
 		},
@@ -293,8 +318,8 @@ func TestCORSMiddleware_PreflightDisallowed(t *testing.T) {
 	if got := rec.Header().Get("Vary"); got != "Origin" {
 		t.Fatalf("Vary = %q; want Origin", got)
 	}
-	if got := rec.Header().Get("Access-Control-Max-Age"); got != "86400" {
-		t.Fatalf("Access-Control-Max-Age = %q; want 86400", got)
+	if got := rec.Header().Get("Access-Control-Max-Age"); got != "" {
+		t.Fatalf("Access-Control-Max-Age = %q; want empty for disallowed origin", got)
 	}
 	if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "" {
 		t.Fatalf("Access-Control-Allow-Origin = %q; want empty for disallowed origin", got)
@@ -353,5 +378,88 @@ func TestCORSMiddleware_PlainOptionsPassThrough(t *testing.T) {
 	}
 	if got := rec.Header().Get("Vary"); got != "Origin" {
 		t.Fatalf("Vary = %q; want Origin", got)
+	}
+}
+
+func TestCORSMiddleware_Preflight_UnicodeHomoglyphRejected(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.AllowedOrigins = []string{"https://app.example.com"}
+
+	mw := CORS(cfg)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("next handler called")
+	}))
+
+	req := httptest.NewRequest(http.MethodOptions, "/test", nil)
+	req.Header.Set("Origin", "https://APP.EXAMPL\u212A.COM")
+	req.Header.Set("Access-Control-Request-Method", "POST")
+	rec := httptest.NewRecorder()
+
+	mw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d; want %d", rec.Code, http.StatusNoContent)
+	}
+	if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "" {
+		t.Fatalf("Access-Control-Allow-Origin = %q; want empty", got)
+	}
+	if got := rec.Header().Get("Access-Control-Max-Age"); got != "" {
+		t.Fatalf("Access-Control-Max-Age = %q; want empty", got)
+	}
+}
+
+func TestCORSMiddleware_Preflight_EmptyAllowedHeaders(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.AllowedOrigins = []string{"https://app.example.com"}
+	cfg.AllowedHeaders = []string{}
+
+	mw := CORS(cfg)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("next handler called")
+	}))
+
+	req := httptest.NewRequest(http.MethodOptions, "/test", nil)
+	req.Header.Set("Origin", "https://app.example.com")
+	req.Header.Set("Access-Control-Request-Method", "POST")
+	req.Header.Set("Access-Control-Request-Headers", "X-Custom-Header")
+	rec := httptest.NewRecorder()
+
+	mw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d; want %d", rec.Code, http.StatusNoContent)
+	}
+	if got := rec.Header().Get("Access-Control-Allow-Headers"); got != "" {
+		t.Fatalf("Access-Control-Allow-Headers = %q; want empty", got)
+	}
+}
+
+func TestCORSMiddleware_Preflight_VaryHeaders(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.AllowedOrigins = []string{"https://app.example.com"}
+
+	mw := CORS(cfg)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+
+	req := httptest.NewRequest(http.MethodOptions, "/test", nil)
+	req.Header.Set("Origin", "https://app.example.com")
+	req.Header.Set("Access-Control-Request-Method", "POST")
+	rec := httptest.NewRecorder()
+
+	mw.ServeHTTP(rec, req)
+
+	varyValues := rec.Header().Values("Vary")
+	hasMethodVary := false
+	hasHeadersVary := false
+	for _, v := range varyValues {
+		if v == "Access-Control-Request-Method" {
+			hasMethodVary = true
+		}
+		if v == "Access-Control-Request-Headers" {
+			hasHeadersVary = true
+		}
+	}
+	if !hasMethodVary {
+		t.Fatalf("expected Vary to contain Access-Control-Request-Method, got %v", varyValues)
+	}
+	if !hasHeadersVary {
+		t.Fatalf("expected Vary to contain Access-Control-Request-Headers, got %v", varyValues)
 	}
 }
