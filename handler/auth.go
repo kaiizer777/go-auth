@@ -190,6 +190,15 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 		sess, rawID, err := h.sessionSvc.CreateSession(r.Context(), user.ID, user.CredentialVersion, sessType, ip, r.UserAgent())
 		if err != nil {
 			slog.ErrorContext(r.Context(), "session_create_failed", "user_id", user.ID.String(), "error", err)
+			// Stale credentials at mint (e.g. reset won the race after Login
+			// captured the version) surface as 401, not 500.
+			if appErr, ok := err.(*errors.Error); ok {
+				switch appErr.Code() {
+				case errors.CodeSessionNotFound, errors.CodeSessionExpired, errors.CodeSessionInvalid:
+					errors.WriteJSON(w, err)
+					return
+				}
+			}
 			errors.WriteJSON(w, errors.New(errors.CodeInternalError, "failed to create session", err))
 			return
 		}

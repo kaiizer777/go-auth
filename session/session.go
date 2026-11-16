@@ -83,6 +83,31 @@ func (s *service) CreateSession(
 		return nil, "", apperrors.ErrSessionInvalid
 	}
 
+	// Mint-time credential check: re-read the user's current version so a
+	// session cannot be stamped with superseded credentials (e.g. login
+	// captured the version before a concurrent password reset). A missing
+	// user row is treated as version 0 for orphaned/legacy rows. Nothing is
+	// persisted on mismatch.
+	var user db.User
+	currentVersion := 0
+	if uerr := s.db.WithContext(ctx).
+		Select("credential_version").
+		Where("id = ?", userID).
+		First(&user).Error; uerr != nil {
+		if !errors.Is(uerr, gorm.ErrRecordNotFound) {
+			return nil, "", apperrors.New(apperrors.CodeInternalError, "failed to query user", uerr)
+		}
+	} else {
+		currentVersion = user.CredentialVersion
+	}
+	if currentVersion != credentialVersion {
+		slog.InfoContext(ctx, "session_invalidated",
+			"user_id", userID.String(),
+			"reason", "stale_credential_version_at_mint",
+		)
+		return nil, "", apperrors.ErrSessionInvalid
+	}
+
 	rawID, err := generateRawID()
 	if err != nil {
 		return nil, "", apperrors.New(apperrors.CodeInternalError, "failed to generate session ID", err)
