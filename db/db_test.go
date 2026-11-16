@@ -319,3 +319,83 @@ func TestMigration000005_TimestampBackfillAndDialectParity(t *testing.T) {
 		t.Errorf("migration 5 backfill (idx %d) must occur before drop (idx %d)", backfillIdx, dropIdx)
 	}
 }
+
+func TestMigration000006_UpAddsCredentialVersionColumns(t *testing.T) {
+	data, err := defaultMigrationsFS.ReadFile("migrations/000006_add_credential_version.up.sql")
+	if err != nil {
+		t.Fatalf("failed to read migration 6 up: %v", err)
+	}
+	content := string(data)
+
+	if got := strings.Count(content, "BEGIN;"); got != 1 {
+		t.Errorf("migration 6 up BEGIN count = %d; want 1 (single tx)", got)
+	}
+	if got := strings.Count(content, "COMMIT;"); got != 1 {
+		t.Errorf("migration 6 up COMMIT count = %d; want 1 (single tx)", got)
+	}
+	beginIdx := strings.Index(content, "BEGIN;")
+	commitIdx := strings.Index(content, "COMMIT;")
+	if beginIdx == -1 || commitIdx == -1 || beginIdx > commitIdx {
+		t.Fatal("migration 6 up must wrap in a single BEGIN/COMMIT tx")
+	}
+
+	for _, table := range []string{"users", "sessions"} {
+		alterIdx := strings.Index(content, "ALTER TABLE "+table)
+		if alterIdx == -1 {
+			t.Errorf("migration 6 up missing ALTER TABLE %s", table)
+			continue
+		}
+		if alterIdx < beginIdx || alterIdx > commitIdx {
+			t.Errorf("migration 6 up ALTER TABLE %s must sit inside BEGIN/COMMIT", table)
+		}
+		colIdx := strings.Index(content[alterIdx:], "credential_version")
+		if colIdx == -1 {
+			t.Errorf("migration 6 up ALTER TABLE %s missing credential_version", table)
+			continue
+		}
+		stmt := content[alterIdx:]
+		if semi := strings.Index(stmt, ";"); semi != -1 {
+			stmt = stmt[:semi]
+		}
+		if !strings.Contains(stmt, "NOT NULL") || !strings.Contains(stmt, "DEFAULT 0") {
+			t.Errorf("migration 6 up %s.credential_version must be NOT NULL DEFAULT 0", table)
+		}
+	}
+
+	usersIdx := strings.Index(content, "ALTER TABLE users")
+	sessionsIdx := strings.Index(content, "ALTER TABLE sessions")
+	if usersIdx == -1 || sessionsIdx == -1 {
+		t.Fatal("migration 6 up must ALTER both users and sessions")
+	}
+	if usersIdx > sessionsIdx {
+		t.Errorf("migration 6 up users ALTER (idx %d) must precede sessions ALTER (idx %d)", usersIdx, sessionsIdx)
+	}
+}
+
+func TestMigration000006_DownRefusesVersionedDB(t *testing.T) {
+	data, err := defaultMigrationsFS.ReadFile("migrations/000006_add_credential_version.down.sql")
+	if err != nil {
+		t.Fatalf("failed to read migration 6 down: %v", err)
+	}
+	content := string(data)
+
+	if !strings.Contains(content, "down refused") {
+		t.Error("migration 6 down must carry the refusal text")
+	}
+	guardIdx := strings.Index(content, "credential_version <> 0")
+	raiseIdx := strings.Index(content, "RAISE EXCEPTION")
+	if guardIdx == -1 {
+		t.Fatal("migration 6 down must gate refusal on non-zero credential_version rows")
+	}
+	if raiseIdx == -1 {
+		t.Fatal("migration 6 down missing RAISE EXCEPTION refusal")
+	}
+	if guardIdx > raiseIdx {
+		t.Errorf("migration 6 version guard (idx %d) must precede refusal (idx %d)", guardIdx, raiseIdx)
+	}
+	for _, table := range []string{"users", "sessions"} {
+		if !strings.Contains(content, table) {
+			t.Errorf("migration 6 down must guard %s", table)
+		}
+	}
+}

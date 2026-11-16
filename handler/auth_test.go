@@ -108,6 +108,7 @@ func setupTestDB(t *testing.T) *gorm.DB {
 		id TEXT PRIMARY KEY,
 		email TEXT UNIQUE NOT NULL,
 		password_hash TEXT NOT NULL,
+		credential_version INTEGER NOT NULL DEFAULT 0,
 		email_verified INTEGER NOT NULL DEFAULT 0,
 		created_at DATETIME,
 		updated_at DATETIME
@@ -131,6 +132,7 @@ func setupTestDB(t *testing.T) *gorm.DB {
 		session_type VARCHAR(10) NOT NULL DEFAULT 'cookie',
 		ip_address VARCHAR(45) NOT NULL DEFAULT '',
 		user_agent TEXT NOT NULL DEFAULT '',
+		credential_version INTEGER NOT NULL DEFAULT 0,
 		last_active_at DATETIME NOT NULL,
 		absolute_expires_at DATETIME NOT NULL,
 		created_at DATETIME
@@ -1511,6 +1513,14 @@ func TestAuthHandler_LoginSessionCreation_CookieAndBearer(t *testing.T) {
 		t.Errorf("expected session cookie to have HttpOnly=true")
 	}
 
+	cookieSess, err := sessSvc.GetSession(context.Background(), sidCookie.Value)
+	if err != nil || cookieSess == nil {
+		t.Fatalf("GetSession(cookie) failed: %v", err)
+	}
+	if cookieSess.CredentialVersion != createdUser.CredentialVersion {
+		t.Errorf("cookie session credential version = %d, want %d", cookieSess.CredentialVersion, createdUser.CredentialVersion)
+	}
+
 	// 2. Bearer login
 	bearerReq := httptest.NewRequest(http.MethodPost, "/auth/login", nil)
 	bearerReq.Header.Set("X-Auth-Type", "bearer")
@@ -1534,6 +1544,134 @@ func TestAuthHandler_LoginSessionCreation_CookieAndBearer(t *testing.T) {
 	}
 	if len(bearerResp.Token) != 32 {
 		t.Errorf("expected 32-char hex token, got %q", bearerResp.Token)
+	}
+
+	bearerSess, err := sessSvc.GetSession(context.Background(), bearerResp.Token)
+	if err != nil || bearerSess == nil {
+		t.Fatalf("GetSession(bearer) failed: %v", err)
+	}
+	if bearerSess.CredentialVersion != createdUser.CredentialVersion {
+		t.Errorf("bearer session credential version = %d, want %d", bearerSess.CredentialVersion, createdUser.CredentialVersion)
+	}
+
+	// Bumped credential version propagates to minted session.
+	if err := database.Model(&db.User{}).Where("id = ?", createdUser.ID).Update("credential_version", createdUser.CredentialVersion+3).Error; err != nil {
+		t.Fatalf("failed to bump credential version: %v", err)
+	}
+	var bumped db.User
+	if err := database.Where("id = ?", createdUser.ID).First(&bumped).Error; err != nil {
+		t.Fatalf("failed to reload user: %v", err)
+	}
+
+	bumpedReq := httptest.NewRequest(http.MethodPost, "/auth/login", nil)
+	bumpedReq.Header.Set("X-Auth-Type", "bearer")
+	bb, _ := json.Marshal(db.LoginRequest{Email: email, Password: pass})
+	bumpedReq.Body = io.NopCloser(bytes.NewReader(bb))
+	recBumped := httptest.NewRecorder()
+	authH.Login(recBumped, bumpedReq)
+	if recBumped.Code != http.StatusOK {
+		t.Fatalf("bumped login failed: %d", recBumped.Code)
+	}
+	var bumpedResp struct {
+		Token string `json:"token"`
+	}
+	if err := json.Unmarshal(recBumped.Body.Bytes(), &bumpedResp); err != nil {
+		t.Fatalf("failed to decode bumped response: %v", err)
+	}
+	bumpedSess, err := sessSvc.GetSession(context.Background(), bumpedResp.Token)
+	if err != nil || bumpedSess == nil {
+		t.Fatalf("GetSession(bumped) failed: %v", err)
+	}
+	if bumpedSess.CredentialVersion != bumped.CredentialVersion {
+		t.Errorf("bumped session credential version = %d, want %d", bumpedSess.CredentialVersion, bumped.CredentialVersion)
+	}
+}
+
+func TestSessionService_StaleMintRejectedAfterVersionBump(t *testing.T) {
+	database, svc, _, _ := setupTestEnv(t)
+	cfg := testConfig()
+	sessSvc := session.NewService(database, &cfg)
+
+	email := "stale-mint@example.com"
+	pass := "ValidPassword123!"
+	createdUser, _, err := svc.Signup(context.Background(), db.SignupRequest{
+		Email:    email,
+		Password: pass,
+	})
+	if err != nil {
+		t.Fatalf("Signup failed: %v", err)
+	}
+
+	_, rawID, err := sessSvc.CreateSession(context.Background(), createdUser.ID, createdUser.CredentialVersion, db.SessionTypeBearer, "127.0.0.1", "agent")
+	if err != nil {
+		t.Fatalf("CreateSession failed: %v", err)
+	}
+
+	if err := database.Model(&db.User{}).Where("id = ?", createdUser.ID).Update("credential_version", createdUser.CredentialVersion+1).Error; err != nil {
+		t.Fatalf("failed to bump credential version: %v", err)
+	}
+
+	if sess, gerr := sessSvc.GetSession(context.Background(), rawID); gerr == nil || sess != nil {
+		t.Fatalf("expected stale session rejected, got sess=%v err=%v", sess, gerr)
+	} else if !stderrors.Is(gerr, errors.ErrSessionInvalid) {
+		t.Fatalf("expected ErrSessionInvalid, got %v", gerr)
+	}
+
+	if sess, _, merr := sessSvc.CreateSession(context.Background(), createdUser.ID, createdUser.CredentialVersion, db.SessionTypeBearer, "127.0.0.1", "agent"); merr == nil || sess != nil {
+		t.Fatalf("expected stale mint rejected, got sess=%v err=%v", sess, merr)
+	} else if !stderrors.Is(merr, errors.ErrSessionInvalid) {
+		t.Fatalf("expected ErrSessionInvalid on stale mint, got %v", merr)
+	}
+
+	var staleCount int64
+	if err := database.Model(&db.Session{}).Where("user_id = ?", createdUser.ID).Count(&staleCount).Error; err != nil {
+		t.Fatalf("failed to count sessions: %v", err)
+	}
+	if staleCount != 0 {
+		t.Fatalf("expected no session persisted on stale mint, found %d", staleCount)
+	}
+}
+
+func TestAuthHandler_LoginStaleMintReturns401(t *testing.T) {
+	cfg := testConfig()
+	userID := uuid.New()
+	staleUser := &db.User{ID: userID, Email: "stale-login@example.com", CredentialVersion: 0}
+	cases := []struct {
+		name    string
+		mintErr error
+	}{
+		{"bare", errors.ErrSessionInvalid},
+		{"wrapped", fmt.Errorf("mint: %w", errors.ErrSessionInvalid)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mockAuth := &mockAuthService{
+				loginFn: func(ctx context.Context, req db.LoginRequest) (*db.User, error) {
+					return staleUser, nil
+				},
+			}
+			mockSess := &mockSessionService{
+				createSessFn: func(ctx context.Context, uid uuid.UUID, cv int, st db.SessionType, ip, ua string) (*session.Session, string, error) {
+					return nil, "", tc.mintErr
+				},
+			}
+			authH := NewAuthHandler(mockAuth, WithAuthSessionService(mockSess), WithAuthConfig(&cfg))
+			b, _ := json.Marshal(db.LoginRequest{Email: "stale-login@example.com", Password: "ValidPassword123!"})
+			req := httptest.NewRequest(http.MethodPost, "/auth/login", bytes.NewReader(b))
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+			authH.Login(rec, req)
+			if rec.Code != http.StatusUnauthorized {
+				t.Fatalf("expected 401, got %d: %s", rec.Code, rec.Body.String())
+			}
+			var resp errors.Response
+			if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+				t.Fatalf("failed to decode error response: %v", err)
+			}
+			if resp.Code != errors.CodeSessionInvalid {
+				t.Fatalf("expected code %s, got %s", errors.CodeSessionInvalid, resp.Code)
+			}
+		})
 	}
 }
 
@@ -1837,11 +1975,14 @@ func TestLogout_CSRFAndAuthProtection(t *testing.T) {
 	h := New(database, cfg, mockAuth, WithSessionService(sessSvc))
 
 	userID := uuid.New()
-	_, rawCookieID, err := sessSvc.CreateSession(context.Background(), userID, db.SessionTypeCookie, "127.0.0.1", "agent")
+	if err := database.Create(&db.User{ID: userID, Email: userID.String() + "@seed.example", PasswordHash: "hash", CredentialVersion: 0}).Error; err != nil {
+		t.Fatalf("failed to seed user: %v", err)
+	}
+	_, rawCookieID, err := sessSvc.CreateSession(context.Background(), userID, 0, db.SessionTypeCookie, "127.0.0.1", "agent")
 	if err != nil {
 		t.Fatalf("failed to create cookie session: %v", err)
 	}
-	_, rawBearerID, err := sessSvc.CreateSession(context.Background(), userID, db.SessionTypeBearer, "127.0.0.1", "agent")
+	_, rawBearerID, err := sessSvc.CreateSession(context.Background(), userID, 0, db.SessionTypeBearer, "127.0.0.1", "agent")
 	if err != nil {
 		t.Fatalf("failed to create bearer session: %v", err)
 	}

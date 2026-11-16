@@ -52,6 +52,7 @@ func setupTestDB(t *testing.T) *gorm.DB {
 		id TEXT PRIMARY KEY,
 		email TEXT UNIQUE NOT NULL,
 		password_hash TEXT NOT NULL,
+		credential_version INTEGER NOT NULL DEFAULT 0,
 		email_verified INTEGER NOT NULL DEFAULT 0,
 		created_at DATETIME,
 		updated_at DATETIME
@@ -75,6 +76,7 @@ func setupTestDB(t *testing.T) *gorm.DB {
 		session_type VARCHAR(10) NOT NULL DEFAULT 'cookie',
 		ip_address VARCHAR(45) NOT NULL DEFAULT '',
 		user_agent TEXT NOT NULL DEFAULT '',
+		credential_version INTEGER NOT NULL DEFAULT 0,
 		last_active_at DATETIME NOT NULL,
 		absolute_expires_at DATETIME NOT NULL,
 		created_at DATETIME
@@ -649,6 +651,11 @@ func TestService_PasswordReset(t *testing.T) {
 			t.Fatalf("expected at least 2 tokens before reset, got %d", countBefore)
 		}
 
+		var userBefore db.User
+		if err := database.Where("id = ?", user.ID).First(&userBefore).Error; err != nil {
+			t.Fatalf("failed to query user before reset: %v", err)
+		}
+
 		// Reset password using tok1
 		newPassword := "BrandNewPassword#2026!"
 		err = svc.ResetPassword(ctx, db.PasswordResetConfirmRequest{Token: tok1, NewPassword: newPassword})
@@ -676,6 +683,14 @@ func TestService_PasswordReset(t *testing.T) {
 		database.Model(&db.PasswordResetToken{}).Where("user_id = ?", user.ID).Count(&countAfter)
 		if countAfter != 0 {
 			t.Fatalf("expected 0 reset tokens after reset (ASVS L1 purge), got %d", countAfter)
+		}
+
+		var userAfter db.User
+		if err := database.Where("id = ?", user.ID).First(&userAfter).Error; err != nil {
+			t.Fatalf("failed to query user after reset: %v", err)
+		}
+		if userAfter.CredentialVersion != userBefore.CredentialVersion+1 {
+			t.Fatalf("expected credential version %d after reset bump, got %d", userBefore.CredentialVersion+1, userAfter.CredentialVersion)
 		}
 
 		// Both tok1 (consumed) and tok2 (purged) must now fail on replay
@@ -725,6 +740,11 @@ func TestService_PasswordReset(t *testing.T) {
 			t.Fatalf("expected at least 2 sessions before reset, got %d", countBefore)
 		}
 
+		var userBefore db.User
+		if err := database.Where("id = ?", user.ID).First(&userBefore).Error; err != nil {
+			t.Fatalf("failed to query user before reset: %v", err)
+		}
+
 		err = svc.ResetPassword(ctx, db.PasswordResetConfirmRequest{Token: tok, NewPassword: "SuperNewPassword#2026!"})
 		if err != nil {
 			t.Fatalf("reset password failed: %v", err)
@@ -734,6 +754,14 @@ func TestService_PasswordReset(t *testing.T) {
 		database.Model(&db.Session{}).Where("user_id = ?", user.ID).Count(&countAfter)
 		if countAfter != 0 {
 			t.Fatalf("expected 0 sessions after password reset, got %d", countAfter)
+		}
+
+		var userAfter db.User
+		if err := database.Where("id = ?", user.ID).First(&userAfter).Error; err != nil {
+			t.Fatalf("failed to query user after reset: %v", err)
+		}
+		if userAfter.CredentialVersion != userBefore.CredentialVersion+1 {
+			t.Fatalf("expected credential version %d after reset bump, got %d", userBefore.CredentialVersion+1, userAfter.CredentialVersion)
 		}
 	})
 }
@@ -1111,6 +1139,20 @@ func TestService_Signup_UnverifiedAccountRecovery(t *testing.T) {
 		t.Fatalf("failed to query user before recovery: %v", err)
 	}
 	oldHash := dbUserBefore.PasswordHash
+	beforeVersion := dbUserBefore.CredentialVersion
+
+	seeded := db.Session{
+		ID:                uuid.New(),
+		UserID:            user.ID,
+		IDHash:            "session_hash_recovery_11111111111111111111111111111111111111111111111111",
+		SessionType:       db.SessionTypeCookie,
+		LastActiveAt:      time.Now().UTC(),
+		AbsoluteExpiresAt: time.Now().UTC().Add(24 * time.Hour),
+		CreatedAt:         time.Now().UTC(),
+	}
+	if err := database.Create(&seeded).Error; err != nil {
+		t.Fatalf("failed to seed session before recovery: %v", err)
+	}
 
 	newPass := "RecoveredPass#67890"
 	recUser, recToken, err := svc.Signup(ctx, db.SignupRequest{Email: "recover@example.com", Password: newPass})
@@ -1160,6 +1202,15 @@ func TestService_Signup_UnverifiedAccountRecovery(t *testing.T) {
 	}
 	if dbUserAfter.PasswordHash == oldHash {
 		t.Fatal("expected password hash to be updated in DB after unverified recovery")
+	}
+	if dbUserAfter.CredentialVersion != beforeVersion+1 {
+		t.Fatalf("expected credential version %d after recovery bump, got %d", beforeVersion+1, dbUserAfter.CredentialVersion)
+	}
+
+	var sessAfter int64
+	database.Model(&db.Session{}).Where("user_id = ?", user.ID).Count(&sessAfter)
+	if sessAfter != 0 {
+		t.Fatalf("expected 0 sessions after unverified recovery, got %d", sessAfter)
 	}
 
 	if err := svc.VerifyEmail(ctx, db.VerifyEmailRequest{Token: origToken}); err == nil {

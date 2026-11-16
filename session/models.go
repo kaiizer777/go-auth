@@ -17,6 +17,7 @@ type Session struct {
 	Type              db.SessionType
 	IPAddress         string
 	UserAgent         string
+	CredentialVersion int
 	LastActiveAt      time.Time
 	AbsoluteExpiresAt time.Time
 	CreatedAt         time.Time
@@ -33,6 +34,7 @@ func fromDB(s *db.Session) *Session {
 		Type:              s.SessionType,
 		IPAddress:         s.IPAddress,
 		UserAgent:         s.UserAgent,
+		CredentialVersion: s.CredentialVersion,
 		LastActiveAt:      s.LastActiveAt,
 		AbsoluteExpiresAt: s.AbsoluteExpiresAt,
 		CreatedAt:         s.CreatedAt,

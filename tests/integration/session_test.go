@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	stderrors "errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -18,6 +19,7 @@ import (
 	"github.com/kaiizer777/go-auth"
 	"github.com/kaiizer777/go-auth/config"
 	"github.com/kaiizer777/go-auth/db"
+	apperrors "github.com/kaiizer777/go-auth/errors"
 )
 
 func setupIntegrationApp(t *testing.T, modifyCfg ...func(*config.Config)) (*goauth.Auth, *gorm.DB, config.Config) {
@@ -36,6 +38,7 @@ func setupIntegrationApp(t *testing.T, modifyCfg ...func(*config.Config)) (*goau
 		id TEXT PRIMARY KEY,
 		email TEXT UNIQUE NOT NULL,
 		password_hash TEXT NOT NULL,
+		credential_version INTEGER NOT NULL DEFAULT 0,
 		email_verified INTEGER NOT NULL DEFAULT 1,
 		created_at DATETIME,
 		updated_at DATETIME
@@ -59,6 +62,7 @@ func setupIntegrationApp(t *testing.T, modifyCfg ...func(*config.Config)) (*goau
 		session_type VARCHAR(10) NOT NULL DEFAULT 'cookie',
 		ip_address VARCHAR(45) NOT NULL DEFAULT '',
 		user_agent TEXT NOT NULL DEFAULT '',
+		credential_version INTEGER NOT NULL DEFAULT 0,
 		last_active_at DATETIME NOT NULL,
 		absolute_expires_at DATETIME NOT NULL,
 		created_at DATETIME
@@ -359,6 +363,61 @@ func TestAllSessionsInvalidatedOnPasswordChange(t *testing.T) {
 	app.Handler.ServeHTTP(recAfter2, reqCheck2)
 	if recAfter2.Code != http.StatusUnauthorized {
 		t.Fatalf("expected session 2 to return 401 after password reset, got %d", recAfter2.Code)
+	}
+}
+
+// Test: login whose credential check precedes a password reset must not mint a
+// usable session when it resumes after the reset (issue #27). Sequentially
+// simulates the login-vs-reset window: mint-time validation rejects the stale
+// version and persists nothing.
+func TestSessionRejectedWhenLoginCapturedOldCredentialVersion(t *testing.T) {
+	app, database, _ := setupIntegrationApp(t)
+	email := "login_vs_reset@example.com"
+	pass := "OriginalPass123!"
+	newPass := "NewPass9876543!"
+	signupUser(t, app, email, pass)
+
+	// Credential check happens before the reset: capture old version.
+	user, err := app.Auth.Login(context.Background(), db.LoginRequest{Email: email, Password: pass})
+	if err != nil {
+		t.Fatalf("Login failed: %v", err)
+	}
+	oldVersion := user.CredentialVersion
+
+	// Reset completes in between, bumping credential version and purging sessions.
+	tok, err := app.Auth.RequestPasswordReset(context.Background(), db.PasswordResetRequest{Email: email})
+	if err != nil {
+		t.Fatalf("RequestPasswordReset failed: %v", err)
+	}
+	if err := app.Auth.ResetPassword(context.Background(), db.PasswordResetConfirmRequest{
+		Token:       tok,
+		NewPassword: newPass,
+	}); err != nil {
+		t.Fatalf("ResetPassword failed: %v", err)
+	}
+
+	// In-flight login resumes and attempts to mint a session stamped with the
+	// old version: mint-time validation rejects it and persists nothing.
+	_, _, err = app.Session.CreateSession(context.Background(), user.ID, oldVersion, db.SessionTypeCookie, "127.0.0.1", "agent")
+	if !stderrors.Is(err, apperrors.ErrSessionInvalid) {
+		t.Fatalf("expected ErrSessionInvalid on stale mint, got %v", err)
+	}
+
+	var count int64
+	if err := database.Model(&db.Session{}).Where("user_id = ?", user.ID).Count(&count).Error; err != nil {
+		t.Fatalf("failed to count sessions: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("expected no session persisted on stale mint, found %d", count)
+	}
+
+	// Positive control: mint with the fresh post-reset version succeeds.
+	freshUser, err := app.Auth.Login(context.Background(), db.LoginRequest{Email: email, Password: newPass})
+	if err != nil {
+		t.Fatalf("fresh Login failed: %v", err)
+	}
+	if _, _, err := app.Session.CreateSession(context.Background(), user.ID, freshUser.CredentialVersion, db.SessionTypeCookie, "127.0.0.1", "agent"); err != nil {
+		t.Fatalf("fresh mint with current version failed: %v", err)
 	}
 }
 

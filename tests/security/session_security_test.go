@@ -39,6 +39,7 @@ func setupSecurityApp(t *testing.T, modifyCfg ...func(*config.Config)) (*goauth.
 		id TEXT PRIMARY KEY,
 		email TEXT UNIQUE NOT NULL,
 		password_hash TEXT NOT NULL,
+		credential_version INTEGER NOT NULL DEFAULT 0,
 		email_verified INTEGER NOT NULL DEFAULT 1,
 		created_at DATETIME,
 		updated_at DATETIME
@@ -62,6 +63,7 @@ func setupSecurityApp(t *testing.T, modifyCfg ...func(*config.Config)) (*goauth.
 		session_type VARCHAR(10) NOT NULL DEFAULT 'cookie',
 		ip_address VARCHAR(45) NOT NULL DEFAULT '',
 		user_agent TEXT NOT NULL DEFAULT '',
+		credential_version INTEGER NOT NULL DEFAULT 0,
 		last_active_at DATETIME NOT NULL,
 		absolute_expires_at DATETIME NOT NULL,
 		created_at DATETIME
@@ -115,7 +117,7 @@ func readCookie(res *http.Response, name string) *http.Cookie {
 }
 
 // Test 8: TestReplayDeletedSession (ASVS V3.3.1)
-// Replaying logged-out raw session ID returns 401 SESSION_NOT_FOUND (confirms server-side invalidation)
+// Replaying logged-out raw session ID returns 401 SESSION_INVALID (confirms server-side invalidation)
 func TestReplayDeletedSession(t *testing.T) {
 	app, _, cfg := setupSecurityApp(t)
 	email := "replay_del@example.com"
@@ -527,12 +529,17 @@ func TestSessionCookieHttpOnly(t *testing.T) {
 // Test 18: TestBearerTokenEntropy (ASVS V3.1.1)
 // 1,000 generated tokens are exactly 32 hex chars with zero duplicate collisions
 func TestBearerTokenEntropy(t *testing.T) {
-	app, _, _ := setupSecurityApp(t)
+	app, database, _ := setupSecurityApp(t)
 	const count = 1000
 	seen := make(map[string]struct{}, count)
 
+	entropyUserID := uuid.New()
+	if err := database.Create(&db.User{ID: entropyUserID, Email: "entropy@example.com", PasswordHash: "hash", CredentialVersion: 0}).Error; err != nil {
+		t.Fatalf("failed to seed user: %v", err)
+	}
+
 	for i := 0; i < count; i++ {
-		_, rawID, err := app.Session.CreateSession(context.Background(), uuid.New(), db.SessionTypeBearer, "127.0.0.1", "ua")
+		_, rawID, err := app.Session.CreateSession(context.Background(), entropyUserID, 0, db.SessionTypeBearer, "127.0.0.1", "ua")
 		if err != nil {
 			t.Fatalf("failed to create session: %v", err)
 		}
@@ -547,7 +554,7 @@ func TestBearerTokenEntropy(t *testing.T) {
 }
 
 // Test 19: TestRotateSession_OldIDRejected (ASVS V3.2.1)
-// After rotation, old session ID returns 401 SESSION_NOT_FOUND while new session ID succeeds
+// After rotation, old session ID returns 401 SESSION_INVALID while new session ID succeeds
 func TestRotateSession_OldIDRejected(t *testing.T) {
 	app, _, cfg := setupSecurityApp(t)
 	email := "rotate_test@example.com"

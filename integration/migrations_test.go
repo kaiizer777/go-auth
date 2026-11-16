@@ -6,6 +6,7 @@ import (
 	"context"
 	"database/sql"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/golang-migrate/migrate/v4"
@@ -127,5 +128,73 @@ func TestMigrations_Lifecycle(t *testing.T) {
 	}
 	if tableCount != 4 {
 		t.Fatalf("expected 4 application tables after re-Up, found %d", tableCount)
+	}
+}
+
+func TestMigrations_DownRefusedOnSeededDB(t *testing.T) {
+	dbURL := resolveDatabaseURL()
+
+	testDB, err := sql.Open("pgx", dbURL)
+	if err != nil {
+		if os.Getenv("CI") != "" {
+			t.Fatalf("CI: failed to open postgres connection: %v", err)
+		}
+		t.Skipf("Postgres not available, skipping: %v", err)
+	}
+	if err := testDB.Ping(); err != nil {
+		_ = testDB.Close()
+		if os.Getenv("CI") != "" {
+			t.Fatalf("CI: PostgreSQL connection failed: %v", err)
+		}
+		t.Skipf("Postgres not available, skipping: %v", err)
+	}
+	_ = testDB.Close()
+
+	m, sqlDB := newMigrator(t, dbURL)
+	defer func() {
+		_, _ = m.Close()
+		_ = sqlDB.Close()
+	}()
+
+	if err := m.Up(); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("m.Up() failed: %v", err)
+	}
+
+	if _, err := sqlDB.Exec(`INSERT INTO users (email, password_hash, credential_version) VALUES ('down-refusal@example.com', 'hash', 1)`); err != nil {
+		t.Fatalf("failed to seed versioned user: %v", err)
+	}
+
+	err = m.Steps(-1)
+	if err == nil {
+		t.Fatal("expected 000006 down to refuse on versioned DB, got nil")
+	}
+	if !strings.Contains(err.Error(), "down refused") {
+		t.Fatalf("expected down-refused error, got: %v", err)
+	}
+
+	// The refused down records version 5 dirty and leaves the driver's
+	// connection unusable for unlock, so recover on a fresh migrator: the
+	// script rolled back, the schema is still at 6, and force 6 re-pins it
+	// clean. The seed row is removed so the shared DB stays empty.
+	_, _ = m.Close()
+	_ = sqlDB.Close()
+
+	m2, sqlDB2 := newMigrator(t, dbURL)
+	defer func() {
+		_, _ = m2.Close()
+		_ = sqlDB2.Close()
+	}()
+
+	if verr, ddirty, verr2 := m2.Version(); verr2 != nil || verr != 5 || !ddirty {
+		t.Fatalf("expected version 5 dirty after refusal, got version=%d dirty=%v err=%v", verr, ddirty, verr2)
+	}
+	if ferr := m2.Force(6); ferr != nil {
+		t.Fatalf("m2.Force(6) failed: %v", ferr)
+	}
+	if _, err := sqlDB2.Exec(`DELETE FROM users WHERE email = 'down-refusal@example.com'`); err != nil {
+		t.Fatalf("failed to remove seed row: %v", err)
+	}
+	if verr, ddirty, verr2 := m2.Version(); verr2 != nil || verr != 6 || ddirty {
+		t.Fatalf("expected version 6 clean after recovery, got version=%d dirty=%v err=%v", verr, ddirty, verr2)
 	}
 }

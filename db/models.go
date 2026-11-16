@@ -8,12 +8,13 @@ import (
 
 // User represents an authenticated account record in the database.
 type User struct {
-	ID            uuid.UUID `gorm:"primaryKey;type:uuid;default:uuid_generate_v4()"`
-	Email         string    `gorm:"type:varchar(255);uniqueIndex;not null"`
-	PasswordHash  string    `gorm:"type:text;not null"`
-	EmailVerified bool      `gorm:"default:false;not null"`
-	CreatedAt     time.Time
-	UpdatedAt     time.Time
+	ID                uuid.UUID `gorm:"primaryKey;type:uuid;default:uuid_generate_v4()"`
+	Email             string    `gorm:"type:varchar(255);uniqueIndex;not null"`
+	PasswordHash      string    `gorm:"type:text;not null"`
+	CredentialVersion int       `gorm:"not null;default:0"`
+	EmailVerified     bool      `gorm:"default:false;not null"`
+	CreatedAt         time.Time
+	UpdatedAt         time.Time
 }
 
 // TableName returns the table name for User.
@@ -35,6 +36,7 @@ type Session struct {
 	SessionType       SessionType `gorm:"type:varchar(10);not null;default:'cookie'"`
 	IPAddress         string      `gorm:"type:varchar(45);not null;default:''"`
 	UserAgent         string      `gorm:"type:text;not null;default:''"`
+	CredentialVersion int         `gorm:"not null;default:0"`
 	LastActiveAt      time.Time   `gorm:"not null"`
 	AbsoluteExpiresAt time.Time   `gorm:"not null"`
 	CreatedAt         time.Time   `gorm:"autoCreateTime"`

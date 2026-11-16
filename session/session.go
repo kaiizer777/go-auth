@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -15,11 +16,12 @@ import (
 	"github.com/kaiizer777/go-auth/db"
 	apperrors "github.com/kaiizer777/go-auth/errors"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // Service defines session management operations.
 type Service interface {
-	CreateSession(ctx context.Context, userID uuid.UUID, sessionType db.SessionType, ip, userAgent string) (*Session, string, error)
+	CreateSession(ctx context.Context, userID uuid.UUID, credentialVersion int, sessionType db.SessionType, ip, userAgent string) (*Session, string, error)
 	GetSession(ctx context.Context, rawID string) (*Session, error)
 	InvalidateSession(ctx context.Context, rawID string) error
 	InvalidateAllUserSessions(ctx context.Context, userID uuid.UUID) error
@@ -42,6 +44,16 @@ func NewService(gormDB *gorm.DB, cfg *config.Config) Service {
 		cfg = &defaultCfg
 	}
 	return &service{db: gormDB, cfg: cfg}
+}
+
+// lockForUpdate applies SELECT ... FOR UPDATE on dialects with row locking.
+// SQLite has no FOR UPDATE syntax and serializes writers inside the tx, so the
+// clause is skipped there; other dialects lock the re-read user row.
+func lockForUpdate(tx *gorm.DB) *gorm.DB {
+	if strings.Contains(strings.ToLower(tx.Name()), "sqlite") {
+		return tx
+	}
+	return tx.Clauses(clause.Locking{Strength: "UPDATE"})
 }
 
 // generateRawID creates a cryptographically random 128-bit session ID.
@@ -75,6 +87,7 @@ func hashID(rawID string) string {
 func (s *service) CreateSession(
 	ctx context.Context,
 	userID uuid.UUID,
+	credentialVersion int,
 	sessionType db.SessionType,
 	ip, userAgent string,
 ) (*Session, string, error) {
@@ -82,8 +95,48 @@ func (s *service) CreateSession(
 		return nil, "", apperrors.ErrSessionInvalid
 	}
 
+	// Mint-time credential check runs inside a transaction with the insert so
+	// a password reset committing between the version re-read and the insert
+	// cannot mint a stale-version row. The user row is locked for update
+	// where the dialect supports it (skipped on SQLite, which serializes
+	// writers in-tx). A missing user row fails closed with
+	// ErrSessionInvalid (no orphan mint). Read-time rejection in GetSession
+	// stays as backstop. Nothing persists on mismatch.
+	tx := s.db.WithContext(ctx).Begin()
+	if tx.Error != nil {
+		return nil, "", apperrors.New(apperrors.CodeInternalError, "failed to begin transaction", tx.Error)
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			tx.Rollback()
+			panic(r)
+		}
+	}()
+
+	var user db.User
+	if uerr := lockForUpdate(tx).Select("credential_version").Where("id = ?", userID).First(&user).Error; uerr != nil {
+		tx.Rollback()
+		if errors.Is(uerr, gorm.ErrRecordNotFound) {
+			slog.InfoContext(ctx, "session_invalidated",
+				"user_id", userID.String(),
+				"reason", "missing_user_at_mint",
+			)
+			return nil, "", apperrors.ErrSessionInvalid
+		}
+		return nil, "", apperrors.New(apperrors.CodeInternalError, "failed to query user", uerr)
+	}
+	if user.CredentialVersion != credentialVersion {
+		tx.Rollback()
+		slog.InfoContext(ctx, "session_invalidated",
+			"user_id", userID.String(),
+			"reason", "stale_credential_version_at_mint",
+		)
+		return nil, "", apperrors.ErrSessionInvalid
+	}
+
 	rawID, err := generateRawID()
 	if err != nil {
+		tx.Rollback()
 		return nil, "", apperrors.New(apperrors.CodeInternalError, "failed to generate session ID", err)
 	}
 
@@ -95,13 +148,19 @@ func (s *service) CreateSession(
 		SessionType:       sessionType,
 		IPAddress:         ip,
 		UserAgent:         userAgent,
+		CredentialVersion: credentialVersion,
 		LastActiveAt:      now,
 		AbsoluteExpiresAt: now.Add(s.cfg.SessionAbsoluteMaxAge),
 		CreatedAt:         now,
 	}
 
-	if err := s.db.WithContext(ctx).Create(record).Error; err != nil {
+	if err := tx.Create(record).Error; err != nil {
+		tx.Rollback()
 		return nil, "", apperrors.New(apperrors.CodeInternalError, "failed to create session", err)
+	}
+	if err := tx.Commit().Error; err != nil {
+		tx.Rollback()
+		return nil, "", apperrors.New(apperrors.CodeInternalError, "failed to commit session", err)
 	}
 
 	slog.InfoContext(ctx, "session_created",
@@ -126,9 +185,59 @@ func (s *service) GetSession(ctx context.Context, rawID string) (*Session, error
 		First(&record).Error
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return nil, apperrors.ErrSessionNotFound
+			// Unknown token rejects as invalid so errors.Is cannot oracle stale-vs-nonexistent.
+			return nil, apperrors.ErrSessionInvalid
 		}
 		return nil, apperrors.New(apperrors.CodeInternalError, "failed to query session", err)
+	}
+
+	// Credential-version check runs in a tx with the stale-row purge so a
+	// password reset committing between the version re-read and the delete
+	// cannot leave the purge nondeterministic. The user row is locked for
+	// update where the dialect supports it (skipped on SQLite, which
+	// serializes writers in-tx). A missing user row fails closed: the
+	// orphan row is purged in-tx and rejected as invalid.
+	tx := s.db.WithContext(ctx).Begin()
+	if tx.Error != nil {
+		return nil, apperrors.New(apperrors.CodeInternalError, "failed to begin transaction", tx.Error)
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			tx.Rollback()
+			panic(r)
+		}
+	}()
+
+	var user db.User
+	uerr := lockForUpdate(tx).
+		Select("credential_version").
+		Where("id = ?", record.UserID).
+		First(&user).Error
+	if uerr != nil {
+		if errors.Is(uerr, gorm.ErrRecordNotFound) {
+			_ = tx.Where("id = ?", record.ID).Delete(&db.Session{}).Error
+			_ = tx.Commit().Error
+			slog.InfoContext(ctx, "session_invalidated",
+				"user_id", record.UserID.String(),
+				"reason", "missing_user_at_read",
+			)
+			return nil, apperrors.ErrSessionInvalid
+		}
+		tx.Rollback()
+		return nil, apperrors.New(apperrors.CodeInternalError, "failed to query user", uerr)
+	}
+	if user.CredentialVersion != record.CredentialVersion {
+		_ = tx.Where("id = ?", record.ID).Delete(&db.Session{}).Error
+		_ = tx.Commit().Error
+		slog.InfoContext(ctx, "session_invalidated",
+			"user_id", record.UserID.String(),
+			"reason", "credential_version_mismatch",
+		)
+		return nil, apperrors.ErrSessionInvalid
+	}
+	if err := tx.Commit().Error; err != nil {
+		tx.Rollback()
+		return nil, apperrors.New(apperrors.CodeInternalError, "failed to commit session read", err)
 	}
 
 	now := time.Now().UTC()
@@ -258,7 +367,8 @@ func (s *service) RotateSession(
 		Where("id_hash = ?", oldHash).
 		First(&oldRecord).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return nil, "", apperrors.ErrSessionNotFound
+			// Unknown token rejects as invalid so errors.Is cannot oracle stale-vs-nonexistent.
+			return nil, "", apperrors.ErrSessionInvalid
 		}
 		return nil, "", apperrors.New(apperrors.CodeInternalError, "failed to rotate session", err)
 	}
@@ -306,6 +416,11 @@ func (s *service) RotateSession(
 		}
 	}
 
+	// Re-check the user's current credential version inside the transaction so a
+	// rotation cannot mint a session under a superseded credential. The user
+	// row is locked where the dialect supports it; a missing user fails
+	// closed and purges the orphan row. Transient lookup failures surface as
+	// internal errors; a version mismatch purges the stale row.
 	tx := s.db.WithContext(ctx).Begin()
 	if tx.Error != nil {
 		return nil, "", apperrors.New(apperrors.CodeInternalError, "failed to begin transaction", tx.Error)
@@ -317,6 +432,37 @@ func (s *service) RotateSession(
 		}
 	}()
 
+	var user db.User
+	uerr := lockForUpdate(tx).
+		Select("credential_version").
+		Where("id = ?", oldRecord.UserID).
+		First(&user).Error
+	if uerr != nil {
+		if errors.Is(uerr, gorm.ErrRecordNotFound) {
+			_ = tx.Where("id_hash = ?", oldHash).Delete(&db.Session{}).Error
+			_ = tx.Commit().Error
+			slog.InfoContext(ctx, "session_invalidated",
+				"user_id", oldRecord.UserID.String(),
+				"reason", "missing_user_at_rotate",
+			)
+			return nil, "", apperrors.ErrSessionInvalid
+		}
+		tx.Rollback()
+		return nil, "", apperrors.New(apperrors.CodeInternalError, "failed to query user", uerr)
+	}
+	currentVersion := user.CredentialVersion
+	if currentVersion != oldRecord.CredentialVersion {
+		_ = tx.Where("id_hash = ?", oldHash).Delete(&db.Session{}).Error
+		_ = tx.Commit().Error
+		slog.InfoContext(ctx, "session_invalidated",
+			"user_id", oldRecord.UserID.String(),
+			"reason", "credential_version_mismatch",
+		)
+		return nil, "", apperrors.ErrSessionInvalid
+	}
+
+	// NOTE: InvalidateAllUserSessions stays a lone non-tx DELETE by design;
+	// its bulk-revoke blind window is tracked in issue #28 (out of scope here).
 	res := tx.Where("id_hash = ?", oldHash).Delete(&db.Session{})
 	if res.Error != nil {
 		tx.Rollback()
@@ -324,7 +470,7 @@ func (s *service) RotateSession(
 	}
 	if res.RowsAffected == 0 {
 		tx.Rollback()
-		return nil, "", apperrors.ErrSessionNotFound
+		return nil, "", apperrors.ErrSessionInvalid
 	}
 
 	rawID, err := generateRawID()
@@ -357,6 +503,7 @@ func (s *service) RotateSession(
 		SessionType:       oldRecord.SessionType,
 		IPAddress:         ip,
 		UserAgent:         userAgent,
+		CredentialVersion: currentVersion,
 		LastActiveAt:      now,
 		AbsoluteExpiresAt: oldRecord.AbsoluteExpiresAt,
 		CreatedAt:         oldRecord.CreatedAt,
@@ -368,6 +515,7 @@ func (s *service) RotateSession(
 	}
 
 	if err := tx.Commit().Error; err != nil {
+		tx.Rollback()
 		return nil, "", apperrors.New(apperrors.CodeInternalError, "failed to commit session rotation", err)
 	}
 
