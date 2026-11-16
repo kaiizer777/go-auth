@@ -8,6 +8,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/golang-migrate/migrate/v4"
 	pgmigrate "github.com/golang-migrate/migrate/v4/database/postgres"
@@ -26,13 +27,16 @@ func newMigrator(t *testing.T, dbURL string) (*migrate.Migrate, *sql.DB) {
 		t.Fatalf("failed to open sql connection: %v", err)
 	}
 
-	conn, err := sqlDB.Conn(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	conn, err := sqlDB.Conn(ctx)
 	if err != nil {
 		_ = sqlDB.Close()
 		t.Fatalf("failed to checkout conn: %v", err)
 	}
 
-	driver, err := pgmigrate.WithConnection(context.Background(), conn, &pgmigrate.Config{})
+	driver, err := pgmigrate.WithConnection(ctx, conn, &pgmigrate.Config{})
 	if err != nil {
 		_ = conn.Close()
 		_ = sqlDB.Close()
@@ -68,7 +72,9 @@ func TestMigrations_Lifecycle(t *testing.T) {
 		}
 		t.Skipf("Postgres not available, skipping: %v", err)
 	}
-	if err := testDB.Ping(); err != nil {
+	pingCtx, pingCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer pingCancel()
+	if err := testDB.PingContext(pingCtx); err != nil {
 		_ = testDB.Close()
 		if os.Getenv("CI") != "" {
 			t.Fatalf("CI: PostgreSQL connection failed: %v", err)
@@ -93,6 +99,9 @@ func TestMigrations_Lifecycle(t *testing.T) {
 	if err := m.Up(); err != migrate.ErrNoChange {
 		t.Fatalf("expected ErrNoChange on re-running Up, got: %v", err)
 	}
+
+	// Clean tables before downing all migrations to ensure no non-zero credential_version rows block 000006 down
+	_, _ = sqlDB.Exec("TRUNCATE TABLE sessions, verification_tokens, password_reset_tokens, users CASCADE")
 
 	// 4. Down all migrations cleanly
 	if err := m.Down(); err != nil {
@@ -141,7 +150,9 @@ func TestMigrations_DownRefusedOnSeededDB(t *testing.T) {
 		}
 		t.Skipf("Postgres not available, skipping: %v", err)
 	}
-	if err := testDB.Ping(); err != nil {
+	pingCtx, pingCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer pingCancel()
+	if err := testDB.PingContext(pingCtx); err != nil {
 		_ = testDB.Close()
 		if os.Getenv("CI") != "" {
 			t.Fatalf("CI: PostgreSQL connection failed: %v", err)
