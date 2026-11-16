@@ -127,13 +127,21 @@ func TestInvalidateAllUserSessions_RaceWithRotate_Postgres(t *testing.T) {
 		}
 	}()
 
+	var stopOnce sync.Once
+	stop := func() {
+		stopOnce.Do(func() {
+			close(done)
+			wg.Wait()
+		})
+	}
+	defer stop()
+
 	// Revoke after a short delay.
 	time.Sleep(10 * time.Millisecond)
 	if err := authInst.Session.InvalidateAllUserSessions(ctx, userID); err != nil {
 		t.Fatalf("InvalidateAllUserSessions failed: %v", err)
 	}
-	close(done)
-	wg.Wait()
+	stop()
 
 	mu.Lock()
 	n := rotations
