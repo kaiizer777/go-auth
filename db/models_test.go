@@ -1,8 +1,13 @@
 package db
 
 import (
+	"encoding/json"
 	"reflect"
+	"strings"
 	"testing"
+	"time"
+
+	"github.com/google/uuid"
 )
 
 func TestModelPrimaryKeyTags(t *testing.T) {
@@ -174,5 +179,75 @@ func TestCredentialVersionModelTags(t *testing.T) {
 				t.Errorf("model %s CredentialVersion gorm tag = %q; want %q", tc.name, tag, tc.expectedTag)
 			}
 		})
+	}
+}
+
+func TestUserPasswordHashJSONOmissionAndLogValuer(t *testing.T) {
+	field, ok := reflect.TypeOf(User{}).FieldByName("PasswordHash")
+	if !ok {
+		t.Fatal("User missing PasswordHash field")
+	}
+	if tag := field.Tag.Get("json"); tag != "-" {
+		t.Fatalf("User PasswordHash json tag = %q; want \"-\"", tag)
+	}
+
+	rawHash := "$argon2id$v=19$m=65536,t=3,p=4$c29tZXNhbHQ$9s"
+	u := User{
+		ID:                uuid.New(),
+		Email:             "secure@example.com",
+		PasswordHash:      rawHash,
+		CredentialVersion: 1,
+		EmailVerified:     true,
+		CreatedAt:         time.Now(),
+		UpdatedAt:         time.Now(),
+	}
+
+	data, err := json.Marshal(u)
+	if err != nil {
+		t.Fatalf("json.Marshal(User) failed: %v", err)
+	}
+	if strings.Contains(string(data), rawHash) || strings.Contains(string(data), "password_hash") {
+		t.Fatalf("json.Marshal leaked password hash: %s", string(data))
+	}
+
+	val := u.LogValue()
+	attrs := val.Group()
+	var foundRedacted bool
+	for _, a := range attrs {
+		if a.Key == "password_hash" {
+			if a.Value.String() != "[REDACTED]" {
+				t.Fatalf("expected [REDACTED], got %s", a.Value.String())
+			}
+			foundRedacted = true
+		}
+	}
+	if !foundRedacted {
+		t.Fatal("LogValue() did not contain password_hash attribute")
+	}
+
+	vt := VerificationToken{
+		TokenHash: []byte("sensitive_hash"),
+		UserID:    u.ID,
+		ExpiresAt: time.Now().Add(time.Hour),
+		CreatedAt: time.Now(),
+	}
+	vtVal := vt.LogValue()
+	for _, a := range vtVal.Group() {
+		if a.Key == "token_hash" && a.Value.String() != "[REDACTED]" {
+			t.Fatalf("VerificationToken LogValue expected [REDACTED], got %s", a.Value.String())
+		}
+	}
+
+	prt := PasswordResetToken{
+		TokenHash: []byte("sensitive_hash"),
+		UserID:    u.ID,
+		ExpiresAt: time.Now().Add(time.Hour),
+		CreatedAt: time.Now(),
+	}
+	prtVal := prt.LogValue()
+	for _, a := range prtVal.Group() {
+		if a.Key == "token_hash" && a.Value.String() != "[REDACTED]" {
+			t.Fatalf("PasswordResetToken LogValue expected [REDACTED], got %s", a.Value.String())
+		}
 	}
 }

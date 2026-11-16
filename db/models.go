@@ -1,6 +1,7 @@
 package db
 
 import (
+	"log/slog"
 	"time"
 
 	"github.com/google/uuid"
@@ -10,11 +11,24 @@ import (
 type User struct {
 	ID                uuid.UUID `gorm:"primaryKey;type:uuid;default:uuid_generate_v4()"`
 	Email             string    `gorm:"type:varchar(255);uniqueIndex;not null"`
-	PasswordHash      string    `gorm:"type:text;not null"`
+	PasswordHash      string    `gorm:"type:text;not null" json:"-"`
 	CredentialVersion int       `gorm:"not null;default:0"`
 	EmailVerified     bool      `gorm:"default:false;not null"`
 	CreatedAt         time.Time
 	UpdatedAt         time.Time
+}
+
+// LogValue implements slog.LogValuer to prevent credential leakage in logs.
+func (u User) LogValue() slog.Value {
+	return slog.GroupValue(
+		slog.String("id", u.ID.String()),
+		slog.String("email", u.Email),
+		slog.String("password_hash", "[REDACTED]"),
+		slog.Int("credential_version", u.CredentialVersion),
+		slog.Bool("email_verified", u.EmailVerified),
+		slog.Time("created_at", u.CreatedAt),
+		slog.Time("updated_at", u.UpdatedAt),
+	)
 }
 
 // TableName returns the table name for User.
@@ -56,6 +70,16 @@ type VerificationToken struct {
 // TableName returns the table name for VerificationToken.
 func (VerificationToken) TableName() string { return "verification_tokens" }
 
+// LogValue implements slog.LogValuer to prevent token hash leakage in logs.
+func (v VerificationToken) LogValue() slog.Value {
+	return slog.GroupValue(
+		slog.String("token_hash", "[REDACTED]"),
+		slog.String("user_id", v.UserID.String()),
+		slog.Time("expires_at", v.ExpiresAt),
+		slog.Time("created_at", v.CreatedAt),
+	)
+}
+
 // PasswordResetToken represents a single-use password reset token record.
 type PasswordResetToken struct {
 	TokenHash []byte    `gorm:"primaryKey;column:token_hash;type:bytea"`
@@ -66,3 +90,13 @@ type PasswordResetToken struct {
 
 // TableName returns the table name for PasswordResetToken.
 func (PasswordResetToken) TableName() string { return "password_reset_tokens" }
+
+// LogValue implements slog.LogValuer to prevent token hash leakage in logs.
+func (p PasswordResetToken) LogValue() slog.Value {
+	return slog.GroupValue(
+		slog.String("token_hash", "[REDACTED]"),
+		slog.String("user_id", p.UserID.String()),
+		slog.Time("expires_at", p.ExpiresAt),
+		slog.Time("created_at", p.CreatedAt),
+	)
+}
