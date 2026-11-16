@@ -142,15 +142,13 @@ func (s *service) GetSession(ctx context.Context, rawID string) (*Session, error
 		Where("id = ?", record.UserID).
 		First(&user).Error
 	currentVersion := 0
-	if uerr != nil && !errors.Is(uerr, gorm.ErrRecordNotFound) {
-		_ = s.db.WithContext(ctx).Where("id = ?", record.ID).Delete(&db.Session{}).Error
-		slog.InfoContext(ctx, "session_invalidated",
-			"user_id", record.UserID.String(),
-			"reason", "credential_version_mismatch",
-		)
-		return nil, apperrors.ErrSessionInvalid
-	}
-	if uerr == nil {
+	if uerr != nil {
+		if errors.Is(uerr, gorm.ErrRecordNotFound) {
+			currentVersion = 0
+		} else {
+			return nil, apperrors.New(apperrors.CodeInternalError, "failed to query user", uerr)
+		}
+	} else {
 		currentVersion = user.CredentialVersion
 	}
 	if currentVersion != record.CredentialVersion {
@@ -337,20 +335,10 @@ func (s *service) RotateSession(
 		}
 	}
 
-	// Re-check the user's current credential version so a rotation cannot mint
-	// a session under a superseded credential. A missing user row is tolerated.
-	var user db.User
-	uerr := s.db.WithContext(ctx).
-		Select("credential_version").
-		Where("id = ?", oldRecord.UserID).
-		First(&user).Error
-	if uerr != nil && !errors.Is(uerr, gorm.ErrRecordNotFound) {
-		return nil, "", apperrors.ErrSessionInvalid
-	}
-	if uerr == nil && user.CredentialVersion != oldRecord.CredentialVersion {
-		return nil, "", apperrors.ErrSessionInvalid
-	}
-
+	// Re-check the user's current credential version inside the transaction so a
+	// rotation cannot mint a session under a superseded credential. A missing
+	// user row is tolerated (treated as version 0). Transient lookup failures
+	// surface as internal errors; a version mismatch purges the stale row.
 	tx := s.db.WithContext(ctx).Begin()
 	if tx.Error != nil {
 		return nil, "", apperrors.New(apperrors.CodeInternalError, "failed to begin transaction", tx.Error)
@@ -361,6 +349,32 @@ func (s *service) RotateSession(
 			panic(r)
 		}
 	}()
+
+	var user db.User
+	uerr := tx.
+		Select("credential_version").
+		Where("id = ?", oldRecord.UserID).
+		First(&user).Error
+	currentVersion := oldRecord.CredentialVersion
+	if uerr != nil {
+		if errors.Is(uerr, gorm.ErrRecordNotFound) {
+			currentVersion = 0
+		} else {
+			tx.Rollback()
+			return nil, "", apperrors.New(apperrors.CodeInternalError, "failed to query user", uerr)
+		}
+	} else {
+		currentVersion = user.CredentialVersion
+	}
+	if currentVersion != oldRecord.CredentialVersion {
+		_ = tx.Where("id_hash = ?", oldHash).Delete(&db.Session{}).Error
+		_ = tx.Commit().Error
+		slog.InfoContext(ctx, "session_invalidated",
+			"user_id", oldRecord.UserID.String(),
+			"reason", "credential_version_mismatch",
+		)
+		return nil, "", apperrors.ErrSessionInvalid
+	}
 
 	res := tx.Where("id_hash = ?", oldHash).Delete(&db.Session{})
 	if res.Error != nil {
@@ -402,7 +416,7 @@ func (s *service) RotateSession(
 		SessionType:       oldRecord.SessionType,
 		IPAddress:         ip,
 		UserAgent:         userAgent,
-		CredentialVersion:  oldRecord.CredentialVersion,
+		CredentialVersion: currentVersion,
 		LastActiveAt:      now,
 		AbsoluteExpiresAt: oldRecord.AbsoluteExpiresAt,
 		CreatedAt:         oldRecord.CreatedAt,

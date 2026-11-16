@@ -8,11 +8,11 @@ import (
 
 // User represents an authenticated account record in the database.
 type User struct {
-	ID            uuid.UUID `gorm:"primaryKey;type:uuid;default:uuid_generate_v4()"`
-	Email         string    `gorm:"type:varchar(255);uniqueIndex;not null"`
-	PasswordHash      string `gorm:"type:text;not null"`
-	CredentialVersion int    `gorm:"not null;default:0"`
-	EmailVerified     bool   `gorm:"default:false;not null"`
+	ID                uuid.UUID `gorm:"primaryKey;type:uuid;default:uuid_generate_v4()"`
+	Email             string    `gorm:"type:varchar(255);uniqueIndex;not null"`
+	PasswordHash      string    `gorm:"type:text;not null"`
+	CredentialVersion int       `gorm:"not null;default:0"`
+	EmailVerified     bool      `gorm:"default:false;not null"`
 	CreatedAt         time.Time
 	UpdatedAt         time.Time
 }
