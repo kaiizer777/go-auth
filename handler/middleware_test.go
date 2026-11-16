@@ -51,6 +51,10 @@ func (m *mockSessionService) ListSessions(ctx context.Context, userID uuid.UUID)
 	return nil, nil
 }
 
+func (m *mockSessionService) PurgeExpired(ctx context.Context) (int64, error) {
+	return 0, nil
+}
+
 const validTestToken = "0123456789abcdef0123456789abcdef"
 
 func TestRequireAuth_CookieSession_Valid(t *testing.T) {
