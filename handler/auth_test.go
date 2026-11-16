@@ -1112,6 +1112,52 @@ func TestAuthHandler_Logout_InvalidateSessionError(t *testing.T) {
 	}
 }
 
+func TestAuthHandler_Logout_ClearsCSRFCookieAndSessionCookie(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.SessionCookieName = "sid"
+	cfg.CSRFCookieName = "csrf_token"
+
+	mockSvc := &mockAuthService{}
+	mockSess := &mockSessionService{}
+	authH := NewAuthHandler(mockSvc,
+		WithAuthConfig(&cfg),
+		WithAuthSessionService(mockSess),
+	)
+
+	req := httptest.NewRequest(http.MethodPost, "/auth/logout", nil)
+	req.AddCookie(&http.Cookie{Name: "sid", Value: "0123456789abcdef0123456789abcdef"})
+	rec := httptest.NewRecorder()
+
+	authH.Logout(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK on logout, got %d", rec.Code)
+	}
+
+	var clearedSession, clearedCSRF *http.Cookie
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == cfg.SessionCookieName {
+			clearedSession = c
+		}
+		if c.Name == cfg.CSRFCookieName {
+			clearedCSRF = c
+		}
+	}
+
+	if clearedSession == nil {
+		t.Fatalf("expected session cookie %q to be cleared", cfg.SessionCookieName)
+	}
+	if clearedSession.MaxAge != -1 {
+		t.Fatalf("expected session cookie MaxAge -1, got %d", clearedSession.MaxAge)
+	}
+	if clearedCSRF == nil {
+		t.Fatalf("expected CSRF cookie %q to be cleared", cfg.CSRFCookieName)
+	}
+	if clearedCSRF.MaxAge != -1 {
+		t.Fatalf("expected CSRF cookie MaxAge -1, got %d", clearedCSRF.MaxAge)
+	}
+}
+
 func TestDecodeJSON_NilBody(t *testing.T) {
 	mockSvc := &mockAuthService{}
 	authH := NewAuthHandler(mockSvc)

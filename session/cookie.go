@@ -30,8 +30,8 @@ func SetSessionCookie(w http.ResponseWriter, rawID string, cfg *config.Config) {
 // HttpOnly is HARDCODED to true — callers cannot opt out.
 func SetSessionCookieWithExpiry(w http.ResponseWriter, rawID string, expiresAt time.Time, cfg *config.Config) {
 	remaining := int(time.Until(expiresAt).Seconds())
-	if remaining < 0 {
-		remaining = 0
+	if remaining <= 0 {
+		remaining = -1
 	}
 	http.SetCookie(w, &http.Cookie{
 		Name:     cfg.SessionCookieName,

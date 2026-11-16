@@ -250,15 +250,14 @@ func (h *AuthHandler) Logout(w http.ResponseWriter, r *http.Request) {
 		sessionID = rawID
 	}
 
-	if h.sessionSvc != nil {
-		if sessionID != "" {
-			if err := h.sessionSvc.InvalidateSession(r.Context(), sessionID); err != nil {
-				errors.WriteJSON(w, err)
-				return
-			}
+	if h.sessionSvc != nil && sessionID != "" {
+		if err := h.sessionSvc.InvalidateSession(r.Context(), sessionID); err != nil {
+			errors.WriteJSON(w, err)
+			return
 		}
-		session.ClearSessionCookie(w, h.cfg)
 	}
+	session.ClearSessionCookie(w, h.cfg)
+	clearCSRFCookie(w, h.cfg)
 
 	if h.svc != nil {
 		if err := h.svc.Logout(r.Context(), sessionID); err != nil {

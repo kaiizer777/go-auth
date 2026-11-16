@@ -241,7 +241,7 @@ func TestSetSessionCookieWithExpiry(t *testing.T) {
 		}
 	})
 
-	t.Run("clamps non-positive remaining expiry to zero", func(t *testing.T) {
+	t.Run("clamps non-positive remaining expiry to -1 for immediate deletion", func(t *testing.T) {
 		rec := httptest.NewRecorder()
 		rawID := "0123456789abcdef0123456789abcdef"
 		expiresAt := time.Now().Add(-10 * time.Second)
@@ -253,8 +253,8 @@ func TestSetSessionCookieWithExpiry(t *testing.T) {
 			t.Fatalf("expected 1 cookie, got %d", len(cookies))
 		}
 		c := cookies[0]
-		if c.MaxAge != 0 {
-			t.Fatalf("expected MaxAge 0 for past expiry, got %d", c.MaxAge)
+		if c.MaxAge != -1 {
+			t.Fatalf("expected MaxAge -1 for past expiry, got %d", c.MaxAge)
 		}
 	})
 }
