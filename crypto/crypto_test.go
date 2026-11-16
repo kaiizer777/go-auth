@@ -373,6 +373,44 @@ func TestValidatePassword(t *testing.T) {
 	}
 }
 
+func TestValidatePassword_SentinelErrorsAndExtensibility(t *testing.T) {
+	// Verify sentinel errors match via errors.Is
+	if !errors.Is(ValidatePassword("short", 8, 64), ErrPasswordTooShort) {
+		t.Error("expected ErrPasswordTooShort via errors.Is")
+	}
+	if !errors.Is(ValidatePassword(strings.Repeat("a", 65), 8, 64), ErrPasswordTooLong) {
+		t.Error("expected ErrPasswordTooLong via errors.Is")
+	}
+	if !errors.Is(ValidatePassword("password", 8, 64), ErrPasswordTooCommon) {
+		t.Error("expected ErrPasswordTooCommon via errors.Is")
+	}
+
+	// Test extraBlocked parameter in ValidatePassword
+	customPassword := "CompanyCustomSecret2026!"
+	if err := ValidatePassword(customPassword, 8, 64); err != nil {
+		t.Fatalf("expected custom password to be valid by default, got %v", err)
+	}
+	if err := ValidatePassword(customPassword, 8, 64, "companycustomsecret2026!"); !errors.Is(err, ErrPasswordTooCommon) {
+		t.Fatalf("expected custom password to be rejected with ErrPasswordTooCommon when passed in extraBlocked, got %v", err)
+	}
+
+	// Test AddBlockedPasswords
+	dynamicPassword := "SuperCompanyDisallowedPassphrase123!"
+	if IsCommonPassword(dynamicPassword) {
+		t.Fatalf("password should not be in blocklist yet")
+	}
+	AddBlockedPasswords(dynamicPassword)
+	if !IsCommonPassword(dynamicPassword) {
+		t.Fatalf("password should now be found in blocklist after AddBlockedPasswords")
+	}
+	if !IsCommonPassword(strings.ToLower(dynamicPassword)) {
+		t.Fatalf("password should be found in blocklist case-insensitively")
+	}
+	if err := ValidatePassword(dynamicPassword, 8, 64); !errors.Is(err, ErrPasswordTooCommon) {
+		t.Fatalf("expected ValidatePassword to reject newly added dynamic password, got %v", err)
+	}
+}
+
 func TestVerifyPassword_ParameterOrderPermutations(t *testing.T) {
 	params := fastTestParams()
 	password := "SecretP@ssw0rd!"
