@@ -353,6 +353,16 @@ func (s *service) InvalidateAllUserSessions(ctx context.Context, userID uuid.UUI
 		}
 	}()
 
+	// Bump the user's credential version (revocation epoch) when the row
+	// exists; this serializes against concurrent RotateSession/CreateSession
+	// via the row lock and gives a read-time backstop for any session row
+	// that escapes deletion. Missing user is a no-op success (no row to bump).
+	if err := tx.Model(&db.User{}).Where("id = ?", userID).
+		Update("credential_version", gorm.Expr("credential_version + 1")).Error; err != nil {
+		tx.Rollback()
+		return apperrors.New(apperrors.CodeInternalError, "failed to bump credential version", err)
+	}
+
 	if err := tx.Where("user_id = ?", userID).Delete(&db.Session{}).Error; err != nil {
 		tx.Rollback()
 		return apperrors.New(apperrors.CodeInternalError, "failed to invalidate all sessions", err)
