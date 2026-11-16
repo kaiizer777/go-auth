@@ -37,13 +37,11 @@ func TestInvalidateAllUserSessions_BumpsVersion_Postgres(t *testing.T) {
 	}
 
 	// Create a few sessions via the service.
-	var rawIDs []string
 	for i := 0; i < 3; i++ {
-		_, rawID, err := authInst.Session.CreateSession(ctx, userID, 0, db.SessionTypeCookie, "127.0.0.1", "agent")
+		_, _, err := authInst.Session.CreateSession(ctx, userID, 0, db.SessionTypeCookie, "127.0.0.1", "agent")
 		if err != nil {
 			t.Fatalf("CreateSession failed: %v", err)
 		}
-		rawIDs = append(rawIDs, rawID)
 	}
 
 	if err := authInst.Session.InvalidateAllUserSessions(ctx, userID); err != nil {
@@ -102,6 +100,7 @@ func TestInvalidateAllUserSessions_RaceWithRotate_Postgres(t *testing.T) {
 
 	var mu sync.Mutex
 	current := rawID
+	var rotations int
 
 	// Rotate in a loop.
 	done := make(chan struct{})
@@ -122,6 +121,7 @@ func TestInvalidateAllUserSessions_RaceWithRotate_Postgres(t *testing.T) {
 			if err == nil && sess != nil && newTok != "" {
 				mu.Lock()
 				current = newTok
+				rotations++
 				mu.Unlock()
 			}
 		}
@@ -134,6 +134,13 @@ func TestInvalidateAllUserSessions_RaceWithRotate_Postgres(t *testing.T) {
 	}
 	close(done)
 	wg.Wait()
+
+	mu.Lock()
+	n := rotations
+	mu.Unlock()
+	if n == 0 {
+		t.Fatal("expected at least one successful rotation")
+	}
 
 	// Invariant: every surviving session row must carry the current credential version.
 	var user db.User
