@@ -484,8 +484,6 @@ func (s *service) RotateSession(
 		return nil, "", apperrors.ErrSessionInvalid
 	}
 
-	// NOTE: InvalidateAllUserSessions stays a lone non-tx DELETE by design;
-	// its bulk-revoke blind window is tracked in issue #28 (out of scope here).
 	res := tx.Where("id_hash = ?", oldHash).Delete(&db.Session{})
 	if res.Error != nil {
 		tx.Rollback()
