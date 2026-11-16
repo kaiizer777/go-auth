@@ -287,6 +287,88 @@ func TestCreateSession_RejectsMissingUser(t *testing.T) {
 	}
 }
 
+func TestGetSession_RejectsMissingUser(t *testing.T) {
+	database := setupTestDB(t)
+	cfg := testConfig()
+	svc := NewService(database, cfg)
+
+	orphanID := uuid.New()
+	rawID, err := generateRawID()
+	if err != nil {
+		t.Fatalf("generateRawID failed: %v", err)
+	}
+	now := time.Now().UTC()
+	if err := database.Create(&db.Session{
+		ID:                uuid.New(),
+		UserID:            orphanID,
+		IDHash:            hashID(rawID),
+		SessionType:       db.SessionTypeCookie,
+		CredentialVersion: 0,
+		LastActiveAt:      now,
+		AbsoluteExpiresAt: now.Add(cfg.SessionAbsoluteMaxAge),
+		CreatedAt:         now,
+	}).Error; err != nil {
+		t.Fatalf("failed to seed orphan session: %v", err)
+	}
+
+	sess, err := svc.GetSession(context.Background(), rawID)
+	if sess != nil {
+		t.Fatalf("expected nil session for missing user, got %+v", sess)
+	}
+	if !errors.Is(err, apperrors.ErrSessionInvalid) {
+		t.Fatalf("expected ErrSessionInvalid, got %v", err)
+	}
+
+	var count int64
+	if err := database.Model(&db.Session{}).Where("id_hash = ?", hashID(rawID)).Count(&count).Error; err != nil {
+		t.Fatalf("failed to count sessions: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("expected orphan session purged, found %d", count)
+	}
+}
+
+func TestRotateSession_RejectsMissingUser(t *testing.T) {
+	database := setupTestDB(t)
+	cfg := testConfig()
+	svc := NewService(database, cfg)
+
+	orphanID := uuid.New()
+	rawID, err := generateRawID()
+	if err != nil {
+		t.Fatalf("generateRawID failed: %v", err)
+	}
+	now := time.Now().UTC()
+	if err := database.Create(&db.Session{
+		ID:                uuid.New(),
+		UserID:            orphanID,
+		IDHash:            hashID(rawID),
+		SessionType:       db.SessionTypeCookie,
+		CredentialVersion: 0,
+		LastActiveAt:      now,
+		AbsoluteExpiresAt: now.Add(cfg.SessionAbsoluteMaxAge),
+		CreatedAt:         now,
+	}).Error; err != nil {
+		t.Fatalf("failed to seed orphan session: %v", err)
+	}
+
+	newSess, newRawID, err := svc.RotateSession(context.Background(), rawID, "2.2.2.2", "agent-new")
+	if newSess != nil || newRawID != "" {
+		t.Fatalf("expected nil sess and empty rawID, got sess=%+v rawID=%q", newSess, newRawID)
+	}
+	if !errors.Is(err, apperrors.ErrSessionInvalid) {
+		t.Fatalf("expected ErrSessionInvalid, got %v", err)
+	}
+
+	var count int64
+	if err := database.Model(&db.Session{}).Where("id_hash = ?", hashID(rawID)).Count(&count).Error; err != nil {
+		t.Fatalf("failed to count sessions: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("expected orphan session purged, found %d", count)
+	}
+}
+
 func TestRotateSession_CredentialMismatch(t *testing.T) {
 	database := setupTestDB(t)
 	cfg := testConfig()
@@ -342,9 +424,11 @@ func TestGetSession_IdleTimeout(t *testing.T) {
 
 	rawID, _ := generateRawID()
 	now := time.Now().UTC()
+	userID := uuid.New()
+	seedTestUser(t, database, userID)
 	row := &db.Session{
 		ID:                uuid.New(),
-		UserID:            uuid.New(),
+		UserID:            userID,
 		IDHash:            hashID(rawID),
 		SessionType:       db.SessionTypeCookie,
 		LastActiveAt:      now.Add(-cfg.SessionIdleTimeout - 2*time.Second),
@@ -376,6 +460,7 @@ func TestGetSession_IdleCheckDoesNotEvictRefreshedSession(t *testing.T) {
 	svc := NewService(database, cfg)
 
 	userID := uuid.New()
+	seedTestUser(t, database, userID)
 	rawID, err := generateRawID()
 	if err != nil {
 		t.Fatalf("generateRawID failed: %v", err)
@@ -428,9 +513,11 @@ func TestGetSession_AbsoluteTimeout(t *testing.T) {
 
 	rawID, _ := generateRawID()
 	now := time.Now().UTC()
+	userID := uuid.New()
+	seedTestUser(t, database, userID)
 	row := &db.Session{
 		ID:                uuid.New(),
-		UserID:            uuid.New(),
+		UserID:            userID,
 		IDHash:            hashID(rawID),
 		SessionType:       db.SessionTypeCookie,
 		LastActiveAt:      now,
@@ -462,6 +549,7 @@ func TestGetSession_Valid(t *testing.T) {
 	svc := NewService(database, cfg)
 
 	userID := uuid.New()
+	seedTestUser(t, database, userID)
 	rawID, err := generateRawID()
 	if err != nil {
 		t.Fatalf("generateRawID failed: %v", err)
@@ -520,6 +608,7 @@ func TestGetSession_MonotonicLastActiveAtUpdate(t *testing.T) {
 	svc := NewService(database, cfg)
 
 	userID := uuid.New()
+	seedTestUser(t, database, userID)
 	rawID, err := generateRawID()
 	if err != nil {
 		t.Fatalf("generateRawID failed: %v", err)
@@ -564,6 +653,7 @@ func TestGetSession_LastActiveAtThrottling(t *testing.T) {
 	svc := NewService(database, cfg)
 
 	userID := uuid.New()
+	seedTestUser(t, database, userID)
 	rawID, err := generateRawID()
 	if err != nil {
 		t.Fatalf("generateRawID failed: %v", err)
@@ -825,9 +915,11 @@ func TestRotateSession_Expired_IdleTimeout(t *testing.T) {
 
 	rawID, _ := generateRawID()
 	now := time.Now().UTC()
+	userID := uuid.New()
+	seedTestUser(t, database, userID)
 	row := &db.Session{
 		ID:                uuid.New(),
-		UserID:            uuid.New(),
+		UserID:            userID,
 		IDHash:            hashID(rawID),
 		SessionType:       db.SessionTypeCookie,
 		LastActiveAt:      now.Add(-cfg.SessionIdleTimeout - 2*time.Second),
@@ -859,6 +951,7 @@ func TestRotateSession_IdleCheckDoesNotEvictRefreshedSession(t *testing.T) {
 	svc := NewService(database, cfg)
 
 	userID := uuid.New()
+	seedTestUser(t, database, userID)
 	rawID, err := generateRawID()
 	if err != nil {
 		t.Fatalf("generateRawID failed: %v", err)
@@ -906,9 +999,11 @@ func TestRotateSession_Expired_AbsoluteTimeout(t *testing.T) {
 
 	rawID, _ := generateRawID()
 	now := time.Now().UTC()
+	userID := uuid.New()
+	seedTestUser(t, database, userID)
 	row := &db.Session{
 		ID:                uuid.New(),
-		UserID:            uuid.New(),
+		UserID:            userID,
 		IDHash:            hashID(rawID),
 		SessionType:       db.SessionTypeCookie,
 		LastActiveAt:      now,
@@ -985,9 +1080,11 @@ func TestRotateSession_PreservesAbsoluteExpiresAt(t *testing.T) {
 	now := time.Now().UTC()
 	// Set absolute expiry to 3 hours from now (less than default 24h)
 	initialAbsoluteExpiry := now.Add(3 * time.Hour).Truncate(time.Second)
+	userID := uuid.New()
+	seedTestUser(t, database, userID)
 	row := &db.Session{
 		ID:                uuid.New(),
-		UserID:            uuid.New(),
+		UserID:            userID,
 		IDHash:            hashID(rawID),
 		SessionType:       db.SessionTypeCookie,
 		LastActiveAt:      now,
@@ -1027,9 +1124,11 @@ func TestRotateSession_PreservesCreatedAt(t *testing.T) {
 	rawID, _ := generateRawID()
 	now := time.Now().UTC()
 	initialCreatedAt := now.Add(-5 * time.Hour).Truncate(time.Second)
+	userID := uuid.New()
+	seedTestUser(t, database, userID)
 	row := &db.Session{
 		ID:                uuid.New(),
-		UserID:            uuid.New(),
+		UserID:            userID,
 		IDHash:            hashID(rawID),
 		SessionType:       db.SessionTypeCookie,
 		LastActiveAt:      now,
@@ -1066,9 +1165,11 @@ func TestRotateSession_ExpiryWindowGuard(t *testing.T) {
 	t.Run("fails when absolute timeout elapses right at rotation", func(t *testing.T) {
 		rawID, _ := generateRawID()
 		now := time.Now().UTC()
+		userID := uuid.New()
+		seedTestUser(t, database, userID)
 		row := &db.Session{
 			ID:                uuid.New(),
-			UserID:            uuid.New(),
+			UserID:            userID,
 			IDHash:            hashID(rawID),
 			SessionType:       db.SessionTypeCookie,
 			LastActiveAt:      now,
@@ -1093,9 +1194,11 @@ func TestRotateSession_ExpiryWindowGuard(t *testing.T) {
 	t.Run("fails when idle timeout elapses right at rotation", func(t *testing.T) {
 		rawID, _ := generateRawID()
 		now := time.Now().UTC()
+		userID := uuid.New()
+		seedTestUser(t, database, userID)
 		row := &db.Session{
 			ID:                uuid.New(),
-			UserID:            uuid.New(),
+			UserID:            userID,
 			IDHash:            hashID(rawID),
 			SessionType:       db.SessionTypeCookie,
 			LastActiveAt:      now.Add(-cfg.SessionIdleTimeout).Add(1 * time.Millisecond),

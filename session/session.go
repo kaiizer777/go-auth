@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -15,6 +16,7 @@ import (
 	"github.com/kaiizer777/go-auth/db"
 	apperrors "github.com/kaiizer777/go-auth/errors"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // Service defines session management operations.
@@ -42,6 +44,16 @@ func NewService(gormDB *gorm.DB, cfg *config.Config) Service {
 		cfg = &defaultCfg
 	}
 	return &service{db: gormDB, cfg: cfg}
+}
+
+// lockForUpdate applies SELECT ... FOR UPDATE on dialects with row locking.
+// SQLite has no FOR UPDATE syntax and serializes writers inside the tx, so the
+// clause is skipped there; other dialects lock the re-read user row.
+func lockForUpdate(tx *gorm.DB) *gorm.DB {
+	if strings.Contains(strings.ToLower(tx.Dialector.Name()), "sqlite") {
+		return tx
+	}
+	return tx.Clauses(clause.Locking{Strength: "UPDATE"})
 }
 
 // generateRawID creates a cryptographically random 128-bit session ID.
@@ -85,9 +97,11 @@ func (s *service) CreateSession(
 
 	// Mint-time credential check runs inside a transaction with the insert so
 	// a password reset committing between the version re-read and the insert
-	// cannot mint a stale-version row. A missing user row fails closed with
-	// ErrSessionInvalid (no orphan mint). Residual read-committed interleaving
-	// stays fail-closed via GetSession version rejection. Nothing persists on mismatch.
+	// cannot mint a stale-version row. The user row is locked for update
+	// where the dialect supports it (skipped on SQLite, which serializes
+	// writers in-tx). A missing user row fails closed with
+	// ErrSessionInvalid (no orphan mint). Read-time rejection in GetSession
+	// stays as backstop. Nothing persists on mismatch.
 	tx := s.db.WithContext(ctx).Begin()
 	if tx.Error != nil {
 		return nil, "", apperrors.New(apperrors.CodeInternalError, "failed to begin transaction", tx.Error)
@@ -100,7 +114,7 @@ func (s *service) CreateSession(
 	}()
 
 	var user db.User
-	if uerr := tx.Select("credential_version").Where("id = ?", userID).First(&user).Error; uerr != nil {
+	if uerr := lockForUpdate(tx).Select("credential_version").Where("id = ?", userID).First(&user).Error; uerr != nil {
 		tx.Rollback()
 		if errors.Is(uerr, gorm.ErrRecordNotFound) {
 			slog.InfoContext(ctx, "session_invalidated",
@@ -145,6 +159,7 @@ func (s *service) CreateSession(
 		return nil, "", apperrors.New(apperrors.CodeInternalError, "failed to create session", err)
 	}
 	if err := tx.Commit().Error; err != nil {
+		tx.Rollback()
 		return nil, "", apperrors.New(apperrors.CodeInternalError, "failed to commit session", err)
 	}
 
@@ -176,24 +191,25 @@ func (s *service) GetSession(ctx context.Context, rawID string) (*Session, error
 	}
 
 	// Credential-version check: reject sessions minted under superseded credentials
-	// (e.g. after a password reset) and drop the stale row. A missing user row is
-	// treated as version 0 for backward compatibility with orphaned/legacy rows.
+	// (e.g. after a password reset) and drop the stale row. A missing user row
+	// fails closed: the orphan row is purged and rejected as invalid.
 	var user db.User
 	uerr := s.db.WithContext(ctx).
 		Select("credential_version").
 		Where("id = ?", record.UserID).
 		First(&user).Error
-	currentVersion := 0
 	if uerr != nil {
 		if errors.Is(uerr, gorm.ErrRecordNotFound) {
-			currentVersion = 0
-		} else {
-			return nil, apperrors.New(apperrors.CodeInternalError, "failed to query user", uerr)
+			_ = s.db.WithContext(ctx).Where("id = ?", record.ID).Delete(&db.Session{}).Error
+			slog.InfoContext(ctx, "session_invalidated",
+				"user_id", record.UserID.String(),
+				"reason", "missing_user_at_read",
+			)
+			return nil, apperrors.ErrSessionInvalid
 		}
-	} else {
-		currentVersion = user.CredentialVersion
+		return nil, apperrors.New(apperrors.CodeInternalError, "failed to query user", uerr)
 	}
-	if currentVersion != record.CredentialVersion {
+	if user.CredentialVersion != record.CredentialVersion {
 		_ = s.db.WithContext(ctx).Where("id = ?", record.ID).Delete(&db.Session{}).Error
 		slog.InfoContext(ctx, "session_invalidated",
 			"user_id", record.UserID.String(),
@@ -378,9 +394,10 @@ func (s *service) RotateSession(
 	}
 
 	// Re-check the user's current credential version inside the transaction so a
-	// rotation cannot mint a session under a superseded credential. A missing
-	// user row is tolerated (treated as version 0). Transient lookup failures
-	// surface as internal errors; a version mismatch purges the stale row.
+	// rotation cannot mint a session under a superseded credential. The user
+	// row is locked where the dialect supports it; a missing user fails
+	// closed and purges the orphan row. Transient lookup failures surface as
+	// internal errors; a version mismatch purges the stale row.
 	tx := s.db.WithContext(ctx).Begin()
 	if tx.Error != nil {
 		return nil, "", apperrors.New(apperrors.CodeInternalError, "failed to begin transaction", tx.Error)
@@ -393,21 +410,24 @@ func (s *service) RotateSession(
 	}()
 
 	var user db.User
-	uerr := tx.
+	uerr := lockForUpdate(tx).
 		Select("credential_version").
 		Where("id = ?", oldRecord.UserID).
 		First(&user).Error
-	currentVersion := 0
 	if uerr != nil {
 		if errors.Is(uerr, gorm.ErrRecordNotFound) {
-			currentVersion = 0
-		} else {
-			tx.Rollback()
-			return nil, "", apperrors.New(apperrors.CodeInternalError, "failed to query user", uerr)
+			_ = tx.Where("id_hash = ?", oldHash).Delete(&db.Session{}).Error
+			_ = tx.Commit().Error
+			slog.InfoContext(ctx, "session_invalidated",
+				"user_id", oldRecord.UserID.String(),
+				"reason", "missing_user_at_rotate",
+			)
+			return nil, "", apperrors.ErrSessionInvalid
 		}
-	} else {
-		currentVersion = user.CredentialVersion
+		tx.Rollback()
+		return nil, "", apperrors.New(apperrors.CodeInternalError, "failed to query user", uerr)
 	}
+	currentVersion := user.CredentialVersion
 	if currentVersion != oldRecord.CredentialVersion {
 		_ = tx.Where("id_hash = ?", oldHash).Delete(&db.Session{}).Error
 		_ = tx.Commit().Error
@@ -470,6 +490,7 @@ func (s *service) RotateSession(
 	}
 
 	if err := tx.Commit().Error; err != nil {
+		tx.Rollback()
 		return nil, "", apperrors.New(apperrors.CodeInternalError, "failed to commit session rotation", err)
 	}
 
