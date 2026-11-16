@@ -342,11 +342,24 @@ func (s *service) InvalidateSession(ctx context.Context, rawID string) error {
 }
 
 func (s *service) InvalidateAllUserSessions(ctx context.Context, userID uuid.UUID) error {
-	result := s.db.WithContext(ctx).
-		Where("user_id = ?", userID).
-		Delete(&db.Session{})
-	if result.Error != nil {
-		return apperrors.New(apperrors.CodeInternalError, "failed to invalidate all sessions", result.Error)
+	tx := s.db.WithContext(ctx).Begin()
+	if tx.Error != nil {
+		return apperrors.New(apperrors.CodeInternalError, "failed to begin transaction", tx.Error)
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			tx.Rollback()
+			panic(r)
+		}
+	}()
+
+	if err := tx.Where("user_id = ?", userID).Delete(&db.Session{}).Error; err != nil {
+		tx.Rollback()
+		return apperrors.New(apperrors.CodeInternalError, "failed to invalidate all sessions", err)
+	}
+	if err := tx.Commit().Error; err != nil {
+		tx.Rollback()
+		return apperrors.New(apperrors.CodeInternalError, "failed to commit session invalidation", err)
 	}
 	slog.InfoContext(ctx, "all_sessions_invalidated", "user_id", userID.String())
 	return nil
