@@ -40,14 +40,6 @@ func BuildResetURL(baseURL, token string) string {
 	return baseURL + "/auth/password/reset?token=" + url.QueryEscape(token)
 }
 
-func buildVerificationURL(baseURL, token string) string {
-	return BuildVerificationURL(baseURL, token)
-}
-
-func buildResetURL(baseURL, token string) string {
-	return BuildResetURL(baseURL, token)
-}
-
 // DispatcherConfig holds email dispatcher settings owned by the email package.
 type DispatcherConfig struct {
 	BaseURL                   string

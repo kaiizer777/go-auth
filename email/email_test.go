@@ -18,7 +18,7 @@ func captureLogger(buf *bytes.Buffer) *slog.Logger {
 }
 
 func TestBuildVerificationURL(t *testing.T) {
-	got := buildVerificationURL("https://example.com", "tok123")
+	got := BuildVerificationURL("https://example.com", "tok123")
 	want := "https://example.com/auth/verify/email?token=tok123"
 	if got != want {
 		t.Fatalf("got %q, want %q", got, want)
@@ -26,7 +26,7 @@ func TestBuildVerificationURL(t *testing.T) {
 }
 
 func TestBuildVerificationURL_EscapesToken(t *testing.T) {
-	got := buildVerificationURL("https://example.com", "a b&c=d")
+	got := BuildVerificationURL("https://example.com", "a b&c=d")
 	want := "https://example.com/auth/verify/email?token=a+b%26c%3Dd"
 	if got != want {
 		t.Fatalf("got %q, want %q", got, want)
@@ -34,7 +34,7 @@ func TestBuildVerificationURL_EscapesToken(t *testing.T) {
 }
 
 func TestBuildResetURL(t *testing.T) {
-	got := buildResetURL("https://example.com", "tok123")
+	got := BuildResetURL("https://example.com", "tok123")
 	want := "https://example.com/auth/password/reset?token=tok123"
 	if got != want {
 		t.Fatalf("got %q, want %q", got, want)
@@ -42,7 +42,7 @@ func TestBuildResetURL(t *testing.T) {
 }
 
 func TestBuildResetURL_EscapesToken(t *testing.T) {
-	got := buildResetURL("https://example.com", "a b&c=d")
+	got := BuildResetURL("https://example.com", "a b&c=d")
 	want := "https://example.com/auth/password/reset?token=a+b%26c%3Dd"
 	if got != want {
 		t.Fatalf("got %q, want %q", got, want)
@@ -71,7 +71,7 @@ func TestDispatchVerification_PayloadCaptured(t *testing.T) {
 		UserID:    "user-1",
 		To:        "user@example.com",
 		Token:     "tok-123",
-		URL:       buildVerificationURL("https://example.com", "tok-123"),
+		URL:       BuildVerificationURL("https://example.com", "tok-123"),
 		ExpiresAt: expires,
 	}
 	d.DispatchVerification(context.Background(), payload)
@@ -123,7 +123,7 @@ func TestDispatchPasswordReset_PayloadCaptured(t *testing.T) {
 		UserID:    "user-2",
 		To:        "user2@example.com",
 		Token:     "reset-456",
-		URL:       buildResetURL("https://example.com", "reset-456"),
+		URL:       BuildResetURL("https://example.com", "reset-456"),
 		ExpiresAt: expires,
 	}
 	d.DispatchPasswordReset(context.Background(), payload)
@@ -422,7 +422,7 @@ func TestDispatch_EmptyUserIDZeroExpiresAt(t *testing.T) {
 		DisableAsyncEmailDispatch: true,
 		EmailDispatchTimeout:      time.Second,
 	}, captureLogger(&bytes.Buffer{}))
-	payload := VerificationEmailPayload{UserID: "", To: "a@b.com", Token: "t", URL: buildVerificationURL("https://example.com", "t"), ExpiresAt: time.Time{}}
+	payload := VerificationEmailPayload{UserID: "", To: "a@b.com", Token: "t", URL: BuildVerificationURL("https://example.com", "t"), ExpiresAt: time.Time{}}
 	d.DispatchVerification(context.Background(), payload)
 	select {
 	case <-called:
