@@ -355,7 +355,7 @@ func (s *service) RotateSession(
 		Select("credential_version").
 		Where("id = ?", oldRecord.UserID).
 		First(&user).Error
-	currentVersion := oldRecord.CredentialVersion
+	currentVersion := 0
 	if uerr != nil {
 		if errors.Is(uerr, gorm.ErrRecordNotFound) {
 			currentVersion = 0
