@@ -529,12 +529,17 @@ func TestSessionCookieHttpOnly(t *testing.T) {
 // Test 18: TestBearerTokenEntropy (ASVS V3.1.1)
 // 1,000 generated tokens are exactly 32 hex chars with zero duplicate collisions
 func TestBearerTokenEntropy(t *testing.T) {
-	app, _, _ := setupSecurityApp(t)
+	app, database, _ := setupSecurityApp(t)
 	const count = 1000
 	seen := make(map[string]struct{}, count)
 
+	entropyUserID := uuid.New()
+	if err := database.Create(&db.User{ID: entropyUserID, Email: "entropy@example.com", PasswordHash: "hash", CredentialVersion: 0}).Error; err != nil {
+		t.Fatalf("failed to seed user: %v", err)
+	}
+
 	for i := 0; i < count; i++ {
-		_, rawID, err := app.Session.CreateSession(context.Background(), uuid.New(), 0, db.SessionTypeBearer, "127.0.0.1", "ua")
+		_, rawID, err := app.Session.CreateSession(context.Background(), entropyUserID, 0, db.SessionTypeBearer, "127.0.0.1", "ua")
 		if err != nil {
 			t.Fatalf("failed to create session: %v", err)
 		}

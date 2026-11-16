@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	stderrors "errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -18,6 +19,7 @@ import (
 	"github.com/kaiizer777/go-auth"
 	"github.com/kaiizer777/go-auth/config"
 	"github.com/kaiizer777/go-auth/db"
+	apperrors "github.com/kaiizer777/go-auth/errors"
 )
 
 func setupIntegrationApp(t *testing.T, modifyCfg ...func(*config.Config)) (*goauth.Auth, *gorm.DB, config.Config) {
@@ -365,8 +367,9 @@ func TestAllSessionsInvalidatedOnPasswordChange(t *testing.T) {
 }
 
 // Test: login whose credential check precedes a password reset must not mint a
-// usable session when it resumes after the reset (issue #27). Mint-time
-// validation rejects the stale version; nothing usable is persisted.
+// usable session when it resumes after the reset (issue #27). Sequentially
+// simulates the login-vs-reset window: mint-time validation rejects the stale
+// version and persists nothing.
 func TestSessionRejectedWhenLoginCapturedOldCredentialVersion(t *testing.T) {
 	app, database, _ := setupIntegrationApp(t)
 	email := "login_vs_reset@example.com"
@@ -396,8 +399,8 @@ func TestSessionRejectedWhenLoginCapturedOldCredentialVersion(t *testing.T) {
 	// In-flight login resumes and attempts to mint a session stamped with the
 	// old version: mint-time validation rejects it and persists nothing.
 	_, _, err = app.Session.CreateSession(context.Background(), user.ID, oldVersion, db.SessionTypeCookie, "127.0.0.1", "agent")
-	if err == nil {
-		t.Fatal("expected stale mint rejected, got nil error")
+	if !stderrors.Is(err, apperrors.ErrSessionInvalid) {
+		t.Fatalf("expected ErrSessionInvalid on stale mint, got %v", err)
 	}
 
 	var count int64
@@ -406,6 +409,15 @@ func TestSessionRejectedWhenLoginCapturedOldCredentialVersion(t *testing.T) {
 	}
 	if count != 0 {
 		t.Fatalf("expected no session persisted on stale mint, found %d", count)
+	}
+
+	// Positive control: mint with the fresh post-reset version succeeds.
+	freshUser, err := app.Auth.Login(context.Background(), db.LoginRequest{Email: email, Password: newPass})
+	if err != nil {
+		t.Fatalf("fresh Login failed: %v", err)
+	}
+	if _, _, err := app.Session.CreateSession(context.Background(), user.ID, freshUser.CredentialVersion, db.SessionTypeCookie, "127.0.0.1", "agent"); err != nil {
+		t.Fatalf("fresh mint with current version failed: %v", err)
 	}
 }
 
