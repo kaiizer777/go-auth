@@ -417,6 +417,46 @@ func TestRotateSession_CredentialMismatch(t *testing.T) {
 	}
 }
 
+func TestGetSession_CredentialMismatch(t *testing.T) {
+	database := setupTestDB(t)
+	cfg := testConfig()
+	svc := NewService(database, cfg)
+
+	userID := uuid.New()
+	if err := database.Create(&db.User{
+		ID:                userID,
+		Email:             "get-mismatch@example.com",
+		PasswordHash:      "hash",
+		CredentialVersion: 0,
+	}).Error; err != nil {
+		t.Fatalf("failed to seed user: %v", err)
+	}
+	_, rawID, err := svc.CreateSession(context.Background(), userID, 0, db.SessionTypeCookie, "1.1.1.1", "agent")
+	if err != nil {
+		t.Fatalf("CreateSession failed: %v", err)
+	}
+
+	if err := database.Model(&db.User{}).Where("id = ?", userID).Update("credential_version", 1).Error; err != nil {
+		t.Fatalf("failed to bump credential version: %v", err)
+	}
+
+	sess, err := svc.GetSession(context.Background(), rawID)
+	if sess != nil {
+		t.Fatalf("expected nil session on version mismatch, got %+v", sess)
+	}
+	if !errors.Is(err, apperrors.ErrSessionInvalid) {
+		t.Fatalf("expected ErrSessionInvalid, got %v", err)
+	}
+
+	var count int64
+	if err := database.Model(&db.Session{}).Where("id_hash = ?", hashID(rawID)).Count(&count).Error; err != nil {
+		t.Fatalf("failed to count sessions: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("expected stale session row purged, found %d", count)
+	}
+}
+
 func TestGetSession_IdleTimeout(t *testing.T) {
 	database := setupTestDB(t)
 	cfg := testConfig()

@@ -190,32 +190,53 @@ func (s *service) GetSession(ctx context.Context, rawID string) (*Session, error
 		return nil, apperrors.New(apperrors.CodeInternalError, "failed to query session", err)
 	}
 
-	// Credential-version check: reject sessions minted under superseded credentials
-	// (e.g. after a password reset) and drop the stale row. A missing user row
-	// fails closed: the orphan row is purged and rejected as invalid.
+	// Credential-version check runs in a tx with the stale-row purge so a
+	// password reset committing between the version re-read and the delete
+	// cannot leave the purge nondeterministic. The user row is locked for
+	// update where the dialect supports it (skipped on SQLite, which
+	// serializes writers in-tx). A missing user row fails closed: the
+	// orphan row is purged in-tx and rejected as invalid.
+	tx := s.db.WithContext(ctx).Begin()
+	if tx.Error != nil {
+		return nil, apperrors.New(apperrors.CodeInternalError, "failed to begin transaction", tx.Error)
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			tx.Rollback()
+			panic(r)
+		}
+	}()
+
 	var user db.User
-	uerr := s.db.WithContext(ctx).
+	uerr := lockForUpdate(tx).
 		Select("credential_version").
 		Where("id = ?", record.UserID).
 		First(&user).Error
 	if uerr != nil {
 		if errors.Is(uerr, gorm.ErrRecordNotFound) {
-			_ = s.db.WithContext(ctx).Where("id = ?", record.ID).Delete(&db.Session{}).Error
+			_ = tx.Where("id = ?", record.ID).Delete(&db.Session{}).Error
+			_ = tx.Commit().Error
 			slog.InfoContext(ctx, "session_invalidated",
 				"user_id", record.UserID.String(),
 				"reason", "missing_user_at_read",
 			)
 			return nil, apperrors.ErrSessionInvalid
 		}
+		tx.Rollback()
 		return nil, apperrors.New(apperrors.CodeInternalError, "failed to query user", uerr)
 	}
 	if user.CredentialVersion != record.CredentialVersion {
-		_ = s.db.WithContext(ctx).Where("id = ?", record.ID).Delete(&db.Session{}).Error
+		_ = tx.Where("id = ?", record.ID).Delete(&db.Session{}).Error
+		_ = tx.Commit().Error
 		slog.InfoContext(ctx, "session_invalidated",
 			"user_id", record.UserID.String(),
 			"reason", "credential_version_mismatch",
 		)
 		return nil, apperrors.ErrSessionInvalid
+	}
+	if err := tx.Commit().Error; err != nil {
+		tx.Rollback()
+		return nil, apperrors.New(apperrors.CodeInternalError, "failed to commit session read", err)
 	}
 
 	now := time.Now().UTC()
@@ -438,6 +459,8 @@ func (s *service) RotateSession(
 		return nil, "", apperrors.ErrSessionInvalid
 	}
 
+	// NOTE: InvalidateAllUserSessions stays a lone non-tx DELETE by design;
+	// its bulk-revoke blind window is tracked in issue #28 (out of scope here).
 	res := tx.Where("id_hash = ?", oldHash).Delete(&db.Session{})
 	if res.Error != nil {
 		tx.Rollback()
