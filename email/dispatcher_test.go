@@ -218,7 +218,9 @@ func TestDispatch_ErrorTypeLoggedWithoutSecret(t *testing.T) {
 	var logBuf bytes.Buffer
 	logger := captureLogger(&logBuf)
 	d := NewAsyncDispatcher(DispatcherConfig{
-		SendVerificationEmail:     func(ctx context.Context, p VerificationEmailPayload) error { return errors.New("smtp auth failed: secret-pwd-123") },
+		SendVerificationEmail: func(ctx context.Context, p VerificationEmailPayload) error {
+			return errors.New("smtp auth failed: secret-pwd-123")
+		},
 		DisableAsyncEmailDispatch: true,
 	}, logger)
 
