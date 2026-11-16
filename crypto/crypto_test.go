@@ -84,6 +84,8 @@ func TestVerifyPassword_MalformedHashes(t *testing.T) {
 		"$argon2id$v=19$m=65536,t=3,p=4,x=1$" + validSaltB64 + "$aGFzaA",     // unexpected extra parameter
 		"$argon2id$v=19$m=065536,t=3,p=4$" + validSaltB64 + "$aGFzaA",        // leading zero in memory param
 		"$argon2id$v=19$m=65536,t=3,p=256$" + validSaltB64 + "$aGFzaA",       // parallelism overflow uint8
+		"$argon2id$v=19$m=65536,t=3,p=17$" + validSaltB64 + "$aGFzaA",        // parallelism > 16 (DoS prevention)
+		"$argon2id$v=19$m=7,t=3,p=1$" + validSaltB64 + "$aGFzaA",             // memory < 8*parallelism (RFC 9106)
 	}
 
 	for _, hash := range malformed {
@@ -102,6 +104,8 @@ func TestHashPassword_InvalidParams(t *testing.T) {
 		{Memory: 65536, Time: 3, Parallelism: 4, SaltLength: 0, KeyLength: 32},
 		{Memory: 65536, Time: 3, Parallelism: 4, SaltLength: 15, KeyLength: 32},
 		{Memory: 65536, Time: 3, Parallelism: 4, SaltLength: 16, KeyLength: 0},
+		{Memory: 65536, Time: 3, Parallelism: 17, SaltLength: 16, KeyLength: 32},
+		{Memory: 7, Time: 3, Parallelism: 1, SaltLength: 16, KeyLength: 32},
 	}
 
 	for _, p := range invalidParams {
@@ -136,6 +140,39 @@ func TestGenerateDummyHash(t *testing.T) {
 	}
 	if match {
 		t.Fatalf("dummy hash unexpectedly matched password")
+	}
+}
+
+func TestArgon2_EntropyFailures(t *testing.T) {
+	origRand := randReader
+	defer func() { randReader = origRand }()
+
+	randReader = iotest.ErrReader(io.ErrUnexpectedEOF)
+
+	params := fastTestParams()
+	_, err := HashPassword("somepass", params)
+	if !errors.Is(err, ErrSaltReadFailed) {
+		t.Errorf("expected ErrSaltReadFailed on salt entropy failure, got %v", err)
+	}
+
+	_, err = GenerateDummyHash(params)
+	if !errors.Is(err, ErrDummySecretReadFailed) {
+		t.Errorf("expected ErrDummySecretReadFailed on dummy secret entropy failure, got %v", err)
+	}
+}
+
+func TestHashPasswordBytes(t *testing.T) {
+	params := fastTestParams()
+	rawSecret := []byte("BytePassword123!")
+	defer wipeBytes(rawSecret)
+
+	phc, err := HashPasswordBytes(rawSecret, params)
+	if err != nil {
+		t.Fatalf("HashPasswordBytes failed: %v", err)
+	}
+	match, err := VerifyPassword("BytePassword123!", phc)
+	if err != nil || !match {
+		t.Fatalf("expected password match via VerifyPassword, match=%v err=%v", match, err)
 	}
 }
 

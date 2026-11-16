@@ -1,7 +1,6 @@
 package crypto
 
 import (
-	"crypto/rand"
 	"crypto/subtle"
 	"encoding/base64"
 	"fmt"
@@ -35,8 +34,13 @@ func DefaultHashParams() HashParams {
 	}
 }
 
-// ErrInvalidHashFormat is returned when a hash string does not conform to the Argon2id PHC format.
-var ErrInvalidHashFormat = errors.New(errors.CodeInternalError, "invalid argon2id hash format", nil)
+// Predefined sentinel errors for Argon2 operations.
+var (
+	ErrInvalidHashFormat     = errors.New(errors.CodeInternalError, "invalid argon2id hash format", nil)
+	ErrInvalidHashParams     = errors.New(errors.CodeInternalError, "invalid argon2 hash parameters", nil)
+	ErrSaltReadFailed        = errors.New(errors.CodeInternalError, "failed to generate crypto salt", nil)
+	ErrDummySecretReadFailed = errors.New(errors.CodeInternalError, "failed to generate dummy secret", nil)
+)
 
 // wipeBytes securely clears sensitive bytes in memory and prevents compiler dead-store elimination.
 func wipeBytes(b []byte) {
@@ -46,17 +50,25 @@ func wipeBytes(b []byte) {
 
 // HashPassword hashes a plain text password using Argon2id and returns a standard PHC formatted string.
 func HashPassword(password string, params HashParams) (string, error) {
-	if params.Time < 1 || params.Parallelism < 1 || params.Memory < 1 || params.SaltLength < 16 || params.KeyLength == 0 {
-		return "", errors.New(errors.CodeInternalError, "invalid argon2 hash parameters", nil)
+	pwdBytes := []byte(password)
+	defer wipeBytes(pwdBytes)
+	return hashPasswordBytes(pwdBytes, params)
+}
+
+// HashPasswordBytes hashes raw password bytes using Argon2id and returns a standard PHC formatted string.
+func HashPasswordBytes(pwdBytes []byte, params HashParams) (string, error) {
+	return hashPasswordBytes(pwdBytes, params)
+}
+
+func hashPasswordBytes(pwdBytes []byte, params HashParams) (string, error) {
+	if params.Time < 1 || params.Parallelism < 1 || params.Parallelism > 16 || params.Memory < 8*uint32(params.Parallelism) || params.SaltLength < 16 || params.KeyLength == 0 {
+		return "", ErrInvalidHashParams
 	}
 
 	salt := make([]byte, params.SaltLength)
-	if _, err := io.ReadFull(rand.Reader, salt); err != nil {
-		return "", errors.New(errors.CodeInternalError, "failed to generate crypto salt", err)
+	if _, err := io.ReadFull(randReader, salt); err != nil {
+		return "", ErrSaltReadFailed
 	}
-
-	pwdBytes := []byte(password)
-	defer wipeBytes(pwdBytes)
 
 	hash := argon2.IDKey(
 		pwdBytes,
@@ -136,7 +148,7 @@ func VerifyPassword(password, phcHash string) (bool, error) {
 			hasT = true
 			time = uint32(val)
 		case "p":
-			if hasP || val > 255 {
+			if hasP || val > 16 {
 				return false, ErrInvalidHashFormat
 			}
 			hasP = true
@@ -150,7 +162,7 @@ func VerifyPassword(password, phcHash string) (bool, error) {
 		return false, ErrInvalidHashFormat
 	}
 
-	if memory > 262144 || time > 10 {
+	if memory > 262144 || time > 10 || parallelism > 16 || memory < 8*uint32(parallelism) {
 		return false, ErrInvalidHashFormat
 	}
 
@@ -165,7 +177,7 @@ func VerifyPassword(password, phcHash string) (bool, error) {
 	}
 	defer wipeBytes(expectedHash)
 
-	if time < 1 || parallelism < 1 || memory < 1 || len(salt) < 16 || len(expectedHash) == 0 || len(expectedHash) > 128 {
+	if time < 1 || parallelism < 1 || parallelism > 16 || memory < 8*uint32(parallelism) || len(salt) < 16 || len(expectedHash) == 0 || len(expectedHash) > 128 {
 		return false, ErrInvalidHashFormat
 	}
 
@@ -187,11 +199,12 @@ func VerifyPassword(password, phcHash string) (bool, error) {
 }
 
 // GenerateDummyHash generates a valid Argon2id PHC string with a random secret for anti-enumeration timing parity.
+// It avoids intermediate string allocations for the secret, ensuring zero plaintext lingering in GC heap.
 func GenerateDummyHash(params HashParams) (string, error) {
 	dummySecret := make([]byte, 32)
-	if _, err := io.ReadFull(rand.Reader, dummySecret); err != nil {
-		return "", errors.New(errors.CodeInternalError, "failed to generate dummy secret", err)
+	if _, err := io.ReadFull(randReader, dummySecret); err != nil {
+		return "", ErrDummySecretReadFailed
 	}
 	defer wipeBytes(dummySecret)
-	return HashPassword(base64.RawStdEncoding.EncodeToString(dummySecret), params)
+	return hashPasswordBytes(dummySecret, params)
 }

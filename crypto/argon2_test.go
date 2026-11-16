@@ -63,9 +63,19 @@ func TestHashPassword_BoundaryParams(t *testing.T) {
 		wantErr bool
 	}{
 		{
-			name:    "valid minimal boundary (time=1, memory=1, parallelism=1, salt=16, key=1)",
-			params:  HashParams{Memory: 1, Time: 1, Parallelism: 1, SaltLength: 16, KeyLength: 1},
+			name:    "valid minimal boundary (time=1, memory=8, parallelism=1, salt=16, key=1)",
+			params:  HashParams{Memory: 8, Time: 1, Parallelism: 1, SaltLength: 16, KeyLength: 1},
 			wantErr: false,
+		},
+		{
+			name:    "memory below 8*parallelism fails",
+			params:  HashParams{Memory: 7, Time: 1, Parallelism: 1, SaltLength: 16, KeyLength: 32},
+			wantErr: true,
+		},
+		{
+			name:    "parallelism above 16 fails",
+			params:  HashParams{Memory: 65536, Time: 1, Parallelism: 17, SaltLength: 16, KeyLength: 32},
+			wantErr: true,
 		},
 		{
 			name:    "time zero fails",
