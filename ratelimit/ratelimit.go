@@ -18,9 +18,9 @@ type windowEntry struct {
 	timestamps []time.Time
 }
 
-// Limiter is a concurrency-safe sliding-window in-memory rate limiter.
+// Limiter is a concurrency-safe sliding-window in-memory rate limiter with optimized RWMutex read paths.
 type Limiter struct {
-	mu       sync.Mutex
+	mu       sync.RWMutex
 	windows  map[string]*windowEntry
 	duration time.Duration
 	max      int
@@ -29,7 +29,14 @@ type Limiter struct {
 }
 
 // NewLimiter creates a Limiter with the given window duration and attempt cap.
+// If duration <= 0, it defaults to 1 minute; if max <= 0, it defaults to 1.
 func NewLimiter(duration time.Duration, max int) *Limiter {
+	if duration <= 0 {
+		duration = time.Minute
+	}
+	if max <= 0 {
+		max = 1
+	}
 	return &Limiter{
 		windows:  make(map[string]*windowEntry),
 		duration: duration,
@@ -53,30 +60,39 @@ func AccountKey(account string) string {
 	return "account:" + account
 }
 
-// ClientIP extracts the client IP address from r.RemoteAddr, stripping the port.
-// Falls back to r.RemoteAddr if net.SplitHostPort encounters an error (e.g. no port present).
+// ClientIP extracts the client IP address from r.RemoteAddr, stripping the port
+// and normalizing IPv6 bracket enclosing formats.
 func ClientIP(r *http.Request) string {
 	if r == nil {
 		return ""
 	}
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
-		return strings.TrimSpace(r.RemoteAddr)
+		host = strings.TrimSpace(r.RemoteAddr)
 	}
-	return host
+	return strings.Trim(host, "[]")
 }
 
 // Allow evaluates whether an action is permitted within the sliding window.
 // Only successful attempts are recorded — blocked calls do not increment counter.
+// Uses an RWMutex read path on existing keys to minimize lock contention.
 func (l *Limiter) Allow(key string) bool {
-	l.mu.Lock()
+	l.mu.RLock()
 	entry, ok := l.windows[key]
-	if !ok {
-		entry = &windowEntry{}
-		l.windows[key] = entry
+	if ok {
+		entry.mu.Lock()
+		l.mu.RUnlock()
+	} else {
+		l.mu.RUnlock()
+		l.mu.Lock()
+		entry, ok = l.windows[key]
+		if !ok {
+			entry = &windowEntry{}
+			l.windows[key] = entry
+		}
+		entry.mu.Lock()
+		l.mu.Unlock()
 	}
-	entry.mu.Lock()
-	l.mu.Unlock()
 
 	defer entry.mu.Unlock()
 
@@ -146,45 +162,67 @@ func (l *Limiter) Prune() {
 }
 
 func (l *Limiter) prune() {
-	l.mu.Lock()
-	keys := make([]string, 0, len(l.windows))
-	for k := range l.windows {
-		keys = append(keys, k)
-	}
-	l.mu.Unlock()
-
+	const batchSize = 256
 	cutoff := time.Now().Add(-l.duration)
 
-	for _, key := range keys {
-		l.mu.Lock()
-		entry, ok := l.windows[key]
-		l.mu.Unlock()
+	type candidate struct {
+		key   string
+		entry *windowEntry
+	}
 
-		if !ok {
-			continue
+	for {
+		l.mu.RLock()
+		if len(l.windows) == 0 {
+			l.mu.RUnlock()
+			return
 		}
 
-		entry.mu.Lock()
-		allExpired := true
-		for _, t := range entry.timestamps {
-			if t.After(cutoff) {
-				allExpired = false
+		candidates := make([]candidate, 0, batchSize)
+		for k, entry := range l.windows {
+			candidates = append(candidates, candidate{key: k, entry: entry})
+			if len(candidates) >= batchSize {
 				break
 			}
 		}
-		if allExpired {
-			entry.timestamps = nil
-		}
-		entry.mu.Unlock()
+		l.mu.RUnlock()
 
-		if allExpired {
-			l.mu.Lock()
-			entry.mu.Lock()
-			if len(entry.timestamps) == 0 && l.windows[key] == entry {
-				delete(l.windows, key)
+		if len(candidates) == 0 {
+			return
+		}
+
+		expiredKeys := make([]string, 0, len(candidates))
+		for _, c := range candidates {
+			c.entry.mu.Lock()
+			allExpired := true
+			for _, t := range c.entry.timestamps {
+				if t.After(cutoff) {
+					allExpired = false
+					break
+				}
 			}
-			entry.mu.Unlock()
+			if allExpired {
+				c.entry.timestamps = nil
+				expiredKeys = append(expiredKeys, c.key)
+			}
+			c.entry.mu.Unlock()
+		}
+
+		if len(expiredKeys) > 0 {
+			l.mu.Lock()
+			for _, k := range expiredKeys {
+				if entry, ok := l.windows[k]; ok {
+					entry.mu.Lock()
+					if len(entry.timestamps) == 0 && l.windows[k] == entry {
+						delete(l.windows, k)
+					}
+					entry.mu.Unlock()
+				}
+			}
 			l.mu.Unlock()
+		}
+
+		if len(candidates) < batchSize || len(expiredKeys) == 0 {
+			return
 		}
 	}
 }
@@ -192,14 +230,14 @@ func (l *Limiter) prune() {
 // RetryAfter returns the duration until the rate limit will permit a new attempt.
 // If the key has not reached the attempt limit, 0 is returned.
 func (l *Limiter) RetryAfter(key string) time.Duration {
-	l.mu.Lock()
+	l.mu.RLock()
 	entry, ok := l.windows[key]
 	if !ok {
-		l.mu.Unlock()
+		l.mu.RUnlock()
 		return 0
 	}
 	entry.mu.Lock()
-	l.mu.Unlock()
+	l.mu.RUnlock()
 
 	defer entry.mu.Unlock()
 

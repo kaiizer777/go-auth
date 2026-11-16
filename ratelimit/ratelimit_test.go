@@ -335,6 +335,7 @@ func TestClientIP(t *testing.T) {
 		{name: "IPv4 without port", remoteAddr: "192.0.2.1", expected: "192.0.2.1"},
 		{name: "IPv6 with port", remoteAddr: "[2001:db8::1]:8080", expected: "2001:db8::1"},
 		{name: "IPv6 without port", remoteAddr: "2001:db8::1", expected: "2001:db8::1"},
+		{name: "IPv6 bracketed without port", remoteAddr: "[2001:db8::1]", expected: "2001:db8::1"},
 	}
 
 	for _, tt := range tests {
@@ -380,4 +381,37 @@ func TestWriteRateLimitError(t *testing.T) {
 	if rec2.Header().Get("Retry-After") != "1" {
 		t.Fatalf("expected Retry-After='1', got %q", rec2.Header().Get("Retry-After"))
 	}
+}
+
+func TestLimiter_NonPositiveParamsSanitized(t *testing.T) {
+	l := NewLimiter(0, 0)
+	if l.duration <= 0 {
+		t.Errorf("expected positive sanitized duration, got %v", l.duration)
+	}
+	if l.max <= 0 {
+		t.Errorf("expected positive sanitized max, got %v", l.max)
+	}
+}
+
+func TestLimiter_RWMutexReadContention(t *testing.T) {
+	limiter := NewLimiter(1*time.Minute, 1000)
+	key := "contended-key"
+
+	limiter.Allow(key)
+
+	var wg sync.WaitGroup
+	const goroutines = 20
+	const opsPerGoroutine = 50
+
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < opsPerGoroutine; j++ {
+				_ = limiter.RetryAfter(key)
+				_ = limiter.Allow(key)
+			}
+		}()
+	}
+	wg.Wait()
 }
