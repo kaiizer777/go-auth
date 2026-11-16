@@ -5,10 +5,12 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 
 	"github.com/google/uuid"
 	"github.com/kaiizer777/go-auth/config"
@@ -309,6 +311,14 @@ func (s *authService) VerifyEmail(ctx context.Context, req db.VerifyEmailRequest
 	return nil
 }
 
+// lockForUpdate applies SELECT ... FOR UPDATE on dialects with row locking.
+func lockForUpdate(tx *gorm.DB) *gorm.DB {
+	if strings.Contains(strings.ToLower(tx.Name()), "sqlite") {
+		return tx
+	}
+	return tx.Clauses(clause.Locking{Strength: "UPDATE"})
+}
+
 // RequestPasswordReset initiates a password reset flow, generating a single-use token.
 // Non-existent emails trigger anti-enumeration parity operations and return silent success.
 func (s *authService) RequestPasswordReset(ctx context.Context, req db.PasswordResetRequest) (string, error) {
@@ -342,8 +352,13 @@ func (s *authService) RequestPasswordReset(ctx context.Context, req db.PasswordR
 		CreatedAt: now,
 	}
 
-	// Invalidate prior unconsumed reset tokens to prevent token flooding
+	// Invalidate prior unconsumed reset tokens. Serialize per-user via a row lock
+	// on the user record so concurrent requests under READ COMMITTED cannot race.
 	if terr := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var lockedUser db.User
+		if err := lockForUpdate(tx).Select("id").Where("id = ?", user.ID).First(&lockedUser).Error; err != nil {
+			return err
+		}
 		if err := tx.Where("user_id = ?", user.ID).Delete(&db.PasswordResetToken{}).Error; err != nil {
 			return err
 		}

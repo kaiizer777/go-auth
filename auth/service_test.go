@@ -837,6 +837,100 @@ func TestService_PasswordReset(t *testing.T) {
 	})
 }
 
+func TestService_RequestPasswordReset_Concurrency(t *testing.T) {
+	database := setupTestDB(t)
+	cfg := testConfig()
+
+	svc, err := New(cfg, database, email.Hooks{})
+	if err != nil {
+		t.Fatalf("failed to create service: %v", err)
+	}
+
+	ctx := context.Background()
+	user, _, err := svc.Signup(ctx, db.SignupRequest{
+		Email:    "concurrent_reset@example.com",
+		Password: "SecureAlpha#2026!",
+	})
+	if err != nil {
+		t.Fatalf("failed to create user: %v", err)
+	}
+
+	const concurrentRequests = 10
+	var wg sync.WaitGroup
+	wg.Add(concurrentRequests)
+
+	tokens := make([]string, concurrentRequests)
+	errs := make([]error, concurrentRequests)
+
+	for i := 0; i < concurrentRequests; i++ {
+		go func(idx int) {
+			defer wg.Done()
+			tok, err := svc.RequestPasswordReset(ctx, db.PasswordResetRequest{
+				Email: "concurrent_reset@example.com",
+			})
+			tokens[idx] = tok
+			errs[idx] = err
+		}(i)
+	}
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("goroutine %d failed with error: %v", i, err)
+		}
+		if len(tokens[i]) != 64 {
+			t.Fatalf("goroutine %d returned invalid token len %d: %q", i, len(tokens[i]), tokens[i])
+		}
+	}
+
+	var count int64
+	if err := database.Model(&db.PasswordResetToken{}).Where("user_id = ?", user.ID).Count(&count).Error; err != nil {
+		t.Fatalf("failed to query reset tokens: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("expected exactly 1 active reset token, got %d", count)
+	}
+
+	var activeTok db.PasswordResetToken
+	if err := database.Where("user_id = ?", user.ID).First(&activeTok).Error; err != nil {
+		t.Fatalf("failed to query active reset token: %v", err)
+	}
+
+	var activeRaw string
+	for _, tok := range tokens {
+		rawBytes, _ := hex.DecodeString(tok)
+		h := sha256.Sum256(rawBytes)
+		if string(h[:]) == string(activeTok.TokenHash) {
+			activeRaw = tok
+			break
+		}
+	}
+	if activeRaw == "" {
+		t.Fatal("active token in db did not match any returned token")
+	}
+
+	newPassword := "BrandNewConcurrentPassword#2026!"
+	if err := svc.ResetPassword(ctx, db.PasswordResetConfirmRequest{
+		Token:       activeRaw,
+		NewPassword: newPassword,
+	}); err != nil {
+		t.Fatalf("failed to reset password with active token: %v", err)
+	}
+
+	for _, tok := range tokens {
+		if tok == activeRaw {
+			continue
+		}
+		err := svc.ResetPassword(ctx, db.PasswordResetConfirmRequest{
+			Token:       tok,
+			NewPassword: "AnotherPassword#2026!",
+		})
+		if !errors.Is(err, errors.ErrInvalidToken) {
+			t.Fatalf("expected ErrInvalidToken for invalidated stale token, got: %v", err)
+		}
+	}
+}
+
 func TestEmailHooks_NilSafe(t *testing.T) {
 	database := setupTestDB(t)
 	cfg := testConfig()
