@@ -4,12 +4,16 @@ import (
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/hex"
+	"io"
 	"net/http"
 	"strings"
 
 	"github.com/kaiizer777/go-auth/config"
 	apperrors "github.com/kaiizer777/go-auth/errors"
 )
+
+// randReader is the CSPRNG entropy source for CSRF token generation, package-scoped for unit test injection.
+var randReader io.Reader = rand.Reader
 
 var safeMethods = map[string]bool{
 	http.MethodGet:     true,
@@ -18,12 +22,24 @@ var safeMethods = map[string]bool{
 	http.MethodTrace:   true,
 }
 
+// ensureConfig returns cfg if non-nil or a pointer to default config if nil.
+func ensureConfig(cfg *config.Config) *config.Config {
+	if cfg == nil {
+		defaultCfg := config.DefaultConfig()
+		return &defaultCfg
+	}
+	return cfg
+}
+
 // generateCSRFToken creates a 32-byte (256-bit) CSPRNG token, hex-encoded to 64 chars.
 func generateCSRFToken() (string, error) {
 	b := make([]byte, 32)
-	if _, err := rand.Read(b); err != nil {
+	if _, err := io.ReadFull(randReader, b); err != nil {
 		return "", err
 	}
+	defer func() {
+		clear(b)
+	}()
 	return hex.EncodeToString(b), nil
 }
 
@@ -43,6 +59,7 @@ func isValidHexToken(s string) bool {
 
 // Middleware enforces Double Submit Cookie CSRF protection.
 func Middleware(cfg *config.Config) func(http.Handler) http.Handler {
+	cfg = ensureConfig(cfg)
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			// Bearer token requests are inherently immune to CSRF — skip only if a non-empty token is present.
@@ -91,6 +108,11 @@ func Middleware(cfg *config.Config) func(http.Handler) http.Handler {
 				return
 			}
 
+			if !isValidHexToken(headerToken) {
+				apperrors.WriteHTTP(w, apperrors.ErrCSRFTokenInvalid)
+				return
+			}
+
 			if !secureCompare(csrfCookie.Value, headerToken) {
 				apperrors.WriteHTTP(w, apperrors.ErrCSRFTokenInvalid)
 				return
@@ -108,7 +130,7 @@ func GenerateToken() (string, error) {
 
 // SetCookie writes the CSRF token cookie to the response writer.
 func SetCookie(w http.ResponseWriter, token string, cfg *config.Config) {
-	setCSRFCookie(w, token, cfg)
+	setCSRFCookie(w, token, ensureConfig(cfg))
 }
 
 // IssueCookie generates a new CSRF token and sets the CSRF cookie on w.
@@ -117,7 +139,7 @@ func IssueCookie(w http.ResponseWriter, cfg *config.Config) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	setCSRFCookie(w, token, cfg)
+	setCSRFCookie(w, token, ensureConfig(cfg))
 	return token, nil
 }
 
@@ -125,6 +147,7 @@ func IssueCookie(w http.ResponseWriter, cfg *config.Config) (string, error) {
 // HttpOnly: false is intentional and mandatory so client JavaScript can read it to set X-CSRF-Token.
 // SameSite: Strict ensures maximum isolation.
 func setCSRFCookie(w http.ResponseWriter, token string, cfg *config.Config) {
+	cfg = ensureConfig(cfg)
 	http.SetCookie(w, &http.Cookie{
 		Name:     cfg.CSRFCookieName,
 		Value:    token,

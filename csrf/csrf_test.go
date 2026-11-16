@@ -2,9 +2,12 @@ package csrf
 
 import (
 	"encoding/hex"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+	"testing/iotest"
 
 	"github.com/kaiizer777/go-auth/config"
 )
@@ -336,5 +339,88 @@ func TestCSRF_EmptyBearerToken_DoesNotBypass(t *testing.T) {
 				t.Fatalf("expected status 403 for header %q, got %d", authHeader, rec.Code)
 			}
 		})
+	}
+}
+
+func TestCSRF_NilConfigFallback(t *testing.T) {
+	// Middleware with nil cfg
+	mw := Middleware(nil)(dummyHandler())
+	req := httptest.NewRequest(http.MethodGet, "/resource", nil)
+	rec := httptest.NewRecorder()
+	mw.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK from nil cfg middleware, got %d", rec.Code)
+	}
+
+	// SetCookie with nil cfg
+	rec2 := httptest.NewRecorder()
+	SetCookie(rec2, "1111222233334444555566667777888899990000aaaabbbbccccddddeeeeffff", nil)
+	if len(rec2.Result().Cookies()) == 0 {
+		t.Fatal("expected cookie to be set with nil cfg")
+	}
+
+	// IssueCookie with nil cfg
+	rec3 := httptest.NewRecorder()
+	token, err := IssueCookie(rec3, nil)
+	if err != nil || len(token) != 64 {
+		t.Fatalf("IssueCookie failed with nil cfg: token=%q err=%v", token, err)
+	}
+}
+
+func TestCSRF_InvalidHeaderToken(t *testing.T) {
+	cfg := testConfig()
+	mw := Middleware(cfg)(dummyHandler())
+
+	validCookieToken := "abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
+
+	invalidHeaders := []struct {
+		name        string
+		headerToken string
+	}{
+		{name: "short header token", headerToken: "abcdef"},
+		{name: "non-hex chars in 64 char token", headerToken: strings.Repeat("z", 64)},
+		{name: "65 char token", headerToken: strings.Repeat("a", 65)},
+	}
+
+	for _, tc := range invalidHeaders {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/resource", nil)
+			req.AddCookie(&http.Cookie{
+				Name:  cfg.CSRFCookieName,
+				Value: validCookieToken,
+			})
+			req.Header.Set(cfg.CSRFHeaderName, tc.headerToken)
+			rec := httptest.NewRecorder()
+
+			mw.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusForbidden {
+				t.Fatalf("expected status 403 Forbidden for invalid header token, got %d", rec.Code)
+			}
+		})
+	}
+}
+
+func TestCSRF_EntropyFailure(t *testing.T) {
+	origRand := randReader
+	defer func() { randReader = origRand }()
+
+	randReader = iotest.ErrReader(io.ErrUnexpectedEOF)
+
+	// generateCSRFToken failure via GenerateToken
+	_, err := GenerateToken()
+	if err == nil {
+		t.Fatal("expected error on CSPRNG read failure in GenerateToken, got nil")
+	}
+
+	// Middleware safe method failure on token generation
+	cfg := testConfig()
+	mw := Middleware(cfg)(dummyHandler())
+	req := httptest.NewRequest(http.MethodGet, "/resource", nil)
+	rec := httptest.NewRecorder()
+
+	mw.ServeHTTP(rec, req)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("expected status 500 when token generation fails, got %d", rec.Code)
 	}
 }
