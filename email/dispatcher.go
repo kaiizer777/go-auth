@@ -159,6 +159,10 @@ func (d *AsyncDispatcher) dispatch(ctx context.Context, op string, run func(cont
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if err := ctx.Err(); err != nil {
+		d.logger.Error("email dispatch cancelled before acquisition", "op", op, "err", err)
+		return err
+	}
 	if d.async {
 		if d.beforeAcquireSem != nil {
 			d.beforeAcquireSem()

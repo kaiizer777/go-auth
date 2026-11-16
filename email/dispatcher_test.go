@@ -325,3 +325,72 @@ func TestDispatch_ConcurrentShutdown(t *testing.T) {
 		}
 	}
 }
+
+func TestDispatch_PreCancelledContextAsync(t *testing.T) {
+	var hookCalled bool
+	var logBuf bytes.Buffer
+	logger := captureLogger(&logBuf)
+
+	d := NewAsyncDispatcher(DispatcherConfig{
+		SendVerificationEmail: func(ctx context.Context, p VerificationEmailPayload) error {
+			hookCalled = true
+			return nil
+		},
+	}, logger)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := d.Dispatch(ctx, "test-op-async", func(c context.Context) error {
+		hookCalled = true
+		return nil
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got %v", err)
+	}
+
+	d.DispatchVerification(ctx, VerificationEmailPayload{To: "precancelled@example.com"})
+
+	if hookCalled {
+		t.Fatal("expected hook not to be called for pre-cancelled context in async mode")
+	}
+
+	if !strings.Contains(logBuf.String(), "email dispatch cancelled before acquisition") {
+		t.Fatalf("expected cancellation log, got: %s", logBuf.String())
+	}
+}
+
+func TestDispatch_PreCancelledContextSync(t *testing.T) {
+	var hookCalled bool
+	var logBuf bytes.Buffer
+	logger := captureLogger(&logBuf)
+
+	d := NewAsyncDispatcher(DispatcherConfig{
+		SendVerificationEmail: func(ctx context.Context, p VerificationEmailPayload) error {
+			hookCalled = true
+			return nil
+		},
+		DisableAsyncEmailDispatch: true,
+	}, logger)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := d.Dispatch(ctx, "test-op-sync", func(c context.Context) error {
+		hookCalled = true
+		return nil
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got %v", err)
+	}
+
+	d.DispatchVerification(ctx, VerificationEmailPayload{To: "precancelled-sync@example.com"})
+
+	if hookCalled {
+		t.Fatal("expected hook not to be called for pre-cancelled context in sync mode")
+	}
+
+	if !strings.Contains(logBuf.String(), "email dispatch cancelled before acquisition") {
+		t.Fatalf("expected cancellation log, got: %s", logBuf.String())
+	}
+}
