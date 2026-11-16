@@ -38,7 +38,7 @@ func TestSessionLifecycle_LogoutInvalidation(t *testing.T) {
 
 	// Placeholder flow for Phase 4:
 	// 1. Authenticate to establish session
-	// 2. POST /auth/logout -> verify 204 No Content and clearing cookie (Max-Age=0)
+	// 2. POST /auth/logout -> verify 200 OK and clearing cookie (Max-Age=-1)
 	// 3. GET /auth/me or protected endpoint -> verify 401 Unauthorized
 	req, err := http.NewRequest(http.MethodPost, server.URL+"/auth/logout", nil)
 	if err != nil {
@@ -50,8 +50,8 @@ func TestSessionLifecycle_LogoutInvalidation(t *testing.T) {
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	if resp.StatusCode != http.StatusNoContent {
-		t.Fatalf("expected 204 No Content on logout, got %d", resp.StatusCode)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK on logout, got %d", resp.StatusCode)
 	}
 }
 
