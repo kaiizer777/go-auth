@@ -1333,13 +1333,11 @@ func TestInvalidateAllUserSessions_BumpsCredentialVersion(t *testing.T) {
 	userID := uuid.New()
 	seedTestUser(t, database, userID)
 
-	var tokens []string
 	for i := 0; i < 2; i++ {
-		_, rawID, err := svc.CreateSession(context.Background(), userID, 0, db.SessionTypeCookie, "127.0.0.1", "agent")
+		_, _, err := svc.CreateSession(context.Background(), userID, 0, db.SessionTypeCookie, "127.0.0.1", "agent")
 		if err != nil {
 			t.Fatalf("CreateSession failed: %v", err)
 		}
-		tokens = append(tokens, rawID)
 	}
 
 	if err := svc.InvalidateAllUserSessions(context.Background(), userID); err != nil {
