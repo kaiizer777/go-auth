@@ -213,6 +213,14 @@ func (a *Auth) SessionService() session.Service {
 	return a.Session
 }
 
+// PurgeExpiredSessions deletes all sessions past their absolute expiration or idle timeout across all users.
+func (a *Auth) PurgeExpiredSessions(ctx context.Context) (int64, error) {
+	if a == nil || a.Session == nil {
+		return 0, nil
+	}
+	return a.Session.PurgeExpired(ctx)
+}
+
 // EmailDispatcher returns the configured email dispatcher.
 func (a *Auth) EmailDispatcher() email.Dispatcher {
 	if a == nil || a.emailDispatcher == nil {

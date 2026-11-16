@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	stderrors "errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"sync"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/glebarez/sqlite"
+	"github.com/google/uuid"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 
@@ -481,5 +483,70 @@ func TestNewWithDB_AppliesDefaults(t *testing.T) {
 	}
 	if a.cfg.SessionIdleTimeout != 30*time.Minute {
 		t.Errorf("SessionIdleTimeout = %v; want 30m", a.cfg.SessionIdleTimeout)
+	}
+}
+
+func TestAuth_PurgeExpiredSessions(t *testing.T) {
+	sqliteDB, err := gorm.Open(sqlite.Open(fmt.Sprintf("file:purge_test_%d?mode=memory&cache=shared", time.Now().UnixNano())), &gorm.Config{
+		DisableAutomaticPing: true,
+	})
+	if err != nil {
+		t.Fatalf("failed to open sqlite db: %v", err)
+	}
+	defer func() {
+		if sqlDB, errDB := sqliteDB.DB(); errDB == nil {
+			_ = sqlDB.Close()
+		}
+	}()
+
+	ddl := `
+	CREATE TABLE IF NOT EXISTS users (
+		id TEXT PRIMARY KEY,
+		email TEXT UNIQUE NOT NULL,
+		password_hash TEXT NOT NULL,
+		credential_version INTEGER NOT NULL DEFAULT 0,
+		email_verified INTEGER NOT NULL DEFAULT 0,
+		created_at DATETIME,
+		updated_at DATETIME
+	);
+	CREATE TABLE IF NOT EXISTS sessions (
+		id TEXT PRIMARY KEY,
+		user_id TEXT NOT NULL,
+		id_hash CHAR(64) UNIQUE NOT NULL,
+		session_type VARCHAR(10) NOT NULL DEFAULT 'cookie',
+		ip_address VARCHAR(45) NOT NULL DEFAULT '',
+		user_agent TEXT NOT NULL DEFAULT '',
+		credential_version INTEGER NOT NULL DEFAULT 0,
+		last_active_at DATETIME NOT NULL,
+		absolute_expires_at DATETIME NOT NULL,
+		created_at DATETIME
+	);
+	`
+	if err := sqliteDB.Exec(ddl).Error; err != nil {
+		t.Fatalf("failed to execute sqlite ddl: %v", err)
+	}
+
+	cfg := config.Config{
+		DatabaseURL: "postgres://user:pass@localhost:5432/testdb",
+		BaseURL:     "https://auth.example.com",
+	}
+
+	a, err := NewWithDB(sqliteDB, cfg)
+	if err != nil {
+		t.Fatalf("NewWithDB failed: %v", err)
+	}
+	defer func() { _ = a.Close() }()
+
+	now := time.Now().UTC()
+	// Insert an expired session
+	sqliteDB.Exec("INSERT INTO sessions (id, user_id, id_hash, session_type, last_active_at, absolute_expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+		uuid.New().String(), uuid.New().String(), "hash1", "cookie", now.Add(-1*time.Hour), now.Add(-1*time.Hour), now.Add(-2*time.Hour))
+
+	purged, err := a.PurgeExpiredSessions(context.Background())
+	if err != nil {
+		t.Fatalf("PurgeExpiredSessions failed: %v", err)
+	}
+	if purged != 1 {
+		t.Fatalf("expected 1 purged session, got %d", purged)
 	}
 }
