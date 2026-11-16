@@ -1587,7 +1587,7 @@ func TestAuthHandler_LoginSessionCreation_CookieAndBearer(t *testing.T) {
 	}
 }
 
-func TestAuthHandler_StaleMintRejectedAfterVersionBump(t *testing.T) {
+func TestSessionService_StaleMintRejectedAfterVersionBump(t *testing.T) {
 	database, svc, _, _ := setupTestEnv(t)
 	cfg := testConfig()
 	sessSvc := session.NewService(database, &cfg)
@@ -1621,6 +1621,58 @@ func TestAuthHandler_StaleMintRejectedAfterVersionBump(t *testing.T) {
 		t.Fatalf("expected stale mint rejected, got sess=%v err=%v", sess, merr)
 	} else if !stderrors.Is(merr, errors.ErrSessionInvalid) {
 		t.Fatalf("expected ErrSessionInvalid on stale mint, got %v", merr)
+	}
+
+	var staleCount int64
+	if err := database.Model(&db.Session{}).Where("user_id = ?", createdUser.ID).Count(&staleCount).Error; err != nil {
+		t.Fatalf("failed to count sessions: %v", err)
+	}
+	if staleCount != 0 {
+		t.Fatalf("expected no session persisted on stale mint, found %d", staleCount)
+	}
+}
+
+func TestAuthHandler_LoginStaleMintReturns401(t *testing.T) {
+	cfg := testConfig()
+	userID := uuid.New()
+	staleUser := &db.User{ID: userID, Email: "stale-login@example.com", CredentialVersion: 0}
+	cases := map[string]error{
+		"bare":    errors.ErrSessionInvalid,
+		"wrapped": stderrors.New("mint failed: " + errors.ErrSessionInvalid.Error()),
+	}
+	for name, mintErr := range cases {
+		t.Run(name, func(t *testing.T) {
+			errToReturn := mintErr
+			if name == "wrapped" {
+				errToReturn = fmt.Errorf("mint: %w", errors.ErrSessionInvalid)
+			}
+			mockAuth := &mockAuthService{
+				loginFn: func(ctx context.Context, req db.LoginRequest) (*db.User, error) {
+					return staleUser, nil
+				},
+			}
+			mockSess := &mockSessionService{
+				createSessFn: func(ctx context.Context, uid uuid.UUID, cv int, st db.SessionType, ip, ua string) (*session.Session, string, error) {
+					return nil, "", errToReturn
+				},
+			}
+			authH := NewAuthHandler(mockAuth, WithAuthSessionService(mockSess), WithAuthConfig(&cfg))
+			b, _ := json.Marshal(db.LoginRequest{Email: "stale-login@example.com", Password: "ValidPassword123!"})
+			req := httptest.NewRequest(http.MethodPost, "/auth/login", bytes.NewReader(b))
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+			authH.Login(rec, req)
+			if rec.Code != http.StatusUnauthorized {
+				t.Fatalf("expected 401, got %d: %s", rec.Code, rec.Body.String())
+			}
+			var resp errors.Response
+			if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+				t.Fatalf("failed to decode error response: %v", err)
+			}
+			if resp.Code != errors.CodeSessionInvalid {
+				t.Fatalf("expected code %s, got %s", errors.CodeSessionInvalid, resp.Code)
+			}
+		})
 	}
 }
 
@@ -1924,6 +1976,9 @@ func TestLogout_CSRFAndAuthProtection(t *testing.T) {
 	h := New(database, cfg, mockAuth, WithSessionService(sessSvc))
 
 	userID := uuid.New()
+	if err := database.Create(&db.User{ID: userID, Email: userID.String() + "@seed.example", PasswordHash: "hash", CredentialVersion: 0}).Error; err != nil {
+		t.Fatalf("failed to seed user: %v", err)
+	}
 	_, rawCookieID, err := sessSvc.CreateSession(context.Background(), userID, 0, db.SessionTypeCookie, "127.0.0.1", "agent")
 	if err != nil {
 		t.Fatalf("failed to create cookie session: %v", err)

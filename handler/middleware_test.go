@@ -18,9 +18,13 @@ import (
 
 type mockSessionService struct {
 	getSessionFn func(ctx context.Context, rawID string) (*session.Session, error)
+	createSessFn func(ctx context.Context, userID uuid.UUID, credentialVersion int, sessionType db.SessionType, ip, userAgent string) (*session.Session, string, error)
 }
 
 func (m *mockSessionService) CreateSession(ctx context.Context, userID uuid.UUID, credentialVersion int, sessionType db.SessionType, ip, userAgent string) (*session.Session, string, error) {
+	if m.createSessFn != nil {
+		return m.createSessFn(ctx, userID, credentialVersion, sessionType, ip, userAgent)
+	}
 	return nil, "", nil
 }
 
