@@ -1636,16 +1636,15 @@ func TestAuthHandler_LoginStaleMintReturns401(t *testing.T) {
 	cfg := testConfig()
 	userID := uuid.New()
 	staleUser := &db.User{ID: userID, Email: "stale-login@example.com", CredentialVersion: 0}
-	cases := map[string]error{
-		"bare":    errors.ErrSessionInvalid,
-		"wrapped": stderrors.New("mint failed: " + errors.ErrSessionInvalid.Error()),
+	cases := []struct {
+		name    string
+		mintErr error
+	}{
+		{"bare", errors.ErrSessionInvalid},
+		{"wrapped", fmt.Errorf("mint: %w", errors.ErrSessionInvalid)},
 	}
-	for name, mintErr := range cases {
-		t.Run(name, func(t *testing.T) {
-			errToReturn := mintErr
-			if name == "wrapped" {
-				errToReturn = fmt.Errorf("mint: %w", errors.ErrSessionInvalid)
-			}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
 			mockAuth := &mockAuthService{
 				loginFn: func(ctx context.Context, req db.LoginRequest) (*db.User, error) {
 					return staleUser, nil
@@ -1653,7 +1652,7 @@ func TestAuthHandler_LoginStaleMintReturns401(t *testing.T) {
 			}
 			mockSess := &mockSessionService{
 				createSessFn: func(ctx context.Context, uid uuid.UUID, cv int, st db.SessionType, ip, ua string) (*session.Session, string, error) {
-					return nil, "", errToReturn
+					return nil, "", tc.mintErr
 				},
 			}
 			authH := NewAuthHandler(mockAuth, WithAuthSessionService(mockSess), WithAuthConfig(&cfg))
