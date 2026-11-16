@@ -217,6 +217,78 @@ func TestCreateSession_SessionTypeValidation(t *testing.T) {
 	}
 }
 
+func TestCreateSession_RejectsStaleCredentialVersion(t *testing.T) {
+	database := setupTestDB(t)
+	cfg := testConfig()
+	svc := NewService(database, cfg)
+
+	userID := uuid.New()
+	if err := database.Create(&db.User{
+		ID:                userID,
+		Email:             "stale-mint@example.com",
+		PasswordHash:      "hash",
+		CredentialVersion: 1,
+	}).Error; err != nil {
+		t.Fatalf("failed to seed user: %v", err)
+	}
+
+	sess, rawID, err := svc.CreateSession(context.Background(), userID, 0, db.SessionTypeCookie, "127.0.0.1", "agent")
+	if sess != nil || rawID != "" {
+		t.Fatalf("expected nil sess and empty rawID, got sess=%+v rawID=%q", sess, rawID)
+	}
+	if !errors.Is(err, apperrors.ErrSessionInvalid) {
+		t.Fatalf("expected ErrSessionInvalid, got %v", err)
+	}
+
+	var count int64
+	if err := database.Model(&db.Session{}).Where("user_id = ?", userID).Count(&count).Error; err != nil {
+		t.Fatalf("failed to count sessions: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("expected no session persisted on stale mint, found %d", count)
+	}
+}
+
+func TestRotateSession_CredentialMismatch(t *testing.T) {
+	database := setupTestDB(t)
+	cfg := testConfig()
+	svc := NewService(database, cfg)
+
+	userID := uuid.New()
+	if err := database.Create(&db.User{
+		ID:                userID,
+		Email:             "rotate-mismatch@example.com",
+		PasswordHash:      "hash",
+		CredentialVersion: 0,
+	}).Error; err != nil {
+		t.Fatalf("failed to seed user: %v", err)
+	}
+	_, oldRawID, err := svc.CreateSession(context.Background(), userID, 0, db.SessionTypeCookie, "1.1.1.1", "agent-old")
+	if err != nil {
+		t.Fatalf("CreateSession failed: %v", err)
+	}
+
+	if err := database.Model(&db.User{}).Where("id = ?", userID).Update("credential_version", 1).Error; err != nil {
+		t.Fatalf("failed to bump credential version: %v", err)
+	}
+
+	newSess, newRawID, err := svc.RotateSession(context.Background(), oldRawID, "2.2.2.2", "agent-new")
+	if newSess != nil || newRawID != "" {
+		t.Fatalf("expected nil sess and empty rawID, got sess=%+v rawID=%q", newSess, newRawID)
+	}
+	if !errors.Is(err, apperrors.ErrSessionInvalid) {
+		t.Fatalf("expected ErrSessionInvalid, got %v", err)
+	}
+
+	var count int64
+	if err := database.Model(&db.Session{}).Where("id_hash = ?", hashID(oldRawID)).Count(&count).Error; err != nil {
+		t.Fatalf("failed to count sessions: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("expected stale session row purged, found %d", count)
+	}
+}
+
 func TestGetSession_IdleTimeout(t *testing.T) {
 	database := setupTestDB(t)
 	cfg := testConfig()

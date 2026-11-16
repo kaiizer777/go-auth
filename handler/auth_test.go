@@ -1587,6 +1587,43 @@ func TestAuthHandler_LoginSessionCreation_CookieAndBearer(t *testing.T) {
 	}
 }
 
+func TestAuthHandler_StaleMintRejectedAfterVersionBump(t *testing.T) {
+	database, svc, _, _ := setupTestEnv(t)
+	cfg := testConfig()
+	sessSvc := session.NewService(database, &cfg)
+
+	email := "stale-mint@example.com"
+	pass := "ValidPassword123!"
+	createdUser, _, err := svc.Signup(context.Background(), db.SignupRequest{
+		Email:    email,
+		Password: pass,
+	})
+	if err != nil {
+		t.Fatalf("Signup failed: %v", err)
+	}
+
+	_, rawID, err := sessSvc.CreateSession(context.Background(), createdUser.ID, createdUser.CredentialVersion, db.SessionTypeBearer, "127.0.0.1", "agent")
+	if err != nil {
+		t.Fatalf("CreateSession failed: %v", err)
+	}
+
+	if err := database.Model(&db.User{}).Where("id = ?", createdUser.ID).Update("credential_version", createdUser.CredentialVersion+1).Error; err != nil {
+		t.Fatalf("failed to bump credential version: %v", err)
+	}
+
+	if sess, gerr := sessSvc.GetSession(context.Background(), rawID); gerr == nil || sess != nil {
+		t.Fatalf("expected stale session rejected, got sess=%v err=%v", sess, gerr)
+	} else if !stderrors.Is(gerr, errors.ErrSessionInvalid) {
+		t.Fatalf("expected ErrSessionInvalid, got %v", gerr)
+	}
+
+	if sess, _, merr := sessSvc.CreateSession(context.Background(), createdUser.ID, createdUser.CredentialVersion, db.SessionTypeBearer, "127.0.0.1", "agent"); merr == nil || sess != nil {
+		t.Fatalf("expected stale mint rejected, got sess=%v err=%v", sess, merr)
+	} else if !stderrors.Is(merr, errors.ErrSessionInvalid) {
+		t.Fatalf("expected ErrSessionInvalid on stale mint, got %v", merr)
+	}
+}
+
 func TestNewAuthHandler_NilConfigDefaults(t *testing.T) {
 	h := NewAuthHandler(nil)
 	if h.cfg == nil {

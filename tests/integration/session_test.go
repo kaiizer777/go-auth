@@ -365,9 +365,10 @@ func TestAllSessionsInvalidatedOnPasswordChange(t *testing.T) {
 }
 
 // Test: login whose credential check precedes a password reset must not mint a
-// usable session when it resumes after the reset (issue #27).
+// usable session when it resumes after the reset (issue #27). Mint-time
+// validation rejects the stale version; nothing usable is persisted.
 func TestSessionRejectedWhenLoginCapturedOldCredentialVersion(t *testing.T) {
-	app, _, cfg := setupIntegrationApp(t)
+	app, database, _ := setupIntegrationApp(t)
 	email := "login_vs_reset@example.com"
 	pass := "OriginalPass123!"
 	newPass := "NewPass9876543!"
@@ -392,24 +393,19 @@ func TestSessionRejectedWhenLoginCapturedOldCredentialVersion(t *testing.T) {
 		t.Fatalf("ResetPassword failed: %v", err)
 	}
 
-	// In-flight login resumes and mints a session stamped with the old version.
-	_, rawID, err := app.Session.CreateSession(context.Background(), user.ID, oldVersion, db.SessionTypeCookie, "127.0.0.1", "agent")
-	if err != nil {
-		t.Fatalf("CreateSession failed: %v", err)
+	// In-flight login resumes and attempts to mint a session stamped with the
+	// old version: mint-time validation rejects it and persists nothing.
+	_, _, err = app.Session.CreateSession(context.Background(), user.ID, oldVersion, db.SessionTypeCookie, "127.0.0.1", "agent")
+	if err == nil {
+		t.Fatal("expected stale mint rejected, got nil error")
 	}
 
-	// The stale session must be rejected by GetSession.
-	if sess, gerr := app.Session.GetSession(context.Background(), rawID); gerr == nil || sess != nil {
-		t.Fatalf("expected session rejected after reset, got sess=%v err=%v", sess, gerr)
+	var count int64
+	if err := database.Model(&db.Session{}).Where("user_id = ?", user.ID).Count(&count).Error; err != nil {
+		t.Fatalf("failed to count sessions: %v", err)
 	}
-
-	// And via the HTTP middleware.
-	req := httptest.NewRequest(http.MethodGet, "/auth/session", nil)
-	req.AddCookie(&http.Cookie{Name: cfg.SessionCookieName, Value: rawID})
-	rec := httptest.NewRecorder()
-	app.Handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusUnauthorized {
-		t.Fatalf("expected 401 for stale session, got %d", rec.Code)
+	if count != 0 {
+		t.Fatalf("expected no session persisted on stale mint, found %d", count)
 	}
 }
 

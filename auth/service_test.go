@@ -1113,6 +1113,7 @@ func TestService_Signup_UnverifiedAccountRecovery(t *testing.T) {
 		t.Fatalf("failed to query user before recovery: %v", err)
 	}
 	oldHash := dbUserBefore.PasswordHash
+	beforeVersion := dbUserBefore.CredentialVersion
 
 	newPass := "RecoveredPass#67890"
 	recUser, recToken, err := svc.Signup(ctx, db.SignupRequest{Email: "recover@example.com", Password: newPass})
@@ -1162,6 +1163,9 @@ func TestService_Signup_UnverifiedAccountRecovery(t *testing.T) {
 	}
 	if dbUserAfter.PasswordHash == oldHash {
 		t.Fatal("expected password hash to be updated in DB after unverified recovery")
+	}
+	if dbUserAfter.CredentialVersion != beforeVersion+1 {
+		t.Fatalf("expected credential version %d after recovery bump, got %d", beforeVersion+1, dbUserAfter.CredentialVersion)
 	}
 
 	if err := svc.VerifyEmail(ctx, db.VerifyEmailRequest{Token: origToken}); err == nil {
