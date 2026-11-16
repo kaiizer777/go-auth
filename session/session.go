@@ -83,24 +83,36 @@ func (s *service) CreateSession(
 		return nil, "", apperrors.ErrSessionInvalid
 	}
 
-	// Mint-time credential check: re-read the user's current version so a
-	// session cannot be stamped with superseded credentials (e.g. login
-	// captured the version before a concurrent password reset). A missing
-	// user row is treated as version 0 for orphaned/legacy rows. Nothing is
-	// persisted on mismatch.
-	var user db.User
-	currentVersion := 0
-	if uerr := s.db.WithContext(ctx).
-		Select("credential_version").
-		Where("id = ?", userID).
-		First(&user).Error; uerr != nil {
-		if !errors.Is(uerr, gorm.ErrRecordNotFound) {
-			return nil, "", apperrors.New(apperrors.CodeInternalError, "failed to query user", uerr)
-		}
-	} else {
-		currentVersion = user.CredentialVersion
+	// Mint-time credential check runs inside a transaction with the insert so
+	// a password reset committing between the version re-read and the insert
+	// cannot mint a stale-version row. A missing user row fails closed with
+	// ErrSessionInvalid (no orphan mint). Residual read-committed interleaving
+	// stays fail-closed via GetSession version rejection. Nothing persists on mismatch.
+	tx := s.db.WithContext(ctx).Begin()
+	if tx.Error != nil {
+		return nil, "", apperrors.New(apperrors.CodeInternalError, "failed to begin transaction", tx.Error)
 	}
-	if currentVersion != credentialVersion {
+	defer func() {
+		if r := recover(); r != nil {
+			tx.Rollback()
+			panic(r)
+		}
+	}()
+
+	var user db.User
+	if uerr := tx.Select("credential_version").Where("id = ?", userID).First(&user).Error; uerr != nil {
+		tx.Rollback()
+		if errors.Is(uerr, gorm.ErrRecordNotFound) {
+			slog.InfoContext(ctx, "session_invalidated",
+				"user_id", userID.String(),
+				"reason", "missing_user_at_mint",
+			)
+			return nil, "", apperrors.ErrSessionInvalid
+		}
+		return nil, "", apperrors.New(apperrors.CodeInternalError, "failed to query user", uerr)
+	}
+	if user.CredentialVersion != credentialVersion {
+		tx.Rollback()
 		slog.InfoContext(ctx, "session_invalidated",
 			"user_id", userID.String(),
 			"reason", "stale_credential_version_at_mint",
@@ -110,6 +122,7 @@ func (s *service) CreateSession(
 
 	rawID, err := generateRawID()
 	if err != nil {
+		tx.Rollback()
 		return nil, "", apperrors.New(apperrors.CodeInternalError, "failed to generate session ID", err)
 	}
 
@@ -127,8 +140,12 @@ func (s *service) CreateSession(
 		CreatedAt:         now,
 	}
 
-	if err := s.db.WithContext(ctx).Create(record).Error; err != nil {
+	if err := tx.Create(record).Error; err != nil {
+		tx.Rollback()
 		return nil, "", apperrors.New(apperrors.CodeInternalError, "failed to create session", err)
+	}
+	if err := tx.Commit().Error; err != nil {
+		return nil, "", apperrors.New(apperrors.CodeInternalError, "failed to commit session", err)
 	}
 
 	slog.InfoContext(ctx, "session_created",

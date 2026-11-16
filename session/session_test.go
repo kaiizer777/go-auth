@@ -64,6 +64,18 @@ func testConfig() *config.Config {
 	return &cfg
 }
 
+func seedTestUser(t *testing.T, database *gorm.DB, userID uuid.UUID) {
+	t.Helper()
+	if err := database.Create(&db.User{
+		ID:                userID,
+		Email:             userID.String() + "@seed.example",
+		PasswordHash:      "hash",
+		CredentialVersion: 0,
+	}).Error; err != nil {
+		t.Fatalf("failed to seed user: %v", err)
+	}
+}
+
 func TestGenerateRawID_Entropy(t *testing.T) {
 	const count = 1000
 	seen := make(map[string]struct{}, count)
@@ -136,7 +148,9 @@ func TestNewService_NilGuards(t *testing.T) {
 		if svc == nil {
 			t.Fatalf("expected non-nil service")
 		}
-		sess, rawID, err := svc.CreateSession(context.Background(), uuid.New(), 0, db.SessionTypeCookie, "127.0.0.1", "agent")
+		seedID := uuid.New()
+		seedTestUser(t, database, seedID)
+		sess, rawID, err := svc.CreateSession(context.Background(), seedID, 0, db.SessionTypeCookie, "127.0.0.1", "agent")
 		if err != nil {
 			t.Fatalf("CreateSession with defaulted config failed: %v", err)
 		}
@@ -152,6 +166,7 @@ func TestCreateSession_StoresHash(t *testing.T) {
 	svc := NewService(database, cfg)
 
 	userID := uuid.New()
+	seedTestUser(t, database, userID)
 	sess, rawID, err := svc.CreateSession(context.Background(), userID, 0, db.SessionTypeCookie, "127.0.0.1", "test-agent")
 	if err != nil {
 		t.Fatalf("CreateSession failed: %v", err)
@@ -197,6 +212,7 @@ func TestCreateSession_SessionTypeValidation(t *testing.T) {
 	svc := NewService(database, cfg)
 
 	userID := uuid.New()
+	seedTestUser(t, database, userID)
 
 	if _, _, err := svc.CreateSession(context.Background(), userID, 0, db.SessionTypeCookie, "127.0.0.1", "agent"); err != nil {
 		t.Fatalf("CreateSession(cookie) failed: %v", err)
@@ -249,6 +265,28 @@ func TestCreateSession_RejectsStaleCredentialVersion(t *testing.T) {
 	}
 }
 
+func TestCreateSession_RejectsMissingUser(t *testing.T) {
+	database := setupTestDB(t)
+	cfg := testConfig()
+	svc := NewService(database, cfg)
+
+	missingID := uuid.New()
+	sess, rawID, err := svc.CreateSession(context.Background(), missingID, 0, db.SessionTypeCookie, "127.0.0.1", "agent")
+	if sess != nil || rawID != "" {
+		t.Fatalf("expected nil sess and empty rawID, got sess=%+v rawID=%q", sess, rawID)
+	}
+	if !errors.Is(err, apperrors.ErrSessionInvalid) {
+		t.Fatalf("expected ErrSessionInvalid, got %v", err)
+	}
+	var count int64
+	if err := database.Model(&db.Session{}).Where("user_id = ?", missingID).Count(&count).Error; err != nil {
+		t.Fatalf("failed to count sessions: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("expected no orphan session persisted, found %d", count)
+	}
+}
+
 func TestRotateSession_CredentialMismatch(t *testing.T) {
 	database := setupTestDB(t)
 	cfg := testConfig()
@@ -286,6 +324,14 @@ func TestRotateSession_CredentialMismatch(t *testing.T) {
 	}
 	if count != 0 {
 		t.Fatalf("expected stale session row purged, found %d", count)
+	}
+
+	var perUser int64
+	if err := database.Model(&db.Session{}).Where("user_id = ?", userID).Count(&perUser).Error; err != nil {
+		t.Fatalf("failed to count user sessions: %v", err)
+	}
+	if perUser != 0 {
+		t.Fatalf("expected no sessions remain for user, found %d", perUser)
 	}
 }
 
@@ -636,7 +682,9 @@ func TestInvalidateSession_DeletesRow(t *testing.T) {
 	cfg := testConfig()
 	svc := NewService(database, cfg)
 
-	_, rawID, err := svc.CreateSession(context.Background(), uuid.New(), 0, db.SessionTypeCookie, "127.0.0.1", "agent")
+	invID := uuid.New()
+	seedTestUser(t, database, invID)
+	_, rawID, err := svc.CreateSession(context.Background(), invID, 0, db.SessionTypeCookie, "127.0.0.1", "agent")
 	if err != nil {
 		t.Fatalf("CreateSession failed: %v", err)
 	}
@@ -659,7 +707,9 @@ func TestInvalidateSession_Idempotent(t *testing.T) {
 	cfg := testConfig()
 	svc := NewService(database, cfg)
 
-	_, rawID, err := svc.CreateSession(context.Background(), uuid.New(), 0, db.SessionTypeCookie, "127.0.0.1", "agent")
+	invID2 := uuid.New()
+	seedTestUser(t, database, invID2)
+	_, rawID, err := svc.CreateSession(context.Background(), invID2, 0, db.SessionTypeCookie, "127.0.0.1", "agent")
 	if err != nil {
 		t.Fatalf("CreateSession failed: %v", err)
 	}
@@ -679,6 +729,8 @@ func TestInvalidateAllUserSessions(t *testing.T) {
 
 	userA := uuid.New()
 	userB := uuid.New()
+	seedTestUser(t, database, userA)
+	seedTestUser(t, database, userB)
 
 	var tokensA []string
 	for i := 0; i < 3; i++ {
@@ -723,6 +775,7 @@ func TestRotateSession_Transaction(t *testing.T) {
 	svc := NewService(database, cfg)
 
 	userID := uuid.New()
+	seedTestUser(t, database, userID)
 	_, oldRawID, err := svc.CreateSession(context.Background(), userID, 0, db.SessionTypeCookie, "1.1.1.1", "agent-old")
 	if err != nil {
 		t.Fatalf("CreateSession failed: %v", err)
@@ -900,7 +953,9 @@ func TestRotateSession_ConcurrentOrDoubleRotate(t *testing.T) {
 	cfg := testConfig()
 	svc := NewService(database, cfg)
 
-	_, oldRawID, err := svc.CreateSession(context.Background(), uuid.New(), 0, db.SessionTypeCookie, "1.1.1.1", "agent")
+	dblID := uuid.New()
+	seedTestUser(t, database, dblID)
+	_, oldRawID, err := svc.CreateSession(context.Background(), dblID, 0, db.SessionTypeCookie, "1.1.1.1", "agent")
 	if err != nil {
 		t.Fatalf("CreateSession failed: %v", err)
 	}
@@ -1068,6 +1123,7 @@ func TestService_ListSessions_PurgesExpired(t *testing.T) {
 	cfg := testConfig()
 	svc := NewService(database, cfg)
 	userID := uuid.New()
+	seedTestUser(t, database, userID)
 	ctx := context.Background()
 
 	// 1 active session
