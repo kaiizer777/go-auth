@@ -173,6 +173,105 @@ func TestLimiter_Prune_RemovesExpired(t *testing.T) {
 	}
 }
 
+func TestLimiter_Prune_BatchesAcrossAllKeys(t *testing.T) {
+	window := 50 * time.Millisecond
+	limiter := NewLimiter(window, 5)
+
+	const activeCount = 270
+	const expiredCount = 60
+	const total = activeCount + expiredCount // 330 entries (>300)
+
+	// Populate expired entries with timestamps older than window.
+	now := time.Now()
+	expiredCutoff := now.Add(-2 * window)
+
+	limiter.mu.Lock()
+	for i := 0; i < expiredCount; i++ {
+		key := fmt.Sprintf("expired-key-%04d", i)
+		limiter.windows[key] = &windowEntry{
+			timestamps: []time.Time{expiredCutoff},
+		}
+	}
+
+	// Populate active entries with current timestamps.
+	for i := 0; i < activeCount; i++ {
+		key := fmt.Sprintf("active-key-%04d", i)
+		limiter.windows[key] = &windowEntry{
+			timestamps: []time.Time{now},
+		}
+	}
+	limiter.mu.Unlock()
+
+	limiter.mu.RLock()
+	initialLen := len(limiter.windows)
+	limiter.mu.RUnlock()
+	if initialLen != total {
+		t.Fatalf("expected %d initial keys, got %d", total, initialLen)
+	}
+
+	// Prune should scan all batches (batchSize=256) and not terminate early
+	// when encountering batches without expired keys.
+	limiter.Prune()
+
+	limiter.mu.RLock()
+	defer limiter.mu.RUnlock()
+
+	if len(limiter.windows) != activeCount {
+		t.Fatalf("expected exactly %d remaining active entries, got %d (leaked %d entries)",
+			activeCount, len(limiter.windows), len(limiter.windows)-activeCount)
+	}
+
+	for i := 0; i < expiredCount; i++ {
+		key := fmt.Sprintf("expired-key-%04d", i)
+		if _, ok := limiter.windows[key]; ok {
+			t.Fatalf("expired key %s was not pruned", key)
+		}
+	}
+
+	for i := 0; i < activeCount; i++ {
+		key := fmt.Sprintf("active-key-%04d", i)
+		if _, ok := limiter.windows[key]; !ok {
+			t.Fatalf("active key %s was unexpectedly removed", key)
+		}
+	}
+}
+
+func TestLimiter_Prune_BatchesAcrossAllKeys_WithAllow(t *testing.T) {
+	window := 40 * time.Millisecond
+	limiter := NewLimiter(window, 5)
+
+	const expiredCount = 50
+	const activeCount = 260
+	// 1. Create expired entries via Allow
+	for i := 0; i < expiredCount; i++ {
+		key := fmt.Sprintf("expire-allow-%04d", i)
+		limiter.Allow(key)
+	}
+
+	time.Sleep(window + 15*time.Millisecond)
+
+	// 2. Create active entries via Allow
+	for i := 0; i < activeCount; i++ {
+		key := fmt.Sprintf("active-allow-%04d", i)
+		limiter.Allow(key)
+	}
+
+	limiter.Prune()
+
+	limiter.mu.RLock()
+	defer limiter.mu.RUnlock()
+
+	if len(limiter.windows) != activeCount {
+		t.Fatalf("expected %d entries, got %d", activeCount, len(limiter.windows))
+	}
+	for i := 0; i < expiredCount; i++ {
+		key := fmt.Sprintf("expire-allow-%04d", i)
+		if _, ok := limiter.windows[key]; ok {
+			t.Fatalf("expected key %s to be pruned", key)
+		}
+	}
+}
+
 func TestLimiter_ConcurrentAccess(t *testing.T) {
 	limiter := NewLimiter(500*time.Millisecond, 20)
 	concurrency := 50

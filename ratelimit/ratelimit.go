@@ -170,28 +170,27 @@ func (l *Limiter) prune() {
 		entry *windowEntry
 	}
 
-	for {
-		l.mu.RLock()
-		if len(l.windows) == 0 {
-			l.mu.RUnlock()
-			return
-		}
-
-		candidates := make([]candidate, 0, batchSize)
-		for k, entry := range l.windows {
-			candidates = append(candidates, candidate{key: k, entry: entry})
-			if len(candidates) >= batchSize {
-				break
-			}
-		}
+	l.mu.RLock()
+	if len(l.windows) == 0 {
 		l.mu.RUnlock()
+		return
+	}
 
-		if len(candidates) == 0 {
-			return
+	candidates := make([]candidate, 0, len(l.windows))
+	for k, entry := range l.windows {
+		candidates = append(candidates, candidate{key: k, entry: entry})
+	}
+	l.mu.RUnlock()
+
+	for i := 0; i < len(candidates); i += batchSize {
+		end := i + batchSize
+		if end > len(candidates) {
+			end = len(candidates)
 		}
+		batch := candidates[i:end]
 
-		expiredKeys := make([]string, 0, len(candidates))
-		for _, c := range candidates {
+		expiredKeys := make([]string, 0, len(batch))
+		for _, c := range batch {
 			c.entry.mu.Lock()
 			allExpired := true
 			for _, t := range c.entry.timestamps {
@@ -219,10 +218,6 @@ func (l *Limiter) prune() {
 				}
 			}
 			l.mu.Unlock()
-		}
-
-		if len(candidates) < batchSize || len(expiredKeys) == 0 {
-			return
 		}
 	}
 }
