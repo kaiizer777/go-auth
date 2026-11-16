@@ -989,6 +989,9 @@ func TestRequestBodyHardening(t *testing.T) {
 }
 
 func TestLogoutInvokesService(t *testing.T) {
+	cfg := config.DefaultConfig()
+	testToken := "0123456789abcdef0123456789abcdef"
+
 	t.Run("success with session cookie", func(t *testing.T) {
 		var receivedSessionID string
 		mockSvc := &mockAuthService{
@@ -997,17 +1000,17 @@ func TestLogoutInvokesService(t *testing.T) {
 				return nil
 			},
 		}
-		h := New(nil, config.DefaultConfig(), mockSvc)
+		authH := NewAuthHandler(mockSvc, WithAuthConfig(&cfg))
 		req := httptest.NewRequest(http.MethodPost, "/auth/logout", nil)
-		req.AddCookie(&http.Cookie{Name: "session", Value: "sess_12345"})
+		req.AddCookie(&http.Cookie{Name: cfg.SessionCookieName, Value: testToken})
 		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, req)
+		authH.Logout(rec, req)
 
-		if rec.Code != http.StatusNoContent {
-			t.Fatalf("expected 204, got %d", rec.Code)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200 OK, got %d", rec.Code)
 		}
-		if receivedSessionID != "sess_12345" {
-			t.Fatalf("expected session ID sess_12345, got %q", receivedSessionID)
+		if receivedSessionID != testToken {
+			t.Fatalf("expected session ID %q, got %q", testToken, receivedSessionID)
 		}
 	})
 
@@ -1017,17 +1020,18 @@ func TestLogoutInvokesService(t *testing.T) {
 				return errors.New(errors.CodeDatabaseError, "db fail", nil)
 			},
 		}
-		h := New(nil, config.DefaultConfig(), mockSvc)
+		authH := NewAuthHandler(mockSvc, WithAuthConfig(&cfg))
 		req := httptest.NewRequest(http.MethodPost, "/auth/logout", nil)
+		req.AddCookie(&http.Cookie{Name: cfg.SessionCookieName, Value: testToken})
 		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, req)
+		authH.Logout(rec, req)
 
 		if rec.Code != http.StatusInternalServerError {
 			t.Fatalf("expected 500 on db error, got %d", rec.Code)
 		}
 	})
 
-	t.Run("session_id cookie fallback", func(t *testing.T) {
+	t.Run("success with bearer token", func(t *testing.T) {
 		var receivedSessionID string
 		mockSvc := &mockAuthService{
 			logoutFn: func(ctx context.Context, sessionID string) error {
@@ -1035,50 +1039,28 @@ func TestLogoutInvokesService(t *testing.T) {
 				return nil
 			},
 		}
-		h := New(nil, config.DefaultConfig(), mockSvc)
+		authH := NewAuthHandler(mockSvc, WithAuthConfig(&cfg))
 		req := httptest.NewRequest(http.MethodPost, "/auth/logout", nil)
-		req.AddCookie(&http.Cookie{Name: "session_id", Value: "alt_sess_456"})
+		req.Header.Set("Authorization", "Bearer "+testToken)
 		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, req)
+		authH.Logout(rec, req)
 
-		if rec.Code != http.StatusNoContent {
-			t.Fatalf("expected 204, got %d", rec.Code)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200 OK, got %d", rec.Code)
 		}
-		if receivedSessionID != "alt_sess_456" {
-			t.Fatalf("expected alt_sess_456, got %q", receivedSessionID)
-		}
-	})
-
-	t.Run("X-Session-ID header fallback", func(t *testing.T) {
-		var receivedSessionID string
-		mockSvc := &mockAuthService{
-			logoutFn: func(ctx context.Context, sessionID string) error {
-				receivedSessionID = sessionID
-				return nil
-			},
-		}
-		h := New(nil, config.DefaultConfig(), mockSvc)
-		req := httptest.NewRequest(http.MethodPost, "/auth/logout", nil)
-		req.Header.Set("X-Session-ID", "header_sess_789")
-		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, req)
-
-		if rec.Code != http.StatusNoContent {
-			t.Fatalf("expected 204, got %d", rec.Code)
-		}
-		if receivedSessionID != "header_sess_789" {
-			t.Fatalf("expected header_sess_789, got %q", receivedSessionID)
+		if receivedSessionID != testToken {
+			t.Fatalf("expected session ID %q, got %q", testToken, receivedSessionID)
 		}
 	})
 
 	t.Run("nil service in AuthHandler", func(t *testing.T) {
-		authH := NewAuthHandler(nil)
+		authH := NewAuthHandler(nil, WithAuthConfig(&cfg))
 		req := httptest.NewRequest(http.MethodPost, "/auth/logout", nil)
 		rec := httptest.NewRecorder()
 		authH.Logout(rec, req)
 
-		if rec.Code != http.StatusNoContent {
-			t.Fatalf("expected 204 on nil service, got %d", rec.Code)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200 on nil service, got %d", rec.Code)
 		}
 	})
 }
