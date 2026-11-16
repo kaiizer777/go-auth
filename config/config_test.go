@@ -1108,6 +1108,31 @@ func TestConfig_DatabaseURL_Validation(t *testing.T) {
 			wantErr: nil,
 		},
 		{
+			name:    "valid postgresql scheme with unix domain socket in host query",
+			url:     "postgresql:///mydb?host=/var/run/postgresql",
+			wantErr: nil,
+		},
+		{
+			name:    "valid postgres scheme with unix domain socket in socket query",
+			url:     "postgres:///mydb?socket=/var/run/postgresql/.s.PGSQL.5432",
+			wantErr: nil,
+		},
+		{
+			name:    "valid postgresql scheme with credentials and socket query",
+			url:     "postgresql://user:pass@/mydb?host=/var/run/postgresql",
+			wantErr: nil,
+		},
+		{
+			name:    "missing host and query socket in postgres url",
+			url:     "postgres:///mydb",
+			wantErr: errors.ErrDatabaseURLInvalid,
+		},
+		{
+			name:    "empty host query parameter in postgres url",
+			url:     "postgresql:///mydb?host=",
+			wantErr: errors.ErrDatabaseURLInvalid,
+		},
+		{
 			name:    "empty database URL returns ErrDatabaseURLRequired",
 			url:     "",
 			wantErr: errors.ErrDatabaseURLRequired,
@@ -1252,7 +1277,17 @@ func TestConfig_SecretRedaction_LogValue_String(t *testing.T) {
 			{"postgres://user:secret@localhost:5432/mydb?sslmode=disable", "postgres://user:REDACTED@localhost:5432/mydb?sslmode=disable"},
 			{"postgres://:secret@localhost:5432/mydb", "postgres://:REDACTED@localhost:5432/mydb"},
 			{"postgres://localhost:5432/mydb", "postgres://localhost:5432/mydb"},
+			{"postgres://localhost:5432/mydb?password=secret", "postgres://localhost:5432/mydb?password=REDACTED"},
+			{"postgres://localhost:5432/mydb?token=topsecret&sslmode=disable", "postgres://localhost:5432/mydb?sslmode=disable&token=REDACTED"},
+			{"postgres://localhost:5432/mydb?api_key=mykey&pass=mypass", "postgres://localhost:5432/mydb?api_key=REDACTED&pass=REDACTED"},
+			{"postgres://user:secret1@localhost:5432/mydb?password=secret2&sslmode=disable", "postgres://user:REDACTED@localhost:5432/mydb?password=REDACTED&sslmode=disable"},
+			{"postgresql:///mydb?host=/var/run/postgresql&password=secret", "postgresql:///mydb?host=%2Fvar%2Frun%2Fpostgresql&password=REDACTED"},
 			{"host=localhost user=alice password=secret dbname=mydb", "host=localhost user=alice password=REDACTED dbname=mydb"},
+			{`user=foo password="bar with spaces" dbname=baz`, `user=foo password=REDACTED dbname=baz`},
+			{`user=foo password='bar with spaces' dbname=baz`, `user=foo password=REDACTED dbname=baz`},
+			{`host=localhost user=alice password = "bar with spaces" dbname=mydb`, `host=localhost user=alice password = REDACTED dbname=mydb`},
+			{`host=localhost pass="my pass" token='secret token' dbname=mydb`, `host=localhost pass=REDACTED token=REDACTED dbname=mydb`},
+			{`user=foo password="bar \"with\" spaces" dbname=baz`, `user=foo password=REDACTED dbname=baz`},
 			{"", ""},
 		}
 
@@ -1260,6 +1295,29 @@ func TestConfig_SecretRedaction_LogValue_String(t *testing.T) {
 			if got := RedactURL(tc.input); got != tc.want {
 				t.Errorf("RedactURL(%q) = %q; want %q", tc.input, got, tc.want)
 			}
+		}
+	})
+
+	t.Run("RedactURL unix socket and query secret", func(t *testing.T) {
+		raw := "postgresql:///mydb?host=/var/run/postgresql&password=supersecret"
+		got := RedactURL(raw)
+		if strings.Contains(got, "supersecret") {
+			t.Errorf("RedactURL leaked plaintext secret: %q", got)
+		}
+		if !strings.Contains(got, "password=REDACTED") {
+			t.Errorf("expected password=REDACTED, got: %q", got)
+		}
+	})
+
+	t.Run("RedactURL quoted DSN with spaces", func(t *testing.T) {
+		raw := `user=foo password="bar with spaces" dbname=baz`
+		got := RedactURL(raw)
+		if strings.Contains(got, "bar with spaces") {
+			t.Errorf("RedactURL leaked plaintext password: %q", got)
+		}
+		want := `user=foo password=REDACTED dbname=baz`
+		if got != want {
+			t.Errorf("RedactURL(%q) = %q; want %q", raw, got, want)
 		}
 	})
 

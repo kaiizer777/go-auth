@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 	"time"
 
@@ -206,7 +207,7 @@ func (c *Config) Validate() error {
 		return errors.ErrDatabaseURLRequired
 	}
 	parsedDBURL, err := url.Parse(c.DatabaseURL)
-	if err != nil || (parsedDBURL.Scheme != "postgres" && parsedDBURL.Scheme != "postgresql") || parsedDBURL.Host == "" {
+	if err != nil || (parsedDBURL.Scheme != "postgres" && parsedDBURL.Scheme != "postgresql") || (parsedDBURL.Host == "" && parsedDBURL.Query().Get("host") == "" && parsedDBURL.Query().Get("socket") == "") {
 		return errors.ErrDatabaseURLInvalid
 	}
 	if c.BaseURL == "" {
@@ -444,27 +445,55 @@ func isCookieDomain(s string) bool {
 	return true
 }
 
+var (
+	dsnSecretRegex = regexp.MustCompile(`(?i)\b(password|pass|token|secret|api_key|apikey|sslpassword)\b(\s*=\s*)(?:'(?:\\.|[^'\\])*'|"(?:\\.|[^"\\])*"|\S+)`)
+	userinfoRegex  = regexp.MustCompile(`://([^:]+):([^@]+)@`)
+)
+
+func isSecretParam(k string) bool {
+	switch strings.ToLower(k) {
+	case "password", "pass", "token", "secret", "api_key", "apikey", "sslpassword", "access_token", "client_secret", "auth_token":
+		return true
+	default:
+		return false
+	}
+}
+
 // RedactURL masks sensitive credentials in a database or connection URL.
 func RedactURL(rawURL string) string {
 	if rawURL == "" {
 		return ""
 	}
-	u, err := url.Parse(rawURL)
-	if err == nil && u.User != nil {
-		u.User = url.UserPassword(u.User.Username(), "REDACTED")
-		return u.String()
-	}
-	// Fallback for non-standard connection strings or DSNs containing passwords
-	if strings.Contains(rawURL, "password=") {
-		parts := strings.Fields(rawURL)
-		for i, p := range parts {
-			if strings.HasPrefix(p, "password=") {
-				parts[i] = "password=REDACTED"
+	if u, err := url.Parse(rawURL); err == nil && u.Scheme != "" && strings.Contains(rawURL, "://") {
+		var redacted bool
+		if u.User != nil {
+			u.User = url.UserPassword(u.User.Username(), "REDACTED")
+			redacted = true
+		}
+		if u.RawQuery != "" {
+			q := u.Query()
+			var queryRedacted bool
+			for k := range q {
+				if isSecretParam(k) {
+					q.Set(k, "REDACTED")
+					queryRedacted = true
+				}
+			}
+			if queryRedacted {
+				u.RawQuery = q.Encode()
+				redacted = true
 			}
 		}
-		return strings.Join(parts, " ")
+		if redacted {
+			return u.String()
+		}
+		return rawURL
 	}
-	return rawURL
+
+	// Fallback for non-standard connection strings or DSNs containing passwords/secrets
+	cleaned := dsnSecretRegex.ReplaceAllString(rawURL, "${1}${2}REDACTED")
+	cleaned = userinfoRegex.ReplaceAllString(cleaned, "://${1}:REDACTED@")
+	return cleaned
 }
 
 // LogValue implements slog.LogValuer to ensure DatabaseURL and sensitive secrets are masked.
