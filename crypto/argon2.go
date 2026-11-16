@@ -38,6 +38,7 @@ func DefaultHashParams() HashParams {
 var (
 	ErrInvalidHashFormat     = errors.New(errors.CodeInternalError, "invalid argon2id hash format", nil)
 	ErrInvalidHashParams     = errors.New(errors.CodeInternalError, "invalid argon2 hash parameters", nil)
+	ErrArgon2ParamsInvalid   = ErrInvalidHashParams
 	ErrSaltReadFailed        = errors.New(errors.CodeInternalError, "failed to generate crypto salt", nil)
 	ErrDummySecretReadFailed = errors.New(errors.CodeInternalError, "failed to generate dummy secret", nil)
 )
@@ -61,8 +62,8 @@ func HashPasswordBytes(pwdBytes []byte, params HashParams) (string, error) {
 }
 
 func hashPasswordBytes(pwdBytes []byte, params HashParams) (string, error) {
-	if params.Time < 1 || params.Parallelism < 1 || params.Parallelism > 16 || params.Memory < 8*uint32(params.Parallelism) || params.SaltLength < 16 || params.KeyLength == 0 {
-		return "", ErrInvalidHashParams
+	if params.Time < 1 || params.Time > 10 || params.Parallelism < 1 || params.Parallelism > 16 || params.Memory < 8*uint32(params.Parallelism) || params.Memory > 262144 || params.SaltLength < 16 || params.KeyLength == 0 {
+		return "", ErrArgon2ParamsInvalid
 	}
 
 	salt := make([]byte, params.SaltLength)

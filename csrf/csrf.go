@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"io"
 	"net/http"
+	"runtime"
 	"strings"
 
 	"github.com/kaiizer777/go-auth/config"
@@ -39,6 +40,7 @@ func generateCSRFToken() (string, error) {
 	}
 	defer func() {
 		clear(b)
+		runtime.KeepAlive(b)
 	}()
 	return hex.EncodeToString(b), nil
 }
