@@ -1513,6 +1513,14 @@ func TestAuthHandler_LoginSessionCreation_CookieAndBearer(t *testing.T) {
 		t.Errorf("expected session cookie to have HttpOnly=true")
 	}
 
+	cookieSess, err := sessSvc.GetSession(context.Background(), sidCookie.Value)
+	if err != nil || cookieSess == nil {
+		t.Fatalf("GetSession(cookie) failed: %v", err)
+	}
+	if cookieSess.CredentialVersion != createdUser.CredentialVersion {
+		t.Errorf("cookie session credential version = %d, want %d", cookieSess.CredentialVersion, createdUser.CredentialVersion)
+	}
+
 	// 2. Bearer login
 	bearerReq := httptest.NewRequest(http.MethodPost, "/auth/login", nil)
 	bearerReq.Header.Set("X-Auth-Type", "bearer")
@@ -1536,6 +1544,46 @@ func TestAuthHandler_LoginSessionCreation_CookieAndBearer(t *testing.T) {
 	}
 	if len(bearerResp.Token) != 32 {
 		t.Errorf("expected 32-char hex token, got %q", bearerResp.Token)
+	}
+
+	bearerSess, err := sessSvc.GetSession(context.Background(), bearerResp.Token)
+	if err != nil || bearerSess == nil {
+		t.Fatalf("GetSession(bearer) failed: %v", err)
+	}
+	if bearerSess.CredentialVersion != createdUser.CredentialVersion {
+		t.Errorf("bearer session credential version = %d, want %d", bearerSess.CredentialVersion, createdUser.CredentialVersion)
+	}
+
+	// Bumped credential version propagates to minted session.
+	if err := database.Model(&db.User{}).Where("id = ?", createdUser.ID).Update("credential_version", createdUser.CredentialVersion+3).Error; err != nil {
+		t.Fatalf("failed to bump credential version: %v", err)
+	}
+	var bumped db.User
+	if err := database.Where("id = ?", createdUser.ID).First(&bumped).Error; err != nil {
+		t.Fatalf("failed to reload user: %v", err)
+	}
+
+	bumpedReq := httptest.NewRequest(http.MethodPost, "/auth/login", nil)
+	bumpedReq.Header.Set("X-Auth-Type", "bearer")
+	bb, _ := json.Marshal(db.LoginRequest{Email: email, Password: pass})
+	bumpedReq.Body = io.NopCloser(bytes.NewReader(bb))
+	recBumped := httptest.NewRecorder()
+	authH.Login(recBumped, bumpedReq)
+	if recBumped.Code != http.StatusOK {
+		t.Fatalf("bumped login failed: %d", recBumped.Code)
+	}
+	var bumpedResp struct {
+		Token string `json:"token"`
+	}
+	if err := json.Unmarshal(recBumped.Body.Bytes(), &bumpedResp); err != nil {
+		t.Fatalf("failed to decode bumped response: %v", err)
+	}
+	bumpedSess, err := sessSvc.GetSession(context.Background(), bumpedResp.Token)
+	if err != nil || bumpedSess == nil {
+		t.Fatalf("GetSession(bumped) failed: %v", err)
+	}
+	if bumpedSess.CredentialVersion != bumped.CredentialVersion {
+		t.Errorf("bumped session credential version = %d, want %d", bumpedSess.CredentialVersion, bumped.CredentialVersion)
 	}
 }
 
