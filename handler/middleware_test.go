@@ -1,10 +1,14 @@
 package handler
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -483,5 +487,168 @@ func TestRequireAuth_NilSessionService_ReturnsInternalError(t *testing.T) {
 	}
 	if resp.Code != apperrors.CodeInternalError {
 		t.Errorf("expected code %s, got %s", apperrors.CodeInternalError, resp.Code)
+	}
+}
+
+func TestSecurityHeaders_Middleware(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.SessionCookieSecure = true
+
+	mw := SecurityHeaders(&cfg)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/test", nil)
+	rec := httptest.NewRecorder()
+
+	mw.ServeHTTP(rec, req)
+
+	if got := rec.Header().Get("X-Content-Type-Options"); got != "nosniff" {
+		t.Errorf("X-Content-Type-Options = %q, want nosniff", got)
+	}
+	if got := rec.Header().Get("X-Frame-Options"); got != "DENY" {
+		t.Errorf("X-Frame-Options = %q, want DENY", got)
+	}
+	if got := rec.Header().Get("Referrer-Policy"); got != "strict-origin-when-cross-origin" {
+		t.Errorf("Referrer-Policy = %q, want strict-origin-when-cross-origin", got)
+	}
+	if got := rec.Header().Get("Content-Security-Policy"); got != "default-src 'none'; frame-ancestors 'none'" {
+		t.Errorf("Content-Security-Policy = %q, want default-src 'none'; frame-ancestors 'none'", got)
+	}
+	if got := rec.Header().Get("Strict-Transport-Security"); got != "max-age=63072000; includeSubDomains; preload" {
+		t.Errorf("Strict-Transport-Security = %q, want HSTS header when secure", got)
+	}
+}
+
+func TestRecovery_Middleware(t *testing.T) {
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, nil))
+
+	secretPanicValue := "secret-panic-token-12345"
+	mw := Recovery(logger)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		panic(secretPanicValue)
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/panic", nil)
+	rec := httptest.NewRecorder()
+
+	mw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500, got %d", rec.Code)
+	}
+
+	var resp apperrors.Response
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to decode error body: %v", err)
+	}
+	if resp.Code != apperrors.CodeInternalError {
+		t.Errorf("expected INTERNAL_ERROR, got %s", resp.Code)
+	}
+
+	logOutput := logBuf.String()
+	if !strings.Contains(logOutput, "panic recovered in http handler") {
+		t.Errorf("expected recovery message in log, got: %s", logOutput)
+	}
+	if strings.Contains(logOutput, secretPanicValue) {
+		t.Fatalf("secret panic value leaked into log: %s", logOutput)
+	}
+}
+
+func TestRequireAuth_PreservesTypedCookieError(t *testing.T) {
+	cfg := config.DefaultConfig()
+	mockSvc := &mockSessionService{}
+
+	mw := RequireAuth(mockSvc, &cfg)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("next handler should not be called")
+	}))
+
+	// Cookie is present but invalid hex
+	req := httptest.NewRequest(http.MethodGet, "/protected", nil)
+	req.AddCookie(&http.Cookie{
+		Name:  cfg.SessionCookieName,
+		Value: "invalid-token-not-hex",
+	})
+	rec := httptest.NewRecorder()
+
+	mw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d", rec.Code)
+	}
+	var resp apperrors.Response
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to decode body: %v", err)
+	}
+	if resp.Code != apperrors.CodeSessionInvalid {
+		t.Fatalf("expected CodeSessionInvalid, got %s", resp.Code)
+	}
+}
+
+func TestRequireAuth_ContextSecretRedacted(t *testing.T) {
+	cfg := config.DefaultConfig()
+	secretToken := validTestToken
+	expectedUserID := uuid.New()
+	expectedSession := &session.Session{
+		ID:     uuid.New(),
+		UserID: expectedUserID,
+		Type:   db.SessionTypeCookie,
+	}
+
+	mockSvc := &mockSessionService{
+		getSessionFn: func(ctx context.Context, rawID string) (*session.Session, error) {
+			return expectedSession, nil
+		},
+	}
+
+	var dumpedContext string
+	mw := RequireAuth(mockSvc, &cfg)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		dumpedContext = fmt.Sprintf("%+v", r.Context())
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/protected", nil)
+	req.AddCookie(&http.Cookie{
+		Name:  cfg.SessionCookieName,
+		Value: secretToken,
+	})
+	rec := httptest.NewRecorder()
+
+	mw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	if strings.Contains(dumpedContext, secretToken) {
+		t.Fatalf("raw secret token leaked in context dump: %s", dumpedContext)
+	}
+	if !strings.Contains(dumpedContext, "[REDACTED]") {
+		t.Fatalf("expected [REDACTED] in context dump, got: %s", dumpedContext)
+	}
+}
+
+func TestRequireAuth_DatabaseError(t *testing.T) {
+	cfg := config.DefaultConfig()
+	mockSvc := &mockSessionService{
+		getSessionFn: func(ctx context.Context, rawID string) (*session.Session, error) {
+			return nil, apperrors.New(apperrors.CodeInternalError, "database connection lost", nil)
+		},
+	}
+
+	mw := RequireAuth(mockSvc, &cfg)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("next handler should not be called")
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/protected", nil)
+	req.AddCookie(&http.Cookie{
+		Name:  cfg.SessionCookieName,
+		Value: validTestToken,
+	})
+	rec := httptest.NewRecorder()
+
+	mw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500 on db error, got %d", rec.Code)
 	}
 }
