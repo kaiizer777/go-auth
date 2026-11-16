@@ -26,6 +26,26 @@ func SetSessionCookie(w http.ResponseWriter, rawID string, cfg *config.Config) {
 	})
 }
 
+// SetSessionCookieWithExpiry writes the session cookie with MaxAge dynamically matching expiresAt.
+// HttpOnly is HARDCODED to true — callers cannot opt out.
+func SetSessionCookieWithExpiry(w http.ResponseWriter, rawID string, expiresAt time.Time, cfg *config.Config) {
+	remaining := int(time.Until(expiresAt).Seconds())
+	if remaining < 0 {
+		remaining = 0
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name:     cfg.SessionCookieName,
+		Value:    rawID,
+		Path:     cfg.SessionCookiePath,
+		Domain:   cfg.SessionCookieDomain,
+		MaxAge:   remaining,
+		Expires:  expiresAt,
+		HttpOnly: true,                      // HARDCODED — prevents JS access; not configurable
+		Secure:   cfg.SessionCookieSecure,   // true in prod; configurable for local dev
+		SameSite: cfg.SessionCookieSameSite, // Lax minimum
+	})
+}
+
 // ClearSessionCookie sets the session cookie to empty with MaxAge=-1,
 // which instructs the browser to delete it immediately.
 // MaxAge=-1 means "delete now". MaxAge=0 means "session cookie" in some browsers — never use 0 for deletion.

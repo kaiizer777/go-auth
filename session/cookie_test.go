@@ -209,3 +209,52 @@ func TestReadSessionCookie_Invalid(t *testing.T) {
 		})
 	}
 }
+
+func TestSetSessionCookieWithExpiry(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.SessionCookieName = "sid"
+	cfg.SessionCookieSecure = true
+	cfg.SessionCookieSameSite = http.SameSiteLaxMode
+	cfg.SessionCookiePath = "/"
+	cfg.SessionCookieDomain = "example.com"
+
+	t.Run("computes dynamic MaxAge for future expiry", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		rawID := "0123456789abcdef0123456789abcdef"
+		expiresAt := time.Now().Add(3600 * time.Second)
+
+		SetSessionCookieWithExpiry(rec, rawID, expiresAt, &cfg)
+
+		cookies := rec.Result().Cookies()
+		if len(cookies) != 1 {
+			t.Fatalf("expected 1 cookie, got %d", len(cookies))
+		}
+		c := cookies[0]
+		if c.Name != "sid" || c.Value != rawID {
+			t.Fatalf("unexpected cookie name/val: %s=%s", c.Name, c.Value)
+		}
+		if !c.HttpOnly || !c.Secure {
+			t.Fatalf("expected HttpOnly and Secure true")
+		}
+		if c.MaxAge <= 3500 || c.MaxAge > 3600 {
+			t.Fatalf("expected MaxAge ~3600s, got %d", c.MaxAge)
+		}
+	})
+
+	t.Run("clamps non-positive remaining expiry to zero", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		rawID := "0123456789abcdef0123456789abcdef"
+		expiresAt := time.Now().Add(-10 * time.Second)
+
+		SetSessionCookieWithExpiry(rec, rawID, expiresAt, &cfg)
+
+		cookies := rec.Result().Cookies()
+		if len(cookies) != 1 {
+			t.Fatalf("expected 1 cookie, got %d", len(cookies))
+		}
+		c := cookies[0]
+		if c.MaxAge != 0 {
+			t.Fatalf("expected MaxAge 0 for past expiry, got %d", c.MaxAge)
+		}
+	})
+}
