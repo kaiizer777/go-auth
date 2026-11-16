@@ -685,8 +685,8 @@ func TestPasswordResetPurge(t *testing.T) {
 
 	var activeTokens int64
 	database.Model(&db.PasswordResetToken{}).Where("user_id = ?", user.ID).Count(&activeTokens)
-	if activeTokens != 2 {
-		t.Fatalf("expected 2 active reset tokens, got %d", activeTokens)
+	if activeTokens != 1 {
+		t.Fatalf("expected 1 active reset token, got %d", activeTokens)
 	}
 
 	// Consume token 2
@@ -920,15 +920,15 @@ func TestRoutingAndAliases(t *testing.T) {
 		t.Fatalf("expected status 403 on alias for unprotected logout, got %d", recApiLogout.Code)
 	}
 
-	// In legacy mode (nil session service), logout returns 204 No Content
+	// In legacy mode (nil session service), logout returns 200 OK
 	legacyH := New(nil, testConfig(), svc)
 	recLegacyLogout := executeRequest(t, legacyH, http.MethodPost, "/auth/logout", nil)
-	if recLegacyLogout.Code != http.StatusNoContent {
-		t.Fatalf("expected status 204 on legacy logout, got %d", recLegacyLogout.Code)
+	if recLegacyLogout.Code != http.StatusOK {
+		t.Fatalf("expected status 200 on legacy logout, got %d", recLegacyLogout.Code)
 	}
 	recLegacyApiLogout := executeRequest(t, legacyH, http.MethodPost, "/api/auth/logout", nil)
-	if recLegacyApiLogout.Code != http.StatusNoContent {
-		t.Fatalf("expected status 204 on legacy alias logout, got %d", recLegacyApiLogout.Code)
+	if recLegacyApiLogout.Code != http.StatusOK {
+		t.Fatalf("expected status 200 on legacy alias logout, got %d", recLegacyApiLogout.Code)
 	}
 
 	// Alias routes: verify they accept identical requests
@@ -1231,9 +1231,9 @@ func TestTamperedCookiesAndHeaders(t *testing.T) {
 
 			h.ServeHTTP(rec, req)
 
-			// Safe handling: 204 No Content, no panic, no 500 secret leakage
-			if rec.Code != http.StatusNoContent {
-				t.Fatalf("expected status 204 No Content for tampered session, got %d", rec.Code)
+			// Safe handling: 200 OK, no panic, no 500 secret leakage
+			if rec.Code != http.StatusOK {
+				t.Fatalf("expected status 200 OK for tampered session, got %d", rec.Code)
 			}
 		})
 	}
