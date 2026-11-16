@@ -437,6 +437,11 @@ func TestValidatePassword_SentinelErrorsAndExtensibility(t *testing.T) {
 		t.Fatalf("password should not be in blocklist yet")
 	}
 	AddBlockedPasswords(dynamicPassword)
+	t.Cleanup(func() {
+		blocklistMu.Lock()
+		delete(commonPasswords, strings.ToLower(strings.TrimSpace(dynamicPassword)))
+		blocklistMu.Unlock()
+	})
 	if !IsCommonPassword(dynamicPassword) {
 		t.Fatalf("password should now be found in blocklist after AddBlockedPasswords")
 	}
