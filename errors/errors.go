@@ -218,12 +218,32 @@ func Wrap(cause error, defaultCode Code, message string) error {
 	return New(code, message, cause)
 }
 
-// Re-exports of standard library errors package functions.
-var (
-	Is     = stderrors.Is
-	As     = stderrors.As
-	Unwrap = stderrors.Unwrap
-)
+// WrapOverride wraps cause error with the specified code unconditionally,
+// even if cause is already a classified *Error with a different code.
+func WrapOverride(cause error, code Code, message string) error {
+	if cause == nil {
+		return nil
+	}
+	return New(code, message, cause)
+}
+
+// Is reports whether any error in err's tree matches target.
+func Is(err, target error) bool {
+	return stderrors.Is(err, target)
+}
+
+// As finds the first error in err's tree that matches target, and if one is found, sets
+// target to that error value and returns true. Otherwise, it returns false.
+func As(err error, target any) bool {
+	return stderrors.As(err, target)
+}
+
+// Unwrap returns the result of calling the Unwrap method on err, if err's
+// type contains an Unwrap method returning error.
+// Otherwise, Unwrap returns nil.
+func Unwrap(err error) error {
+	return stderrors.Unwrap(err)
+}
 
 // Predefined sentinel errors for config.Validate().
 var (
@@ -332,5 +352,7 @@ func WriteJSON(w http.ResponseWriter, err error) {
 	_ = json.NewEncoder(w).Encode(resp)
 }
 
-// WriteHTTP is an alias for WriteJSON conforming to wire response standards.
-var WriteHTTP = WriteJSON
+// WriteHTTP writes an error response envelope to the response writer conforming to wire response standards.
+func WriteHTTP(w http.ResponseWriter, err error) {
+	WriteJSON(w, err)
+}
