@@ -555,6 +555,49 @@ func TestRecovery_Middleware(t *testing.T) {
 	}
 }
 
+func TestRecovery_RePanicsErrAbortHandler(t *testing.T) {
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, nil))
+
+	mw := Recovery(logger)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		panic(http.ErrAbortHandler)
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/abort", nil)
+	rec := httptest.NewRecorder()
+
+	var panickedVal any
+	func() {
+		defer func() {
+			panickedVal = recover()
+		}()
+		mw.ServeHTTP(rec, req)
+	}()
+
+	if panickedVal != http.ErrAbortHandler {
+		t.Fatalf("expected re-panic with http.ErrAbortHandler, got: %v", panickedVal)
+	}
+
+	if strings.Contains(logBuf.String(), "panic recovered in http handler") {
+		t.Errorf("expected no recovery log for http.ErrAbortHandler, got: %s", logBuf.String())
+	}
+}
+
+func TestRecover_DefaultLogger(t *testing.T) {
+	mw := Recover()(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		panic("testing default recover")
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/recover-test", nil)
+	rec := httptest.NewRecorder()
+
+	mw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500 from default Recover(), got %d", rec.Code)
+	}
+}
+
 func TestRequireAuth_PreservesTypedCookieError(t *testing.T) {
 	cfg := config.DefaultConfig()
 	mockSvc := &mockSessionService{}
