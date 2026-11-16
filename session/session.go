@@ -50,7 +50,7 @@ func NewService(gormDB *gorm.DB, cfg *config.Config) Service {
 // SQLite has no FOR UPDATE syntax and serializes writers inside the tx, so the
 // clause is skipped there; other dialects lock the re-read user row.
 func lockForUpdate(tx *gorm.DB) *gorm.DB {
-	if strings.Contains(strings.ToLower(tx.Dialector.Name()), "sqlite") {
+	if strings.Contains(strings.ToLower(tx.Name()), "sqlite") {
 		return tx
 	}
 	return tx.Clauses(clause.Locking{Strength: "UPDATE"})
