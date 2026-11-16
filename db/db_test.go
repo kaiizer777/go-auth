@@ -319,3 +319,31 @@ func TestMigration000005_TimestampBackfillAndDialectParity(t *testing.T) {
 		t.Errorf("migration 5 backfill (idx %d) must occur before drop (idx %d)", backfillIdx, dropIdx)
 	}
 }
+
+func TestMigration000006_DownRefusesVersionedDB(t *testing.T) {
+	data, err := defaultMigrationsFS.ReadFile("migrations/000006_add_credential_version.down.sql")
+	if err != nil {
+		t.Fatalf("failed to read migration 6 down: %v", err)
+	}
+	content := string(data)
+
+	if !strings.Contains(content, "down refused") {
+		t.Error("migration 6 down must carry the refusal text")
+	}
+	guardIdx := strings.Index(content, "credential_version <> 0")
+	raiseIdx := strings.Index(content, "RAISE EXCEPTION")
+	if guardIdx == -1 {
+		t.Fatal("migration 6 down must gate refusal on non-zero credential_version rows")
+	}
+	if raiseIdx == -1 {
+		t.Fatal("migration 6 down missing RAISE EXCEPTION refusal")
+	}
+	if guardIdx > raiseIdx {
+		t.Errorf("migration 6 version guard (idx %d) must precede refusal (idx %d)", guardIdx, raiseIdx)
+	}
+	for _, table := range []string{"users", "sessions"} {
+		if !strings.Contains(content, table) {
+			t.Errorf("migration 6 down must guard %s", table)
+		}
+	}
+}
