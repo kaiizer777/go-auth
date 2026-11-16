@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/url"
@@ -24,6 +25,42 @@ type Argon2Config struct {
 	Parallelism uint8  // Threads. Min: 1. Default: 4
 	SaltLength  uint32 // Bytes. Min: 16. Default: 16
 	KeyLength   uint32 // Output bytes. Min: 32. Default: 32
+}
+
+// OAuthConfig defines settings for a third-party OAuth2 / OIDC identity provider.
+type OAuthConfig struct {
+	ClientID     string
+	ClientSecret string
+	RedirectURL  string
+	Scopes       []string
+	AuthURL      string
+	TokenURL     string
+	UserInfoURL  string
+}
+
+// LogValue implements slog.LogValuer to ensure ClientSecret is masked in logs.
+func (o OAuthConfig) LogValue() slog.Value {
+	secret := "[REDACTED]"
+	if o.ClientSecret == "" {
+		secret = ""
+	}
+	return slog.GroupValue(
+		slog.String("client_id", o.ClientID),
+		slog.String("client_secret", secret),
+		slog.String("redirect_url", o.RedirectURL),
+		slog.String("auth_url", o.AuthURL),
+		slog.String("token_url", o.TokenURL),
+		slog.String("user_info_url", o.UserInfoURL),
+	)
+}
+
+// String implements fmt.Stringer to ensure ClientSecret is masked when printed.
+func (o OAuthConfig) String() string {
+	secret := "[REDACTED]"
+	if o.ClientSecret == "" {
+		secret = ""
+	}
+	return fmt.Sprintf("OAuthConfig{ClientID: %s, ClientSecret: %s, RedirectURL: %s}", o.ClientID, secret, o.RedirectURL)
 }
 
 // Config holds all database, CORS, connection pool, and email hook settings.
@@ -55,6 +92,7 @@ type Config struct {
 	BaseURL string
 
 	// Email delivery hooks (provided by host app)
+	// Deprecated: Prefer EmailHooks for structured transactional email hooks.
 	SendVerificationEmail  SendVerificationEmailFunc
 	SendPasswordResetEmail SendPasswordResetEmailFunc
 
@@ -105,6 +143,9 @@ type Config struct {
 	RateLimitSignupMax    int           // default 10
 	RateLimitSignupIPMax  int           // max signups per IP in window; default 50
 	RateLimitCleanupTick  time.Duration // how often to prune expired entries; default 5m
+
+	// OAuth holds optional third-party OAuth2/OIDC provider configurations keyed by provider name.
+	OAuth map[string]OAuthConfig
 }
 
 // DefaultConfig returns safe default settings. AllowedOrigins is intentionally
@@ -163,6 +204,10 @@ func DefaultConfig() Config {
 func (c *Config) Validate() error {
 	if c.DatabaseURL == "" {
 		return errors.ErrDatabaseURLRequired
+	}
+	parsedDBURL, err := url.Parse(c.DatabaseURL)
+	if err != nil || (parsedDBURL.Scheme != "postgres" && parsedDBURL.Scheme != "postgresql") || parsedDBURL.Host == "" {
+		return errors.ErrDatabaseURLInvalid
 	}
 	if c.BaseURL == "" {
 		return errors.ErrBaseURLRequired
@@ -230,9 +275,6 @@ func (c *Config) Validate() error {
 	}
 	if c.Argon2.Time < 2 {
 		return errors.ErrArgon2TimeTooLow
-	}
-	if c.Argon2.Parallelism < 1 {
-		return errors.ErrArgon2ParallelismZero
 	}
 	if c.Argon2.SaltLength < 16 {
 		return errors.ErrArgon2SaltLengthTooShort
@@ -389,11 +431,77 @@ func isCookieDomain(s string) bool {
 	if s == "" {
 		return true
 	}
+	// Reject schemes, ports, paths, and control characters per RFC 6265 §4.1.1.
+	if strings.ContainsAny(s, ":/\\ \t\r\n;?#@") {
+		return false
+	}
 	for i := 0; i < len(s); i++ {
 		b := s[i]
-		if b <= 32 || b >= 127 || b == ';' {
+		if b <= 32 || b >= 127 {
 			return false
 		}
 	}
 	return true
+}
+
+// RedactURL masks sensitive credentials in a database or connection URL.
+func RedactURL(rawURL string) string {
+	if rawURL == "" {
+		return ""
+	}
+	u, err := url.Parse(rawURL)
+	if err == nil && u.User != nil {
+		u.User = url.UserPassword(u.User.Username(), "REDACTED")
+		return u.String()
+	}
+	// Fallback for non-standard connection strings or DSNs containing passwords
+	if strings.Contains(rawURL, "password=") {
+		parts := strings.Fields(rawURL)
+		for i, p := range parts {
+			if strings.HasPrefix(p, "password=") {
+				parts[i] = "password=REDACTED"
+			}
+		}
+		return strings.Join(parts, " ")
+	}
+	return rawURL
+}
+
+// LogValue implements slog.LogValuer to ensure DatabaseURL and sensitive secrets are masked.
+func (c Config) LogValue() slog.Value {
+	attrs := []slog.Attr{
+		slog.String("database_url", RedactURL(c.DatabaseURL)),
+		slog.String("base_url", c.BaseURL),
+		slog.String("migrations_path", c.MigrationsPath),
+		slog.Int("max_open_conns", c.MaxOpenConns),
+		slog.Int("max_idle_conns", c.MaxIdleConns),
+		slog.Duration("conn_max_lifetime", c.ConnMaxLifetime),
+		slog.Duration("conn_max_idle_time", c.ConnMaxIdleTime),
+		slog.String("session_cookie_name", c.SessionCookieName),
+		slog.String("session_cookie_domain", c.SessionCookieDomain),
+		slog.String("session_cookie_path", c.SessionCookiePath),
+		slog.Bool("session_cookie_secure", c.SessionCookieSecure),
+		slog.Int("session_cookie_samesite", int(c.SessionCookieSameSite)),
+		slog.Duration("session_idle_timeout", c.SessionIdleTimeout),
+		slog.Duration("session_absolute_max_age", c.SessionAbsoluteMaxAge),
+		slog.String("csrf_cookie_name", c.CSRFCookieName),
+		slog.String("csrf_header_name", c.CSRFHeaderName),
+	}
+	if len(c.OAuth) > 0 {
+		oauthAttrs := make([]slog.Attr, 0, len(c.OAuth))
+		for name, provider := range c.OAuth {
+			oauthAttrs = append(oauthAttrs, slog.Any(name, provider.LogValue()))
+		}
+		attrs = append(attrs, slog.Attr{
+			Key:   "oauth",
+			Value: slog.GroupValue(oauthAttrs...),
+		})
+	}
+	return slog.GroupValue(attrs...)
+}
+
+// String implements fmt.Stringer to ensure DatabaseURL and sensitive secrets are masked when formatted.
+func (c Config) String() string {
+	return fmt.Sprintf("Config{DatabaseURL: %s, BaseURL: %s, MigrationsPath: %s, MaxOpenConns: %d, MaxIdleConns: %d}",
+		RedactURL(c.DatabaseURL), c.BaseURL, c.MigrationsPath, c.MaxOpenConns, c.MaxIdleConns)
 }
