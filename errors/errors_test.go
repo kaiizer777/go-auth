@@ -733,3 +733,127 @@ func TestSentinels_Phase4(t *testing.T) {
 		})
 	}
 }
+
+func TestSentinels_Phase3(t *testing.T) {
+	tests := []struct {
+		err         *Error
+		wantCode    Code
+		wantMessage string
+		wantStatus  int
+	}{
+		{ErrInvalidCredentials, CodeInvalidCredentials, "invalid email or password", http.StatusUnauthorized},
+		{ErrUnauthenticated, CodeUnauthenticated, "authentication required", http.StatusUnauthorized},
+		{ErrEmailNotVerified, CodeEmailNotVerified, "email address not verified", http.StatusForbidden},
+		{ErrUserAlreadyExists, CodeUserAlreadyExists, "user already exists", http.StatusConflict},
+		{ErrEmailAlreadyExists, CodeEmailAlreadyExists, "email already exists", http.StatusConflict},
+		{ErrUserNotFound, CodeUserNotFound, "user not found", http.StatusNotFound},
+		{ErrInvalidToken, CodeInvalidToken, "token is invalid or malformed", http.StatusBadRequest},
+		{ErrTokenExpired, CodeTokenExpired, "token has expired", http.StatusBadRequest},
+		{ErrTokenNotFound, CodeTokenNotFound, "token not found", http.StatusNotFound},
+		{ErrPasswordTooShort, CodePasswordTooShort, "password is too short", http.StatusBadRequest},
+		{ErrPasswordTooLong, CodePasswordTooLong, "password is too long", http.StatusBadRequest},
+		{ErrPasswordTooCommon, CodePasswordTooCommon, "password is too common", http.StatusBadRequest},
+		{ErrInvalidEmail, CodeInvalidEmail, "invalid email address", http.StatusBadRequest},
+		{ErrValidationError, CodeValidationError, "validation failed", http.StatusBadRequest},
+	}
+
+	for _, tt := range tests {
+		t.Run(string(tt.wantCode), func(t *testing.T) {
+			if tt.err.Code() != tt.wantCode {
+				t.Errorf("Code() = %q; want %q", tt.err.Code(), tt.wantCode)
+			}
+			if tt.err.Message() != tt.wantMessage {
+				t.Errorf("Message() = %q; want %q", tt.err.Message(), tt.wantMessage)
+			}
+			if got := tt.err.HTTPStatus(); got != tt.wantStatus {
+				t.Errorf("HTTPStatus() = %d; want %d", got, tt.wantStatus)
+			}
+			if !Is(tt.err, tt.err) {
+				t.Error("expected sentinel to match itself via Is")
+			}
+		})
+	}
+}
+
+func TestSentinels_MFAAndOAuth(t *testing.T) {
+	tests := []struct {
+		err         *Error
+		wantCode    Code
+		wantMessage string
+		wantStatus  int
+	}{
+		{ErrMFARequired, CodeMFARequired, "mfa verification required", http.StatusUnauthorized},
+		{ErrMFAInvalidCode, CodeMFAInvalidCode, "invalid mfa code", http.StatusUnauthorized},
+		{ErrOAuthStateInvalid, CodeOAuthStateInvalid, "invalid oauth state", http.StatusBadRequest},
+		{ErrOAuthCallbackFailed, CodeOAuthCallbackFailed, "oauth callback failed", http.StatusBadRequest},
+		{ErrOAuthProviderError, CodeOAuthProviderError, "oauth provider error", http.StatusBadGateway},
+		{ErrOAuthAccountAlreadyLinked, CodeOAuthAccountAlreadyLinked, "oauth account already linked", http.StatusConflict},
+		{ErrOAuthAccountNotLinked, CodeOAuthAccountNotLinked, "oauth account not linked", http.StatusNotFound},
+	}
+
+	for _, tt := range tests {
+		t.Run(string(tt.wantCode), func(t *testing.T) {
+			if tt.err.Code() != tt.wantCode {
+				t.Errorf("Code() = %q; want %q", tt.err.Code(), tt.wantCode)
+			}
+			if tt.err.Message() != tt.wantMessage {
+				t.Errorf("Message() = %q; want %q", tt.err.Message(), tt.wantMessage)
+			}
+			if got := tt.err.HTTPStatus(); got != tt.wantStatus {
+				t.Errorf("HTTPStatus() = %d; want %d", got, tt.wantStatus)
+			}
+		})
+	}
+}
+
+func TestWrapOverride(t *testing.T) {
+	t.Run("nil cause returns nil", func(t *testing.T) {
+		if got := WrapOverride(nil, CodeInvalidCredentials, "ignored"); got != nil {
+			t.Fatalf("WrapOverride(nil) = %v; want nil", got)
+		}
+	})
+
+	t.Run("overrides code of existing domain error", func(t *testing.T) {
+		orig := New(CodeNotFound, "user missing", nil)
+		wrapped := WrapOverride(orig, CodeInvalidCredentials, "bad credentials")
+
+		var appErr *Error
+		if !As(wrapped, &appErr) {
+			t.Fatal("expected As to find *Error")
+		}
+		if appErr.Code() != CodeInvalidCredentials {
+			t.Errorf("got code %q; want %q", appErr.Code(), CodeInvalidCredentials)
+		}
+		if appErr.Message() != "bad credentials" {
+			t.Errorf("got message %q; want %q", appErr.Message(), "bad credentials")
+		}
+		if !Is(wrapped, orig) {
+			t.Error("expected wrapped error to match original cause via Is")
+		}
+	})
+
+	t.Run("wraps standard error with specified code", func(t *testing.T) {
+		stdErr := stderrors.New("connection failed")
+		wrapped := WrapOverride(stdErr, CodeOAuthProviderError, "provider unreachable")
+
+		var appErr *Error
+		if !As(wrapped, &appErr) {
+			t.Fatal("expected As to find *Error")
+		}
+		if appErr.Code() != CodeOAuthProviderError {
+			t.Errorf("got code %q; want %q", appErr.Code(), CodeOAuthProviderError)
+		}
+	})
+}
+
+func TestSentinelAliasesAndConfigSentinels(t *testing.T) {
+	if !Is(ErrInvalidSession, ErrSessionInvalid) {
+		t.Error("expected ErrInvalidSession to equal ErrSessionInvalid")
+	}
+	if ErrDatabaseURLInvalid.Code() != CodeInvalidConfig {
+		t.Errorf("ErrDatabaseURLInvalid code = %q; want %q", ErrDatabaseURLInvalid.Code(), CodeInvalidConfig)
+	}
+	if ErrDatabaseURLInvalid.Message() != "database URL is invalid" {
+		t.Errorf("ErrDatabaseURLInvalid message = %q; want %q", ErrDatabaseURLInvalid.Message(), "database URL is invalid")
+	}
+}

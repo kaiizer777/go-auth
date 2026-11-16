@@ -35,8 +35,21 @@ const (
 	CodeValidationError    Code = "VALIDATION_ERROR"
 	CodeInvalidToken       Code = "INVALID_TOKEN"
 	CodeTokenExpired       Code = "TOKEN_EXPIRED"
+	CodeTokenNotFound      Code = "TOKEN_NOT_FOUND"
 	CodeUserAlreadyExists  Code = "USER_ALREADY_EXISTS"
+	CodeEmailAlreadyExists Code = "EMAIL_ALREADY_EXISTS"
 	CodeUserNotFound       Code = "USER_NOT_FOUND"
+
+	// Multi-Factor Authentication (MFA) error codes
+	CodeMFARequired    Code = "MFA_REQUIRED"
+	CodeMFAInvalidCode Code = "MFA_INVALID_CODE"
+
+	// OAuth2 and OIDC error codes
+	CodeOAuthStateInvalid         Code = "OAUTH_STATE_INVALID"
+	CodeOAuthCallbackFailed       Code = "OAUTH_CALLBACK_FAILED"
+	CodeOAuthProviderError        Code = "OAUTH_PROVIDER_ERROR"
+	CodeOAuthAccountAlreadyLinked Code = "OAUTH_ACCOUNT_ALREADY_LINKED"
+	CodeOAuthAccountNotLinked     Code = "OAUTH_ACCOUNT_NOT_LINKED"
 
 	// Phase 4 Session errors
 	CodeSessionNotFound Code = "SESSION_NOT_FOUND" // 401
@@ -50,24 +63,39 @@ const (
 	// Phase 4 Rate limiting
 	CodeRateLimitExceeded Code = "RATE_LIMIT_EXCEEDED" // 429
 
-	// Aliases
-	INVALID_CONFIG       = CodeInvalidConfig
-	DATABASE_ERROR       = CodeDatabaseError
+	// Deprecated: Use CodeInvalidConfig instead.
+	INVALID_CONFIG = CodeInvalidConfig
+	// Deprecated: Use CodeDatabaseError instead.
+	DATABASE_ERROR = CodeDatabaseError
+	// Deprecated: Use CodeDatabaseUnavailable instead.
 	DATABASE_UNAVAILABLE = CodeDatabaseUnavailable
-	MIGRATION_FAILED     = CodeMigrationFailed
-	INTERNAL_ERROR       = CodeInternalError
-	NOT_FOUND            = CodeNotFound
-	METHOD_NOT_ALLOWED   = CodeMethodNotAllowed
+	// Deprecated: Use CodeMigrationFailed instead.
+	MIGRATION_FAILED = CodeMigrationFailed
+	// Deprecated: Use CodeInternalError instead.
+	INTERNAL_ERROR = CodeInternalError
+	// Deprecated: Use CodeNotFound instead.
+	NOT_FOUND = CodeNotFound
+	// Deprecated: Use CodeMethodNotAllowed instead.
+	METHOD_NOT_ALLOWED = CodeMethodNotAllowed
 
-	EMAIL_HOOK_NIL         = CodeEmailHookNil
-	EMAIL_DISPATCH_FAILED  = CodeEmailDispatchFailed
+	// Deprecated: Use CodeEmailHookNil instead.
+	EMAIL_HOOK_NIL = CodeEmailHookNil
+	// Deprecated: Use CodeEmailDispatchFailed instead.
+	EMAIL_DISPATCH_FAILED = CodeEmailDispatchFailed
+	// Deprecated: Use CodeEmailDispatchTimeout instead.
 	EMAIL_DISPATCH_TIMEOUT = CodeEmailDispatchTimeout
 
-	SESSION_NOT_FOUND   = CodeSessionNotFound
-	SESSION_EXPIRED     = CodeSessionExpired
-	SESSION_INVALID     = CodeSessionInvalid
-	CSRF_TOKEN_MISSING  = CodeCSRFTokenMissing
-	CSRF_TOKEN_INVALID  = CodeCSRFTokenInvalid
+	// Deprecated: Use CodeSessionNotFound instead.
+	SESSION_NOT_FOUND = CodeSessionNotFound
+	// Deprecated: Use CodeSessionExpired instead.
+	SESSION_EXPIRED = CodeSessionExpired
+	// Deprecated: Use CodeSessionInvalid instead.
+	SESSION_INVALID = CodeSessionInvalid
+	// Deprecated: Use CodeCSRFTokenMissing instead.
+	CSRF_TOKEN_MISSING = CodeCSRFTokenMissing
+	// Deprecated: Use CodeCSRFTokenInvalid instead.
+	CSRF_TOKEN_INVALID = CodeCSRFTokenInvalid
+	// Deprecated: Use CodeRateLimitExceeded instead.
 	RATE_LIMIT_EXCEEDED = CodeRateLimitExceeded
 )
 
@@ -75,21 +103,25 @@ const (
 func (c Code) HTTPStatus() int {
 	switch c {
 	case CodePasswordTooShort, CodePasswordTooLong, CodePasswordTooCommon,
-		CodeInvalidEmail, CodeValidationError, CodeInvalidToken, CodeTokenExpired:
+		CodeInvalidEmail, CodeValidationError, CodeInvalidToken, CodeTokenExpired,
+		CodeOAuthStateInvalid, CodeOAuthCallbackFailed:
 		return http.StatusBadRequest
 	case CodeInvalidCredentials, CodeUnauthenticated,
-		CodeSessionNotFound, CodeSessionExpired, CodeSessionInvalid:
+		CodeSessionNotFound, CodeSessionExpired, CodeSessionInvalid,
+		CodeMFARequired, CodeMFAInvalidCode:
 		return http.StatusUnauthorized
 	case CodeEmailNotVerified, CodeCSRFTokenMissing, CodeCSRFTokenInvalid:
 		return http.StatusForbidden
 	case CodeRateLimitExceeded:
 		return http.StatusTooManyRequests
-	case CodeNotFound, CodeUserNotFound:
+	case CodeNotFound, CodeUserNotFound, CodeTokenNotFound, CodeOAuthAccountNotLinked:
 		return http.StatusNotFound
-	case CodeUserAlreadyExists:
+	case CodeUserAlreadyExists, CodeEmailAlreadyExists, CodeOAuthAccountAlreadyLinked:
 		return http.StatusConflict
 	case CodeMethodNotAllowed:
 		return http.StatusMethodNotAllowed
+	case CodeOAuthProviderError:
+		return http.StatusBadGateway
 	case CodeDatabaseUnavailable:
 		return http.StatusServiceUnavailable
 	default:
@@ -248,6 +280,7 @@ func Unwrap(err error) error {
 // Predefined sentinel errors for config.Validate().
 var (
 	ErrDatabaseURLRequired             = New(CodeInvalidConfig, "database URL is required", nil)
+	ErrDatabaseURLInvalid              = New(CodeInvalidConfig, "database URL is invalid", nil)
 	ErrMaxOpenConnsNegative            = New(CodeInvalidConfig, "max open conns cannot be negative", nil)
 	ErrMaxIdleConnsNegative            = New(CodeInvalidConfig, "max idle conns cannot be negative", nil)
 	ErrMaxIdleExceedsOpen              = New(CodeInvalidConfig, "max idle conns cannot exceed max open conns", nil)
@@ -277,10 +310,32 @@ var (
 	ErrCSRFCookieNameInvalid           = New(CodeInvalidConfig, "CSRF cookie name is invalid", nil)
 	ErrCSRFHeaderNameInvalid           = New(CodeInvalidConfig, "CSRF header name is invalid", nil)
 
-	// Aliases
-	ErrInvalidCookieName   = ErrSessionCookieNameInvalid
-	ErrInvalidCookiePath   = ErrSessionCookiePathInvalid
-	ErrInvalidCookieDomain = ErrSessionCookieDomainInvalid
+	// Predefined sentinel errors for Phase 3 Core Auth.
+	ErrInvalidCredentials = New(CodeInvalidCredentials, "invalid email or password", nil)
+	ErrUnauthenticated    = New(CodeUnauthenticated, "authentication required", nil)
+	ErrEmailNotVerified   = New(CodeEmailNotVerified, "email address not verified", nil)
+	ErrUserAlreadyExists  = New(CodeUserAlreadyExists, "user already exists", nil)
+	ErrEmailAlreadyExists = New(CodeEmailAlreadyExists, "email already exists", nil)
+	ErrUserNotFound       = New(CodeUserNotFound, "user not found", nil)
+	ErrInvalidToken       = New(CodeInvalidToken, "token is invalid or malformed", nil)
+	ErrTokenExpired       = New(CodeTokenExpired, "token has expired", nil)
+	ErrTokenNotFound      = New(CodeTokenNotFound, "token not found", nil)
+	ErrPasswordTooShort   = New(CodePasswordTooShort, "password is too short", nil)
+	ErrPasswordTooLong    = New(CodePasswordTooLong, "password is too long", nil)
+	ErrPasswordTooCommon  = New(CodePasswordTooCommon, "password is too common", nil)
+	ErrInvalidEmail       = New(CodeInvalidEmail, "invalid email address", nil)
+	ErrValidationError    = New(CodeValidationError, "validation failed", nil)
+
+	// Predefined sentinel errors for Multi-Factor Authentication (MFA).
+	ErrMFARequired    = New(CodeMFARequired, "mfa verification required", nil)
+	ErrMFAInvalidCode = New(CodeMFAInvalidCode, "invalid mfa code", nil)
+
+	// Predefined sentinel errors for OAuth2 and OIDC.
+	ErrOAuthStateInvalid         = New(CodeOAuthStateInvalid, "invalid oauth state", nil)
+	ErrOAuthCallbackFailed       = New(CodeOAuthCallbackFailed, "oauth callback failed", nil)
+	ErrOAuthProviderError        = New(CodeOAuthProviderError, "oauth provider error", nil)
+	ErrOAuthAccountAlreadyLinked = New(CodeOAuthAccountAlreadyLinked, "oauth account already linked", nil)
+	ErrOAuthAccountNotLinked     = New(CodeOAuthAccountNotLinked, "oauth account not linked", nil)
 
 	// Predefined sentinel errors for Phase 4 Session, CSRF, and Rate Limiting.
 	ErrSessionNotFound   = New(CodeSessionNotFound, "Session is invalid or has expired", nil)
@@ -289,6 +344,12 @@ var (
 	ErrCSRFTokenMissing  = New(CodeCSRFTokenMissing, "CSRF token is missing", nil)
 	ErrCSRFTokenInvalid  = New(CodeCSRFTokenInvalid, "CSRF token is invalid", nil)
 	ErrRateLimitExceeded = New(CodeRateLimitExceeded, "Too many requests, try again later", nil)
+
+	// Aliases
+	ErrInvalidCookieName   = ErrSessionCookieNameInvalid
+	ErrInvalidCookiePath   = ErrSessionCookiePathInvalid
+	ErrInvalidCookieDomain = ErrSessionCookieDomainInvalid
+	ErrInvalidSession      = ErrSessionInvalid
 )
 
 // WriteJSON writes an error response envelope to the response writer with the appropriate HTTP status.
