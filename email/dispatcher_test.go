@@ -104,8 +104,8 @@ func TestDispatch_GracefulShutdown(t *testing.T) {
 
 	// Ensure shutdown is waiting for in-flight jobs
 	select {
-	case <-shutdownDone:
-		t.Fatal("shutdown returned before in-flight tasks completed")
+	case err := <-shutdownDone:
+		t.Fatalf("shutdown returned before in-flight tasks completed: %v", err)
 	case <-time.After(50 * time.Millisecond):
 	}
 
@@ -212,9 +212,6 @@ func TestDispatch_RecipientCRLFInjectionRejected(t *testing.T) {
 }
 
 func TestDispatch_ErrorTypeLoggedWithoutSecret(t *testing.T) {
-	type customNetworkError struct {
-		secretToken string
-	}
 	var logBuf bytes.Buffer
 	logger := captureLogger(&logBuf)
 	d := NewAsyncDispatcher(DispatcherConfig{

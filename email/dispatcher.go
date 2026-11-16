@@ -95,7 +95,7 @@ func (d *AsyncDispatcher) DispatchVerification(ctx context.Context, payload Veri
 	}
 
 	payload.URL = BuildVerificationURL(d.baseURL, payload.Token)
-	d.dispatch(ctx, "verification", func(c context.Context) error {
+	_ = d.dispatch(ctx, "verification", func(c context.Context) error {
 		if d.sendVerification == nil {
 			d.logger.Warn("email hook is nil", "op", "verification", "code", string(errors.CodeEmailHookNil))
 			return nil
@@ -120,7 +120,7 @@ func (d *AsyncDispatcher) DispatchPasswordReset(ctx context.Context, payload Pas
 	}
 
 	payload.URL = BuildResetURL(d.baseURL, payload.Token)
-	d.dispatch(ctx, "password_reset", func(c context.Context) error {
+	_ = d.dispatch(ctx, "password_reset", func(c context.Context) error {
 		if d.sendPasswordReset == nil {
 			d.logger.Warn("email hook is nil", "op", "password_reset", "code", string(errors.CodeEmailHookNil))
 			return nil
