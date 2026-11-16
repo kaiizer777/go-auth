@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -232,5 +233,96 @@ func TestDispatch_ErrorTypeLoggedWithoutSecret(t *testing.T) {
 	}
 	if strings.Contains(logOutput, "secret-pwd-123") {
 		t.Fatalf("secret password leaked into log: %s", logOutput)
+	}
+}
+
+func TestDispatch_ConcurrentDispatchAndShutdown(t *testing.T) {
+	const numCallers = 40
+	const dispatchesPerCaller = 50
+
+	var executed atomic.Int64
+	hook := func(ctx context.Context, p VerificationEmailPayload) error {
+		executed.Add(1)
+		time.Sleep(time.Duration(10+executed.Load()%30) * time.Microsecond)
+		return nil
+	}
+
+	d := NewAsyncDispatcher(DispatcherConfig{
+		SendVerificationEmail: hook,
+		EmailDispatchTimeout:  2 * time.Second,
+	}, captureLogger(&bytes.Buffer{}))
+
+	var startWg sync.WaitGroup
+	startWg.Add(1)
+	var callersWg sync.WaitGroup
+	callersWg.Add(numCallers)
+
+	for i := 0; i < numCallers; i++ {
+		go func(callerID int) {
+			defer callersWg.Done()
+			startWg.Wait()
+			for j := 0; j < dispatchesPerCaller; j++ {
+				d.DispatchVerification(context.Background(), VerificationEmailPayload{
+					To: fmt.Sprintf("user-%d-%d@example.com", callerID, j),
+				})
+			}
+		}(i)
+	}
+
+	startWg.Done()
+
+	// Concurrently trigger shutdown while dispatchers are actively submitting
+	time.Sleep(5 * time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := d.Shutdown(ctx); err != nil {
+		t.Fatalf("shutdown failed: %v", err)
+	}
+
+	callersWg.Wait()
+
+	// Post-shutdown dispatch must return ErrDispatcherClosed
+	err := d.Dispatch(context.Background(), "test", func(ctx context.Context) error {
+		t.Fatal("hook should not run after shutdown")
+		return nil
+	})
+	if !errors.Is(err, ErrDispatcherClosed) {
+		t.Fatalf("expected ErrDispatcherClosed, got %v", err)
+	}
+}
+
+func TestDispatch_ConcurrentShutdown(t *testing.T) {
+	d := NewAsyncDispatcher(DispatcherConfig{
+		SendVerificationEmail: func(ctx context.Context, p VerificationEmailPayload) error {
+			time.Sleep(10 * time.Millisecond)
+			return nil
+		},
+		EmailDispatchTimeout: 2 * time.Second,
+	}, captureLogger(&bytes.Buffer{}))
+
+	for i := 0; i < 10; i++ {
+		d.DispatchVerification(context.Background(), VerificationEmailPayload{To: "concurrent@example.com"})
+	}
+
+	const shutdownCallers = 8
+	var wg sync.WaitGroup
+	wg.Add(shutdownCallers)
+	errs := make([]error, shutdownCallers)
+
+	for i := 0; i < shutdownCallers; i++ {
+		go func(idx int) {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			errs[idx] = d.Shutdown(ctx)
+		}(i)
+	}
+
+	wg.Wait()
+	for idx, err := range errs {
+		if err != nil {
+			t.Fatalf("shutdown caller %d returned error: %v", idx, err)
+		}
 	}
 }

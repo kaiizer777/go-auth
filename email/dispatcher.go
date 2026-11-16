@@ -17,6 +17,9 @@ type Dispatcher interface {
 	DispatchPasswordReset(ctx context.Context, payload PasswordResetEmailPayload)
 }
 
+// ErrDispatcherClosed is returned when attempting to dispatch on a closed dispatcher.
+var ErrDispatcherClosed = errors.New(errors.CodeInternalError, "email dispatcher is closed", nil)
+
 // emailDispatchSemaphoreSize bounds concurrent async dispatch goroutines.
 const emailDispatchSemaphoreSize = 128
 
@@ -29,6 +32,8 @@ type AsyncDispatcher struct {
 	async             bool
 	logger            *slog.Logger
 	sem               chan struct{}
+	closeChan         chan struct{}
+	shutdownDone      chan struct{}
 	beforeAcquireSem  func()
 	wg                sync.WaitGroup
 	mu                sync.RWMutex
@@ -38,11 +43,13 @@ type AsyncDispatcher struct {
 // NewAsyncDispatcher constructs an AsyncDispatcher from opts.
 func NewAsyncDispatcher(opts DispatcherConfig, logger *slog.Logger) *AsyncDispatcher {
 	d := &AsyncDispatcher{
-		baseURL: strings.TrimRight(opts.BaseURL, "/"),
-		logger:  slog.Default(),
-		timeout: 10 * time.Second,
-		async:   !opts.DisableAsyncEmailDispatch,
-		sem:     make(chan struct{}, emailDispatchSemaphoreSize),
+		baseURL:      strings.TrimRight(opts.BaseURL, "/"),
+		logger:       slog.Default(),
+		timeout:      10 * time.Second,
+		async:        !opts.DisableAsyncEmailDispatch,
+		sem:          make(chan struct{}, emailDispatchSemaphoreSize),
+		closeChan:    make(chan struct{}),
+		shutdownDone: make(chan struct{}),
 	}
 	if logger != nil {
 		d.logger = logger
@@ -125,24 +132,30 @@ func (d *AsyncDispatcher) DispatchPasswordReset(ctx context.Context, payload Pas
 // Shutdown gracefully waits for all active email dispatch tasks to finish or until ctx is done.
 func (d *AsyncDispatcher) Shutdown(ctx context.Context) error {
 	d.mu.Lock()
-	d.closed = true
+	if !d.closed {
+		d.closed = true
+		close(d.closeChan)
+		go func() {
+			d.wg.Wait()
+			close(d.shutdownDone)
+		}()
+	}
 	d.mu.Unlock()
 
-	done := make(chan struct{})
-	go func() {
-		d.wg.Wait()
-		close(done)
-	}()
-
 	select {
-	case <-done:
+	case <-d.shutdownDone:
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
 	}
 }
 
-func (d *AsyncDispatcher) dispatch(ctx context.Context, op string, run func(context.Context) error) {
+// Dispatch dispatches an email operation with panic recovery and timeout.
+func (d *AsyncDispatcher) Dispatch(ctx context.Context, op string, run func(context.Context) error) error {
+	return d.dispatch(ctx, op, run)
+}
+
+func (d *AsyncDispatcher) dispatch(ctx context.Context, op string, run func(context.Context) error) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -152,11 +165,24 @@ func (d *AsyncDispatcher) dispatch(ctx context.Context, op string, run func(cont
 		}
 		select {
 		case d.sem <- struct{}{}:
+		case <-d.closeChan:
+			d.logger.Warn("email dispatch ignored: dispatcher is closed", "op", op)
+			return ErrDispatcherClosed
 		case <-ctx.Done():
 			d.logger.Error("email dispatch cancelled before acquisition", "op", op, "err", ctx.Err())
-			return
+			return ctx.Err()
+		}
+
+		d.mu.RLock()
+		if d.closed {
+			d.mu.RUnlock()
+			<-d.sem
+			d.logger.Warn("email dispatch ignored: dispatcher is closed", "op", op)
+			return ErrDispatcherClosed
 		}
 		d.wg.Add(1)
+		d.mu.RUnlock()
+
 		go func() {
 			defer d.wg.Done()
 			defer func() { <-d.sem }()
@@ -167,9 +193,18 @@ func (d *AsyncDispatcher) dispatch(ctx context.Context, op string, run func(cont
 			}()
 			d.execute(ctx, op, run)
 		}()
-		return
+		return nil
+	}
+
+	d.mu.RLock()
+	if d.closed {
+		d.mu.RUnlock()
+		d.logger.Warn("email dispatch ignored: dispatcher is closed", "op", op)
+		return ErrDispatcherClosed
 	}
 	d.wg.Add(1)
+	d.mu.RUnlock()
+
 	defer d.wg.Done()
 	func() {
 		defer func() {
@@ -179,6 +214,7 @@ func (d *AsyncDispatcher) dispatch(ctx context.Context, op string, run func(cont
 		}()
 		d.execute(ctx, op, run)
 	}()
+	return nil
 }
 
 func (d *AsyncDispatcher) execute(ctx context.Context, op string, run func(context.Context) error) {
