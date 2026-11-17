@@ -257,7 +257,7 @@ func (h *AuthHandler) Logout(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	session.ClearSessionCookie(w, h.cfg)
-	clearCSRFCookie(w, h.cfg)
+	csrf.ClearCookie(w, h.cfg)
 
 	if h.svc != nil {
 		if err := h.svc.Logout(r.Context(), sessionID); err != nil {

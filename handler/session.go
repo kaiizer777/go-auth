@@ -83,7 +83,7 @@ func (h *SessionHandler) Logout(w http.ResponseWriter, r *http.Request) {
 	}
 
 	session.ClearSessionCookie(w, h.cfg)
-	clearCSRFCookie(w, h.cfg)
+	csrf.ClearCookie(w, h.cfg)
 
 	slog.InfoContext(r.Context(), "logout",
 		"user_id", userID.String(),
@@ -157,7 +157,7 @@ func (h *SessionHandler) InvalidateAllSessions(w http.ResponseWriter, r *http.Re
 	}
 
 	session.ClearSessionCookie(w, h.cfg)
-	clearCSRFCookie(w, h.cfg)
+	csrf.ClearCookie(w, h.cfg)
 
 	slog.InfoContext(r.Context(), "all_sessions_invalidated",
 		"user_id", userID.String(),
@@ -207,23 +207,5 @@ func (h *SessionHandler) RotateSession(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(map[string]string{
 		"message": "Session rotated successfully",
-	})
-}
-
-// clearCSRFCookie invalidates the CSRF token cookie on w immediately.
-func clearCSRFCookie(w http.ResponseWriter, cfg *config.Config) {
-	if cfg == nil {
-		defaultCfg := config.DefaultConfig()
-		cfg = &defaultCfg
-	}
-	http.SetCookie(w, &http.Cookie{
-		Name:     cfg.CSRFCookieName,
-		Value:    "",
-		Path:     "/",
-		MaxAge:   -1,
-		Expires:  time.Unix(1, 0),
-		HttpOnly: false,
-		Secure:   cfg.SessionCookieSecure,
-		SameSite: http.SameSiteStrictMode,
 	})
 }
