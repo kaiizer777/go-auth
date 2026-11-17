@@ -151,6 +151,21 @@ func TestSecurityHeaders_CustomCSPAndFrameOptions(t *testing.T) {
 	}
 }
 
+func TestSecurityHeaders_NilConfig(t *testing.T) {
+	mw := SecurityHeaders(nil)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	req := httptest.NewRequest(http.MethodGet, "/x", nil)
+	rec := httptest.NewRecorder()
+	mw.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if got := rec.Header().Get("X-Content-Type-Options"); got != "nosniff" {
+		t.Errorf("X-Content-Type-Options = %q, want nosniff", got)
+	}
+}
+
 func TestSecurityHeaders_LocksBaselineAgainstMutation(t *testing.T) {
 	cfg := config.DefaultConfig()
 	mw := SecurityHeaders(&cfg)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

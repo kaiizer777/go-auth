@@ -34,6 +34,10 @@ func (w *securityResponseWriter) Write(b []byte) (int, error) {
 // SecurityHeaders injects the baseline HTTP security header set on every
 // response. Downstream mutations are locked out at wire-write time.
 func SecurityHeaders(cfg *config.Config) func(http.Handler) http.Handler {
+	if cfg == nil {
+		defaultCfg := config.DefaultConfig()
+		cfg = &defaultCfg
+	}
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			baseHeaders := make(http.Header)
