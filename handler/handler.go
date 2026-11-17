@@ -88,7 +88,7 @@ func New(db *gorm.DB, cfg config.Config, authSvc auth.Service, opts ...Option) h
 	}
 
 	h.registerRoutes()
-	return CORS(cfg)(h)
+	return SecurityHeaders(&cfg)(CORS(cfg)(h))
 }
 
 // ServeHTTP handles requests, dispatching to the router and translating 404/405 to standardized JSON responses.
