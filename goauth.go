@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"sync"
+	"time"
 
 	"gorm.io/gorm"
 
@@ -188,15 +189,25 @@ func (a *Auth) Close() error {
 			a.signupIPLimiter.Close()
 		}
 		if a.emailDispatcher != nil {
-			if err := a.emailDispatcher.Shutdown(context.Background()); err != nil && a.closeErr == nil {
+			timeout := a.cfg.EmailDispatchTimeout
+			if timeout <= 0 {
+				timeout = 5 * time.Second
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), timeout)
+			defer cancel()
+			if err := a.emailDispatcher.Shutdown(ctx); err != nil && a.closeErr == nil {
 				a.closeErr = err
 			}
 		}
 		if a.db != nil {
 			if sqlDB, err := a.db.DB(); err != nil {
-				a.closeErr = errors.New(errors.CodeDatabaseError, "failed to get sql.DB", err)
+				if a.closeErr == nil {
+					a.closeErr = errors.New(errors.CodeDatabaseError, "failed to get sql.DB", err)
+				}
 			} else if err := sqlDB.Close(); err != nil {
-				a.closeErr = errors.New(errors.CodeDatabaseError, "failed to close database", err)
+				if a.closeErr == nil {
+					a.closeErr = errors.New(errors.CodeDatabaseError, "failed to close database", err)
+				}
 			}
 		}
 	})

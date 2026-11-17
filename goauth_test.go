@@ -217,6 +217,49 @@ func TestAuth_Close_ShutsDownEmailDispatcher(t *testing.T) {
 	}
 }
 
+func TestAuth_Close_EmailDispatcherShutdownTimeoutBounded(t *testing.T) {
+	var inFlight atomic.Int32
+	hang := make(chan struct{})
+	defer close(hang)
+
+	dispatcher := email.NewAsyncDispatcher(email.DispatcherConfig{
+		BaseURL: "https://example.com",
+		SendVerificationEmail: func(ctx context.Context, payload email.VerificationEmailPayload) error {
+			inFlight.Add(1)
+			<-hang
+			return nil
+		},
+		EmailDispatchTimeout: 5 * time.Second,
+	}, nil)
+
+	auth := &Auth{
+		cfg: config.Config{
+			EmailDispatchTimeout: 100 * time.Millisecond,
+		},
+		emailDispatcher: dispatcher,
+	}
+
+	auth.EmailDispatcher().DispatchVerification(context.Background(), email.VerificationEmailPayload{To: "user@example.com"})
+
+	for i := 0; i < 50; i++ {
+		if inFlight.Load() == 1 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	start := time.Now()
+	err := auth.Close()
+	elapsed := time.Since(start)
+
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected context.DeadlineExceeded from bounded shutdown, got: %v", err)
+	}
+	if elapsed > 1*time.Second {
+		t.Fatalf("auth.Close() took %v, expected bounded shutdown under 1s", elapsed)
+	}
+}
+
 func TestAuth_EmailDispatcher(t *testing.T) {
 	dispatcher := email.NewAsyncDispatcher(email.DispatcherConfig{
 		BaseURL:                   "https://example.com",
