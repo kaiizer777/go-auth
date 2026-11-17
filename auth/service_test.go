@@ -439,6 +439,36 @@ func TestService_Logout_Invalidation(t *testing.T) {
 			t.Fatalf("expected session to be deleted after Logout, found %d", count)
 		}
 	})
+
+	t.Run("internal UUID does not delete session without secret token", func(t *testing.T) {
+		rawID := "test-session-secret-token-67890"
+		sum := sha256.Sum256([]byte(rawID))
+		idHash := hex.EncodeToString(sum[:])
+
+		sess := db.Session{
+			ID:                uuid.New(),
+			UserID:            uuid.New(),
+			IDHash:            idHash,
+			SessionType:       db.SessionTypeBearer,
+			LastActiveAt:      time.Now().UTC(),
+			AbsoluteExpiresAt: time.Now().UTC().Add(time.Hour),
+		}
+		if err := database.Create(&sess).Error; err != nil {
+			t.Fatalf("failed to seed session: %v", err)
+		}
+
+		if err := svc.Logout(ctx, sess.ID.String()); err != nil {
+			t.Fatalf("Logout failed: %v", err)
+		}
+
+		var count int64
+		if err := database.Model(&db.Session{}).Where("id = ?", sess.ID).Count(&count).Error; err != nil {
+			t.Fatalf("failed to count sessions: %v", err)
+		}
+		if count != 1 {
+			t.Fatalf("expected session to remain intact when Logout called with internal UUID, found count %d", count)
+		}
+	})
 }
 
 func TestService_VerifyEmail(t *testing.T) {

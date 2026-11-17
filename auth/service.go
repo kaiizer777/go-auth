@@ -244,18 +244,14 @@ func (s *authService) Login(ctx context.Context, req db.LoginRequest) (*db.User,
 	return &user, nil
 }
 
-// Logout invalidates the active session by ID or hashed token.
+// Logout invalidates the active session by hashed token.
 func (s *authService) Logout(ctx context.Context, sessionID string) error {
 	if sessionID == "" {
 		return nil
 	}
 	sum := sha256.Sum256([]byte(sessionID))
 	idHash := hex.EncodeToString(sum[:])
-	q := s.db.WithContext(ctx).Where("id_hash = ?", idHash)
-	if uid, err := uuid.Parse(sessionID); err == nil {
-		q = s.db.WithContext(ctx).Where("id = ? OR id_hash = ?", uid, idHash)
-	}
-	if err := q.Delete(&db.Session{}).Error; err != nil {
+	if err := s.db.WithContext(ctx).Where("id_hash = ?", idHash).Delete(&db.Session{}).Error; err != nil {
 		return errors.Wrap(err, errors.CodeDatabaseError, "failed to delete session")
 	}
 	return nil
