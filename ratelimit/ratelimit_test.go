@@ -514,3 +514,57 @@ func TestLimiter_RWMutexReadContention(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+func TestLimiter_CapacityBounded_FailClosed(t *testing.T) {
+	limiter := NewLimiter(1*time.Minute, 5)
+	const capLimit = 10
+	limiter.SetMaxEntries(capLimit)
+
+	for i := 0; i < capLimit; i++ {
+		key := fmt.Sprintf("key-%d", i)
+		if !limiter.Allow(key) {
+			t.Fatalf("expected key %s to be allowed under capacity limit", key)
+		}
+	}
+
+	// 11th distinct key must fail closed because capacity is saturated
+	if limiter.Allow("overflow-key") {
+		t.Fatalf("expected overflow-key to be refused when capacity is saturated")
+	}
+
+	// Existing keys must still evaluate properly
+	if !limiter.Allow("key-0") {
+		t.Fatalf("expected existing key-0 to evaluate and be allowed under its attempt cap")
+	}
+
+	// Map size must not exceed capLimit
+	limiter.mu.RLock()
+	size := len(limiter.windows)
+	limiter.mu.RUnlock()
+	if size > capLimit {
+		t.Fatalf("limiter map size = %d; want at most %d", size, capLimit)
+	}
+}
+
+func TestLimiter_CapacityRecoversAfterPrune(t *testing.T) {
+	window := 50 * time.Millisecond
+	limiter := NewLimiter(window, 5)
+	limiter.SetMaxEntries(2)
+
+	if !limiter.Allow("key-1") || !limiter.Allow("key-2") {
+		t.Fatal("initial keys should be allowed")
+	}
+
+	if limiter.Allow("key-3") {
+		t.Fatal("key-3 should be refused when capacity is saturated")
+	}
+
+	// Wait for window to expire and prune
+	time.Sleep(70 * time.Millisecond)
+	limiter.Prune()
+
+	// Capacity freed up, key-3 should now be allowed
+	if !limiter.Allow("key-3") {
+		t.Fatal("key-3 should be allowed after expired entries were pruned")
+	}
+}

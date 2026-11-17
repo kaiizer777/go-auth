@@ -18,14 +18,18 @@ type windowEntry struct {
 	timestamps []time.Time
 }
 
+// defaultMaxEntries bounds the maximum number of distinct keys tracked in memory.
+const defaultMaxEntries = 100000
+
 // Limiter is a concurrency-safe sliding-window in-memory rate limiter with optimized RWMutex read paths.
 type Limiter struct {
-	mu       sync.RWMutex
-	windows  map[string]*windowEntry
-	duration time.Duration
-	max      int
-	stopCh   chan struct{}
-	stopOnce sync.Once
+	mu         sync.RWMutex
+	windows    map[string]*windowEntry
+	duration   time.Duration
+	max        int
+	maxEntries int
+	stopCh     chan struct{}
+	stopOnce   sync.Once
 }
 
 // NewLimiter creates a Limiter with the given window duration and attempt cap.
@@ -38,11 +42,23 @@ func NewLimiter(duration time.Duration, max int) *Limiter {
 		max = 1
 	}
 	return &Limiter{
-		windows:  make(map[string]*windowEntry),
-		duration: duration,
-		max:      max,
-		stopCh:   make(chan struct{}),
+		windows:    make(map[string]*windowEntry),
+		duration:   duration,
+		max:        max,
+		maxEntries: defaultMaxEntries,
+		stopCh:     make(chan struct{}),
 	}
+}
+
+// SetMaxEntries overrides the maximum allowed entries in the limiter window map.
+// If max <= 0, defaultMaxEntries is used.
+func (l *Limiter) SetMaxEntries(max int) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if max <= 0 {
+		max = defaultMaxEntries
+	}
+	l.maxEntries = max
 }
 
 // Key builds the composite IP and account rate limit key.
@@ -87,6 +103,14 @@ func (l *Limiter) Allow(key string) bool {
 		l.mu.Lock()
 		entry, ok = l.windows[key]
 		if !ok {
+			limit := l.maxEntries
+			if limit <= 0 {
+				limit = defaultMaxEntries
+			}
+			if len(l.windows) >= limit {
+				l.mu.Unlock()
+				return false
+			}
 			entry = &windowEntry{}
 			l.windows[key] = entry
 		}
