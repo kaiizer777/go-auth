@@ -143,6 +143,30 @@ func TestConfigValidate(t *testing.T) {
 			wantErr: errors.ErrDatabaseURLRequired,
 		},
 		{
+			name: "valid keyword value DSN with host and dbname",
+			mutate: func(c *Config) {
+				c.DatabaseURL = "host=localhost port=5432 user=alice password=secret dbname=mydb"
+				c.BaseURL = "https://example.com"
+			},
+			wantErr: nil,
+		},
+		{
+			name: "valid keyword value DSN with dbname only",
+			mutate: func(c *Config) {
+				c.DatabaseURL = "dbname=mydb sslmode=disable"
+				c.BaseURL = "https://example.com"
+			},
+			wantErr: nil,
+		},
+		{
+			name: "invalid database URL string lacking URL scheme and DSN keywords",
+			mutate: func(c *Config) {
+				c.DatabaseURL = "random-invalid-string"
+				c.BaseURL = "https://example.com"
+			},
+			wantErr: errors.ErrDatabaseURLInvalid,
+		},
+		{
 			name: "missing base URL",
 			mutate: func(c *Config) {
 				c.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"

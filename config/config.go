@@ -206,8 +206,11 @@ func (c *Config) Validate() error {
 	if c.DatabaseURL == "" {
 		return errors.ErrDatabaseURLRequired
 	}
-	parsedDBURL, err := url.Parse(c.DatabaseURL)
-	if err != nil || (parsedDBURL.Scheme != "postgres" && parsedDBURL.Scheme != "postgresql") || (parsedDBURL.Host == "" && parsedDBURL.Query().Get("host") == "" && parsedDBURL.Query().Get("socket") == "") {
+	if parsedDBURL, err := url.Parse(c.DatabaseURL); err == nil && (strings.ToLower(parsedDBURL.Scheme) == "postgres" || strings.ToLower(parsedDBURL.Scheme) == "postgresql") {
+		if parsedDBURL.Host == "" && parsedDBURL.Query().Get("host") == "" && parsedDBURL.Query().Get("socket") == "" {
+			return errors.ErrDatabaseURLInvalid
+		}
+	} else if strings.Contains(c.DatabaseURL, "://") || !dsnParamRegex.MatchString(c.DatabaseURL) {
 		return errors.ErrDatabaseURLInvalid
 	}
 	if c.BaseURL == "" {
@@ -446,6 +449,7 @@ func isCookieDomain(s string) bool {
 }
 
 var (
+	dsnParamRegex  = regexp.MustCompile(`(?i)\b(host|dbname)\b\s*=\s*(?:'(?:\\.|[^'\\])*'|"(?:\\.|[^"\\])*"|\S+)`)
 	dsnSecretRegex = regexp.MustCompile(`(?i)\b(password|pass|token|secret|api_key|apikey|sslpassword)\b(\s*=\s*)(?:'(?:\\.|[^'\\])*'|"(?:\\.|[^"\\])*"|\S+)`)
 	userinfoRegex  = regexp.MustCompile(`://([^:]+):([^@]+)@`)
 )
