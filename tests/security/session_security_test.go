@@ -116,6 +116,54 @@ func readCookie(res *http.Response, name string) *http.Cookie {
 	return nil
 }
 
+// csrfPairForLogin fetches a CSRF cookie+token pair for state-changing auth requests.
+func csrfPairForLogin(t *testing.T, app *goauth.Auth) (*http.Cookie, string) {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	app.Handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/auth/csrf", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /auth/csrf: expected 200, got %d", rec.Code)
+	}
+	var body struct {
+		CSRFToken string `json:"csrf_token"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil || len(body.CSRFToken) != 64 {
+		t.Fatalf("bad csrf token response: %q err=%v", rec.Body.String(), err)
+	}
+	for _, c := range rec.Result().Cookies() {
+		if c.Value == body.CSRFToken {
+			return c, body.CSRFToken
+		}
+	}
+	t.Fatal("no CSRF cookie matching JSON token")
+	return nil, ""
+}
+
+// attachCSRF equips req with a valid CSRF cookie+header pair.
+func attachCSRF(req *http.Request, cfg config.Config, cookie *http.Cookie, token string) {
+	req.AddCookie(cookie)
+	req.Header.Set(cfg.CSRFHeaderName, token)
+}
+
+// loginCookieSession performs a cookie-transport login with a valid CSRF pair.
+func loginCookieSession(t *testing.T, app *goauth.Auth, cfg config.Config, email, pass string) *http.Cookie {
+	t.Helper()
+	csrfCookie, token := csrfPairForLogin(t, app)
+	loginBody, _ := json.Marshal(db.LoginRequest{Email: email, Password: pass})
+	req := httptest.NewRequest(http.MethodPost, "/auth/login", bytes.NewReader(loginBody))
+	attachCSRF(req, cfg, csrfCookie, token)
+	rec := httptest.NewRecorder()
+	app.Handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("cookie login failed: %d: %s", rec.Code, rec.Body.String())
+	}
+	sid := readCookie(rec.Result(), cfg.SessionCookieName)
+	if sid == nil {
+		t.Fatal("no session cookie in login response")
+	}
+	return sid
+}
+
 // Test 8: TestReplayDeletedSession (ASVS V3.3.1)
 // Replaying logged-out raw session ID returns 401 SESSION_INVALID (confirms server-side invalidation)
 func TestReplayDeletedSession(t *testing.T) {
@@ -165,11 +213,8 @@ func TestCSRFBypassAttempt_CookieEndpoint(t *testing.T) {
 	pass := "Pass123456789!"
 	signupSecurityUser(t, app, email, pass)
 
-	// Login with cookie
-	loginBody, _ := json.Marshal(db.LoginRequest{Email: email, Password: pass})
-	rec := httptest.NewRecorder()
-	app.Handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/auth/login", bytes.NewReader(loginBody)))
-	sidCookie := readCookie(rec.Result(), cfg.SessionCookieName)
+	// Login with cookie (CSRF pair required on the login itself)
+	sidCookie := loginCookieSession(t, app, cfg, email, pass)
 
 	// Attempt state-changing DELETE /auth/session with session cookie but without CSRF token
 	delReq := httptest.NewRequest(http.MethodDelete, "/auth/session", nil)
@@ -190,10 +235,7 @@ func TestCSRFMismatch_CookieEndpoint(t *testing.T) {
 	pass := "Pass123456789!"
 	signupSecurityUser(t, app, email, pass)
 
-	loginBody, _ := json.Marshal(db.LoginRequest{Email: email, Password: pass})
-	rec := httptest.NewRecorder()
-	app.Handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/auth/login", bytes.NewReader(loginBody)))
-	sidCookie := readCookie(rec.Result(), cfg.SessionCookieName)
+	sidCookie := loginCookieSession(t, app, cfg, email, pass)
 
 	tokenA := "1111222233334444555566667777888899990000aaaabbbbccccddddeeeeffff"
 	tokenB := "9999888877776666555544443333222211110000ffffeeeeddddccccbbbbaaaa"
@@ -251,10 +293,7 @@ func TestCSRFBypassAttempt_BearerHeaderSpoofingWithCookie(t *testing.T) {
 	signupSecurityUser(t, app, email, pass)
 
 	// Login with cookie
-	loginBody, _ := json.Marshal(db.LoginRequest{Email: email, Password: pass})
-	rec := httptest.NewRecorder()
-	app.Handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/auth/login", bytes.NewReader(loginBody)))
-	sidCookie := readCookie(rec.Result(), cfg.SessionCookieName)
+	sidCookie := loginCookieSession(t, app, cfg, email, pass)
 
 	// State-changing DELETE /auth/session with valid cookie but dummy/invalid Bearer header
 	delReq := httptest.NewRequest(http.MethodDelete, "/auth/session", nil)
@@ -271,17 +310,19 @@ func TestCSRFBypassAttempt_BearerHeaderSpoofingWithCookie(t *testing.T) {
 // Test 12: TestRateLimitTrigger_Login (ASVS V3.2.4)
 // Attempt MaxAttempts + 1 from same IP|email returns 429 RATE_LIMIT_EXCEEDED with Retry-After header
 func TestRateLimitTrigger_Login(t *testing.T) {
-	app, _, _ := setupSecurityApp(t, func(c *config.Config) {
+	app, _, cfg := setupSecurityApp(t, func(c *config.Config) {
 		c.RateLimitLoginMax = 3
 		c.RateLimitLoginWindow = 15 * time.Minute
 	})
 
 	email := "ratelimit_trigger@example.com"
 	reqBody, _ := json.Marshal(db.LoginRequest{Email: email, Password: "badpassword"})
+	csrfCookie, csrfToken := csrfPairForLogin(t, app)
 
 	for i := 0; i < 3; i++ {
 		req := httptest.NewRequest(http.MethodPost, "/auth/login", bytes.NewReader(reqBody))
 		req.RemoteAddr = "10.0.0.1:1234"
+		attachCSRF(req, cfg, csrfCookie, csrfToken)
 		rec := httptest.NewRecorder()
 		app.Handler.ServeHTTP(rec, req)
 		if rec.Code != http.StatusUnauthorized {
@@ -292,6 +333,7 @@ func TestRateLimitTrigger_Login(t *testing.T) {
 	// 4th attempt exceeds limit
 	req4 := httptest.NewRequest(http.MethodPost, "/auth/login", bytes.NewReader(reqBody))
 	req4.RemoteAddr = "10.0.0.1:1234"
+	attachCSRF(req4, cfg, csrfCookie, csrfToken)
 	rec4 := httptest.NewRecorder()
 	app.Handler.ServeHTTP(rec4, req4)
 
@@ -306,7 +348,7 @@ func TestRateLimitTrigger_Login(t *testing.T) {
 // Test 13: TestRateLimitReset_OnSuccess (ASVS V3.2.4)
 // Successful login clears the rate limit bucket for IP|email
 func TestRateLimitReset_OnSuccess(t *testing.T) {
-	app, _, _ := setupSecurityApp(t, func(c *config.Config) {
+	app, _, cfg := setupSecurityApp(t, func(c *config.Config) {
 		c.RateLimitLoginMax = 2
 		c.RateLimitLoginWindow = 15 * time.Minute
 	})
@@ -314,11 +356,13 @@ func TestRateLimitReset_OnSuccess(t *testing.T) {
 	email := "ratelimit_reset@example.com"
 	pass := "Pass123456789!"
 	signupSecurityUser(t, app, email, pass)
+	csrfCookie, csrfToken := csrfPairForLogin(t, app)
 
 	// 1 failed attempt
 	badBody, _ := json.Marshal(db.LoginRequest{Email: email, Password: "wrong"})
 	reqBad := httptest.NewRequest(http.MethodPost, "/auth/login", bytes.NewReader(badBody))
 	reqBad.RemoteAddr = "10.0.0.2:1234"
+	attachCSRF(reqBad, cfg, csrfCookie, csrfToken)
 	recBad := httptest.NewRecorder()
 	app.Handler.ServeHTTP(recBad, reqBad)
 
@@ -326,6 +370,7 @@ func TestRateLimitReset_OnSuccess(t *testing.T) {
 	goodBody, _ := json.Marshal(db.LoginRequest{Email: email, Password: pass})
 	reqGood := httptest.NewRequest(http.MethodPost, "/auth/login", bytes.NewReader(goodBody))
 	reqGood.RemoteAddr = "10.0.0.2:1234"
+	attachCSRF(reqGood, cfg, csrfCookie, csrfToken)
 	recGood := httptest.NewRecorder()
 	app.Handler.ServeHTTP(recGood, reqGood)
 
@@ -336,6 +381,7 @@ func TestRateLimitReset_OnSuccess(t *testing.T) {
 	// Another attempt should be allowed immediately
 	reqAnother := httptest.NewRequest(http.MethodPost, "/auth/login", bytes.NewReader(goodBody))
 	reqAnother.RemoteAddr = "10.0.0.2:1234"
+	attachCSRF(reqAnother, cfg, csrfCookie, csrfToken)
 	recAnother := httptest.NewRecorder()
 	app.Handler.ServeHTTP(recAnother, reqAnother)
 
@@ -379,10 +425,7 @@ func TestSessionIDNotInLogs(t *testing.T) {
 	})
 
 	// Login
-	loginBody, _ := json.Marshal(db.LoginRequest{Email: email, Password: pass})
-	rec := httptest.NewRecorder()
-	app.Handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/auth/login", bytes.NewReader(loginBody)))
-	sidCookie := readCookie(rec.Result(), cfg.SessionCookieName)
+	sidCookie := loginCookieSession(t, app, cfg, email, pass)
 	rawID := sidCookie.Value
 
 	// GET session
@@ -436,10 +479,16 @@ func TestSessionIDNotInURL(t *testing.T) {
 	pass := "Pass123456789!"
 	signupSecurityUser(t, app, email, pass)
 
+	csrfCookie, csrfToken := csrfPairForLogin(t, app)
 	loginBody, _ := json.Marshal(db.LoginRequest{Email: email, Password: pass})
+	loginReq := httptest.NewRequest(http.MethodPost, "/auth/login", bytes.NewReader(loginBody))
+	attachCSRF(loginReq, cfg, csrfCookie, csrfToken)
 	rec := httptest.NewRecorder()
-	app.Handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/auth/login", bytes.NewReader(loginBody)))
+	app.Handler.ServeHTTP(rec, loginReq)
 	sidCookie := readCookie(rec.Result(), cfg.SessionCookieName)
+	if sidCookie == nil {
+		t.Fatal("no session cookie in login response")
+	}
 	rawID := sidCookie.Value
 
 	// Verify Location header on login response does not contain raw ID
@@ -466,10 +515,7 @@ func TestGetSessionResponse_NoRawID(t *testing.T) {
 	pass := "Pass123456789!"
 	signupSecurityUser(t, app, email, pass)
 
-	loginBody, _ := json.Marshal(db.LoginRequest{Email: email, Password: pass})
-	rec := httptest.NewRecorder()
-	app.Handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/auth/login", bytes.NewReader(loginBody)))
-	sidCookie := readCookie(rec.Result(), cfg.SessionCookieName)
+	sidCookie := loginCookieSession(t, app, cfg, email, pass)
 	rawID := sidCookie.Value
 
 	getReq := httptest.NewRequest(http.MethodGet, "/auth/session", nil)
@@ -507,11 +553,7 @@ func TestSessionCookieHttpOnly(t *testing.T) {
 	pass := "Pass123456789!"
 	signupSecurityUser(t, app, email, pass)
 
-	loginBody, _ := json.Marshal(db.LoginRequest{Email: email, Password: pass})
-	rec := httptest.NewRecorder()
-	app.Handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/auth/login", bytes.NewReader(loginBody)))
-
-	sidCookie := readCookie(rec.Result(), cfg.SessionCookieName)
+	sidCookie := loginCookieSession(t, app, cfg, email, pass)
 	if sidCookie == nil {
 		t.Fatalf("expected session cookie %q to be set", cfg.SessionCookieName)
 	}
@@ -678,17 +720,7 @@ func TestTransportBinding_RejectionNormalized(t *testing.T) {
 	signupSecurityUser(t, app, email, pass)
 
 	// 1. Create cookie session
-	loginBody, _ := json.Marshal(db.LoginRequest{Email: email, Password: pass})
-	reqCookie := httptest.NewRequest(http.MethodPost, "/auth/login", bytes.NewReader(loginBody))
-	recCookie := httptest.NewRecorder()
-	app.Handler.ServeHTTP(recCookie, reqCookie)
-	if recCookie.Code != http.StatusOK {
-		t.Fatalf("expected 200 OK for cookie login, got %d: %s", recCookie.Code, recCookie.Body.String())
-	}
-	cookie := readCookie(recCookie.Result(), cfg.SessionCookieName)
-	if cookie == nil {
-		t.Fatalf("expected session cookie in response")
-	}
+	cookie := loginCookieSession(t, app, cfg, email, pass)
 	cookieVal := cookie.Value
 
 	// Try using cookie token via Bearer header
@@ -710,7 +742,8 @@ func TestTransportBinding_RejectionNormalized(t *testing.T) {
 	}
 
 	// 2. Create bearer session
-	reqBearer := httptest.NewRequest(http.MethodPost, "/auth/login", bytes.NewReader(loginBody))
+	bearerBody, _ := json.Marshal(db.LoginRequest{Email: email, Password: pass})
+	reqBearer := httptest.NewRequest(http.MethodPost, "/auth/login", bytes.NewReader(bearerBody))
 	reqBearer.Header.Set("X-Auth-Type", "bearer")
 	recBearer := httptest.NewRecorder()
 	app.Handler.ServeHTTP(recBearer, reqBearer)

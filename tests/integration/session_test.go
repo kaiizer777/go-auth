@@ -125,7 +125,10 @@ func TestLoginCookieFlow(t *testing.T) {
 
 	// 1. Login with cookie
 	loginBody, _ := json.Marshal(db.LoginRequest{Email: email, Password: pass})
+	loginPair, loginToken := fetchCSRFPair(t, app.Handler)
 	req := httptest.NewRequest(http.MethodPost, "/auth/login", bytes.NewReader(loginBody))
+	req.AddCookie(loginPair)
+	req.Header.Set(cfg.CSRFHeaderName, loginToken)
 	rec := httptest.NewRecorder()
 	app.Handler.ServeHTTP(rec, req)
 
@@ -282,7 +285,10 @@ func TestSessionFixationPrevention(t *testing.T) {
 
 	// First login
 	loginBody, _ := json.Marshal(db.LoginRequest{Email: email, Password: pass})
+	csrfCookie, csrfToken := fetchCSRFPair(t, app.Handler)
 	req1 := httptest.NewRequest(http.MethodPost, "/auth/login", bytes.NewReader(loginBody))
+	req1.AddCookie(csrfCookie)
+	req1.Header.Set(cfg.CSRFHeaderName, csrfToken)
 	rec1 := httptest.NewRecorder()
 	app.Handler.ServeHTTP(rec1, req1)
 	cookie1 := readCookieFromResponse(rec1.Result(), cfg.SessionCookieName)
@@ -293,6 +299,8 @@ func TestSessionFixationPrevention(t *testing.T) {
 	// Second login with existing cookie passed in header
 	req2 := httptest.NewRequest(http.MethodPost, "/auth/login", bytes.NewReader(loginBody))
 	req2.AddCookie(cookie1)
+	req2.AddCookie(csrfCookie)
+	req2.Header.Set(cfg.CSRFHeaderName, csrfToken)
 	rec2 := httptest.NewRecorder()
 	app.Handler.ServeHTTP(rec2, req2)
 	cookie2 := readCookieFromResponse(rec2.Result(), cfg.SessionCookieName)
@@ -316,13 +324,20 @@ func TestAllSessionsInvalidatedOnPasswordChange(t *testing.T) {
 
 	// Device 1 login
 	loginBody, _ := json.Marshal(db.LoginRequest{Email: email, Password: pass})
+	csrfCookie, csrfToken := fetchCSRFPair(t, app.Handler)
+	loginReq1 := httptest.NewRequest(http.MethodPost, "/auth/login", bytes.NewReader(loginBody))
+	loginReq1.AddCookie(csrfCookie)
+	loginReq1.Header.Set(cfg.CSRFHeaderName, csrfToken)
 	rec1 := httptest.NewRecorder()
-	app.Handler.ServeHTTP(rec1, httptest.NewRequest(http.MethodPost, "/auth/login", bytes.NewReader(loginBody)))
+	app.Handler.ServeHTTP(rec1, loginReq1)
 	cookie1 := readCookieFromResponse(rec1.Result(), cfg.SessionCookieName)
 
 	// Device 2 login
+	loginReq2 := httptest.NewRequest(http.MethodPost, "/auth/login", bytes.NewReader(loginBody))
+	loginReq2.AddCookie(csrfCookie)
+	loginReq2.Header.Set(cfg.CSRFHeaderName, csrfToken)
 	rec2 := httptest.NewRecorder()
-	app.Handler.ServeHTTP(rec2, httptest.NewRequest(http.MethodPost, "/auth/login", bytes.NewReader(loginBody)))
+	app.Handler.ServeHTTP(rec2, loginReq2)
 	cookie2 := readCookieFromResponse(rec2.Result(), cfg.SessionCookieName)
 
 	// Verify both sessions work
@@ -431,14 +446,22 @@ func TestListSessions_MultipleDevices(t *testing.T) {
 
 	loginBody, _ := json.Marshal(db.LoginRequest{Email: email, Password: pass})
 
+	pair, pairToken := fetchCSRFPair(t, app.Handler)
+	newLoginReq := func() *http.Request {
+		r := httptest.NewRequest(http.MethodPost, "/auth/login", bytes.NewReader(loginBody))
+		r.AddCookie(pair)
+		r.Header.Set(cfg.CSRFHeaderName, pairToken)
+		return r
+	}
+
 	// Login device 1
 	rec1 := httptest.NewRecorder()
-	app.Handler.ServeHTTP(rec1, httptest.NewRequest(http.MethodPost, "/auth/login", bytes.NewReader(loginBody)))
+	app.Handler.ServeHTTP(rec1, newLoginReq())
 	c1 := readCookieFromResponse(rec1.Result(), cfg.SessionCookieName)
 
 	// Login device 2
 	rec2 := httptest.NewRecorder()
-	app.Handler.ServeHTTP(rec2, httptest.NewRequest(http.MethodPost, "/auth/login", bytes.NewReader(loginBody)))
+	app.Handler.ServeHTTP(rec2, newLoginReq())
 	_ = rec2
 
 	// List sessions from device 1
@@ -492,8 +515,12 @@ func TestIdleTimeoutEnforced_Integration(t *testing.T) {
 	signupUser(t, app, email, pass)
 
 	loginBody, _ := json.Marshal(db.LoginRequest{Email: email, Password: pass})
+	pair, pairToken := fetchCSRFPair(t, app.Handler)
+	loginReq := httptest.NewRequest(http.MethodPost, "/auth/login", bytes.NewReader(loginBody))
+	loginReq.AddCookie(pair)
+	loginReq.Header.Set(cfg.CSRFHeaderName, pairToken)
 	rec := httptest.NewRecorder()
-	app.Handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/auth/login", bytes.NewReader(loginBody)))
+	app.Handler.ServeHTTP(rec, loginReq)
 	c := readCookieFromResponse(rec.Result(), cfg.SessionCookieName)
 
 	// Wait past idle timeout
@@ -522,8 +549,12 @@ func TestAbsoluteTimeoutEnforced_Integration(t *testing.T) {
 	signupUser(t, app, email, pass)
 
 	loginBody, _ := json.Marshal(db.LoginRequest{Email: email, Password: pass})
+	pair, pairToken := fetchCSRFPair(t, app.Handler)
+	loginReq := httptest.NewRequest(http.MethodPost, "/auth/login", bytes.NewReader(loginBody))
+	loginReq.AddCookie(pair)
+	loginReq.Header.Set(cfg.CSRFHeaderName, pairToken)
 	rec := httptest.NewRecorder()
-	app.Handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/auth/login", bytes.NewReader(loginBody)))
+	app.Handler.ServeHTTP(rec, loginReq)
 	c := readCookieFromResponse(rec.Result(), cfg.SessionCookieName)
 
 	// Keep session active before idle timeout expires (first keep-alive at 50ms)
@@ -568,7 +599,10 @@ func TestLogin_SetsCSRFCookieAndEnablesImmediateRotation(t *testing.T) {
 	signupUser(t, app, email, pass)
 
 	loginBody, _ := json.Marshal(db.LoginRequest{Email: email, Password: pass})
+	pair, pairToken := fetchCSRFPair(t, app.Handler)
 	req := httptest.NewRequest(http.MethodPost, "/auth/login", bytes.NewReader(loginBody))
+	req.AddCookie(pair)
+	req.Header.Set(cfg.CSRFHeaderName, pairToken)
 	rec := httptest.NewRecorder()
 	app.Handler.ServeHTTP(rec, req)
 
