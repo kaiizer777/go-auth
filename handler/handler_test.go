@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"database/sql/driver"
@@ -491,6 +492,27 @@ func (m *mockFlusherRecorder) Flush() {
 	m.ResponseRecorder.Flush()
 }
 
+type nonFlusherRecorder struct {
+	header http.Header
+	code   int
+	body   bytes.Buffer
+}
+
+func (n *nonFlusherRecorder) Header() http.Header {
+	if n.header == nil {
+		n.header = make(http.Header)
+	}
+	return n.header
+}
+
+func (n *nonFlusherRecorder) Write(b []byte) (int, error) {
+	return n.body.Write(b)
+}
+
+func (n *nonFlusherRecorder) WriteHeader(statusCode int) {
+	n.code = statusCode
+}
+
 func TestResponseInterceptor_UnwrapAndFlush(t *testing.T) {
 	rec := &mockFlusherRecorder{ResponseRecorder: httptest.NewRecorder()}
 	ri := &responseInterceptor{ResponseWriter: rec}
@@ -502,5 +524,53 @@ func TestResponseInterceptor_UnwrapAndFlush(t *testing.T) {
 	ri.Flush()
 	if !rec.flushed {
 		t.Fatalf("expected Flush() to call underlying flusher Flush()")
+	}
+	if !ri.headerWritten {
+		t.Fatalf("expected headerWritten to be true after Flush")
+	}
+	if ri.statusCode != http.StatusOK {
+		t.Fatalf("expected statusCode 200, got %d", ri.statusCode)
+	}
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected underlying code 200, got %d", rec.Code)
+	}
+
+	// Non-flusher underlying writer should be a no-op
+	nf := &nonFlusherRecorder{}
+	riNF := &responseInterceptor{ResponseWriter: nf}
+	riNF.Flush()
+	if riNF.headerWritten {
+		t.Fatalf("expected headerWritten to remain false on non-flusher")
+	}
+	if riNF.statusCode != 0 {
+		t.Fatalf("expected statusCode to remain 0, got %d", riNF.statusCode)
+	}
+
+	// Buffered 404 without JSON should not commit or flush
+	rec404 := &mockFlusherRecorder{ResponseRecorder: httptest.NewRecorder()}
+	ri404 := &responseInterceptor{ResponseWriter: rec404}
+	ri404.WriteHeader(http.StatusNotFound)
+	ri404.Flush()
+	if ri404.headerWritten {
+		t.Fatalf("expected headerWritten to remain false for buffered 404")
+	}
+	if rec404.flushed {
+		t.Fatalf("expected no flush for buffered 404")
+	}
+
+	// 404 with JSON Content-Type should commit and flush
+	recJSON := &mockFlusherRecorder{ResponseRecorder: httptest.NewRecorder()}
+	riJSON := &responseInterceptor{ResponseWriter: recJSON}
+	riJSON.Header().Set("Content-Type", "application/json")
+	riJSON.WriteHeader(http.StatusNotFound)
+	riJSON.Flush()
+	if !riJSON.headerWritten {
+		t.Fatalf("expected headerWritten to be true for JSON 404")
+	}
+	if !recJSON.flushed {
+		t.Fatalf("expected flush for JSON 404")
+	}
+	if recJSON.Code != http.StatusNotFound {
+		t.Fatalf("expected underlying code 404, got %d", recJSON.Code)
 	}
 }
