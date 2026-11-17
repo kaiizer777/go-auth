@@ -682,6 +682,9 @@ func TestTransportBinding_RejectionNormalized(t *testing.T) {
 	reqCookie := httptest.NewRequest(http.MethodPost, "/auth/login", bytes.NewReader(loginBody))
 	recCookie := httptest.NewRecorder()
 	app.Handler.ServeHTTP(recCookie, reqCookie)
+	if recCookie.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for cookie login, got %d: %s", recCookie.Code, recCookie.Body.String())
+	}
 	cookie := readCookie(recCookie.Result(), cfg.SessionCookieName)
 	if cookie == nil {
 		t.Fatalf("expected session cookie in response")
@@ -699,9 +702,11 @@ func TestTransportBinding_RejectionNormalized(t *testing.T) {
 	var errResp1 struct {
 		Code string `json:"code"`
 	}
-	_ = json.Unmarshal(getRec1.Body.Bytes(), &errResp1)
+	if err := json.Unmarshal(getRec1.Body.Bytes(), &errResp1); err != nil {
+		t.Fatalf("failed to decode error response 1: %v", err)
+	}
 	if errResp1.Code != "SESSION_INVALID" {
-		t.Errorf("expected error code SESSION_INVALID, got %q", errResp1.Code)
+		t.Fatalf("expected error code SESSION_INVALID, got %q", errResp1.Code)
 	}
 
 	// 2. Create bearer session
@@ -709,10 +714,18 @@ func TestTransportBinding_RejectionNormalized(t *testing.T) {
 	reqBearer.Header.Set("X-Auth-Type", "bearer")
 	recBearer := httptest.NewRecorder()
 	app.Handler.ServeHTTP(recBearer, reqBearer)
+	if recBearer.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for bearer login, got %d: %s", recBearer.Code, recBearer.Body.String())
+	}
 	var bearerResp struct {
 		Token string `json:"token"`
 	}
-	_ = json.Unmarshal(recBearer.Body.Bytes(), &bearerResp)
+	if err := json.Unmarshal(recBearer.Body.Bytes(), &bearerResp); err != nil {
+		t.Fatalf("failed to decode bearer login response: %v", err)
+	}
+	if bearerResp.Token == "" {
+		t.Fatalf("expected non-empty bearer token in login response")
+	}
 	bearerVal := bearerResp.Token
 
 	// Try using bearer token via Cookie
@@ -726,8 +739,10 @@ func TestTransportBinding_RejectionNormalized(t *testing.T) {
 	var errResp2 struct {
 		Code string `json:"code"`
 	}
-	_ = json.Unmarshal(getRec2.Body.Bytes(), &errResp2)
+	if err := json.Unmarshal(getRec2.Body.Bytes(), &errResp2); err != nil {
+		t.Fatalf("failed to decode error response 2: %v", err)
+	}
 	if errResp2.Code != "SESSION_INVALID" {
-		t.Errorf("expected error code SESSION_INVALID, got %q", errResp2.Code)
+		t.Fatalf("expected error code SESSION_INVALID, got %q", errResp2.Code)
 	}
 }
