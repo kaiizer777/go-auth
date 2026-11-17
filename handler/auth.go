@@ -121,21 +121,45 @@ func (h *AuthHandler) Signup(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ip := realIP(r)
+	slog.InfoContext(r.Context(), "signup_attempt",
+		"ip", ip,
+		"user_agent", r.UserAgent(),
+		"account", db.NormalizeEmail(req.Email),
+	)
+
 	ipKey := ratelimit.IPKey(ip)
 	if h.signupIPLimiter != nil && !h.signupIPLimiter.Allow(ipKey) {
+		slog.WarnContext(r.Context(), "rate_limit_exceeded",
+			"ip", ip,
+			"endpoint", r.URL.Path,
+		)
 		ratelimit.WriteRateLimitError(w, h.signupIPLimiter.RetryAfter(ipKey))
 		return
 	}
 
 	accountKey := ratelimit.AccountKey(db.NormalizeEmail(req.Email))
 	if h.signupLimiter != nil && !h.signupLimiter.Allow(accountKey) {
+		slog.WarnContext(r.Context(), "rate_limit_exceeded",
+			"ip", ip,
+			"endpoint", r.URL.Path,
+			"account", db.NormalizeEmail(req.Email),
+		)
 		ratelimit.WriteRateLimitError(w, h.signupLimiter.RetryAfter(accountKey))
 		return
 	}
 
-	if _, _, err := h.svc.Signup(r.Context(), req); err != nil {
+	user, _, err := h.svc.Signup(r.Context(), req)
+	if err != nil {
 		errors.WriteJSON(w, err)
 		return
+	}
+	if user != nil {
+		slog.InfoContext(r.Context(), "signup_success",
+			"user_id", user.ID.String(),
+			"ip", ip,
+			"user_agent", r.UserAgent(),
+			"account", db.NormalizeEmail(req.Email),
+		)
 	}
 	writeJSON(w, http.StatusOK, db.MessageResponse{
 		Message: "if this email is new, a verification link has been sent",
@@ -156,12 +180,21 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 	ip := realIP(r)
 	ipKey := ratelimit.IPKey(ip)
 	if h.loginIPLimiter != nil && !h.loginIPLimiter.Allow(ipKey) {
+		slog.WarnContext(r.Context(), "rate_limit_exceeded",
+			"ip", ip,
+			"endpoint", r.URL.Path,
+		)
 		ratelimit.WriteRateLimitError(w, h.loginIPLimiter.RetryAfter(ipKey))
 		return
 	}
 
 	accountKey := ratelimit.AccountKey(db.NormalizeEmail(req.Email))
 	if h.loginLimiter != nil && !h.loginLimiter.Allow(accountKey) {
+		slog.WarnContext(r.Context(), "rate_limit_exceeded",
+			"ip", ip,
+			"endpoint", r.URL.Path,
+			"account", db.NormalizeEmail(req.Email),
+		)
 		ratelimit.WriteRateLimitError(w, h.loginLimiter.RetryAfter(accountKey))
 		return
 	}
@@ -171,6 +204,7 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 		slog.WarnContext(r.Context(), "login_failure",
 			"ip", ip,
 			"user_agent", r.UserAgent(),
+			"account", accountKey,
 			"reason", "invalid_credentials",
 		)
 		errors.WriteJSON(w, err)
@@ -281,10 +315,19 @@ func (h *AuthHandler) VerifyEmail(w http.ResponseWriter, r *http.Request) {
 		errors.WriteJSON(w, err)
 		return
 	}
-	if err := h.svc.VerifyEmail(r.Context(), req); err != nil {
+	slog.InfoContext(r.Context(), "email_verification_attempt",
+		"ip", realIP(r),
+		"user_agent", r.UserAgent(),
+	)
+	user, err := h.svc.VerifyEmail(r.Context(), req)
+	if err != nil {
 		errors.WriteJSON(w, err)
 		return
 	}
+	slog.InfoContext(r.Context(), "email_verified",
+		"user_id", user.ID.String(),
+		"ip", realIP(r),
+	)
 	writeJSON(w, http.StatusOK, db.MessageResponse{
 		Message: "email verified",
 	})
@@ -304,12 +347,21 @@ func (h *AuthHandler) RequestPasswordReset(w http.ResponseWriter, r *http.Reques
 	ip := realIP(r)
 	ipKey := ratelimit.IPKey(ip)
 	if h.resetIPLimiter != nil && !h.resetIPLimiter.Allow(ipKey) {
+		slog.WarnContext(r.Context(), "rate_limit_exceeded",
+			"ip", ip,
+			"endpoint", r.URL.Path,
+		)
 		ratelimit.WriteRateLimitError(w, h.resetIPLimiter.RetryAfter(ipKey))
 		return
 	}
 
 	accountKey := ratelimit.AccountKey(db.NormalizeEmail(req.Email))
 	if h.resetLimiter != nil && !h.resetLimiter.Allow(accountKey) {
+		slog.WarnContext(r.Context(), "rate_limit_exceeded",
+			"ip", ip,
+			"endpoint", r.URL.Path,
+			"account", db.NormalizeEmail(req.Email),
+		)
 		ratelimit.WriteRateLimitError(w, h.resetLimiter.RetryAfter(accountKey))
 		return
 	}
@@ -318,6 +370,11 @@ func (h *AuthHandler) RequestPasswordReset(w http.ResponseWriter, r *http.Reques
 		errors.WriteJSON(w, err)
 		return
 	}
+	slog.InfoContext(r.Context(), "password_reset_request",
+		"ip", ip,
+		"user_agent", r.UserAgent(),
+		"account", db.NormalizeEmail(req.Email),
+	)
 	writeJSON(w, http.StatusOK, db.MessageResponse{
 		Message: "if an account with that email exists, a password reset link has been sent",
 	})
@@ -341,18 +398,32 @@ func (h *AuthHandler) ResetPassword(w http.ResponseWriter, r *http.Request) {
 		limiter = h.resetLimiter
 	}
 	if limiter != nil && !limiter.Allow(key) {
+		slog.WarnContext(r.Context(), "rate_limit_exceeded",
+			"ip", ip,
+			"endpoint", r.URL.Path,
+		)
 		ratelimit.WriteRateLimitError(w, limiter.RetryAfter(key))
 		return
 	}
 	if h.resetLimiter != nil && limiter != h.resetLimiter && !h.resetLimiter.Allow(key) {
+		slog.WarnContext(r.Context(), "rate_limit_exceeded",
+			"ip", ip,
+			"endpoint", r.URL.Path,
+		)
 		ratelimit.WriteRateLimitError(w, h.resetLimiter.RetryAfter(key))
 		return
 	}
 
-	if err := h.svc.ResetPassword(r.Context(), req); err != nil {
+	user, err := h.svc.ResetPassword(r.Context(), req)
+	if err != nil {
 		errors.WriteJSON(w, err)
 		return
 	}
+	slog.InfoContext(r.Context(), "password_changed",
+		"user_id", user.ID.String(),
+		"ip", ip,
+		"user_agent", r.UserAgent(),
+	)
 
 	session.ClearSessionCookie(w, h.cfg)
 
