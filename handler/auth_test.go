@@ -182,9 +182,37 @@ func executeRequest(t *testing.T, h http.Handler, method, path string, body any)
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
+	if method != http.MethodGet && method != http.MethodHead && method != http.MethodOptions && method != http.MethodTrace {
+		attachCSRFForTest(t, h, req)
+	}
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	return rec
+}
+
+// attachCSRFForTest fetches a CSRF pair via GET /auth/csrf and attaches it.
+// Tests asserting CSRF rejection must build raw requests instead of using executeRequest.
+func attachCSRFForTest(t *testing.T, h http.Handler, req *http.Request) {
+	t.Helper()
+	tokenReq := httptest.NewRequest(http.MethodGet, "/auth/csrf", nil)
+	tokenRec := httptest.NewRecorder()
+	h.ServeHTTP(tokenRec, tokenReq)
+	if tokenRec.Code != http.StatusOK {
+		return
+	}
+	var body struct {
+		CSRFToken string `json:"csrf_token"`
+	}
+	if err := json.Unmarshal(tokenRec.Body.Bytes(), &body); err != nil || body.CSRFToken == "" {
+		return
+	}
+	for _, c := range tokenRec.Result().Cookies() {
+		if c.Value == body.CSRFToken {
+			req.AddCookie(c)
+			req.Header.Set(config.DefaultConfig().CSRFHeaderName, body.CSRFToken)
+			return
+		}
+	}
 }
 
 func decodeResponseBody[T any](t *testing.T, rec *httptest.ResponseRecorder) T {
@@ -909,13 +937,18 @@ func TestRoutingAndAliases(t *testing.T) {
 	}
 
 	// Logout route under session protection rejects requests without CSRF / auth -> 403 Forbidden
-	recLogout := executeRequest(t, h, http.MethodPost, "/auth/logout", nil)
+	// Raw requests (no CSRF pair) preserve the original missing-token assertion.
+	rawLogoutReq := httptest.NewRequest(http.MethodPost, "/auth/logout", nil)
+	recLogout := httptest.NewRecorder()
+	h.ServeHTTP(recLogout, rawLogoutReq)
 	if recLogout.Code != http.StatusForbidden {
 		t.Fatalf("expected status 403 for unprotected logout, got %d", recLogout.Code)
 	}
 
 	// Alias route: POST /api/auth/logout -> 403 Forbidden
-	recApiLogout := executeRequest(t, h, http.MethodPost, "/api/auth/logout", nil)
+	rawApiLogoutReq := httptest.NewRequest(http.MethodPost, "/api/auth/logout", nil)
+	recApiLogout := httptest.NewRecorder()
+	h.ServeHTTP(recApiLogout, rawApiLogoutReq)
 	if recApiLogout.Code != http.StatusForbidden {
 		t.Fatalf("expected status 403 on alias for unprotected logout, got %d", recApiLogout.Code)
 	}
@@ -963,6 +996,7 @@ func TestRequestBodyHardening(t *testing.T) {
 		body := strings.NewReader(`{"email":"user@example.com","password":"validpassword123"} {"trailing": true}`)
 		req := httptest.NewRequest(http.MethodPost, "/auth/signup", body)
 		req.Header.Set("Content-Type", "application/json")
+		attachCSRFForTest(t, h, req)
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, req)
 
@@ -979,6 +1013,7 @@ func TestRequestBodyHardening(t *testing.T) {
 		largeBody := `{"email":"` + strings.Repeat("a", 1024*1024+10) + `@example.com","password":"validpassword123"}`
 		req := httptest.NewRequest(http.MethodPost, "/auth/signup", strings.NewReader(largeBody))
 		req.Header.Set("Content-Type", "application/json")
+		attachCSRFForTest(t, h, req)
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, req)
 
@@ -1267,6 +1302,7 @@ func TestTamperedCookiesAndHeaders(t *testing.T) {
 	for _, tt := range cases {
 		t.Run(tt.name, func(t *testing.T) {
 			req := httptest.NewRequest(http.MethodPost, "/auth/logout", nil)
+			attachCSRFForTest(t, h, req)
 			if tt.cookieName != "" {
 				req.AddCookie(&http.Cookie{Name: tt.cookieName, Value: tt.cookieVal})
 			}
