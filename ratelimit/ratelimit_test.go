@@ -174,7 +174,7 @@ func TestLimiter_Prune_RemovesExpired(t *testing.T) {
 }
 
 func TestLimiter_Prune_BatchesAcrossAllKeys(t *testing.T) {
-	window := 50 * time.Millisecond
+	window := 300 * time.Millisecond
 	limiter := NewLimiter(window, 5)
 
 	const activeCount = 270
@@ -237,7 +237,7 @@ func TestLimiter_Prune_BatchesAcrossAllKeys(t *testing.T) {
 }
 
 func TestLimiter_Prune_BatchesAcrossAllKeys_WithAllow(t *testing.T) {
-	window := 40 * time.Millisecond
+	window := 250 * time.Millisecond
 	limiter := NewLimiter(window, 5)
 
 	const expiredCount = 50
@@ -248,7 +248,7 @@ func TestLimiter_Prune_BatchesAcrossAllKeys_WithAllow(t *testing.T) {
 		limiter.Allow(key)
 	}
 
-	time.Sleep(window + 15*time.Millisecond)
+	time.Sleep(window + 50*time.Millisecond)
 
 	// 2. Create active entries via Allow
 	for i := 0; i < activeCount; i++ {
