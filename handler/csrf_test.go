@@ -208,6 +208,21 @@ func TestLogin_XAuthTypeBearerWithSessionCookieRejected(t *testing.T) {
 	}
 }
 
+func TestSafeMethod_XAuthTypeBearerWithSessionCookieSkipped(t *testing.T) {
+	_, _, h, _ := setupTestEnv(t)
+	req := httptest.NewRequest(http.MethodGet, "/auth/csrf", nil)
+	req.Header.Set("X-Auth-Type", "bearer")
+	req.AddCookie(&http.Cookie{Name: "sid", Value: "0123456789abcdef0123456789abcdef"})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code == http.StatusForbidden {
+		t.Fatalf("safe method must skip CSRF verification, got 403 %s", rec.Body.String())
+	}
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+}
+
 func TestLogin_QueryTypeBearerNotExempt(t *testing.T) {
 	_, _, h, _ := setupTestEnv(t)
 	body, _ := json.Marshal(db.LoginRequest{Email: "nobody@example.com", Password: "ValidPassword123#"})

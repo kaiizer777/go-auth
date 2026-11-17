@@ -80,19 +80,6 @@ func Middleware(cfg *config.Config) func(http.Handler) http.Handler {
 				}
 			}
 
-			// Pre-auth bearer flows declare cookie-free transport via header only.
-			// Query parameters never confer exemption. A session cookie alongside
-			// the declaration is ambiguous transport and is rejected outright.
-			if strings.EqualFold(r.Header.Get("X-Auth-Type"), "bearer") {
-				if c, cookieErr := r.Cookie(cfg.SessionCookieName); cookieErr == nil && c.Value != "" {
-					logViolation(r, string(apperrors.CodeCSRFTokenInvalid))
-					apperrors.WriteHTTP(w, apperrors.ErrCSRFTokenInvalid)
-					return
-				}
-				next.ServeHTTP(w, r)
-				return
-			}
-
 			csrfCookie, err := r.Cookie(cfg.CSRFCookieName)
 
 			// Safe methods ensure a valid 64-char hex cookie exists, generating one if absent or invalid.
@@ -104,6 +91,20 @@ func Middleware(cfg *config.Config) func(http.Handler) http.Handler {
 						return
 					}
 					setCSRFCookie(w, token, cfg)
+				}
+				next.ServeHTTP(w, r)
+				return
+			}
+
+			// Pre-auth bearer flows declare cookie-free transport via header only.
+			// Query parameters never confer exemption. A session cookie alongside
+			// the declaration is ambiguous transport and is rejected outright.
+			// Below the safe-method skip: safe methods never 403 here.
+			if strings.EqualFold(r.Header.Get("X-Auth-Type"), "bearer") {
+				if c, cookieErr := r.Cookie(cfg.SessionCookieName); cookieErr == nil && c.Value != "" {
+					logViolation(r, string(apperrors.CodeCSRFTokenInvalid))
+					apperrors.WriteHTTP(w, apperrors.ErrCSRFTokenInvalid)
+					return
 				}
 				next.ServeHTTP(w, r)
 				return
