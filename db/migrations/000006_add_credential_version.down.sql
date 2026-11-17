@@ -1,5 +1,3 @@
-BEGIN;
-
 -- 000006 down is fail-closed on data-bearing databases, unlike earlier
 -- reversible downs (000005 backfills timestamps before dropping columns):
 -- credential_version is security state, not just schema. Dropping these
@@ -19,5 +17,3 @@ DO $$ BEGIN
         ALTER TABLE sessions DROP COLUMN IF EXISTS credential_version;
     END IF;
 END $$;
-
-COMMIT;

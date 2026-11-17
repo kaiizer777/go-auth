@@ -266,3 +266,25 @@ func (rw *responseInterceptor) Write(b []byte) (int, error) {
 	}
 	return rw.ResponseWriter.Write(b)
 }
+
+func (rw *responseInterceptor) Unwrap() http.ResponseWriter {
+	return rw.ResponseWriter
+}
+
+func (rw *responseInterceptor) Flush() {
+	flusher, ok := rw.ResponseWriter.(http.Flusher)
+	if !ok {
+		return
+	}
+	if !rw.headerWritten {
+		if rw.statusCode == 0 {
+			rw.statusCode = http.StatusOK
+		}
+		if (rw.statusCode == http.StatusNotFound || rw.statusCode == http.StatusMethodNotAllowed) && !isJSONContentType(rw.Header().Get("Content-Type")) {
+			return
+		}
+		rw.headerWritten = true
+		rw.ResponseWriter.WriteHeader(rw.statusCode)
+	}
+	flusher.Flush()
+}

@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"sync"
+	"time"
 
 	"gorm.io/gorm"
 
@@ -187,11 +188,26 @@ func (a *Auth) Close() error {
 		if a.signupIPLimiter != nil {
 			a.signupIPLimiter.Close()
 		}
+		if a.emailDispatcher != nil {
+			timeout := a.cfg.EmailDispatchTimeout
+			if timeout <= 0 {
+				timeout = 5 * time.Second
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), timeout)
+			defer cancel()
+			if err := a.emailDispatcher.Shutdown(ctx); err != nil && a.closeErr == nil {
+				a.closeErr = err
+			}
+		}
 		if a.db != nil {
 			if sqlDB, err := a.db.DB(); err != nil {
-				a.closeErr = errors.New(errors.CodeDatabaseError, "failed to get sql.DB", err)
+				if a.closeErr == nil {
+					a.closeErr = errors.New(errors.CodeDatabaseError, "failed to get sql.DB", err)
+				}
 			} else if err := sqlDB.Close(); err != nil {
-				a.closeErr = errors.New(errors.CodeDatabaseError, "failed to close database", err)
+				if a.closeErr == nil {
+					a.closeErr = errors.New(errors.CodeDatabaseError, "failed to close database", err)
+				}
 			}
 		}
 	})
@@ -211,6 +227,14 @@ func (a *Auth) CSRF(next http.Handler) http.Handler {
 // SessionService returns the configured session service.
 func (a *Auth) SessionService() session.Service {
 	return a.Session
+}
+
+// PurgeExpiredSessions deletes all sessions past their absolute expiration or idle timeout across all users.
+func (a *Auth) PurgeExpiredSessions(ctx context.Context) (int64, error) {
+	if a == nil || a.Session == nil {
+		return 0, nil
+	}
+	return a.Session.PurgeExpired(ctx)
 }
 
 // EmailDispatcher returns the configured email dispatcher.

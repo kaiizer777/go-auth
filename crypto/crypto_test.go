@@ -3,8 +3,10 @@ package crypto
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"io"
 	"strings"
 	"testing"
+	"testing/iotest"
 	"unicode/utf8"
 
 	"github.com/kaiizer777/go-auth/errors"
@@ -82,6 +84,8 @@ func TestVerifyPassword_MalformedHashes(t *testing.T) {
 		"$argon2id$v=19$m=65536,t=3,p=4,x=1$" + validSaltB64 + "$aGFzaA",     // unexpected extra parameter
 		"$argon2id$v=19$m=065536,t=3,p=4$" + validSaltB64 + "$aGFzaA",        // leading zero in memory param
 		"$argon2id$v=19$m=65536,t=3,p=256$" + validSaltB64 + "$aGFzaA",       // parallelism overflow uint8
+		"$argon2id$v=19$m=65536,t=3,p=17$" + validSaltB64 + "$aGFzaA",        // parallelism > 16 (DoS prevention)
+		"$argon2id$v=19$m=7,t=3,p=1$" + validSaltB64 + "$aGFzaA",             // memory < 8*parallelism (RFC 9106)
 	}
 
 	for _, hash := range malformed {
@@ -100,6 +104,8 @@ func TestHashPassword_InvalidParams(t *testing.T) {
 		{Memory: 65536, Time: 3, Parallelism: 4, SaltLength: 0, KeyLength: 32},
 		{Memory: 65536, Time: 3, Parallelism: 4, SaltLength: 15, KeyLength: 32},
 		{Memory: 65536, Time: 3, Parallelism: 4, SaltLength: 16, KeyLength: 0},
+		{Memory: 65536, Time: 3, Parallelism: 17, SaltLength: 16, KeyLength: 32},
+		{Memory: 7, Time: 3, Parallelism: 1, SaltLength: 16, KeyLength: 32},
 	}
 
 	for _, p := range invalidParams {
@@ -134,6 +140,39 @@ func TestGenerateDummyHash(t *testing.T) {
 	}
 	if match {
 		t.Fatalf("dummy hash unexpectedly matched password")
+	}
+}
+
+func TestArgon2_EntropyFailures(t *testing.T) {
+	origRand := randReader
+	defer func() { randReader = origRand }()
+
+	randReader = iotest.ErrReader(io.ErrUnexpectedEOF)
+
+	params := fastTestParams()
+	_, err := HashPassword("somepass", params)
+	if !errors.Is(err, ErrSaltReadFailed) {
+		t.Errorf("expected ErrSaltReadFailed on salt entropy failure, got %v", err)
+	}
+
+	_, err = GenerateDummyHash(params)
+	if !errors.Is(err, ErrDummySecretReadFailed) {
+		t.Errorf("expected ErrDummySecretReadFailed on dummy secret entropy failure, got %v", err)
+	}
+}
+
+func TestHashPasswordBytes(t *testing.T) {
+	params := fastTestParams()
+	rawSecret := []byte("BytePassword123!")
+	defer wipeBytes(rawSecret)
+
+	phc, err := HashPasswordBytes(rawSecret, params)
+	if err != nil {
+		t.Fatalf("HashPasswordBytes failed: %v", err)
+	}
+	match, err := VerifyPassword("BytePassword123!", phc)
+	if err != nil || !match {
+		t.Fatalf("expected password match via VerifyPassword, match=%v err=%v", match, err)
 	}
 }
 
@@ -215,6 +254,32 @@ func TestHashToken(t *testing.T) {
 	}
 	if !errors.Is(err, errors.New(errors.CodeInvalidToken, "", nil)) {
 		t.Errorf("expected CodeInvalidToken, got %v", err)
+	}
+}
+
+func TestGenerateToken_EntropyFailure(t *testing.T) {
+	origRand := randReader
+	defer func() { randReader = origRand }()
+
+	randReader = iotest.ErrReader(io.ErrUnexpectedEOF)
+	_, _, err := GenerateToken()
+	if err == nil {
+		t.Fatal("expected error on entropy read failure, got nil")
+	}
+	if !errors.Is(err, ErrEntropyReadFailed) {
+		t.Errorf("expected ErrEntropyReadFailed, got %v", err)
+	}
+}
+
+func TestHashToken_SentinelErrors(t *testing.T) {
+	_, err := HashToken("short")
+	if !errors.Is(err, ErrInvalidTokenLength) {
+		t.Errorf("expected ErrInvalidTokenLength, got %v", err)
+	}
+
+	_, err = HashToken(strings.Repeat("z", 64))
+	if !errors.Is(err, ErrInvalidTokenEncoding) {
+		t.Errorf("expected ErrInvalidTokenEncoding, got %v", err)
 	}
 }
 
@@ -342,6 +407,49 @@ func TestValidatePassword(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestValidatePassword_SentinelErrorsAndExtensibility(t *testing.T) {
+	// Verify sentinel errors match via errors.Is
+	if !errors.Is(ValidatePassword("short", 8, 64), ErrPasswordTooShort) {
+		t.Error("expected ErrPasswordTooShort via errors.Is")
+	}
+	if !errors.Is(ValidatePassword(strings.Repeat("a", 65), 8, 64), ErrPasswordTooLong) {
+		t.Error("expected ErrPasswordTooLong via errors.Is")
+	}
+	if !errors.Is(ValidatePassword("password", 8, 64), ErrPasswordTooCommon) {
+		t.Error("expected ErrPasswordTooCommon via errors.Is")
+	}
+
+	// Test extraBlocked parameter in ValidatePassword
+	customPassword := "CompanyCustomSecret2026!"
+	if err := ValidatePassword(customPassword, 8, 64); err != nil {
+		t.Fatalf("expected custom password to be valid by default, got %v", err)
+	}
+	if err := ValidatePassword(customPassword, 8, 64, "companycustomsecret2026!"); !errors.Is(err, ErrPasswordTooCommon) {
+		t.Fatalf("expected custom password to be rejected with ErrPasswordTooCommon when passed in extraBlocked, got %v", err)
+	}
+
+	// Test AddBlockedPasswords
+	dynamicPassword := "SuperCompanyDisallowedPassphrase123!"
+	if IsCommonPassword(dynamicPassword) {
+		t.Fatalf("password should not be in blocklist yet")
+	}
+	AddBlockedPasswords(dynamicPassword)
+	t.Cleanup(func() {
+		blocklistMu.Lock()
+		delete(commonPasswords, strings.ToLower(strings.TrimSpace(dynamicPassword)))
+		blocklistMu.Unlock()
+	})
+	if !IsCommonPassword(dynamicPassword) {
+		t.Fatalf("password should now be found in blocklist after AddBlockedPasswords")
+	}
+	if !IsCommonPassword(strings.ToLower(dynamicPassword)) {
+		t.Fatalf("password should be found in blocklist case-insensitively")
+	}
+	if err := ValidatePassword(dynamicPassword, 8, 64); !errors.Is(err, ErrPasswordTooCommon) {
+		t.Fatalf("expected ValidatePassword to reject newly added dynamic password, got %v", err)
 	}
 }
 

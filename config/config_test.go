@@ -143,6 +143,30 @@ func TestConfigValidate(t *testing.T) {
 			wantErr: errors.ErrDatabaseURLRequired,
 		},
 		{
+			name: "valid keyword value DSN with host and dbname",
+			mutate: func(c *Config) {
+				c.DatabaseURL = "host=localhost port=5432 user=alice password=secret dbname=mydb"
+				c.BaseURL = "https://example.com"
+			},
+			wantErr: nil,
+		},
+		{
+			name: "valid keyword value DSN with dbname only",
+			mutate: func(c *Config) {
+				c.DatabaseURL = "dbname=mydb sslmode=disable"
+				c.BaseURL = "https://example.com"
+			},
+			wantErr: nil,
+		},
+		{
+			name: "invalid database URL string lacking URL scheme and DSN keywords",
+			mutate: func(c *Config) {
+				c.DatabaseURL = "random-invalid-string"
+				c.BaseURL = "https://example.com"
+			},
+			wantErr: errors.ErrDatabaseURLInvalid,
+		},
+		{
 			name: "missing base URL",
 			mutate: func(c *Config) {
 				c.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
@@ -1087,6 +1111,312 @@ func TestConfig_CookieAndHeaderRFCValidation(t *testing.T) {
 		cfg.CSRFHeaderName = "X-App-CSRF-Token"
 		if err := cfg.Validate(); err != nil {
 			t.Errorf("Validate() unexpected err = %v", err)
+		}
+	})
+}
+
+func TestConfig_DatabaseURL_Validation(t *testing.T) {
+	tests := []struct {
+		name    string
+		url     string
+		wantErr error
+	}{
+		{
+			name:    "valid postgres scheme with port and db",
+			url:     "postgres://user:pass@localhost:5432/mydb",
+			wantErr: nil,
+		},
+		{
+			name:    "valid postgresql scheme",
+			url:     "postgresql://user:pass@127.0.0.1:5432/mydb?sslmode=disable",
+			wantErr: nil,
+		},
+		{
+			name:    "valid postgresql scheme with unix domain socket in host query",
+			url:     "postgresql:///mydb?host=/var/run/postgresql",
+			wantErr: nil,
+		},
+		{
+			name:    "rejects postgres scheme with unsupported socket query parameter",
+			url:     "postgres:///mydb?socket=/var/run/postgresql/.s.PGSQL.5432",
+			wantErr: errors.ErrDatabaseURLInvalid,
+		},
+		{
+			name:    "valid postgresql scheme with credentials and socket query",
+			url:     "postgresql://user:pass@/mydb?host=/var/run/postgresql",
+			wantErr: nil,
+		},
+		{
+			name:    "missing host and query socket in postgres url",
+			url:     "postgres:///mydb",
+			wantErr: errors.ErrDatabaseURLInvalid,
+		},
+		{
+			name:    "empty host query parameter in postgres url",
+			url:     "postgresql:///mydb?host=",
+			wantErr: errors.ErrDatabaseURLInvalid,
+		},
+		{
+			name:    "empty database URL returns ErrDatabaseURLRequired",
+			url:     "",
+			wantErr: errors.ErrDatabaseURLRequired,
+		},
+		{
+			name:    "malformed scheme prefix",
+			url:     "://bad-url",
+			wantErr: errors.ErrDatabaseURLInvalid,
+		},
+		{
+			name:    "unsupported scheme http",
+			url:     "http://localhost:5432/mydb",
+			wantErr: errors.ErrDatabaseURLInvalid,
+		},
+		{
+			name:    "unsupported scheme mysql",
+			url:     "mysql://user:pass@localhost:3306/mydb",
+			wantErr: errors.ErrDatabaseURLInvalid,
+		},
+		{
+			name:    "missing host in postgres url",
+			url:     "postgres://",
+			wantErr: errors.ErrDatabaseURLInvalid,
+		},
+		{
+			name:    "valid keyword dsn with password containing scheme separator",
+			url:     "host=localhost port=5432 user=postgres dbname=mydb password='https://secret-vault/token'",
+			wantErr: nil,
+		},
+		{
+			name:    "valid keyword dsn with double-quoted password containing scheme separator",
+			url:     `host=localhost port=5432 user=postgres dbname=mydb password="custom://auth-token"`,
+			wantErr: nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := DefaultConfig()
+			cfg.BaseURL = "https://example.com"
+			cfg.DatabaseURL = tt.url
+
+			err := cfg.Validate()
+			if tt.wantErr == nil {
+				if err != nil {
+					t.Fatalf("Validate() unexpected err = %v", err)
+				}
+			} else {
+				if !errors.Is(err, tt.wantErr) {
+					t.Fatalf("Validate() err = %v; want %v", err, tt.wantErr)
+				}
+			}
+		})
+	}
+}
+
+func TestConfig_CookieDomain_RFC6265Boundaries(t *testing.T) {
+	baseCfg := func() Config {
+		c := DefaultConfig()
+		c.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+		c.BaseURL = "https://example.com"
+		return c
+	}
+
+	invalidDomains := []struct {
+		name   string
+		domain string
+	}{
+		{"contains port", "example.com:8080"},
+		{"contains http scheme", "http://example.com"},
+		{"contains https scheme", "https://example.com"},
+		{"contains path slash", "example.com/path"},
+		{"contains backslash", "example.com\\path"},
+		{"contains space", "example .com"},
+		{"contains semicolon", "example;com"},
+		{"contains control char", "example\x00.com"},
+		{"contains query param", "example.com?foo=bar"},
+		{"contains fragment", "example.com#anchor"},
+	}
+
+	for _, tt := range invalidDomains {
+		t.Run("rejects "+tt.name, func(t *testing.T) {
+			cfg := baseCfg()
+			cfg.SessionCookieDomain = tt.domain
+			err := cfg.Validate()
+			if !errors.Is(err, errors.ErrSessionCookieDomainInvalid) {
+				t.Fatalf("Validate(domain=%q) err = %v; want ErrSessionCookieDomainInvalid", tt.domain, err)
+			}
+		})
+	}
+
+	validDomains := []string{
+		"",
+		"example.com",
+		".example.com",
+		"auth.sub.example.com",
+		"localhost",
+	}
+
+	for _, d := range validDomains {
+		t.Run("accepts valid domain "+d, func(t *testing.T) {
+			cfg := baseCfg()
+			cfg.SessionCookieDomain = d
+			if err := cfg.Validate(); err != nil {
+				t.Fatalf("Validate(domain=%q) unexpected err = %v", d, err)
+			}
+		})
+	}
+}
+
+func TestConfig_PasswordLength_Boundaries(t *testing.T) {
+	baseCfg := func() Config {
+		c := DefaultConfig()
+		c.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+		c.BaseURL = "https://example.com"
+		return c
+	}
+
+	t.Run("min length below 8 is rejected", func(t *testing.T) {
+		cfg := baseCfg()
+		cfg.PasswordMinLength = 7
+		if err := cfg.Validate(); !errors.Is(err, errors.ErrPasswordMinLengthTooShort) {
+			t.Fatalf("expected ErrPasswordMinLengthTooShort, got %v", err)
+		}
+	})
+
+	t.Run("max length exceeding 128 is rejected", func(t *testing.T) {
+		cfg := baseCfg()
+		cfg.PasswordMinLength = 8
+		cfg.PasswordMaxLength = 129
+		if err := cfg.Validate(); !errors.Is(err, errors.ErrPasswordMaxLengthInvalid) {
+			t.Fatalf("expected ErrPasswordMaxLengthInvalid, got %v", err)
+		}
+	})
+
+	t.Run("min length greater than 128 is rejected via max length check", func(t *testing.T) {
+		cfg := baseCfg()
+		cfg.PasswordMinLength = 130
+		cfg.PasswordMaxLength = 140
+		if err := cfg.Validate(); !errors.Is(err, errors.ErrPasswordMaxLengthInvalid) {
+			t.Fatalf("expected ErrPasswordMaxLengthInvalid, got %v", err)
+		}
+	})
+}
+
+func TestConfig_SecretRedaction_LogValue_String(t *testing.T) {
+	t.Run("RedactURL credentials masking", func(t *testing.T) {
+		cases := []struct {
+			input string
+			want  string
+		}{
+			{"postgres://user:secret@localhost:5432/mydb?sslmode=disable", "postgres://user:REDACTED@localhost:5432/mydb?sslmode=disable"},
+			{"postgres://:secret@localhost:5432/mydb", "postgres://:REDACTED@localhost:5432/mydb"},
+			{"postgres://localhost:5432/mydb", "postgres://localhost:5432/mydb"},
+			{"postgres://localhost:5432/mydb?password=secret", "postgres://localhost:5432/mydb?password=REDACTED"},
+			{"postgres://localhost:5432/mydb?token=topsecret&sslmode=disable", "postgres://localhost:5432/mydb?sslmode=disable&token=REDACTED"},
+			{"postgres://localhost:5432/mydb?api_key=mykey&pass=mypass", "postgres://localhost:5432/mydb?api_key=REDACTED&pass=REDACTED"},
+			{"postgres://user:secret1@localhost:5432/mydb?password=secret2&sslmode=disable", "postgres://user:REDACTED@localhost:5432/mydb?password=REDACTED&sslmode=disable"},
+			{"postgresql:///mydb?host=/var/run/postgresql&password=secret", "postgresql:///mydb?host=%2Fvar%2Frun%2Fpostgresql&password=REDACTED"},
+			{"host=localhost user=alice password=secret dbname=mydb", "host=localhost user=alice password=REDACTED dbname=mydb"},
+			{`user=foo password="bar with spaces" dbname=baz`, `user=foo password=REDACTED dbname=baz`},
+			{`user=foo password='bar with spaces' dbname=baz`, `user=foo password=REDACTED dbname=baz`},
+			{`host=localhost user=alice password = "bar with spaces" dbname=mydb`, `host=localhost user=alice password = REDACTED dbname=mydb`},
+			{`host=localhost pass="my pass" token='secret token' dbname=mydb`, `host=localhost pass=REDACTED token=REDACTED dbname=mydb`},
+			{`user=foo password="bar \"with\" spaces" dbname=baz`, `user=foo password=REDACTED dbname=baz`},
+			{"", ""},
+		}
+
+		for _, tc := range cases {
+			if got := RedactURL(tc.input); got != tc.want {
+				t.Errorf("RedactURL(%q) = %q; want %q", tc.input, got, tc.want)
+			}
+		}
+	})
+
+	t.Run("RedactURL unix socket and query secret", func(t *testing.T) {
+		raw := "postgresql:///mydb?host=/var/run/postgresql&password=supersecret"
+		got := RedactURL(raw)
+		if strings.Contains(got, "supersecret") {
+			t.Errorf("RedactURL leaked plaintext secret: %q", got)
+		}
+		if !strings.Contains(got, "password=REDACTED") {
+			t.Errorf("expected password=REDACTED, got: %q", got)
+		}
+	})
+
+	t.Run("RedactURL quoted DSN with spaces", func(t *testing.T) {
+		raw := `user=foo password="bar with spaces" dbname=baz`
+		got := RedactURL(raw)
+		if strings.Contains(got, "bar with spaces") {
+			t.Errorf("RedactURL leaked plaintext password: %q", got)
+		}
+		want := `user=foo password=REDACTED dbname=baz`
+		if got != want {
+			t.Errorf("RedactURL(%q) = %q; want %q", raw, got, want)
+		}
+	})
+
+	t.Run("Config.LogValue redacts DatabaseURL", func(t *testing.T) {
+		cfg := DefaultConfig()
+		cfg.DatabaseURL = "postgres://admin:supersecret@localhost:5432/auth_db"
+		cfg.BaseURL = "https://auth.example.com"
+
+		val := cfg.LogValue()
+		if val.Kind() != slog.KindGroup {
+			t.Fatalf("LogValue kind = %v; want KindGroup", val.Kind())
+		}
+
+		var dbURLValue string
+		for _, attr := range val.Group() {
+			if attr.Key == "database_url" {
+				dbURLValue = attr.Value.String()
+			}
+		}
+
+		if strings.Contains(dbURLValue, "supersecret") {
+			t.Fatalf("DatabaseURL in LogValue leaked plaintext password: %q", dbURLValue)
+		}
+		if !strings.Contains(dbURLValue, "REDACTED") {
+			t.Fatalf("DatabaseURL in LogValue expected REDACTED: %q", dbURLValue)
+		}
+	})
+
+	t.Run("Config.String redacts DatabaseURL", func(t *testing.T) {
+		cfg := DefaultConfig()
+		cfg.DatabaseURL = "postgres://admin:supersecret@localhost:5432/auth_db"
+
+		str := cfg.String()
+		if strings.Contains(str, "supersecret") {
+			t.Fatalf("Config.String() leaked plaintext password: %q", str)
+		}
+		if !strings.Contains(str, "REDACTED") {
+			t.Fatalf("Config.String() expected REDACTED, got: %q", str)
+		}
+	})
+
+	t.Run("OAuthConfig redacts ClientSecret", func(t *testing.T) {
+		oauthCfg := OAuthConfig{
+			ClientID:     "my-client-id",
+			ClientSecret: "top-secret-token",
+			RedirectURL:  "https://example.com/callback",
+		}
+
+		val := oauthCfg.LogValue()
+		var secretVal string
+		for _, attr := range val.Group() {
+			if attr.Key == "client_secret" {
+				secretVal = attr.Value.String()
+			}
+		}
+		if strings.Contains(secretVal, "top-secret-token") {
+			t.Fatalf("OAuthConfig.LogValue leaked client secret: %q", secretVal)
+		}
+		if secretVal != "[REDACTED]" {
+			t.Fatalf("OAuthConfig.LogValue expected [REDACTED], got: %q", secretVal)
+		}
+
+		str := oauthCfg.String()
+		if strings.Contains(str, "top-secret-token") {
+			t.Fatalf("OAuthConfig.String() leaked client secret: %q", str)
 		}
 	})
 }

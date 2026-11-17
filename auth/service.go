@@ -2,11 +2,15 @@ package auth
 
 import (
 	"context"
-	"log"
+	"crypto/sha256"
+	"encoding/hex"
+	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 
 	"github.com/google/uuid"
 	"github.com/kaiizer777/go-auth/config"
@@ -120,13 +124,20 @@ func (s *authService) Signup(ctx context.Context, req db.SignupRequest) (*db.Use
 					return nil, "", errors.Wrap(gerr, errors.CodeInternalError, "failed to generate verification token")
 				}
 				now := time.Now().UTC()
+				var updated bool
 				if terr := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-					if err := tx.Model(&db.User{}).Where("id = ?", existing.ID).Updates(map[string]any{
+					res := tx.Model(&db.User{}).Where("id = ? AND email_verified = ?", existing.ID, false).Updates(map[string]any{
 						"password_hash":      passwordHash,
 						"credential_version": gorm.Expr("credential_version + 1"),
-					}).Error; err != nil {
-						return err
+					})
+					if res.Error != nil {
+						return res.Error
 					}
+					if res.RowsAffected == 0 {
+						// Already verified or updated concurrently
+						return nil
+					}
+					updated = true
 					if err := tx.Where("user_id = ?", existing.ID).Delete(&db.VerificationToken{}).Error; err != nil {
 						return err
 					}
@@ -143,10 +154,14 @@ func (s *authService) Signup(ctx context.Context, req db.SignupRequest) (*db.Use
 				}); terr != nil {
 					return nil, "", errors.Wrap(terr, errors.CodeDatabaseError, "failed to update unverified account")
 				}
-				s.dispatchVerificationEmail(ctx, existing.Email, rawToken)
+				if updated {
+					s.dispatchVerificationEmail(ctx, existing.Email, rawToken)
+				}
+				// Recovery already performed real hashing; return immediately without redundant dummy hash.
+				return nil, "", nil
 			}
 		}
-		// Anti-enumeration parity: perform dummy hashing
+		// Anti-enumeration parity: perform dummy hashing only for verified accounts where real hashing was skipped.
 		_, _ = crypto.HashPassword(req.Password, s.hashParams)
 		return nil, "", nil
 	}
@@ -212,25 +227,33 @@ func (s *authService) Login(ctx context.Context, req db.LoginRequest) (*db.User,
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			_, _ = crypto.VerifyPassword(req.Password, s.dummyHash)
-			return nil, errors.New(errors.CodeInvalidCredentials, "invalid email or password", nil)
+			return nil, errors.ErrInvalidCredentials
 		}
 		return nil, errors.Wrap(err, errors.CodeDatabaseError, "failed to query user")
 	}
 
 	match, err := crypto.VerifyPassword(req.Password, user.PasswordHash)
 	if err != nil || !match {
-		return nil, errors.New(errors.CodeInvalidCredentials, "invalid email or password", nil)
+		return nil, errors.ErrInvalidCredentials
 	}
 
 	if s.cfg.RequireEmailVerification && !user.EmailVerified {
-		return nil, errors.New(errors.CodeEmailNotVerified, "email address has not been verified", nil)
+		return nil, errors.ErrEmailNotVerified
 	}
 
 	return &user, nil
 }
 
-// Logout invalidates the active session. Stubbed for Phase 4 session management.
+// Logout invalidates the active session by hashed token.
 func (s *authService) Logout(ctx context.Context, sessionID string) error {
+	if sessionID == "" {
+		return nil
+	}
+	sum := sha256.Sum256([]byte(sessionID))
+	idHash := hex.EncodeToString(sum[:])
+	if err := s.db.WithContext(ctx).Where("id_hash = ?", idHash).Delete(&db.Session{}).Error; err != nil {
+		return errors.Wrap(err, errors.CodeDatabaseError, "failed to delete session")
+	}
 	return nil
 }
 
@@ -242,7 +265,7 @@ func (s *authService) VerifyEmail(ctx context.Context, req db.VerifyEmailRequest
 
 	tokenHash, err := crypto.HashToken(req.Token)
 	if err != nil {
-		return errors.New(errors.CodeInvalidToken, "invalid token", err)
+		return errors.ErrInvalidToken
 	}
 
 	var isExpired bool
@@ -250,7 +273,7 @@ func (s *authService) VerifyEmail(ctx context.Context, req db.VerifyEmailRequest
 		var tok db.VerificationToken
 		if err := tx.Where("token_hash = ?", tokenHash[:]).First(&tok).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
-				return errors.New(errors.CodeInvalidToken, "invalid token", nil)
+				return errors.ErrInvalidToken
 			}
 			return errors.Wrap(err, errors.CodeDatabaseError, "failed to query verification token")
 		}
@@ -265,7 +288,7 @@ func (s *authService) VerifyEmail(ctx context.Context, req db.VerifyEmailRequest
 			return res.Error
 		}
 		if res.RowsAffected == 0 {
-			return errors.New(errors.CodeInvalidToken, "invalid or consumed verification token", nil)
+			return errors.ErrInvalidToken
 		}
 
 		return tx.Model(&db.User{}).Where("id = ?", tok.UserID).Update("email_verified", true).Error
@@ -278,10 +301,18 @@ func (s *authService) VerifyEmail(ctx context.Context, req db.VerifyEmailRequest
 		return errors.Wrap(err, errors.CodeDatabaseError, "failed to verify email")
 	}
 	if isExpired {
-		return errors.New(errors.CodeTokenExpired, "verification token has expired", nil)
+		return errors.ErrTokenExpired
 	}
 
 	return nil
+}
+
+// lockForUpdate applies SELECT ... FOR UPDATE on dialects with row locking.
+func lockForUpdate(tx *gorm.DB) *gorm.DB {
+	if strings.Contains(strings.ToLower(tx.Name()), "sqlite") {
+		return tx
+	}
+	return tx.Clauses(clause.Locking{Strength: "UPDATE"})
 }
 
 // RequestPasswordReset initiates a password reset flow, generating a single-use token.
@@ -296,6 +327,9 @@ func (s *authService) RequestPasswordReset(ctx context.Context, req db.PasswordR
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			_, _, _ = crypto.GenerateToken()
+			// Anti-enumeration timing parity: perform a simulated DB query to equalize latency with found branch
+			var dummy db.PasswordResetToken
+			_ = s.db.WithContext(ctx).Where("user_id = ?", uuid.Nil).First(&dummy).Error
 			return "", nil
 		}
 		return "", errors.Wrap(err, errors.CodeDatabaseError, "failed to query user")
@@ -314,8 +348,19 @@ func (s *authService) RequestPasswordReset(ctx context.Context, req db.PasswordR
 		CreatedAt: now,
 	}
 
-	if err := s.db.WithContext(ctx).Create(&resetToken).Error; err != nil {
-		return "", errors.Wrap(err, errors.CodeDatabaseError, "failed to create password reset token")
+	// Invalidate prior unconsumed reset tokens. Serialize per-user via a row lock
+	// on the user record so concurrent requests under READ COMMITTED cannot race.
+	if terr := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var lockedUser db.User
+		if err := lockForUpdate(tx).Select("id").Where("id = ?", user.ID).First(&lockedUser).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("user_id = ?", user.ID).Delete(&db.PasswordResetToken{}).Error; err != nil {
+			return err
+		}
+		return tx.Create(&resetToken).Error
+	}); terr != nil {
+		return "", errors.Wrap(terr, errors.CodeDatabaseError, "failed to create password reset token")
 	}
 
 	s.dispatchPasswordResetEmail(ctx, user.Email, rawToken)
@@ -332,7 +377,7 @@ func (s *authService) ResetPassword(ctx context.Context, req db.PasswordResetCon
 
 	tokenHash, err := crypto.HashToken(req.Token)
 	if err != nil {
-		return errors.New(errors.CodeInvalidToken, "invalid token", err)
+		return errors.ErrInvalidToken
 	}
 
 	// Cheap existence/expiry gate before the expensive Argon2id hash: unknown
@@ -340,14 +385,14 @@ func (s *authService) ResetPassword(ctx context.Context, req db.PasswordResetCon
 	var tok db.PasswordResetToken
 	if err := s.db.WithContext(ctx).Where("token_hash = ?", tokenHash[:]).First(&tok).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return errors.New(errors.CodeInvalidToken, "invalid token", nil)
+			return errors.ErrInvalidToken
 		}
 		return errors.Wrap(err, errors.CodeDatabaseError, "failed to query password reset token")
 	}
 
 	if time.Now().UTC().After(tok.ExpiresAt) {
 		_ = s.db.WithContext(ctx).Where("token_hash = ?", tokenHash[:]).Delete(&db.PasswordResetToken{}).Error
-		return errors.New(errors.CodeTokenExpired, "password reset token has expired", nil)
+		return errors.ErrTokenExpired
 	}
 
 	newHash, err := crypto.HashPassword(req.NewPassword, s.hashParams)
@@ -356,6 +401,11 @@ func (s *authService) ResetPassword(ctx context.Context, req db.PasswordResetCon
 	}
 
 	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var lockedUser db.User
+		if err := lockForUpdate(tx).Select("id").Where("id = ?", tok.UserID).First(&lockedUser).Error; err != nil {
+			return err
+		}
+
 		res := tx.Where("token_hash = ? AND expires_at > ?", tokenHash[:], time.Now().UTC()).Delete(&db.PasswordResetToken{})
 		if res.Error != nil {
 			return res.Error
@@ -367,9 +417,9 @@ func (s *authService) ResetPassword(ctx context.Context, req db.PasswordResetCon
 			}
 			if count > 0 {
 				_ = tx.Where("token_hash = ?", tokenHash[:]).Delete(&db.PasswordResetToken{}).Error
-				return errors.New(errors.CodeTokenExpired, "password reset token has expired", nil)
+				return errors.ErrTokenExpired
 			}
-			return errors.New(errors.CodeInvalidToken, "invalid or consumed password reset token", nil)
+			return errors.ErrInvalidToken
 		}
 
 		if err := tx.Model(&db.User{}).Where("id = ?", tok.UserID).Updates(map[string]any{
@@ -419,7 +469,7 @@ func (s *authService) tryAcquireEmailSlot(recipient string) bool {
 	case s.emailSem <- struct{}{}:
 		return true
 	default:
-		log.Printf("email: dispatch queue saturated for %s, parking bounded retry", recipient)
+		slog.Info("email: dispatch queue saturated, parking bounded retry", slog.String("recipient", recipient))
 		return false
 	}
 }
@@ -441,11 +491,19 @@ func (s *authService) dispatchEmailAsync(ctx context.Context, recipient, token, 
 		}
 		defer func() {
 			if r := recover(); r != nil {
-				log.Printf("email: panic recovered in %s email dispatch to %s: %v", op, recipient, r)
+				slog.ErrorContext(timeoutCtx, "email: panic recovered in email dispatch",
+					slog.String("operation", op),
+					slog.String("recipient", recipient),
+					slog.Any("panic", r),
+				)
 			}
 		}()
 		if err := send(timeoutCtx, recipient, token); err != nil {
-			log.Printf("email: failed to send %s email to %s: %v", op, recipient, err)
+			slog.WarnContext(timeoutCtx, "email: failed to send email",
+				slog.String("operation", op),
+				slog.String("recipient", recipient),
+				slog.String("error", err.Error()),
+			)
 		}
 	}
 	if s.emailSem == nil {
@@ -462,7 +520,10 @@ func (s *authService) dispatchEmailAsync(ctx context.Context, recipient, token, 
 		select {
 		case s.emailPendingSem <- struct{}{}:
 		default:
-			log.Printf("email: dispatch queue overflow for %s email to %s, dropping", op, recipient)
+			slog.Warn("email: dispatch queue overflow, dropping",
+				slog.String("operation", op),
+				slog.String("recipient", recipient),
+			)
 			return
 		}
 	}
@@ -476,7 +537,10 @@ func (s *authService) dispatchEmailAsync(ctx context.Context, recipient, token, 
 		case s.emailSem <- struct{}{}:
 			run()
 		case <-wait.Done():
-			log.Printf("email: dispatch queue saturated, giving up on %s email to %s", op, recipient)
+			slog.Warn("email: dispatch queue saturated, giving up",
+				slog.String("operation", op),
+				slog.String("recipient", recipient),
+			)
 		}
 	}()
 }

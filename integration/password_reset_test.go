@@ -60,30 +60,41 @@ func TestPasswordReset_BYTEAPrimaryKeyAndASVSPurge(t *testing.T) {
 		t.Fatal("expected non-empty reset token 2")
 	}
 
-	// Verify both tokens exist in password_reset_tokens table with BYTEA PK
+	// Verify only latest token is active in password_reset_tokens table (stale token invalidated)
 	tokenHash1, _ := crypto.HashToken(rawResetToken1)
 	tokenHash2, _ := crypto.HashToken(rawResetToken2)
 
-	var activeCount int64
-	if err := database.Model(&db.PasswordResetToken{}).Where("user_id = ?", user.ID).Count(&activeCount).Error; err != nil {
-		t.Fatalf("counting active reset tokens failed: %v", err)
+	var count1, count2 int64
+	_ = database.Model(&db.PasswordResetToken{}).Where("token_hash = ?", tokenHash1[:]).Count(&count1).Error
+	_ = database.Model(&db.PasswordResetToken{}).Where("token_hash = ?", tokenHash2[:]).Count(&count2).Error
+	if count1 != 0 {
+		t.Fatalf("expected stale token 1 to be deleted from DB, found %d", count1)
 	}
-	if activeCount != 2 {
-		t.Fatalf("expected 2 active reset tokens in DB, found %d", activeCount)
+	if count2 != 1 {
+		t.Fatalf("expected latest token 2 to exist in DB, found %d", count2)
 	}
 
-	// 3. Confirm password reset using rawResetToken1
-	newPassword := "NewVerySecurePass123!"
+	// 3. Stale token 1 must be rejected
 	err = authInst.Auth.ResetPassword(ctx, db.PasswordResetConfirmRequest{
 		Token:       rawResetToken1,
+		NewPassword: "AttemptWithStaleToken123!",
+	})
+	if err == nil {
+		t.Fatal("expected reset with stale token 1 to fail, got nil")
+	}
+
+	// 4. Confirm password reset using active rawResetToken2
+	newPassword := "NewVerySecurePass123!"
+	err = authInst.Auth.ResetPassword(ctx, db.PasswordResetConfirmRequest{
+		Token:       rawResetToken2,
 		NewPassword: newPassword,
 	})
 	if err != nil {
-		t.Fatalf("ResetPassword failed: %v", err)
+		t.Fatalf("ResetPassword with token 2 failed: %v", err)
 	}
 
-	// 4. Invariants check:
-	// - ASVS L1 token purge: BOTH token 1 and sibling token 2 must be purged
+	// 5. Invariants check:
+	// - ASVS L1 token purge: active reset tokens must be 0
 	var remainingCount int64
 	if err := database.Model(&db.PasswordResetToken{}).Where("user_id = ?", user.ID).Count(&remainingCount).Error; err != nil {
 		t.Fatalf("counting reset tokens after ASVS L1 purge failed: %v", err)
@@ -92,7 +103,7 @@ func TestPasswordReset_BYTEAPrimaryKeyAndASVSPurge(t *testing.T) {
 		t.Fatalf("expected 0 reset tokens after ASVS L1 purge, found %d", remainingCount)
 	}
 
-	// - Token 1 cannot be replayed
+	// - Neither token 1 nor token 2 can be replayed
 	err = authInst.Auth.ResetPassword(ctx, db.PasswordResetConfirmRequest{
 		Token:       rawResetToken1,
 		NewPassword: "AnotherPassword123!",
@@ -101,13 +112,12 @@ func TestPasswordReset_BYTEAPrimaryKeyAndASVSPurge(t *testing.T) {
 		t.Fatal("expected error on replaying token 1, got nil")
 	}
 
-	// - Sibling token 2 is also invalid
 	err = authInst.Auth.ResetPassword(ctx, db.PasswordResetConfirmRequest{
 		Token:       rawResetToken2,
 		NewPassword: "AnotherPassword123!",
 	})
 	if err == nil {
-		t.Fatal("expected sibling token 2 to be invalidated by ASVS L1 purge, got nil")
+		t.Fatal("expected sibling token 2 to be invalidated after reset, got nil")
 	}
 
 	// - User can now log in with the new password

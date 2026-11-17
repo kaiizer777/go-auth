@@ -27,6 +27,7 @@ type Service interface {
 	InvalidateAllUserSessions(ctx context.Context, userID uuid.UUID) error
 	RotateSession(ctx context.Context, oldRawID string, ip, userAgent string) (*Session, string, error)
 	ListSessions(ctx context.Context, userID uuid.UUID) ([]*Session, error)
+	PurgeExpired(ctx context.Context) (int64, error)
 }
 
 type service struct {
@@ -191,53 +192,40 @@ func (s *service) GetSession(ctx context.Context, rawID string) (*Session, error
 		return nil, apperrors.New(apperrors.CodeInternalError, "failed to query session", err)
 	}
 
-	// Credential-version check runs in a tx with the stale-row purge so a
-	// password reset committing between the version re-read and the delete
-	// cannot leave the purge nondeterministic. The user row is locked for
-	// update where the dialect supports it (skipped on SQLite, which
-	// serializes writers in-tx). A missing user row fails closed: the
-	// orphan row is purged in-tx and rejected as invalid.
-	tx := s.db.WithContext(ctx).Begin()
-	if tx.Error != nil {
-		return nil, apperrors.New(apperrors.CodeInternalError, "failed to begin transaction", tx.Error)
-	}
-	defer func() {
-		if r := recover(); r != nil {
-			tx.Rollback()
-			panic(r)
-		}
-	}()
-
+	// Non-locking snapshot read of credential_version to avoid row-lock contention
+	// on users table across concurrent requests. If a discrepancy or missing user is
+	// detected, begin a transaction to purge the stale/orphan session.
 	var user db.User
-	uerr := lockForUpdate(tx).
+	uerr := s.db.WithContext(ctx).
 		Select("credential_version").
 		Where("id = ?", record.UserID).
 		First(&user).Error
 	if uerr != nil {
 		if errors.Is(uerr, gorm.ErrRecordNotFound) {
-			_ = tx.Where("id = ?", record.ID).Delete(&db.Session{}).Error
-			_ = tx.Commit().Error
+			tx := s.db.WithContext(ctx).Begin()
+			if tx.Error == nil {
+				_ = tx.Where("id = ?", record.ID).Delete(&db.Session{}).Error
+				_ = tx.Commit().Error
+			}
 			slog.InfoContext(ctx, "session_invalidated",
 				"user_id", record.UserID.String(),
 				"reason", "missing_user_at_read",
 			)
 			return nil, apperrors.ErrSessionInvalid
 		}
-		tx.Rollback()
 		return nil, apperrors.New(apperrors.CodeInternalError, "failed to query user", uerr)
 	}
 	if user.CredentialVersion != record.CredentialVersion {
-		_ = tx.Where("id = ?", record.ID).Delete(&db.Session{}).Error
-		_ = tx.Commit().Error
+		tx := s.db.WithContext(ctx).Begin()
+		if tx.Error == nil {
+			_ = tx.Where("id = ?", record.ID).Delete(&db.Session{}).Error
+			_ = tx.Commit().Error
+		}
 		slog.InfoContext(ctx, "session_invalidated",
 			"user_id", record.UserID.String(),
 			"reason", "credential_version_mismatch",
 		)
 		return nil, apperrors.ErrSessionInvalid
-	}
-	if err := tx.Commit().Error; err != nil {
-		tx.Rollback()
-		return nil, apperrors.New(apperrors.CodeInternalError, "failed to commit session read", err)
 	}
 
 	now := time.Now().UTC()
@@ -552,10 +540,10 @@ func (s *service) ListSessions(ctx context.Context, userID uuid.UUID) ([]*Sessio
 		Where("user_id = ? AND (absolute_expires_at <= ? OR last_active_at <= ?)", userID, now, idleCutoff).
 		Delete(&db.Session{}).Error
 
-	// 2. Fetch active sessions with bounded limit
+	// 2. Fetch active sessions with bounded limit, defensively filtering out expired sessions
 	var records []db.Session
 	if err := s.db.WithContext(ctx).
-		Where("user_id = ?", userID).
+		Where("user_id = ? AND absolute_expires_at > ? AND last_active_at > ?", userID, now, idleCutoff).
 		Order("last_active_at DESC").
 		Limit(50).
 		Find(&records).Error; err != nil {
@@ -567,4 +555,17 @@ func (s *service) ListSessions(ctx context.Context, userID uuid.UUID) ([]*Sessio
 		sessions[i] = fromDB(&records[i])
 	}
 	return sessions, nil
+}
+
+// PurgeExpired deletes all sessions past their absolute expiration or idle timeout across all users.
+func (s *service) PurgeExpired(ctx context.Context) (int64, error) {
+	now := time.Now().UTC()
+	idleCutoff := now.Add(-s.cfg.SessionIdleTimeout)
+	res := s.db.WithContext(ctx).
+		Where("absolute_expires_at <= ? OR last_active_at <= ?", now, idleCutoff).
+		Delete(&db.Session{})
+	if res.Error != nil {
+		return 0, apperrors.New(apperrors.CodeInternalError, "failed to purge expired sessions", res.Error)
+	}
+	return res.RowsAffected, nil
 }

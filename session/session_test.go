@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -1434,5 +1435,170 @@ func TestService_ListSessions_Limit50(t *testing.T) {
 
 	if len(sessions) != 50 {
 		t.Fatalf("expected 50 sessions (capped by limit), got %d", len(sessions))
+	}
+}
+
+func TestService_PurgeExpired(t *testing.T) {
+	database := setupTestDB(t)
+	cfg := testConfig()
+	svc := NewService(database, cfg)
+	userA := uuid.New()
+	userB := uuid.New()
+	ctx := context.Background()
+
+	now := time.Now().UTC()
+	// 1. Active session
+	rawActive, _ := generateRawID()
+	database.Create(&db.Session{
+		ID:                uuid.New(),
+		UserID:            userA,
+		IDHash:            hashID(rawActive),
+		SessionType:       db.SessionTypeCookie,
+		LastActiveAt:      now,
+		AbsoluteExpiresAt: now.Add(24 * time.Hour),
+		CreatedAt:         now,
+	})
+
+	// 2. Idle expired session
+	rawIdleExpired, _ := generateRawID()
+	database.Create(&db.Session{
+		ID:                uuid.New(),
+		UserID:            userA,
+		IDHash:            hashID(rawIdleExpired),
+		SessionType:       db.SessionTypeCookie,
+		LastActiveAt:      now.Add(-2 * cfg.SessionIdleTimeout),
+		AbsoluteExpiresAt: now.Add(24 * time.Hour),
+		CreatedAt:         now.Add(-2 * cfg.SessionIdleTimeout),
+	})
+
+	// 3. Absolute expired session
+	rawAbsExpired, _ := generateRawID()
+	database.Create(&db.Session{
+		ID:                uuid.New(),
+		UserID:            userB,
+		IDHash:            hashID(rawAbsExpired),
+		SessionType:       db.SessionTypeBearer,
+		LastActiveAt:      now,
+		AbsoluteExpiresAt: now.Add(-1 * time.Hour),
+		CreatedAt:         now.Add(-25 * time.Hour),
+	})
+
+	purged, err := svc.PurgeExpired(ctx)
+	if err != nil {
+		t.Fatalf("PurgeExpired failed: %v", err)
+	}
+	if purged != 2 {
+		t.Fatalf("expected 2 purged sessions, got %d", purged)
+	}
+
+	var remaining []db.Session
+	database.Find(&remaining)
+	if len(remaining) != 1 {
+		t.Fatalf("expected 1 remaining session, got %d", len(remaining))
+	}
+	if remaining[0].IDHash != hashID(rawActive) {
+		t.Fatalf("expected active session to remain, got %s", remaining[0].IDHash)
+	}
+}
+
+func TestService_ListSessions_DefensiveFilter(t *testing.T) {
+	database := setupTestDB(t)
+	cfg := testConfig()
+	svc := NewService(database, cfg)
+	userID := uuid.New()
+	ctx := context.Background()
+
+	now := time.Now().UTC()
+	// Active
+	rawActive, _ := generateRawID()
+	database.Create(&db.Session{
+		ID:                uuid.New(),
+		UserID:            userID,
+		IDHash:            hashID(rawActive),
+		SessionType:       db.SessionTypeCookie,
+		LastActiveAt:      now,
+		AbsoluteExpiresAt: now.Add(24 * time.Hour),
+		CreatedAt:         now,
+	})
+
+	// Idle expired
+	rawIdle, _ := generateRawID()
+	database.Create(&db.Session{
+		ID:                uuid.New(),
+		UserID:            userID,
+		IDHash:            hashID(rawIdle),
+		SessionType:       db.SessionTypeCookie,
+		LastActiveAt:      now.Add(-2 * cfg.SessionIdleTimeout),
+		AbsoluteExpiresAt: now.Add(24 * time.Hour),
+		CreatedAt:         now.Add(-2 * cfg.SessionIdleTimeout),
+	})
+
+	// Absolute expired
+	rawAbs, _ := generateRawID()
+	database.Create(&db.Session{
+		ID:                uuid.New(),
+		UserID:            userID,
+		IDHash:            hashID(rawAbs),
+		SessionType:       db.SessionTypeCookie,
+		LastActiveAt:      now,
+		AbsoluteExpiresAt: now.Add(-1 * time.Hour),
+		CreatedAt:         now.Add(-25 * time.Hour),
+	})
+
+	sessions, err := svc.ListSessions(ctx, userID)
+	if err != nil {
+		t.Fatalf("ListSessions failed: %v", err)
+	}
+	if len(sessions) != 1 {
+		t.Fatalf("expected exactly 1 active session in list, got %d", len(sessions))
+	}
+	if sessions[0].IDHash != hashID(rawActive) {
+		t.Fatalf("expected active session in list, got %s", sessions[0].IDHash)
+	}
+}
+
+func TestRotateSession_HighConcurrencyRace(t *testing.T) {
+	database := setupTestDB(t)
+	cfg := testConfig()
+	svc := NewService(database, cfg)
+	userID := uuid.New()
+	seedTestUser(t, database, userID)
+
+	_, rawID, err := svc.CreateSession(context.Background(), userID, 0, db.SessionTypeCookie, "127.0.0.1", "agent")
+	if err != nil {
+		t.Fatalf("CreateSession failed: %v", err)
+	}
+
+	concurrency := 20
+	successCount := 0
+	invalidCount := 0
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	startCh := make(chan struct{})
+
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-startCh
+			_, _, rerr := svc.RotateSession(context.Background(), rawID, "127.0.0.1", "agent")
+			mu.Lock()
+			defer mu.Unlock()
+			if rerr == nil {
+				successCount++
+			} else if errors.Is(rerr, apperrors.ErrSessionInvalid) {
+				invalidCount++
+			}
+		}()
+	}
+
+	close(startCh)
+	wg.Wait()
+
+	if successCount != 1 {
+		t.Fatalf("expected strictly 1 successful rotation, got %d (invalid: %d)", successCount, invalidCount)
+	}
+	if invalidCount != concurrency-1 {
+		t.Fatalf("expected %d invalid errors, got %d", concurrency-1, invalidCount)
 	}
 }

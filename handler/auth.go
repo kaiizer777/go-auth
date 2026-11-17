@@ -244,28 +244,20 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 // Logout terminates the current session.
 func (h *AuthHandler) Logout(w http.ResponseWriter, r *http.Request) {
 	var sessionID string
-	if cookie, err := r.Cookie("session"); err == nil {
-		sessionID = cookie.Value
-	} else if cookie, err := r.Cookie("session_id"); err == nil {
-		sessionID = cookie.Value
-	}
-	if sessionID == "" {
-		sessionID = r.Header.Get("X-Session-ID")
+	if rawID, err := session.ReadSessionCookie(r, h.cfg); err == nil {
+		sessionID = rawID
+	} else if rawID, err := session.ReadBearerToken(r); err == nil {
+		sessionID = rawID
 	}
 
-	if h.sessionSvc != nil {
-		var invalidateErr error
-		if rawID, err := session.ReadSessionCookie(r, h.cfg); err == nil {
-			invalidateErr = h.sessionSvc.InvalidateSession(r.Context(), rawID)
-		} else if rawID, err := session.ReadBearerToken(r); err == nil {
-			invalidateErr = h.sessionSvc.InvalidateSession(r.Context(), rawID)
-		}
-		if invalidateErr != nil {
-			errors.WriteJSON(w, invalidateErr)
+	if h.sessionSvc != nil && sessionID != "" {
+		if err := h.sessionSvc.InvalidateSession(r.Context(), sessionID); err != nil {
+			errors.WriteJSON(w, err)
 			return
 		}
-		session.ClearSessionCookie(w, h.cfg)
 	}
+	session.ClearSessionCookie(w, h.cfg)
+	clearCSRFCookie(w, h.cfg)
 
 	if h.svc != nil {
 		if err := h.svc.Logout(r.Context(), sessionID); err != nil {
@@ -273,7 +265,10 @@ func (h *AuthHandler) Logout(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	w.WriteHeader(http.StatusNoContent)
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(map[string]string{"message": "Logged out successfully"})
 }
 
 // VerifyEmail verifies a user's email with a single-use token.

@@ -5,13 +5,16 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	stderrors "errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/glebarez/sqlite"
+	"github.com/google/uuid"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 
@@ -150,6 +153,110 @@ func TestAuth_Close_ConcurrentIdempotent(t *testing.T) {
 		if err != nil {
 			t.Errorf("goroutine %d close error: %v", i, err)
 		}
+	}
+}
+
+func TestAuth_Close_ShutsDownEmailDispatcher(t *testing.T) {
+	var inFlight atomic.Int32
+	var completed atomic.Int32
+	unblock := make(chan struct{})
+
+	dispatcher := email.NewAsyncDispatcher(email.DispatcherConfig{
+		BaseURL: "https://example.com",
+		SendVerificationEmail: func(ctx context.Context, payload email.VerificationEmailPayload) error {
+			inFlight.Add(1)
+			<-unblock
+			completed.Add(1)
+			return nil
+		},
+		EmailDispatchTimeout: 5 * time.Second,
+	}, nil)
+
+	auth := &Auth{
+		emailDispatcher: dispatcher,
+	}
+
+	for i := 0; i < 3; i++ {
+		auth.EmailDispatcher().DispatchVerification(context.Background(), email.VerificationEmailPayload{To: "user@example.com"})
+	}
+
+	for i := 0; i < 50; i++ {
+		if inFlight.Load() == 3 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	closeDone := make(chan error, 1)
+	go func() {
+		closeDone <- auth.Close()
+	}()
+
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatalf("Auth.Close() failed: %v", err)
+		}
+		t.Fatal("Auth.Close() returned before in-flight email dispatches completed")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(unblock)
+
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatalf("unexpected error from Auth.Close(): %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Auth.Close() timed out waiting for email dispatcher shutdown")
+	}
+
+	if got := completed.Load(); got != 3 {
+		t.Fatalf("completed dispatches = %d, want 3", got)
+	}
+}
+
+func TestAuth_Close_EmailDispatcherShutdownTimeoutBounded(t *testing.T) {
+	var inFlight atomic.Int32
+	hang := make(chan struct{})
+	defer close(hang)
+
+	dispatcher := email.NewAsyncDispatcher(email.DispatcherConfig{
+		BaseURL: "https://example.com",
+		SendVerificationEmail: func(ctx context.Context, payload email.VerificationEmailPayload) error {
+			inFlight.Add(1)
+			<-hang
+			return nil
+		},
+		EmailDispatchTimeout: 5 * time.Second,
+	}, nil)
+
+	auth := &Auth{
+		cfg: config.Config{
+			EmailDispatchTimeout: 100 * time.Millisecond,
+		},
+		emailDispatcher: dispatcher,
+	}
+
+	auth.EmailDispatcher().DispatchVerification(context.Background(), email.VerificationEmailPayload{To: "user@example.com"})
+
+	for i := 0; i < 50; i++ {
+		if inFlight.Load() == 1 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	start := time.Now()
+	err := auth.Close()
+	elapsed := time.Since(start)
+
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected context.DeadlineExceeded from bounded shutdown, got: %v", err)
+	}
+	if elapsed > 1*time.Second {
+		t.Fatalf("auth.Close() took %v, expected bounded shutdown under 1s", elapsed)
 	}
 }
 
@@ -481,5 +588,70 @@ func TestNewWithDB_AppliesDefaults(t *testing.T) {
 	}
 	if a.cfg.SessionIdleTimeout != 30*time.Minute {
 		t.Errorf("SessionIdleTimeout = %v; want 30m", a.cfg.SessionIdleTimeout)
+	}
+}
+
+func TestAuth_PurgeExpiredSessions(t *testing.T) {
+	sqliteDB, err := gorm.Open(sqlite.Open(fmt.Sprintf("file:purge_test_%d?mode=memory&cache=shared", time.Now().UnixNano())), &gorm.Config{
+		DisableAutomaticPing: true,
+	})
+	if err != nil {
+		t.Fatalf("failed to open sqlite db: %v", err)
+	}
+	defer func() {
+		if sqlDB, errDB := sqliteDB.DB(); errDB == nil {
+			_ = sqlDB.Close()
+		}
+	}()
+
+	ddl := `
+	CREATE TABLE IF NOT EXISTS users (
+		id TEXT PRIMARY KEY,
+		email TEXT UNIQUE NOT NULL,
+		password_hash TEXT NOT NULL,
+		credential_version INTEGER NOT NULL DEFAULT 0,
+		email_verified INTEGER NOT NULL DEFAULT 0,
+		created_at DATETIME,
+		updated_at DATETIME
+	);
+	CREATE TABLE IF NOT EXISTS sessions (
+		id TEXT PRIMARY KEY,
+		user_id TEXT NOT NULL,
+		id_hash CHAR(64) UNIQUE NOT NULL,
+		session_type VARCHAR(10) NOT NULL DEFAULT 'cookie',
+		ip_address VARCHAR(45) NOT NULL DEFAULT '',
+		user_agent TEXT NOT NULL DEFAULT '',
+		credential_version INTEGER NOT NULL DEFAULT 0,
+		last_active_at DATETIME NOT NULL,
+		absolute_expires_at DATETIME NOT NULL,
+		created_at DATETIME
+	);
+	`
+	if err := sqliteDB.Exec(ddl).Error; err != nil {
+		t.Fatalf("failed to execute sqlite ddl: %v", err)
+	}
+
+	cfg := config.Config{
+		DatabaseURL: "postgres://user:pass@localhost:5432/testdb",
+		BaseURL:     "https://auth.example.com",
+	}
+
+	a, err := NewWithDB(sqliteDB, cfg)
+	if err != nil {
+		t.Fatalf("NewWithDB failed: %v", err)
+	}
+	defer func() { _ = a.Close() }()
+
+	now := time.Now().UTC()
+	// Insert an expired session
+	sqliteDB.Exec("INSERT INTO sessions (id, user_id, id_hash, session_type, last_active_at, absolute_expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+		uuid.New().String(), uuid.New().String(), "hash1", "cookie", now.Add(-1*time.Hour), now.Add(-1*time.Hour), now.Add(-2*time.Hour))
+
+	purged, err := a.PurgeExpiredSessions(context.Background())
+	if err != nil {
+		t.Fatalf("PurgeExpiredSessions failed: %v", err)
+	}
+	if purged != 1 {
+		t.Fatalf("expected 1 purged session, got %d", purged)
 	}
 }

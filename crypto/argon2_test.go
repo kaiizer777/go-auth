@@ -3,6 +3,8 @@ package crypto
 import (
 	"strings"
 	"testing"
+
+	"github.com/kaiizer777/go-auth/errors"
 )
 
 func TestDefaultHashParams(t *testing.T) {
@@ -63,9 +65,29 @@ func TestHashPassword_BoundaryParams(t *testing.T) {
 		wantErr bool
 	}{
 		{
-			name:    "valid minimal boundary (time=1, memory=1, parallelism=1, salt=16, key=1)",
-			params:  HashParams{Memory: 1, Time: 1, Parallelism: 1, SaltLength: 16, KeyLength: 1},
+			name:    "valid minimal boundary (time=1, memory=8, parallelism=1, salt=16, key=1)",
+			params:  HashParams{Memory: 8, Time: 1, Parallelism: 1, SaltLength: 16, KeyLength: 1},
 			wantErr: false,
+		},
+		{
+			name:    "memory below 8*parallelism fails",
+			params:  HashParams{Memory: 7, Time: 1, Parallelism: 1, SaltLength: 16, KeyLength: 32},
+			wantErr: true,
+		},
+		{
+			name:    "memory exceeds 262144 (256 MiB) fails",
+			params:  HashParams{Memory: 262145, Time: 1, Parallelism: 1, SaltLength: 16, KeyLength: 32},
+			wantErr: true,
+		},
+		{
+			name:    "time exceeds 10 fails",
+			params:  HashParams{Memory: 1024, Time: 11, Parallelism: 1, SaltLength: 16, KeyLength: 32},
+			wantErr: true,
+		},
+		{
+			name:    "parallelism above 16 fails",
+			params:  HashParams{Memory: 65536, Time: 1, Parallelism: 17, SaltLength: 16, KeyLength: 32},
+			wantErr: true,
 		},
 		{
 			name:    "time zero fails",
@@ -109,6 +131,34 @@ func TestHashPassword_BoundaryParams(t *testing.T) {
 			_, err := HashPassword("test-password", tt.params)
 			if (err != nil) != tt.wantErr {
 				t.Fatalf("HashPassword(%+v) err = %v; wantErr %v", tt.params, err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestHashPassword_UpperBounds(t *testing.T) {
+	tests := []struct {
+		name   string
+		params HashParams
+	}{
+		{
+			name:   "memory exceeding 262144 is rejected",
+			params: HashParams{Memory: 262145, Time: 1, Parallelism: 1, SaltLength: 16, KeyLength: 32},
+		},
+		{
+			name:   "time exceeding 10 is rejected",
+			params: HashParams{Memory: 1024, Time: 11, Parallelism: 1, SaltLength: 16, KeyLength: 32},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := HashPassword("test-password", tt.params)
+			if err == nil {
+				t.Fatalf("HashPassword(%+v) expected error, got nil", tt.params)
+			}
+			if !errors.Is(err, ErrArgon2ParamsInvalid) {
+				t.Fatalf("HashPassword(%+v) err = %v; want ErrArgon2ParamsInvalid", tt.params, err)
 			}
 		})
 	}

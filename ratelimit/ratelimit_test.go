@@ -173,6 +173,105 @@ func TestLimiter_Prune_RemovesExpired(t *testing.T) {
 	}
 }
 
+func TestLimiter_Prune_BatchesAcrossAllKeys(t *testing.T) {
+	window := 300 * time.Millisecond
+	limiter := NewLimiter(window, 5)
+
+	const activeCount = 270
+	const expiredCount = 60
+	const total = activeCount + expiredCount // 330 entries (>300)
+
+	// Populate expired entries with timestamps older than window.
+	now := time.Now()
+	expiredCutoff := now.Add(-2 * window)
+
+	limiter.mu.Lock()
+	for i := 0; i < expiredCount; i++ {
+		key := fmt.Sprintf("expired-key-%04d", i)
+		limiter.windows[key] = &windowEntry{
+			timestamps: []time.Time{expiredCutoff},
+		}
+	}
+
+	// Populate active entries with current timestamps.
+	for i := 0; i < activeCount; i++ {
+		key := fmt.Sprintf("active-key-%04d", i)
+		limiter.windows[key] = &windowEntry{
+			timestamps: []time.Time{now},
+		}
+	}
+	limiter.mu.Unlock()
+
+	limiter.mu.RLock()
+	initialLen := len(limiter.windows)
+	limiter.mu.RUnlock()
+	if initialLen != total {
+		t.Fatalf("expected %d initial keys, got %d", total, initialLen)
+	}
+
+	// Prune should scan all batches (batchSize=256) and not terminate early
+	// when encountering batches without expired keys.
+	limiter.Prune()
+
+	limiter.mu.RLock()
+	defer limiter.mu.RUnlock()
+
+	if len(limiter.windows) != activeCount {
+		t.Fatalf("expected exactly %d remaining active entries, got %d (leaked %d entries)",
+			activeCount, len(limiter.windows), len(limiter.windows)-activeCount)
+	}
+
+	for i := 0; i < expiredCount; i++ {
+		key := fmt.Sprintf("expired-key-%04d", i)
+		if _, ok := limiter.windows[key]; ok {
+			t.Fatalf("expired key %s was not pruned", key)
+		}
+	}
+
+	for i := 0; i < activeCount; i++ {
+		key := fmt.Sprintf("active-key-%04d", i)
+		if _, ok := limiter.windows[key]; !ok {
+			t.Fatalf("active key %s was unexpectedly removed", key)
+		}
+	}
+}
+
+func TestLimiter_Prune_BatchesAcrossAllKeys_WithAllow(t *testing.T) {
+	window := 250 * time.Millisecond
+	limiter := NewLimiter(window, 5)
+
+	const expiredCount = 50
+	const activeCount = 260
+	// 1. Create expired entries via Allow
+	for i := 0; i < expiredCount; i++ {
+		key := fmt.Sprintf("expire-allow-%04d", i)
+		limiter.Allow(key)
+	}
+
+	time.Sleep(window + 50*time.Millisecond)
+
+	// 2. Create active entries via Allow
+	for i := 0; i < activeCount; i++ {
+		key := fmt.Sprintf("active-allow-%04d", i)
+		limiter.Allow(key)
+	}
+
+	limiter.Prune()
+
+	limiter.mu.RLock()
+	defer limiter.mu.RUnlock()
+
+	if len(limiter.windows) != activeCount {
+		t.Fatalf("expected %d entries, got %d", activeCount, len(limiter.windows))
+	}
+	for i := 0; i < expiredCount; i++ {
+		key := fmt.Sprintf("expire-allow-%04d", i)
+		if _, ok := limiter.windows[key]; ok {
+			t.Fatalf("expected key %s to be pruned", key)
+		}
+	}
+}
+
 func TestLimiter_ConcurrentAccess(t *testing.T) {
 	limiter := NewLimiter(500*time.Millisecond, 20)
 	concurrency := 50
@@ -335,6 +434,7 @@ func TestClientIP(t *testing.T) {
 		{name: "IPv4 without port", remoteAddr: "192.0.2.1", expected: "192.0.2.1"},
 		{name: "IPv6 with port", remoteAddr: "[2001:db8::1]:8080", expected: "2001:db8::1"},
 		{name: "IPv6 without port", remoteAddr: "2001:db8::1", expected: "2001:db8::1"},
+		{name: "IPv6 bracketed without port", remoteAddr: "[2001:db8::1]", expected: "2001:db8::1"},
 	}
 
 	for _, tt := range tests {
@@ -379,5 +479,112 @@ func TestWriteRateLimitError(t *testing.T) {
 	WriteRateLimitError(rec2, 200*time.Millisecond)
 	if rec2.Header().Get("Retry-After") != "1" {
 		t.Fatalf("expected Retry-After='1', got %q", rec2.Header().Get("Retry-After"))
+	}
+}
+
+func TestLimiter_NonPositiveParamsSanitized(t *testing.T) {
+	l := NewLimiter(0, 0)
+	if l.duration <= 0 {
+		t.Errorf("expected positive sanitized duration, got %v", l.duration)
+	}
+	if l.max <= 0 {
+		t.Errorf("expected positive sanitized max, got %v", l.max)
+	}
+}
+
+func TestLimiter_RWMutexReadContention(t *testing.T) {
+	limiter := NewLimiter(1*time.Minute, 1000)
+	key := "contended-key"
+
+	limiter.Allow(key)
+
+	var wg sync.WaitGroup
+	const goroutines = 20
+	const opsPerGoroutine = 50
+
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < opsPerGoroutine; j++ {
+				_ = limiter.RetryAfter(key)
+				_ = limiter.Allow(key)
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+func TestLimiter_CapacityBounded_FailClosed(t *testing.T) {
+	limiter := NewLimiter(1*time.Minute, 5)
+	const capLimit = 10
+	limiter.SetMaxEntries(capLimit)
+
+	for i := 0; i < capLimit; i++ {
+		key := fmt.Sprintf("key-%d", i)
+		if !limiter.Allow(key) {
+			t.Fatalf("expected key %s to be allowed under capacity limit", key)
+		}
+	}
+
+	// 11th distinct key must fail closed because capacity is saturated
+	if limiter.Allow("overflow-key") {
+		t.Fatalf("expected overflow-key to be refused when capacity is saturated")
+	}
+
+	// Existing keys must still evaluate properly
+	if !limiter.Allow("key-0") {
+		t.Fatalf("expected existing key-0 to evaluate and be allowed under its attempt cap")
+	}
+
+	// Map size must not exceed capLimit
+	limiter.mu.RLock()
+	size := len(limiter.windows)
+	limiter.mu.RUnlock()
+	if size > capLimit {
+		t.Fatalf("limiter map size = %d; want at most %d", size, capLimit)
+	}
+}
+
+func TestLimiter_CapacityRecoversAfterPrune(t *testing.T) {
+	window := 50 * time.Millisecond
+	limiter := NewLimiter(window, 5)
+	limiter.SetMaxEntries(2)
+
+	if !limiter.Allow("key-1") || !limiter.Allow("key-2") {
+		t.Fatal("initial keys should be allowed")
+	}
+
+	if limiter.Allow("key-3") {
+		t.Fatal("key-3 should be refused when capacity is saturated")
+	}
+
+	// Wait for window to expire and prune
+	time.Sleep(70 * time.Millisecond)
+	limiter.Prune()
+
+	// Capacity freed up, key-3 should now be allowed
+	if !limiter.Allow("key-3") {
+		t.Fatal("key-3 should be allowed after expired entries were pruned")
+	}
+}
+
+func TestLimiter_Allow_AutoPruneOnCapacity(t *testing.T) {
+	window := 50 * time.Millisecond
+	limiter := NewLimiter(window, 5)
+	limiter.SetMaxEntries(2)
+
+	if !limiter.Allow("key-1") || !limiter.Allow("key-2") {
+		t.Fatal("initial keys should be allowed")
+	}
+
+	if limiter.Allow("key-3") {
+		t.Fatal("key-3 should be refused when capacity is saturated with active entries")
+	}
+
+	time.Sleep(70 * time.Millisecond)
+
+	if !limiter.Allow("key-3") {
+		t.Fatal("key-3 should be allowed after automatic inline eviction")
 	}
 }

@@ -320,6 +320,9 @@ func TestService_Login(t *testing.T) {
 		if user != nil {
 			t.Fatalf("expected nil user, got %v", user)
 		}
+		if !errors.Is(err, errors.ErrInvalidCredentials) {
+			t.Fatalf("expected ErrInvalidCredentials sentinel, got: %v", err)
+		}
 		var appErr *errors.Error
 		if !errors.As(err, &appErr) || appErr.Code() != errors.CodeInvalidCredentials {
 			t.Fatalf("expected CodeInvalidCredentials, got %v", err)
@@ -333,6 +336,9 @@ func TestService_Login(t *testing.T) {
 		}
 		if user != nil {
 			t.Fatalf("expected nil user, got %v", user)
+		}
+		if !errors.Is(err, errors.ErrInvalidCredentials) {
+			t.Fatalf("expected ErrInvalidCredentials sentinel, got: %v", err)
 		}
 		var appErr *errors.Error
 		if !errors.As(err, &appErr) || appErr.Code() != errors.CodeInvalidCredentials {
@@ -365,6 +371,9 @@ func TestService_Login(t *testing.T) {
 		if user != nil {
 			t.Fatalf("expected nil user, got %v", user)
 		}
+		if !errors.Is(err, errors.ErrEmailNotVerified) {
+			t.Fatalf("expected ErrEmailNotVerified sentinel, got: %v", err)
+		}
 		var appErr *errors.Error
 		if !errors.As(err, &appErr) || appErr.Code() != errors.CodeEmailNotVerified {
 			t.Fatalf("expected CodeEmailNotVerified, got %v", err)
@@ -381,6 +390,83 @@ func TestService_Login(t *testing.T) {
 		}
 		if user == nil {
 			t.Fatal("expected user after verification, got nil")
+		}
+	})
+}
+
+func TestService_Logout_Invalidation(t *testing.T) {
+	database := setupTestDB(t)
+	cfg := testConfig()
+	svc, err := New(cfg, database, email.Hooks{})
+	if err != nil {
+		t.Fatalf("failed to create service: %v", err)
+	}
+
+	ctx := context.Background()
+
+	t.Run("empty session ID returns nil without error", func(t *testing.T) {
+		if err := svc.Logout(ctx, ""); err != nil {
+			t.Fatalf("expected nil for empty session ID, got: %v", err)
+		}
+	})
+
+	t.Run("valid session ID deletes session row from database", func(t *testing.T) {
+		rawID := "test-session-secret-token-12345"
+		sum := sha256.Sum256([]byte(rawID))
+		idHash := hex.EncodeToString(sum[:])
+
+		sess := db.Session{
+			ID:                uuid.New(),
+			UserID:            uuid.New(),
+			IDHash:            idHash,
+			SessionType:       db.SessionTypeCookie,
+			LastActiveAt:      time.Now().UTC(),
+			AbsoluteExpiresAt: time.Now().UTC().Add(time.Hour),
+		}
+		if err := database.Create(&sess).Error; err != nil {
+			t.Fatalf("failed to seed session: %v", err)
+		}
+
+		if err := svc.Logout(ctx, rawID); err != nil {
+			t.Fatalf("Logout failed: %v", err)
+		}
+
+		var count int64
+		if err := database.Model(&db.Session{}).Where("id = ?", sess.ID).Count(&count).Error; err != nil {
+			t.Fatalf("failed to count sessions: %v", err)
+		}
+		if count != 0 {
+			t.Fatalf("expected session to be deleted after Logout, found %d", count)
+		}
+	})
+
+	t.Run("internal UUID does not delete session without secret token", func(t *testing.T) {
+		rawID := "test-session-secret-token-67890"
+		sum := sha256.Sum256([]byte(rawID))
+		idHash := hex.EncodeToString(sum[:])
+
+		sess := db.Session{
+			ID:                uuid.New(),
+			UserID:            uuid.New(),
+			IDHash:            idHash,
+			SessionType:       db.SessionTypeBearer,
+			LastActiveAt:      time.Now().UTC(),
+			AbsoluteExpiresAt: time.Now().UTC().Add(time.Hour),
+		}
+		if err := database.Create(&sess).Error; err != nil {
+			t.Fatalf("failed to seed session: %v", err)
+		}
+
+		if err := svc.Logout(ctx, sess.ID.String()); err != nil {
+			t.Fatalf("Logout failed: %v", err)
+		}
+
+		var count int64
+		if err := database.Model(&db.Session{}).Where("id = ?", sess.ID).Count(&count).Error; err != nil {
+			t.Fatalf("failed to count sessions: %v", err)
+		}
+		if count != 1 {
+			t.Fatalf("expected session to remain intact when Logout called with internal UUID, found count %d", count)
 		}
 	})
 }
@@ -412,6 +498,9 @@ func TestService_VerifyEmail(t *testing.T) {
 		if err == nil {
 			t.Fatal("expected error for unknown token, got nil")
 		}
+		if !errors.Is(err, errors.ErrInvalidToken) {
+			t.Fatalf("expected ErrInvalidToken sentinel, got: %v", err)
+		}
 		var appErr *errors.Error
 		if !errors.As(err, &appErr) || appErr.Code() != errors.CodeInvalidToken {
 			t.Fatalf("expected CodeInvalidToken, got %v", err)
@@ -436,6 +525,9 @@ func TestService_VerifyEmail(t *testing.T) {
 		err = svc.VerifyEmail(ctx, db.VerifyEmailRequest{Token: rawToken})
 		if err == nil {
 			t.Fatal("expected error for expired token, got nil")
+		}
+		if !errors.Is(err, errors.ErrTokenExpired) {
+			t.Fatalf("expected ErrTokenExpired sentinel, got: %v", err)
 		}
 		var appErr *errors.Error
 		if !errors.As(err, &appErr) || appErr.Code() != errors.CodeTokenExpired {
@@ -647,8 +739,8 @@ func TestService_PasswordReset(t *testing.T) {
 
 		var countBefore int64
 		database.Model(&db.PasswordResetToken{}).Where("user_id = ?", user.ID).Count(&countBefore)
-		if countBefore < 2 {
-			t.Fatalf("expected at least 2 tokens before reset, got %d", countBefore)
+		if countBefore != 1 {
+			t.Fatalf("expected exactly 1 active token before reset due to stale token invalidation, got %d", countBefore)
 		}
 
 		var userBefore db.User
@@ -656,11 +748,20 @@ func TestService_PasswordReset(t *testing.T) {
 			t.Fatalf("failed to query user before reset: %v", err)
 		}
 
-		// Reset password using tok1
+		// Verify that stale tok1 was invalidated upon issuing tok2 and cannot be used
 		newPassword := "BrandNewPassword#2026!"
 		err = svc.ResetPassword(ctx, db.PasswordResetConfirmRequest{Token: tok1, NewPassword: newPassword})
+		if err == nil {
+			t.Fatal("expected stale tok1 reset to fail, got nil")
+		}
+		if !errors.Is(err, errors.ErrInvalidToken) {
+			t.Fatalf("expected ErrInvalidToken for stale reset token, got: %v", err)
+		}
+
+		// Reset password using active tok2
+		err = svc.ResetPassword(ctx, db.PasswordResetConfirmRequest{Token: tok2, NewPassword: newPassword})
 		if err != nil {
-			t.Fatalf("unexpected reset error: %v", err)
+			t.Fatalf("unexpected reset error with active tok2: %v", err)
 		}
 
 		// Verify login with old password fails
@@ -764,6 +865,146 @@ func TestService_PasswordReset(t *testing.T) {
 			t.Fatalf("expected credential version %d after reset bump, got %d", userBefore.CredentialVersion+1, userAfter.CredentialVersion)
 		}
 	})
+}
+
+func TestService_RequestPasswordReset_Concurrency(t *testing.T) {
+	database := setupTestDB(t)
+	cfg := testConfig()
+
+	svc, err := New(cfg, database, email.Hooks{})
+	if err != nil {
+		t.Fatalf("failed to create service: %v", err)
+	}
+
+	ctx := context.Background()
+	user, _, err := svc.Signup(ctx, db.SignupRequest{
+		Email:    "concurrent_reset@example.com",
+		Password: "SecureAlpha#2026!",
+	})
+	if err != nil {
+		t.Fatalf("failed to create user: %v", err)
+	}
+
+	const concurrentRequests = 10
+	var wg sync.WaitGroup
+	wg.Add(concurrentRequests)
+
+	tokens := make([]string, concurrentRequests)
+	errs := make([]error, concurrentRequests)
+
+	for i := 0; i < concurrentRequests; i++ {
+		go func(idx int) {
+			defer wg.Done()
+			tok, err := svc.RequestPasswordReset(ctx, db.PasswordResetRequest{
+				Email: "concurrent_reset@example.com",
+			})
+			tokens[idx] = tok
+			errs[idx] = err
+		}(i)
+	}
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("goroutine %d failed with error: %v", i, err)
+		}
+		if len(tokens[i]) != 64 {
+			t.Fatalf("goroutine %d returned invalid token len %d: %q", i, len(tokens[i]), tokens[i])
+		}
+	}
+
+	var count int64
+	if err := database.Model(&db.PasswordResetToken{}).Where("user_id = ?", user.ID).Count(&count).Error; err != nil {
+		t.Fatalf("failed to query reset tokens: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("expected exactly 1 active reset token, got %d", count)
+	}
+
+	var activeTok db.PasswordResetToken
+	if err := database.Where("user_id = ?", user.ID).First(&activeTok).Error; err != nil {
+		t.Fatalf("failed to query active reset token: %v", err)
+	}
+
+	var activeRaw string
+	for _, tok := range tokens {
+		rawBytes, _ := hex.DecodeString(tok)
+		h := sha256.Sum256(rawBytes)
+		if string(h[:]) == string(activeTok.TokenHash) {
+			activeRaw = tok
+			break
+		}
+	}
+	if activeRaw == "" {
+		t.Fatal("active token in db did not match any returned token")
+	}
+
+	newPassword := "BrandNewConcurrentPassword#2026!"
+	if err := svc.ResetPassword(ctx, db.PasswordResetConfirmRequest{
+		Token:       activeRaw,
+		NewPassword: newPassword,
+	}); err != nil {
+		t.Fatalf("failed to reset password with active token: %v", err)
+	}
+
+	for _, tok := range tokens {
+		if tok == activeRaw {
+			continue
+		}
+		err := svc.ResetPassword(ctx, db.PasswordResetConfirmRequest{
+			Token:       tok,
+			NewPassword: "AnotherPassword#2026!",
+		})
+		if !errors.Is(err, errors.ErrInvalidToken) {
+			t.Fatalf("expected ErrInvalidToken for invalidated stale token, got: %v", err)
+		}
+	}
+}
+
+func TestResetPassword_CanonicalLockOrderConcurrent(t *testing.T) {
+	database := setupTestDB(t)
+	cfg := testConfig()
+	svc, err := New(cfg, database, email.Hooks{})
+	if err != nil {
+		t.Fatalf("unexpected init error: %v", err)
+	}
+
+	ctx := context.Background()
+	user, _, err := svc.Signup(ctx, db.SignupRequest{
+		Email:    "lock_order_test@example.com",
+		Password: "ValidPassword#123",
+	})
+	if err != nil {
+		t.Fatalf("signup failed: %v", err)
+	}
+
+	initialToken, err := svc.RequestPasswordReset(ctx, db.PasswordResetRequest{
+		Email: user.Email,
+	})
+	if err != nil {
+		t.Fatalf("initial request reset failed: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	const iterations = 5
+	wg.Add(2 * iterations)
+
+	for i := 0; i < iterations; i++ {
+		go func() {
+			defer wg.Done()
+			_, _ = svc.RequestPasswordReset(ctx, db.PasswordResetRequest{
+				Email: user.Email,
+			})
+		}()
+		go func() {
+			defer wg.Done()
+			_ = svc.ResetPassword(ctx, db.PasswordResetConfirmRequest{
+				Token:       initialToken,
+				NewPassword: "BrandNewPassword#2026!",
+			})
+		}()
+	}
+	wg.Wait()
 }
 
 func TestEmailHooks_NilSafe(t *testing.T) {

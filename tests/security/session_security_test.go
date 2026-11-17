@@ -667,3 +667,82 @@ func TestConcurrentLogout(t *testing.T) {
 		t.Errorf("expected at least one 200 OK in concurrent logouts")
 	}
 }
+
+// Test 21: TestTransportBinding_RejectionNormalized (ASVS V3.2)
+// Cookie sessions rejected via Bearer, bearer sessions rejected via Cookie.
+// Error envelope normalized to CodeSessionInvalid.
+func TestTransportBinding_RejectionNormalized(t *testing.T) {
+	app, _, cfg := setupSecurityApp(t)
+	email := "transport_bind@example.com"
+	pass := "Pass123456789!"
+	signupSecurityUser(t, app, email, pass)
+
+	// 1. Create cookie session
+	loginBody, _ := json.Marshal(db.LoginRequest{Email: email, Password: pass})
+	reqCookie := httptest.NewRequest(http.MethodPost, "/auth/login", bytes.NewReader(loginBody))
+	recCookie := httptest.NewRecorder()
+	app.Handler.ServeHTTP(recCookie, reqCookie)
+	if recCookie.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for cookie login, got %d: %s", recCookie.Code, recCookie.Body.String())
+	}
+	cookie := readCookie(recCookie.Result(), cfg.SessionCookieName)
+	if cookie == nil {
+		t.Fatalf("expected session cookie in response")
+	}
+	cookieVal := cookie.Value
+
+	// Try using cookie token via Bearer header
+	getReq1 := httptest.NewRequest(http.MethodGet, "/auth/session", nil)
+	getReq1.Header.Set("Authorization", "Bearer "+cookieVal)
+	getRec1 := httptest.NewRecorder()
+	app.Handler.ServeHTTP(getRec1, getReq1)
+	if getRec1.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 Unauthorized for cookie session delivered via Bearer, got %d", getRec1.Code)
+	}
+	var errResp1 struct {
+		Code string `json:"code"`
+	}
+	if err := json.Unmarshal(getRec1.Body.Bytes(), &errResp1); err != nil {
+		t.Fatalf("failed to decode error response 1: %v", err)
+	}
+	if errResp1.Code != "SESSION_INVALID" {
+		t.Fatalf("expected error code SESSION_INVALID, got %q", errResp1.Code)
+	}
+
+	// 2. Create bearer session
+	reqBearer := httptest.NewRequest(http.MethodPost, "/auth/login", bytes.NewReader(loginBody))
+	reqBearer.Header.Set("X-Auth-Type", "bearer")
+	recBearer := httptest.NewRecorder()
+	app.Handler.ServeHTTP(recBearer, reqBearer)
+	if recBearer.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for bearer login, got %d: %s", recBearer.Code, recBearer.Body.String())
+	}
+	var bearerResp struct {
+		Token string `json:"token"`
+	}
+	if err := json.Unmarshal(recBearer.Body.Bytes(), &bearerResp); err != nil {
+		t.Fatalf("failed to decode bearer login response: %v", err)
+	}
+	if bearerResp.Token == "" {
+		t.Fatalf("expected non-empty bearer token in login response")
+	}
+	bearerVal := bearerResp.Token
+
+	// Try using bearer token via Cookie
+	getReq2 := httptest.NewRequest(http.MethodGet, "/auth/session", nil)
+	getReq2.AddCookie(&http.Cookie{Name: cfg.SessionCookieName, Value: bearerVal})
+	getRec2 := httptest.NewRecorder()
+	app.Handler.ServeHTTP(getRec2, getReq2)
+	if getRec2.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 Unauthorized for bearer session delivered via Cookie, got %d", getRec2.Code)
+	}
+	var errResp2 struct {
+		Code string `json:"code"`
+	}
+	if err := json.Unmarshal(getRec2.Body.Bytes(), &errResp2); err != nil {
+		t.Fatalf("failed to decode error response 2: %v", err)
+	}
+	if errResp2.Code != "SESSION_INVALID" {
+		t.Fatalf("expected error code SESSION_INVALID, got %q", errResp2.Code)
+	}
+}

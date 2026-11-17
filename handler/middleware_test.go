@@ -1,10 +1,14 @@
 package handler
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -49,6 +53,10 @@ func (m *mockSessionService) RotateSession(ctx context.Context, oldRawID string,
 
 func (m *mockSessionService) ListSessions(ctx context.Context, userID uuid.UUID) ([]*session.Session, error) {
 	return nil, nil
+}
+
+func (m *mockSessionService) PurgeExpired(ctx context.Context) (int64, error) {
+	return 0, nil
 }
 
 const validTestToken = "0123456789abcdef0123456789abcdef"
@@ -479,5 +487,453 @@ func TestRequireAuth_NilSessionService_ReturnsInternalError(t *testing.T) {
 	}
 	if resp.Code != apperrors.CodeInternalError {
 		t.Errorf("expected code %s, got %s", apperrors.CodeInternalError, resp.Code)
+	}
+}
+
+func TestSecurityHeaders_Middleware(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.SessionCookieSecure = true
+
+	mw := SecurityHeaders(&cfg)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/test", nil)
+	rec := httptest.NewRecorder()
+
+	mw.ServeHTTP(rec, req)
+
+	if got := rec.Header().Get("X-Content-Type-Options"); got != "nosniff" {
+		t.Errorf("X-Content-Type-Options = %q, want nosniff", got)
+	}
+	if got := rec.Header().Get("X-Frame-Options"); got != "DENY" {
+		t.Errorf("X-Frame-Options = %q, want DENY", got)
+	}
+	if got := rec.Header().Get("Referrer-Policy"); got != "strict-origin-when-cross-origin" {
+		t.Errorf("Referrer-Policy = %q, want strict-origin-when-cross-origin", got)
+	}
+	if got := rec.Header().Get("Content-Security-Policy"); got != "default-src 'none'; frame-ancestors 'none'" {
+		t.Errorf("Content-Security-Policy = %q, want default-src 'none'; frame-ancestors 'none'", got)
+	}
+	if got := rec.Header().Get("Strict-Transport-Security"); got != "max-age=63072000; includeSubDomains; preload" {
+		t.Errorf("Strict-Transport-Security = %q, want HSTS header when secure", got)
+	}
+}
+
+func TestRecovery_Middleware(t *testing.T) {
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, nil))
+
+	secretPanicValue := "secret-panic-token-12345"
+	mw := Recovery(logger)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		panic(secretPanicValue)
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/panic", nil)
+	rec := httptest.NewRecorder()
+
+	mw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500, got %d", rec.Code)
+	}
+
+	var resp apperrors.Response
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to decode error body: %v", err)
+	}
+	if resp.Code != apperrors.CodeInternalError {
+		t.Errorf("expected INTERNAL_ERROR, got %s", resp.Code)
+	}
+
+	logOutput := logBuf.String()
+	if !strings.Contains(logOutput, "panic recovered in http handler") {
+		t.Errorf("expected recovery message in log, got: %s", logOutput)
+	}
+	if strings.Contains(logOutput, secretPanicValue) {
+		t.Fatalf("secret panic value leaked into log: %s", logOutput)
+	}
+}
+
+func TestRecovery_RePanicsErrAbortHandler(t *testing.T) {
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, nil))
+
+	mw := Recovery(logger)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		panic(http.ErrAbortHandler)
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/abort", nil)
+	rec := httptest.NewRecorder()
+
+	var panickedVal any
+	func() {
+		defer func() {
+			panickedVal = recover()
+		}()
+		mw.ServeHTTP(rec, req)
+	}()
+
+	if panickedVal != http.ErrAbortHandler {
+		t.Fatalf("expected re-panic with http.ErrAbortHandler, got: %v", panickedVal)
+	}
+
+	if strings.Contains(logBuf.String(), "panic recovered in http handler") {
+		t.Errorf("expected no recovery log for http.ErrAbortHandler, got: %s", logBuf.String())
+	}
+}
+
+func TestRecover_DefaultLogger(t *testing.T) {
+	mw := Recover()(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		panic("testing default recover")
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/recover-test", nil)
+	rec := httptest.NewRecorder()
+
+	mw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500 from default Recover(), got %d", rec.Code)
+	}
+}
+
+func TestRecovery_RePanicsWhenResponseCommitted_WriteHeader(t *testing.T) {
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, nil))
+
+	mw := Recovery(logger)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		panic("panic after WriteHeader")
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/committed-header", nil)
+	rec := httptest.NewRecorder()
+
+	var panickedVal any
+	func() {
+		defer func() {
+			panickedVal = recover()
+		}()
+		mw.ServeHTTP(rec, req)
+	}()
+
+	if panickedVal != http.ErrAbortHandler {
+		t.Fatalf("expected re-panic with http.ErrAbortHandler, got: %v", panickedVal)
+	}
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected original status code 200, got %d", rec.Code)
+	}
+
+	if !strings.Contains(logBuf.String(), "panic recovered in http handler") {
+		t.Errorf("expected recovery message in log, got: %s", logBuf.String())
+	}
+}
+
+func TestRecovery_RePanicsWhenResponseCommitted_Write(t *testing.T) {
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, nil))
+
+	mw := Recovery(logger)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("early payload"))
+		panic("panic after Write")
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/committed-body", nil)
+	rec := httptest.NewRecorder()
+
+	var panickedVal any
+	func() {
+		defer func() {
+			panickedVal = recover()
+		}()
+		mw.ServeHTTP(rec, req)
+	}()
+
+	if panickedVal != http.ErrAbortHandler {
+		t.Fatalf("expected re-panic with http.ErrAbortHandler, got: %v", panickedVal)
+	}
+
+	if rec.Body.String() != "early payload" {
+		t.Fatalf("expected body %q, got %q", "early payload", rec.Body.String())
+	}
+
+	if !strings.Contains(logBuf.String(), "panic recovered in http handler") {
+		t.Errorf("expected recovery message in log, got: %s", logBuf.String())
+	}
+}
+
+func TestRecovery_RePanicsWhenResponseCommitted_Interceptor(t *testing.T) {
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, nil))
+
+	mw := Recovery(logger)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		panic("panic after interceptor write")
+	}))
+
+	req := httptest.NewRequest(http.MethodPost, "/interceptor", nil)
+	rec := httptest.NewRecorder()
+	interceptor := &responseInterceptor{ResponseWriter: rec}
+
+	var panickedVal any
+	func() {
+		defer func() {
+			panickedVal = recover()
+		}()
+		mw.ServeHTTP(interceptor, req)
+	}()
+
+	if panickedVal != http.ErrAbortHandler {
+		t.Fatalf("expected re-panic with http.ErrAbortHandler, got: %v", panickedVal)
+	}
+
+	if !interceptor.headerWritten {
+		t.Fatal("expected interceptor.headerWritten to be true")
+	}
+
+	if !strings.Contains(logBuf.String(), "panic recovered in http handler") {
+		t.Errorf("expected recovery message in log, got: %s", logBuf.String())
+	}
+}
+
+func TestRecovery_Flush_NonFlusherDoesNotCommit(t *testing.T) {
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, nil))
+
+	mw := Recovery(logger)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		panic("panic after flush attempt on non-flusher")
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/flush-nonflusher", nil)
+	rec := &nonFlusherRecorder{}
+
+	var panickedVal any
+	func() {
+		defer func() {
+			panickedVal = recover()
+		}()
+		mw.ServeHTTP(rec, req)
+	}()
+
+	if panickedVal != nil {
+		t.Fatalf("expected panic to be recovered without re-panic, got: %v", panickedVal)
+	}
+
+	if rec.code != http.StatusInternalServerError {
+		t.Fatalf("expected 500 Internal Server Error, got: %d", rec.code)
+	}
+
+	var resp apperrors.Response
+	if err := json.Unmarshal(rec.body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to decode json error response: %v", err)
+	}
+	if resp.Code != apperrors.CodeInternalError {
+		t.Fatalf("expected CodeInternalError, got: %s", resp.Code)
+	}
+}
+
+func TestRecovery_Flush_FlusherCommitsAndRePanics(t *testing.T) {
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, nil))
+
+	mw := Recovery(logger)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		panic("panic after flush on flusher")
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/flush-flusher", nil)
+	rec := &mockFlusherRecorder{ResponseRecorder: httptest.NewRecorder()}
+
+	var panickedVal any
+	func() {
+		defer func() {
+			panickedVal = recover()
+		}()
+		mw.ServeHTTP(rec, req)
+	}()
+
+	if panickedVal != http.ErrAbortHandler {
+		t.Fatalf("expected re-panic with http.ErrAbortHandler, got: %v", panickedVal)
+	}
+	if !rec.flushed {
+		t.Fatal("expected flusher to have flushed")
+	}
+}
+
+type test1xxRecorder struct {
+	*httptest.ResponseRecorder
+	informationalCodes []int
+	finalCode          int
+}
+
+func (r *test1xxRecorder) WriteHeader(code int) {
+	if code >= 100 && code < 200 && code != http.StatusSwitchingProtocols {
+		r.informationalCodes = append(r.informationalCodes, code)
+		return
+	}
+	r.finalCode = code
+	r.ResponseRecorder.WriteHeader(code)
+}
+
+func TestRecovery_Informational1xx_DoesNotCommit(t *testing.T) {
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, nil))
+
+	mw := Recovery(logger)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusEarlyHints)
+		panic("panic after 103 Early Hints")
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/early-hints", nil)
+	rec := &test1xxRecorder{ResponseRecorder: httptest.NewRecorder()}
+
+	var panickedVal any
+	func() {
+		defer func() {
+			panickedVal = recover()
+		}()
+		mw.ServeHTTP(rec, req)
+	}()
+
+	if panickedVal != nil {
+		t.Fatalf("unexpected panic propagation: %v", panickedVal)
+	}
+
+	if rec.finalCode != http.StatusInternalServerError {
+		t.Fatalf("expected 500 Internal Server Error, got: %d", rec.finalCode)
+	}
+	if !strings.Contains(rec.Body.String(), "INTERNAL_ERROR") {
+		t.Fatalf("expected INTERNAL_ERROR in body, got: %s", rec.Body.String())
+	}
+}
+
+func TestRecovery_SwitchingProtocols101_CommitsAndRePanics(t *testing.T) {
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, nil))
+
+	mw := Recovery(logger)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusSwitchingProtocols)
+		panic("panic after 101 Switching Protocols")
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/ws-upgrade", nil)
+	rec := httptest.NewRecorder()
+
+	var panickedVal any
+	func() {
+		defer func() {
+			panickedVal = recover()
+		}()
+		mw.ServeHTTP(rec, req)
+	}()
+
+	if panickedVal != http.ErrAbortHandler {
+		t.Fatalf("expected re-panic with http.ErrAbortHandler, got: %v", panickedVal)
+	}
+}
+
+func TestRequireAuth_PreservesTypedCookieError(t *testing.T) {
+	cfg := config.DefaultConfig()
+	mockSvc := &mockSessionService{}
+
+	mw := RequireAuth(mockSvc, &cfg)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("next handler should not be called")
+	}))
+
+	// Cookie is present but invalid hex
+	req := httptest.NewRequest(http.MethodGet, "/protected", nil)
+	req.AddCookie(&http.Cookie{
+		Name:  cfg.SessionCookieName,
+		Value: "invalid-token-not-hex",
+	})
+	rec := httptest.NewRecorder()
+
+	mw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d", rec.Code)
+	}
+	var resp apperrors.Response
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to decode body: %v", err)
+	}
+	if resp.Code != apperrors.CodeSessionInvalid {
+		t.Fatalf("expected CodeSessionInvalid, got %s", resp.Code)
+	}
+}
+
+func TestRequireAuth_ContextSecretRedacted(t *testing.T) {
+	cfg := config.DefaultConfig()
+	secretToken := validTestToken
+	expectedUserID := uuid.New()
+	expectedSession := &session.Session{
+		ID:     uuid.New(),
+		UserID: expectedUserID,
+		Type:   db.SessionTypeCookie,
+	}
+
+	mockSvc := &mockSessionService{
+		getSessionFn: func(ctx context.Context, rawID string) (*session.Session, error) {
+			return expectedSession, nil
+		},
+	}
+
+	var dumpedContext string
+	mw := RequireAuth(mockSvc, &cfg)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		dumpedContext = fmt.Sprintf("%+v", r.Context())
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/protected", nil)
+	req.AddCookie(&http.Cookie{
+		Name:  cfg.SessionCookieName,
+		Value: secretToken,
+	})
+	rec := httptest.NewRecorder()
+
+	mw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	if strings.Contains(dumpedContext, secretToken) {
+		t.Fatalf("raw secret token leaked in context dump: %s", dumpedContext)
+	}
+	if !strings.Contains(dumpedContext, "[REDACTED]") {
+		t.Fatalf("expected [REDACTED] in context dump, got: %s", dumpedContext)
+	}
+}
+
+func TestRequireAuth_DatabaseError(t *testing.T) {
+	cfg := config.DefaultConfig()
+	mockSvc := &mockSessionService{
+		getSessionFn: func(ctx context.Context, rawID string) (*session.Session, error) {
+			return nil, apperrors.New(apperrors.CodeInternalError, "database connection lost", nil)
+		},
+	}
+
+	mw := RequireAuth(mockSvc, &cfg)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("next handler should not be called")
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/protected", nil)
+	req.AddCookie(&http.Cookie{
+		Name:  cfg.SessionCookieName,
+		Value: validTestToken,
+	})
+	rec := httptest.NewRecorder()
+
+	mw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500 on db error, got %d", rec.Code)
 	}
 }
