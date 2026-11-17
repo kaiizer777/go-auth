@@ -849,7 +849,7 @@ func (m *mockAuthService) VerifyEmail(ctx context.Context, req db.VerifyEmailReq
 	if m.verifyEmailFn != nil {
 		return m.verifyEmailFn(ctx, req)
 	}
-	return nil, nil
+	return nil, stderrors.New("mockAuthService verifyEmail not implemented")
 }
 
 func (m *mockAuthService) RequestPasswordReset(ctx context.Context, req db.PasswordResetRequest) (string, error) {
@@ -863,7 +863,7 @@ func (m *mockAuthService) ResetPassword(ctx context.Context, req db.PasswordRese
 	if m.resetPasswordFn != nil {
 		return m.resetPasswordFn(ctx, req)
 	}
-	return nil, nil
+	return nil, stderrors.New("mockAuthService resetPassword not implemented")
 }
 
 // Test 15: 500 Error Masking (unexpected internal error produces generic 500 CodeInternalError with "internal server error")
