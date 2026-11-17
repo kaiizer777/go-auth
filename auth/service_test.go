@@ -961,6 +961,52 @@ func TestService_RequestPasswordReset_Concurrency(t *testing.T) {
 	}
 }
 
+func TestResetPassword_CanonicalLockOrderConcurrent(t *testing.T) {
+	database := setupTestDB(t)
+	cfg := testConfig()
+	svc, err := New(cfg, database, email.Hooks{})
+	if err != nil {
+		t.Fatalf("unexpected init error: %v", err)
+	}
+
+	ctx := context.Background()
+	user, _, err := svc.Signup(ctx, db.SignupRequest{
+		Email:    "lock_order_test@example.com",
+		Password: "ValidPassword#123",
+	})
+	if err != nil {
+		t.Fatalf("signup failed: %v", err)
+	}
+
+	initialToken, err := svc.RequestPasswordReset(ctx, db.PasswordResetRequest{
+		Email: user.Email,
+	})
+	if err != nil {
+		t.Fatalf("initial request reset failed: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	const iterations = 5
+	wg.Add(2 * iterations)
+
+	for i := 0; i < iterations; i++ {
+		go func() {
+			defer wg.Done()
+			_, _ = svc.RequestPasswordReset(ctx, db.PasswordResetRequest{
+				Email: user.Email,
+			})
+		}()
+		go func() {
+			defer wg.Done()
+			_ = svc.ResetPassword(ctx, db.PasswordResetConfirmRequest{
+				Token:       initialToken,
+				NewPassword: "BrandNewPassword#2026!",
+			})
+		}()
+	}
+	wg.Wait()
+}
+
 func TestEmailHooks_NilSafe(t *testing.T) {
 	database := setupTestDB(t)
 	cfg := testConfig()
