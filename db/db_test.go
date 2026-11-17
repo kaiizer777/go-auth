@@ -459,3 +459,14 @@ func TestMigrations_NoExplicitTransactionWrappers(t *testing.T) {
 		})
 	}
 }
+
+func TestRunMigrations_ConfiguresStatementTimeout(t *testing.T) {
+	data, err := os.ReadFile("db.go")
+	if err != nil {
+		t.Fatalf("failed to read db.go: %v", err)
+	}
+	src := string(data)
+	if !strings.Contains(src, "StatementTimeout: defaultMigrationTimeout") {
+		t.Fatal("runMigrations must configure StatementTimeout: defaultMigrationTimeout in pgmigrate.Config")
+	}
+}

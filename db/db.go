@@ -126,7 +126,9 @@ func runMigrations(databaseURL, migrationsPath string) error {
 		return errors.New(errors.CodeDatabaseError, "checkout migration connection failed", err)
 	}
 
-	driver, err := pgmigrate.WithConnection(ctx, conn, &pgmigrate.Config{})
+	driver, err := pgmigrate.WithConnection(ctx, conn, &pgmigrate.Config{
+		StatementTimeout: defaultMigrationTimeout,
+	})
 	if err != nil {
 		_ = conn.Close()
 		_ = db.Close()
