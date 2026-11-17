@@ -207,7 +207,7 @@ func (c *Config) Validate() error {
 		return errors.ErrDatabaseURLRequired
 	}
 	if parsedDBURL, err := url.Parse(c.DatabaseURL); err == nil && (strings.ToLower(parsedDBURL.Scheme) == "postgres" || strings.ToLower(parsedDBURL.Scheme) == "postgresql") {
-		if parsedDBURL.Host == "" && parsedDBURL.Query().Get("host") == "" && parsedDBURL.Query().Get("socket") == "" {
+		if (parsedDBURL.Host == "" && parsedDBURL.Query().Get("host") == "") || parsedDBURL.Query().Has("socket") {
 			return errors.ErrDatabaseURLInvalid
 		}
 	} else if strings.Contains(c.DatabaseURL, "://") || !dsnParamRegex.MatchString(c.DatabaseURL) {

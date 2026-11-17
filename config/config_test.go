@@ -1137,9 +1137,9 @@ func TestConfig_DatabaseURL_Validation(t *testing.T) {
 			wantErr: nil,
 		},
 		{
-			name:    "valid postgres scheme with unix domain socket in socket query",
+			name:    "rejects postgres scheme with unsupported socket query parameter",
 			url:     "postgres:///mydb?socket=/var/run/postgresql/.s.PGSQL.5432",
-			wantErr: nil,
+			wantErr: errors.ErrDatabaseURLInvalid,
 		},
 		{
 			name:    "valid postgresql scheme with credentials and socket query",
