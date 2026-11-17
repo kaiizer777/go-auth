@@ -46,7 +46,7 @@ const (
 type Session struct {
 	ID                uuid.UUID   `gorm:"primaryKey;type:uuid;default:uuid_generate_v4()"`
 	UserID            uuid.UUID   `gorm:"type:uuid;not null;index:idx_sessions_user_id"`
-	IDHash            string      `gorm:"column:id_hash;type:char(64);uniqueIndex;not null"`
+	IDHash            string      `gorm:"column:id_hash;type:char(64);uniqueIndex;not null" json:"-"`
 	SessionType       SessionType `gorm:"type:varchar(10);not null;default:'cookie'"`
 	IPAddress         string      `gorm:"type:varchar(45);not null;default:''"`
 	UserAgent         string      `gorm:"type:text;not null;default:''"`
@@ -61,7 +61,7 @@ func (Session) TableName() string { return "sessions" }
 
 // VerificationToken represents an email verification token record.
 type VerificationToken struct {
-	TokenHash []byte    `gorm:"primaryKey;column:token_hash;type:bytea"`
+	TokenHash []byte    `gorm:"primaryKey;column:token_hash;type:bytea" json:"-"`
 	UserID    uuid.UUID `gorm:"type:uuid;not null;index:idx_verification_tokens_user_id"`
 	ExpiresAt time.Time `gorm:"not null"`
 	CreatedAt time.Time
@@ -82,7 +82,7 @@ func (v VerificationToken) LogValue() slog.Value {
 
 // PasswordResetToken represents a single-use password reset token record.
 type PasswordResetToken struct {
-	TokenHash []byte    `gorm:"primaryKey;column:token_hash;type:bytea"`
+	TokenHash []byte    `gorm:"primaryKey;column:token_hash;type:bytea" json:"-"`
 	UserID    uuid.UUID `gorm:"type:uuid;not null;index:idx_password_reset_tokens_user_id"`
 	ExpiresAt time.Time `gorm:"not null"`
 	CreatedAt time.Time

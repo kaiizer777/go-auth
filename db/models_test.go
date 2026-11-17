@@ -251,3 +251,77 @@ func TestUserPasswordHashJSONOmissionAndLogValuer(t *testing.T) {
 		}
 	}
 }
+
+func TestTokenAndSessionHashesJSONOmission(t *testing.T) {
+	// Verify Session.IDHash json:"-"
+	sessField, ok := reflect.TypeOf(Session{}).FieldByName("IDHash")
+	if !ok {
+		t.Fatal("Session missing IDHash field")
+	}
+	if tag := sessField.Tag.Get("json"); tag != "-" {
+		t.Errorf("Session IDHash json tag = %q; want \"-\"", tag)
+	}
+
+	rawIDHash := "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+	sess := Session{
+		ID:                uuid.New(),
+		UserID:            uuid.New(),
+		IDHash:            rawIDHash,
+		SessionType:       SessionTypeBearer,
+		LastActiveAt:      time.Now(),
+		AbsoluteExpiresAt: time.Now().Add(time.Hour),
+	}
+	sessData, err := json.Marshal(sess)
+	if err != nil {
+		t.Fatalf("json.Marshal(Session) failed: %v", err)
+	}
+	if strings.Contains(string(sessData), rawIDHash) || strings.Contains(string(sessData), "id_hash") || strings.Contains(string(sessData), "IDHash") {
+		t.Errorf("json.Marshal(Session) leaked IDHash: %s", string(sessData))
+	}
+
+	// Verify VerificationToken.TokenHash json:"-"
+	vtField, ok := reflect.TypeOf(VerificationToken{}).FieldByName("TokenHash")
+	if !ok {
+		t.Fatal("VerificationToken missing TokenHash field")
+	}
+	if tag := vtField.Tag.Get("json"); tag != "-" {
+		t.Errorf("VerificationToken TokenHash json tag = %q; want \"-\"", tag)
+	}
+
+	rawVTHash := []byte("verification_token_secret_hash_bytes")
+	vt := VerificationToken{
+		TokenHash: rawVTHash,
+		UserID:    uuid.New(),
+		ExpiresAt: time.Now().Add(time.Hour),
+	}
+	vtData, err := json.Marshal(vt)
+	if err != nil {
+		t.Fatalf("json.Marshal(VerificationToken) failed: %v", err)
+	}
+	if strings.Contains(string(vtData), "TokenHash") || strings.Contains(string(vtData), "token_hash") {
+		t.Errorf("json.Marshal(VerificationToken) leaked TokenHash: %s", string(vtData))
+	}
+
+	// Verify PasswordResetToken.TokenHash json:"-"
+	prtField, ok := reflect.TypeOf(PasswordResetToken{}).FieldByName("TokenHash")
+	if !ok {
+		t.Fatal("PasswordResetToken missing TokenHash field")
+	}
+	if tag := prtField.Tag.Get("json"); tag != "-" {
+		t.Errorf("PasswordResetToken TokenHash json tag = %q; want \"-\"", tag)
+	}
+
+	rawPRTHash := []byte("reset_token_secret_hash_bytes")
+	prt := PasswordResetToken{
+		TokenHash: rawPRTHash,
+		UserID:    uuid.New(),
+		ExpiresAt: time.Now().Add(time.Hour),
+	}
+	prtData, err := json.Marshal(prt)
+	if err != nil {
+		t.Fatalf("json.Marshal(PasswordResetToken) failed: %v", err)
+	}
+	if strings.Contains(string(prtData), "TokenHash") || strings.Contains(string(prtData), "token_hash") {
+		t.Errorf("json.Marshal(PasswordResetToken) leaked TokenHash: %s", string(prtData))
+	}
+}
