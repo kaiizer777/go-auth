@@ -768,6 +768,78 @@ func TestRecovery_Flush_FlusherCommitsAndRePanics(t *testing.T) {
 	}
 }
 
+type test1xxRecorder struct {
+	*httptest.ResponseRecorder
+	informationalCodes []int
+	finalCode          int
+}
+
+func (r *test1xxRecorder) WriteHeader(code int) {
+	if code >= 100 && code < 200 && code != http.StatusSwitchingProtocols {
+		r.informationalCodes = append(r.informationalCodes, code)
+		return
+	}
+	r.finalCode = code
+	r.ResponseRecorder.WriteHeader(code)
+}
+
+func TestRecovery_Informational1xx_DoesNotCommit(t *testing.T) {
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, nil))
+
+	mw := Recovery(logger)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusEarlyHints)
+		panic("panic after 103 Early Hints")
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/early-hints", nil)
+	rec := &test1xxRecorder{ResponseRecorder: httptest.NewRecorder()}
+
+	var panickedVal any
+	func() {
+		defer func() {
+			panickedVal = recover()
+		}()
+		mw.ServeHTTP(rec, req)
+	}()
+
+	if panickedVal != nil {
+		t.Fatalf("unexpected panic propagation: %v", panickedVal)
+	}
+
+	if rec.finalCode != http.StatusInternalServerError {
+		t.Fatalf("expected 500 Internal Server Error, got: %d", rec.finalCode)
+	}
+	if !strings.Contains(rec.Body.String(), "INTERNAL_ERROR") {
+		t.Fatalf("expected INTERNAL_ERROR in body, got: %s", rec.Body.String())
+	}
+}
+
+func TestRecovery_SwitchingProtocols101_CommitsAndRePanics(t *testing.T) {
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, nil))
+
+	mw := Recovery(logger)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusSwitchingProtocols)
+		panic("panic after 101 Switching Protocols")
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/ws-upgrade", nil)
+	rec := httptest.NewRecorder()
+
+	var panickedVal any
+	func() {
+		defer func() {
+			panickedVal = recover()
+		}()
+		mw.ServeHTTP(rec, req)
+	}()
+
+	if panickedVal != http.ErrAbortHandler {
+		t.Fatalf("expected re-panic with http.ErrAbortHandler, got: %v", panickedVal)
+	}
+}
+
 func TestRequireAuth_PreservesTypedCookieError(t *testing.T) {
 	cfg := config.DefaultConfig()
 	mockSvc := &mockSessionService{}

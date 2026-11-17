@@ -116,7 +116,9 @@ type recoveryResponseWriter struct {
 }
 
 func (rw *recoveryResponseWriter) WriteHeader(statusCode int) {
-	rw.committed = true
+	if statusCode < 100 || statusCode >= 200 || statusCode == http.StatusSwitchingProtocols {
+		rw.committed = true
+	}
 	rw.ResponseWriter.WriteHeader(statusCode)
 }
 
