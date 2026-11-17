@@ -37,7 +37,7 @@ func testConfig() config.Config {
 	return cfg
 }
 
-func setupTestDB(t *testing.T) *gorm.DB {
+func setupTestDB(t testing.TB) *gorm.DB {
 	t.Helper()
 	dbName := fmt.Sprintf("file:mem_%d_%s?mode=memory&cache=shared", time.Now().UnixNano(), uuid.New().String())
 	database, err := gorm.Open(sqlite.Open(dbName), &gorm.Config{
@@ -1994,5 +1994,44 @@ func TestService_DispatchEmailAsync_PendingTimeoutSlotRelease(t *testing.T) {
 	}
 	if !pendingReleased {
 		t.Fatalf("expected pending slot to be released upon timeout, got emailPendingSem=%d", len(svc.emailPendingSem))
+	}
+}
+
+// loginBenchSink defeats dead-code elimination in login benchmarks.
+var loginBenchSink *db.User
+
+// Missing-user login executes a full dummy Argon2id verification; compare
+// against BenchmarkLoginExistingUser with benchstat to confirm timing parity.
+func BenchmarkLoginMissingUser(b *testing.B) {
+	b.ReportAllocs()
+	database := setupTestDB(b)
+	svc, err := New(testConfig(), database, email.Hooks{})
+	if err != nil {
+		b.Fatalf("failed to create service: %v", err)
+	}
+	req := db.LoginRequest{Email: "ghost@example.com", Password: "SecretPassword#2026!"}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		u, _ := svc.Login(context.Background(), req)
+		loginBenchSink = u
+	}
+}
+
+func BenchmarkLoginExistingUser(b *testing.B) {
+	b.ReportAllocs()
+	database := setupTestDB(b)
+	svc, err := New(testConfig(), database, email.Hooks{})
+	if err != nil {
+		b.Fatalf("failed to create service: %v", err)
+	}
+	ctx := context.Background()
+	if _, _, err := svc.Signup(ctx, db.SignupRequest{Email: "bench@example.com", Password: "SecretPassword#2026!"}); err != nil {
+		b.Fatalf("failed to create bench user: %v", err)
+	}
+	req := db.LoginRequest{Email: "bench@example.com", Password: "SecretPassword#2026!"}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		u, _ := svc.Login(ctx, req)
+		loginBenchSink = u
 	}
 }
