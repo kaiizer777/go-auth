@@ -34,7 +34,7 @@ func TestPasswordReset_BYTEAPrimaryKeyAndASVSPurge(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Signup failed: %v", err)
 	}
-	if err := authInst.Auth.VerifyEmail(ctx, db.VerifyEmailRequest{Token: verifyToken}); err != nil {
+	if _, err := authInst.Auth.VerifyEmail(ctx, db.VerifyEmailRequest{Token: verifyToken}); err != nil {
 		t.Fatalf("VerifyEmail failed: %v", err)
 	}
 
@@ -75,7 +75,7 @@ func TestPasswordReset_BYTEAPrimaryKeyAndASVSPurge(t *testing.T) {
 	}
 
 	// 3. Stale token 1 must be rejected
-	err = authInst.Auth.ResetPassword(ctx, db.PasswordResetConfirmRequest{
+	_, err = authInst.Auth.ResetPassword(ctx, db.PasswordResetConfirmRequest{
 		Token:       rawResetToken1,
 		NewPassword: "AttemptWithStaleToken123!",
 	})
@@ -85,7 +85,7 @@ func TestPasswordReset_BYTEAPrimaryKeyAndASVSPurge(t *testing.T) {
 
 	// 4. Confirm password reset using active rawResetToken2
 	newPassword := "NewVerySecurePass123!"
-	err = authInst.Auth.ResetPassword(ctx, db.PasswordResetConfirmRequest{
+	_, err = authInst.Auth.ResetPassword(ctx, db.PasswordResetConfirmRequest{
 		Token:       rawResetToken2,
 		NewPassword: newPassword,
 	})
@@ -104,7 +104,7 @@ func TestPasswordReset_BYTEAPrimaryKeyAndASVSPurge(t *testing.T) {
 	}
 
 	// - Neither token 1 nor token 2 can be replayed
-	err = authInst.Auth.ResetPassword(ctx, db.PasswordResetConfirmRequest{
+	_, err = authInst.Auth.ResetPassword(ctx, db.PasswordResetConfirmRequest{
 		Token:       rawResetToken1,
 		NewPassword: "AnotherPassword123!",
 	})
@@ -112,7 +112,7 @@ func TestPasswordReset_BYTEAPrimaryKeyAndASVSPurge(t *testing.T) {
 		t.Fatal("expected error on replaying token 1, got nil")
 	}
 
-	err = authInst.Auth.ResetPassword(ctx, db.PasswordResetConfirmRequest{
+	_, err = authInst.Auth.ResetPassword(ctx, db.PasswordResetConfirmRequest{
 		Token:       rawResetToken2,
 		NewPassword: "AnotherPassword123!",
 	})
@@ -184,7 +184,7 @@ func TestPasswordReset_ExpiredTokenPurge(t *testing.T) {
 	}
 
 	// Attempt reset
-	err = authInst.Auth.ResetPassword(ctx, db.PasswordResetConfirmRequest{
+	_, err = authInst.Auth.ResetPassword(ctx, db.PasswordResetConfirmRequest{
 		Token:       rawToken,
 		NewPassword: "NewValidPassword123!",
 	})
@@ -241,7 +241,7 @@ func TestPasswordReset_ConcurrentResetRace(t *testing.T) {
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
-			err := authInst.Auth.ResetPassword(context.Background(), db.PasswordResetConfirmRequest{
+			_, err := authInst.Auth.ResetPassword(context.Background(), db.PasswordResetConfirmRequest{
 				Token:       rawToken,
 				NewPassword: "ConcurrentSuccessPassword123!",
 			})
