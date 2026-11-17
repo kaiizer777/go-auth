@@ -1181,6 +1181,16 @@ func TestConfig_DatabaseURL_Validation(t *testing.T) {
 			url:     "postgres://",
 			wantErr: errors.ErrDatabaseURLInvalid,
 		},
+		{
+			name:    "valid keyword dsn with password containing scheme separator",
+			url:     "host=localhost port=5432 user=postgres dbname=mydb password='https://secret-vault/token'",
+			wantErr: nil,
+		},
+		{
+			name:    "valid keyword dsn with double-quoted password containing scheme separator",
+			url:     `host=localhost port=5432 user=postgres dbname=mydb password="custom://auth-token"`,
+			wantErr: nil,
+		},
 	}
 
 	for _, tt := range tests {
