@@ -161,7 +161,7 @@ func setupTestEnv(t *testing.T, modifyCfg ...func(*config.Config)) (*gorm.DB, au
 	return database, svc, h, capture
 }
 
-func executeRequest(t *testing.T, h http.Handler, method, path string, body any) *httptest.ResponseRecorder {
+func executeRequest(t *testing.T, h http.Handler, method, path string, body any, csrfHeader ...string) *httptest.ResponseRecorder {
 	t.Helper()
 	var bodyReader io.Reader
 	if body != nil {
@@ -183,7 +183,7 @@ func executeRequest(t *testing.T, h http.Handler, method, path string, body any)
 		req.Header.Set("Content-Type", "application/json")
 	}
 	if method != http.MethodGet && method != http.MethodHead && method != http.MethodOptions && method != http.MethodTrace {
-		attachCSRFForTest(t, h, req)
+		attachCSRFForTest(t, h, req, csrfHeader...)
 	}
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
@@ -192,7 +192,8 @@ func executeRequest(t *testing.T, h http.Handler, method, path string, body any)
 
 // attachCSRFForTest fetches a CSRF pair via GET /auth/csrf and attaches it.
 // Tests asserting CSRF rejection must build raw requests instead of using executeRequest.
-func attachCSRFForTest(t *testing.T, h http.Handler, req *http.Request) {
+// Pass the handler cfg's CSRFHeaderName when it differs from DefaultConfig.
+func attachCSRFForTest(t *testing.T, h http.Handler, req *http.Request, csrfHeader ...string) {
 	t.Helper()
 	tokenReq := httptest.NewRequest(http.MethodGet, "/auth/csrf", nil)
 	tokenRec := httptest.NewRecorder()
@@ -206,10 +207,14 @@ func attachCSRFForTest(t *testing.T, h http.Handler, req *http.Request) {
 	if err := json.Unmarshal(tokenRec.Body.Bytes(), &body); err != nil || body.CSRFToken == "" {
 		return
 	}
+	headerName := config.DefaultConfig().CSRFHeaderName
+	if len(csrfHeader) > 0 && csrfHeader[0] != "" {
+		headerName = csrfHeader[0]
+	}
 	for _, c := range tokenRec.Result().Cookies() {
 		if c.Value == body.CSRFToken {
 			req.AddCookie(c)
-			req.Header.Set(config.DefaultConfig().CSRFHeaderName, body.CSRFToken)
+			req.Header.Set(headerName, body.CSRFToken)
 			return
 		}
 	}
