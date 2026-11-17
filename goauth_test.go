@@ -193,7 +193,10 @@ func TestAuth_Close_ShutsDownEmailDispatcher(t *testing.T) {
 	}()
 
 	select {
-	case <-closeDone:
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatalf("Auth.Close() failed: %v", err)
+		}
 		t.Fatal("Auth.Close() returned before in-flight email dispatches completed")
 	case <-time.After(50 * time.Millisecond):
 	}

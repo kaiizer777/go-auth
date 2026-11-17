@@ -188,7 +188,9 @@ func (a *Auth) Close() error {
 			a.signupIPLimiter.Close()
 		}
 		if a.emailDispatcher != nil {
-			_ = a.emailDispatcher.Shutdown(context.Background())
+			if err := a.emailDispatcher.Shutdown(context.Background()); err != nil && a.closeErr == nil {
+				a.closeErr = err
+			}
 		}
 		if a.db != nil {
 			if sqlDB, err := a.db.DB(); err != nil {
