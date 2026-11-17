@@ -15,7 +15,10 @@ import (
 type Dispatcher interface {
 	DispatchVerification(ctx context.Context, payload VerificationEmailPayload)
 	DispatchPasswordReset(ctx context.Context, payload PasswordResetEmailPayload)
+	Shutdown(ctx context.Context) error
 }
+
+var _ Dispatcher = (*AsyncDispatcher)(nil)
 
 // ErrDispatcherClosed is returned when attempting to dispatch on a closed dispatcher.
 var ErrDispatcherClosed = errors.New(errors.CodeInternalError, "email dispatcher is closed", nil)

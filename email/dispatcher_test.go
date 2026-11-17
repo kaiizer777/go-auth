@@ -137,6 +137,15 @@ func TestDispatch_GracefulShutdown(t *testing.T) {
 	}
 }
 
+func TestDispatcherInterface_Shutdown(t *testing.T) {
+	var d Dispatcher = NewAsyncDispatcher(DispatcherConfig{}, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := d.Shutdown(ctx); err != nil {
+		t.Fatalf("expected nil shutdown error via Dispatcher interface, got %v", err)
+	}
+}
+
 func TestDispatch_ShutdownTimeout(t *testing.T) {
 	block := make(chan struct{})
 	defer close(block)
