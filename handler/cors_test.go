@@ -250,7 +250,7 @@ func TestCORSMiddleware_AllowedOrigin(t *testing.T) {
 	if got := rec.Header().Get("Access-Control-Allow-Methods"); got != "GET, POST, PUT, DELETE, OPTIONS" {
 		t.Fatalf("Access-Control-Allow-Methods = %q; unexpected value", got)
 	}
-	if got := rec.Header().Get("Access-Control-Allow-Headers"); got != "Authorization, Content-Type, X-CSRF-Token" {
+	if got := rec.Header().Get("Access-Control-Allow-Headers"); got != "Authorization, Content-Type, X-CSRF-Token, X-Auth-Type" {
 		t.Fatalf("Access-Control-Allow-Headers = %q; unexpected value", got)
 	}
 }
@@ -356,7 +356,7 @@ func TestCORSMiddleware_PreflightAllowed(t *testing.T) {
 	if got := rec.Header().Get("Access-Control-Allow-Methods"); got != "GET, POST, PUT, DELETE, OPTIONS" {
 		t.Fatalf("Access-Control-Allow-Methods = %q; unexpected value", got)
 	}
-	if got := rec.Header().Get("Access-Control-Allow-Headers"); got != "Authorization, Content-Type, X-CSRF-Token" {
+	if got := rec.Header().Get("Access-Control-Allow-Headers"); got != "Authorization, Content-Type, X-CSRF-Token, X-Auth-Type" {
 		t.Fatalf("Access-Control-Allow-Headers = %q; unexpected value", got)
 	}
 }
