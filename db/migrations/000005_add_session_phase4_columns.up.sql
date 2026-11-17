@@ -1,5 +1,3 @@
-BEGIN;
-
 -- 1. Rename token_hash to id_hash if token_hash exists
 DO $$ BEGIN
     IF EXISTS (
@@ -50,5 +48,3 @@ ALTER TABLE sessions
 -- 7. Ensure exactly one unique index on id_hash: drop legacy constraint if present
 ALTER TABLE sessions DROP CONSTRAINT IF EXISTS sessions_token_hash_key;
 CREATE UNIQUE INDEX IF NOT EXISTS sessions_id_hash_idx ON sessions (id_hash);
-
-COMMIT;

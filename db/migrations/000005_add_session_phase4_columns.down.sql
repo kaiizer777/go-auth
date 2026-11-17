@@ -1,5 +1,3 @@
-BEGIN;
-
 DROP INDEX IF EXISTS sessions_id_hash_idx;
 
 -- Restore obsolete columns and backfill timestamps from Phase 4 columns before dropping them
@@ -41,5 +39,3 @@ DO $$ BEGIN
         ALTER TABLE sessions ADD CONSTRAINT sessions_token_hash_key UNIQUE (token_hash);
     END IF;
 END $$;
-
-COMMIT;

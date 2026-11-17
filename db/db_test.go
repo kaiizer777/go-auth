@@ -79,6 +79,31 @@ func TestDefaultMigrationsEmbedded(t *testing.T) {
 	}
 }
 
+func TestDefaultMigrations_NoExplicitTransactions(t *testing.T) {
+	entries, err := defaultMigrationsFS.ReadDir("migrations")
+	if err != nil {
+		t.Fatalf("failed to read migrations dir: %v", err)
+	}
+
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".sql") {
+			continue
+		}
+		content, err := defaultMigrationsFS.ReadFile("migrations/" + entry.Name())
+		if err != nil {
+			t.Fatalf("failed to read migration file %s: %v", entry.Name(), err)
+		}
+		lines := strings.Split(string(content), "\n")
+		for lineNum, line := range lines {
+			trimmed := strings.TrimSpace(line)
+			upper := strings.ToUpper(trimmed)
+			if upper == "BEGIN;" || upper == "BEGIN" || upper == "COMMIT;" || upper == "COMMIT" {
+				t.Errorf("%s:%d contains explicit transaction control: %q", entry.Name(), lineNum+1, trimmed)
+			}
+		}
+	}
+}
+
 func TestIsDefaultMigrationsPath(t *testing.T) {
 	tests := []struct {
 		path string
@@ -337,16 +362,11 @@ func TestMigration000006_UpAddsCredentialVersionColumns(t *testing.T) {
 	}
 	content := string(data)
 
-	if got := strings.Count(content, "BEGIN;"); got != 1 {
-		t.Errorf("migration 6 up BEGIN count = %d; want 1 (single tx)", got)
+	if got := strings.Count(content, "BEGIN;"); got != 0 {
+		t.Errorf("migration 6 up BEGIN count = %d; want 0", got)
 	}
-	if got := strings.Count(content, "COMMIT;"); got != 1 {
-		t.Errorf("migration 6 up COMMIT count = %d; want 1 (single tx)", got)
-	}
-	beginIdx := strings.Index(content, "BEGIN;")
-	commitIdx := strings.Index(content, "COMMIT;")
-	if beginIdx == -1 || commitIdx == -1 || beginIdx > commitIdx {
-		t.Fatal("migration 6 up must wrap in a single BEGIN/COMMIT tx")
+	if got := strings.Count(content, "COMMIT;"); got != 0 {
+		t.Errorf("migration 6 up COMMIT count = %d; want 0", got)
 	}
 
 	for _, table := range []string{"users", "sessions"} {
@@ -354,9 +374,6 @@ func TestMigration000006_UpAddsCredentialVersionColumns(t *testing.T) {
 		if alterIdx == -1 {
 			t.Errorf("migration 6 up missing ALTER TABLE %s", table)
 			continue
-		}
-		if alterIdx < beginIdx || alterIdx > commitIdx {
-			t.Errorf("migration 6 up ALTER TABLE %s must sit inside BEGIN/COMMIT", table)
 		}
 		colIdx := strings.Index(content[alterIdx:], "credential_version")
 		if colIdx == -1 {
@@ -410,7 +427,7 @@ func TestMigration000006_DownRefusesVersionedDB(t *testing.T) {
 	}
 }
 
-func TestMigrations_AtomicTransactionWrappers(t *testing.T) {
+func TestMigrations_NoExplicitTransactionWrappers(t *testing.T) {
 	files := []string{
 		"migrations/000001_create_users.up.sql",
 		"migrations/000001_create_users.down.sql",
@@ -433,11 +450,11 @@ func TestMigrations_AtomicTransactionWrappers(t *testing.T) {
 				t.Fatalf("failed to read migration file %s: %v", file, err)
 			}
 			content := strings.TrimSpace(string(data))
-			if !strings.HasPrefix(content, "BEGIN;") {
-				t.Errorf("migration file %s must begin with 'BEGIN;'", file)
+			if strings.HasPrefix(content, "BEGIN;") {
+				t.Errorf("migration file %s must not begin with 'BEGIN;'", file)
 			}
-			if !strings.HasSuffix(content, "COMMIT;") {
-				t.Errorf("migration file %s must end with 'COMMIT;'", file)
+			if strings.HasSuffix(content, "COMMIT;") {
+				t.Errorf("migration file %s must not end with 'COMMIT;'", file)
 			}
 		})
 	}
