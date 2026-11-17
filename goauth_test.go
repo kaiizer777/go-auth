@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -152,6 +153,64 @@ func TestAuth_Close_ConcurrentIdempotent(t *testing.T) {
 		if err != nil {
 			t.Errorf("goroutine %d close error: %v", i, err)
 		}
+	}
+}
+
+func TestAuth_Close_ShutsDownEmailDispatcher(t *testing.T) {
+	var inFlight atomic.Int32
+	var completed atomic.Int32
+	unblock := make(chan struct{})
+
+	dispatcher := email.NewAsyncDispatcher(email.DispatcherConfig{
+		BaseURL: "https://example.com",
+		SendVerificationEmail: func(ctx context.Context, payload email.VerificationEmailPayload) error {
+			inFlight.Add(1)
+			<-unblock
+			completed.Add(1)
+			return nil
+		},
+		EmailDispatchTimeout: 5 * time.Second,
+	}, nil)
+
+	auth := &Auth{
+		emailDispatcher: dispatcher,
+	}
+
+	for i := 0; i < 3; i++ {
+		auth.EmailDispatcher().DispatchVerification(context.Background(), email.VerificationEmailPayload{To: "user@example.com"})
+	}
+
+	for i := 0; i < 50; i++ {
+		if inFlight.Load() == 3 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	closeDone := make(chan error, 1)
+	go func() {
+		closeDone <- auth.Close()
+	}()
+
+	select {
+	case <-closeDone:
+		t.Fatal("Auth.Close() returned before in-flight email dispatches completed")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(unblock)
+
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatalf("unexpected error from Auth.Close(): %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Auth.Close() timed out waiting for email dispatcher shutdown")
+	}
+
+	if got := completed.Load(); got != 3 {
+		t.Fatalf("completed dispatches = %d, want 3", got)
 	}
 }
 

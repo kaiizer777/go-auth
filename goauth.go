@@ -187,6 +187,9 @@ func (a *Auth) Close() error {
 		if a.signupIPLimiter != nil {
 			a.signupIPLimiter.Close()
 		}
+		if a.emailDispatcher != nil {
+			_ = a.emailDispatcher.Shutdown(context.Background())
+		}
 		if a.db != nil {
 			if sqlDB, err := a.db.DB(); err != nil {
 				a.closeErr = errors.New(errors.CodeDatabaseError, "failed to get sql.DB", err)
