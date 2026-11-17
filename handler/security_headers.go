@@ -17,7 +17,7 @@ type securityResponseWriter struct {
 func (w *securityResponseWriter) WriteHeader(code int) {
 	if !w.written {
 		for k, v := range w.headers {
-			w.ResponseWriter.Header()[k] = v
+			w.Header()[k] = v
 		}
 		w.written = true
 	}
