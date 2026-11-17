@@ -699,6 +699,75 @@ func TestRecovery_RePanicsWhenResponseCommitted_Interceptor(t *testing.T) {
 	}
 }
 
+func TestRecovery_Flush_NonFlusherDoesNotCommit(t *testing.T) {
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, nil))
+
+	mw := Recovery(logger)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		panic("panic after flush attempt on non-flusher")
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/flush-nonflusher", nil)
+	rec := &nonFlusherRecorder{}
+
+	var panickedVal any
+	func() {
+		defer func() {
+			panickedVal = recover()
+		}()
+		mw.ServeHTTP(rec, req)
+	}()
+
+	if panickedVal != nil {
+		t.Fatalf("expected panic to be recovered without re-panic, got: %v", panickedVal)
+	}
+
+	if rec.code != http.StatusInternalServerError {
+		t.Fatalf("expected 500 Internal Server Error, got: %d", rec.code)
+	}
+
+	var resp apperrors.Response
+	if err := json.Unmarshal(rec.body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to decode json error response: %v", err)
+	}
+	if resp.Code != apperrors.CodeInternalError {
+		t.Fatalf("expected CodeInternalError, got: %s", resp.Code)
+	}
+}
+
+func TestRecovery_Flush_FlusherCommitsAndRePanics(t *testing.T) {
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, nil))
+
+	mw := Recovery(logger)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		panic("panic after flush on flusher")
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/flush-flusher", nil)
+	rec := &mockFlusherRecorder{ResponseRecorder: httptest.NewRecorder()}
+
+	var panickedVal any
+	func() {
+		defer func() {
+			panickedVal = recover()
+		}()
+		mw.ServeHTTP(rec, req)
+	}()
+
+	if panickedVal != http.ErrAbortHandler {
+		t.Fatalf("expected re-panic with http.ErrAbortHandler, got: %v", panickedVal)
+	}
+	if !rec.flushed {
+		t.Fatal("expected flusher to have flushed")
+	}
+}
+
 func TestRequireAuth_PreservesTypedCookieError(t *testing.T) {
 	cfg := config.DefaultConfig()
 	mockSvc := &mockSessionService{}

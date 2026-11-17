@@ -130,10 +130,12 @@ func (rw *recoveryResponseWriter) Unwrap() http.ResponseWriter {
 }
 
 func (rw *recoveryResponseWriter) Flush() {
-	rw.committed = true
-	if flusher, ok := rw.ResponseWriter.(http.Flusher); ok {
-		flusher.Flush()
+	flusher, ok := rw.ResponseWriter.(http.Flusher)
+	if !ok {
+		return
 	}
+	rw.committed = true
+	flusher.Flush()
 }
 
 func isResponseCommitted(w http.ResponseWriter) bool {
