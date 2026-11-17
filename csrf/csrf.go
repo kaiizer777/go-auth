@@ -5,12 +5,15 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"io"
+	"log/slog"
 	"net/http"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/kaiizer777/go-auth/config"
 	apperrors "github.com/kaiizer777/go-auth/errors"
+	"github.com/kaiizer777/go-auth/ratelimit"
 )
 
 // randReader is the CSPRNG entropy source for CSRF token generation, package-scoped for unit test injection.
@@ -77,6 +80,19 @@ func Middleware(cfg *config.Config) func(http.Handler) http.Handler {
 				}
 			}
 
+			// Pre-auth bearer flows declare cookie-free transport via header only.
+			// Query parameters never confer exemption. A session cookie alongside
+			// the declaration is ambiguous transport and is rejected outright.
+			if strings.EqualFold(r.Header.Get("X-Auth-Type"), "bearer") {
+				if c, cookieErr := r.Cookie(cfg.SessionCookieName); cookieErr == nil && c.Value != "" {
+					logViolation(r, string(apperrors.CodeCSRFTokenInvalid))
+					apperrors.WriteHTTP(w, apperrors.ErrCSRFTokenInvalid)
+					return
+				}
+				next.ServeHTTP(w, r)
+				return
+			}
+
 			csrfCookie, err := r.Cookie(cfg.CSRFCookieName)
 
 			// Safe methods ensure a valid 64-char hex cookie exists, generating one if absent or invalid.
@@ -95,27 +111,32 @@ func Middleware(cfg *config.Config) func(http.Handler) http.Handler {
 
 			// State-changing methods (POST, PUT, PATCH, DELETE) enforce cookie and header.
 			if err != nil || csrfCookie.Value == "" {
+				logViolation(r, string(apperrors.CodeCSRFTokenMissing))
 				apperrors.WriteHTTP(w, apperrors.ErrCSRFTokenMissing)
 				return
 			}
 
 			if !isValidHexToken(csrfCookie.Value) {
+				logViolation(r, string(apperrors.CodeCSRFTokenInvalid))
 				apperrors.WriteHTTP(w, apperrors.ErrCSRFTokenInvalid)
 				return
 			}
 
 			headerToken := r.Header.Get(cfg.CSRFHeaderName)
 			if headerToken == "" {
+				logViolation(r, string(apperrors.CodeCSRFTokenMissing))
 				apperrors.WriteHTTP(w, apperrors.ErrCSRFTokenMissing)
 				return
 			}
 
 			if !isValidHexToken(headerToken) {
+				logViolation(r, string(apperrors.CodeCSRFTokenInvalid))
 				apperrors.WriteHTTP(w, apperrors.ErrCSRFTokenInvalid)
 				return
 			}
 
 			if !secureCompare(csrfCookie.Value, headerToken) {
+				logViolation(r, string(apperrors.CodeCSRFTokenInvalid))
 				apperrors.WriteHTTP(w, apperrors.ErrCSRFTokenInvalid)
 				return
 			}
@@ -154,10 +175,42 @@ func setCSRFCookie(w http.ResponseWriter, token string, cfg *config.Config) {
 		Name:     cfg.CSRFCookieName,
 		Value:    token,
 		Path:     "/",
+		MaxAge:   int(cfg.CSRFCookieMaxAge.Seconds()),
+		Expires:  time.Now().Add(cfg.CSRFCookieMaxAge),
 		HttpOnly: false, // Mandatory false for Double Submit Cookie pattern
 		Secure:   cfg.SessionCookieSecure,
 		SameSite: http.SameSiteStrictMode, // Strict for CSRF cookie
 	})
+}
+
+// ClearCookie invalidates the CSRF token cookie immediately.
+func ClearCookie(w http.ResponseWriter, cfg *config.Config) {
+	cfg = ensureConfig(cfg)
+	http.SetCookie(w, &http.Cookie{
+		Name:     cfg.CSRFCookieName,
+		Value:    "",
+		Path:     "/",
+		MaxAge:   -1,
+		Expires:  time.Unix(0, 0),
+		HttpOnly: false,
+		Secure:   cfg.SessionCookieSecure,
+		SameSite: http.SameSiteStrictMode,
+	})
+}
+
+// ValidToken reports whether s is a well-formed 64-char hex CSRF token.
+func ValidToken(s string) bool {
+	return isValidHexToken(s)
+}
+
+// logViolation records a CSRF rejection. Token values are never emitted.
+func logViolation(r *http.Request, reason string) {
+	slog.WarnContext(r.Context(), "csrf_violation",
+		"ip", ratelimit.ClientIP(r),
+		"user_agent", r.UserAgent(),
+		"path", r.URL.Path,
+		"reason", reason,
+	)
 }
 
 // secureCompare executes constant-time string comparison to prevent timing leaks.
