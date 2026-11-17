@@ -109,10 +109,18 @@ func (l *Limiter) Allow(key string) bool {
 			}
 			if len(l.windows) >= limit {
 				l.mu.Unlock()
-				return false
+				l.prune()
+				l.mu.Lock()
+				entry, ok = l.windows[key]
+				if !ok && len(l.windows) >= limit {
+					l.mu.Unlock()
+					return false
+				}
 			}
-			entry = &windowEntry{}
-			l.windows[key] = entry
+			if !ok {
+				entry = &windowEntry{}
+				l.windows[key] = entry
+			}
 		}
 		entry.mu.Lock()
 		l.mu.Unlock()

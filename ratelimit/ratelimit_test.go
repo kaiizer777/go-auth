@@ -568,3 +568,23 @@ func TestLimiter_CapacityRecoversAfterPrune(t *testing.T) {
 		t.Fatal("key-3 should be allowed after expired entries were pruned")
 	}
 }
+
+func TestLimiter_Allow_AutoPruneOnCapacity(t *testing.T) {
+	window := 50 * time.Millisecond
+	limiter := NewLimiter(window, 5)
+	limiter.SetMaxEntries(2)
+
+	if !limiter.Allow("key-1") || !limiter.Allow("key-2") {
+		t.Fatal("initial keys should be allowed")
+	}
+
+	if limiter.Allow("key-3") {
+		t.Fatal("key-3 should be refused when capacity is saturated with active entries")
+	}
+
+	time.Sleep(70 * time.Millisecond)
+
+	if !limiter.Allow("key-3") {
+		t.Fatal("key-3 should be allowed after automatic inline eviction")
+	}
+}
