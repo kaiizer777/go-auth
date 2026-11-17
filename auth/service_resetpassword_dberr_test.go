@@ -34,7 +34,7 @@ func TestService_ResetPassword_DBErrors(t *testing.T) {
 			t.Fatalf("failed to drop password_reset_tokens: %v", err)
 		}
 
-		err = svc.ResetPassword(context.Background(), db.PasswordResetConfirmRequest{
+		_, err = svc.ResetPassword(context.Background(), db.PasswordResetConfirmRequest{
 			Token:       rawToken,
 			NewPassword: "BrandNewPassword#2026!",
 		})
@@ -85,7 +85,7 @@ func TestService_ResetPassword_DBErrors(t *testing.T) {
 			t.Fatalf("failed to expire token: %v", err)
 		}
 
-		err = svc.ResetPassword(ctx, db.PasswordResetConfirmRequest{
+		_, err = svc.ResetPassword(ctx, db.PasswordResetConfirmRequest{
 			Token:       rawToken,
 			NewPassword: "BrandNewPassword#2026!",
 		})
@@ -124,7 +124,7 @@ func TestService_ResetPassword_DBErrors(t *testing.T) {
 		}
 
 		// First ResetPassword succeeds and purges the token.
-		if err := svc.ResetPassword(ctx, db.PasswordResetConfirmRequest{
+		if _, err := svc.ResetPassword(ctx, db.PasswordResetConfirmRequest{
 			Token:       rawToken,
 			NewPassword: "BrandNewPassword#2026!",
 		}); err != nil {
@@ -133,7 +133,7 @@ func TestService_ResetPassword_DBErrors(t *testing.T) {
 
 		// Second attempt: cheap-gate First() finds no row → CodeInvalidToken
 		// (observable outcome of concurrent token consumption / count==0 path).
-		err = svc.ResetPassword(ctx, db.PasswordResetConfirmRequest{
+		_, err = svc.ResetPassword(ctx, db.PasswordResetConfirmRequest{
 			Token:       rawToken,
 			NewPassword: "AnotherNewPassword#2026!",
 		})
@@ -178,7 +178,7 @@ func TestService_ResetPassword_DBErrors(t *testing.T) {
 			t.Fatalf("failed to drop users table: %v", err)
 		}
 
-		err = svc.ResetPassword(ctx, db.PasswordResetConfirmRequest{
+		_, err = svc.ResetPassword(ctx, db.PasswordResetConfirmRequest{
 			Token:       rawToken,
 			NewPassword: "BrandNewPassword#2026!",
 		})

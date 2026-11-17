@@ -819,9 +819,9 @@ type mockAuthService struct {
 	signupFn               func(ctx context.Context, req db.SignupRequest) (*db.User, string, error)
 	loginFn                func(ctx context.Context, req db.LoginRequest) (*db.User, error)
 	logoutFn               func(ctx context.Context, sessionID string) error
-	verifyEmailFn          func(ctx context.Context, req db.VerifyEmailRequest) error
+	verifyEmailFn          func(ctx context.Context, req db.VerifyEmailRequest) (*db.User, error)
 	requestPasswordResetFn func(ctx context.Context, req db.PasswordResetRequest) (string, error)
-	resetPasswordFn        func(ctx context.Context, req db.PasswordResetConfirmRequest) error
+	resetPasswordFn        func(ctx context.Context, req db.PasswordResetConfirmRequest) (*db.User, error)
 }
 
 func (m *mockAuthService) Signup(ctx context.Context, req db.SignupRequest) (*db.User, string, error) {
@@ -845,11 +845,11 @@ func (m *mockAuthService) Logout(ctx context.Context, sessionID string) error {
 	return nil
 }
 
-func (m *mockAuthService) VerifyEmail(ctx context.Context, req db.VerifyEmailRequest) error {
+func (m *mockAuthService) VerifyEmail(ctx context.Context, req db.VerifyEmailRequest) (*db.User, error) {
 	if m.verifyEmailFn != nil {
 		return m.verifyEmailFn(ctx, req)
 	}
-	return nil
+	return nil, nil
 }
 
 func (m *mockAuthService) RequestPasswordReset(ctx context.Context, req db.PasswordResetRequest) (string, error) {
@@ -859,11 +859,11 @@ func (m *mockAuthService) RequestPasswordReset(ctx context.Context, req db.Passw
 	return "", nil
 }
 
-func (m *mockAuthService) ResetPassword(ctx context.Context, req db.PasswordResetConfirmRequest) error {
+func (m *mockAuthService) ResetPassword(ctx context.Context, req db.PasswordResetConfirmRequest) (*db.User, error) {
 	if m.resetPasswordFn != nil {
 		return m.resetPasswordFn(ctx, req)
 	}
-	return nil
+	return nil, nil
 }
 
 // Test 15: 500 Error Masking (unexpected internal error produces generic 500 CodeInternalError with "internal server error")
@@ -1330,11 +1330,11 @@ func TestAdversarialPayloadResilience_JSONEndpoints(t *testing.T) {
 		loginFn: func(ctx context.Context, req db.LoginRequest) (*db.User, error) {
 			return nil, nil
 		},
-		verifyEmailFn: func(ctx context.Context, req db.VerifyEmailRequest) error {
-			return nil
+		verifyEmailFn: func(ctx context.Context, req db.VerifyEmailRequest) (*db.User, error) {
+			return nil, nil
 		},
-		resetPasswordFn: func(ctx context.Context, req db.PasswordResetConfirmRequest) error {
-			return nil
+		resetPasswordFn: func(ctx context.Context, req db.PasswordResetConfirmRequest) (*db.User, error) {
+			return nil, nil
 		},
 	}
 	h := New(nil, config.DefaultConfig(), mockSvc)

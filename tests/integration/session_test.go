@@ -356,7 +356,7 @@ func TestAllSessionsInvalidatedOnPasswordChange(t *testing.T) {
 	}
 
 	// Complete password reset
-	err = app.Auth.ResetPassword(context.Background(), db.PasswordResetConfirmRequest{
+	_, err = app.Auth.ResetPassword(context.Background(), db.PasswordResetConfirmRequest{
 		Token:       tok,
 		NewPassword: newPass,
 	})
@@ -404,7 +404,7 @@ func TestSessionRejectedWhenLoginCapturedOldCredentialVersion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RequestPasswordReset failed: %v", err)
 	}
-	if err := app.Auth.ResetPassword(context.Background(), db.PasswordResetConfirmRequest{
+	if _, err := app.Auth.ResetPassword(context.Background(), db.PasswordResetConfirmRequest{
 		Token:       tok,
 		NewPassword: newPass,
 	}); err != nil {

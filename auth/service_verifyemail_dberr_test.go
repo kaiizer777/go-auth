@@ -30,7 +30,7 @@ func TestService_VerifyEmail_DBErrors(t *testing.T) {
 			t.Fatalf("failed to drop verification_tokens: %v", err)
 		}
 
-		err = svc.VerifyEmail(context.Background(), db.VerifyEmailRequest{Token: rawToken})
+		_, err = svc.VerifyEmail(context.Background(), db.VerifyEmailRequest{Token: rawToken})
 		if err == nil {
 			t.Fatal("expected error on table drop, got nil")
 		}
@@ -64,7 +64,7 @@ func TestService_VerifyEmail_DBErrors(t *testing.T) {
 			t.Fatalf("failed to drop users table: %v", err)
 		}
 
-		err = svc.VerifyEmail(ctx, db.VerifyEmailRequest{Token: rawToken})
+		_, err = svc.VerifyEmail(ctx, db.VerifyEmailRequest{Token: rawToken})
 		if err == nil {
 			t.Fatal("expected error when users table is dropped, got nil")
 		}
@@ -93,13 +93,13 @@ func TestService_VerifyEmail_DBErrors(t *testing.T) {
 		}
 
 		// Verify once: succeeds, token deleted.
-		if verr := svc.VerifyEmail(ctx, db.VerifyEmailRequest{Token: rawToken}); verr != nil {
+		if _, verr := svc.VerifyEmail(ctx, db.VerifyEmailRequest{Token: rawToken}); verr != nil {
 			t.Fatalf("first VerifyEmail failed unexpectedly: %v", verr)
 		}
 
 		// Second attempt: token is gone → CodeInvalidToken (observable outcome of
 		// concurrent token consumption / RowsAffected==0 path).
-		err = svc.VerifyEmail(ctx, db.VerifyEmailRequest{Token: rawToken})
+		_, err = svc.VerifyEmail(ctx, db.VerifyEmailRequest{Token: rawToken})
 		if err == nil {
 			t.Fatal("expected CodeInvalidToken on replay, got nil")
 		}
