@@ -327,6 +327,7 @@ var (
 	ErrOAuthStateCookieNameInvalid     = New(CodeInvalidConfig, "oauth state cookie name is invalid", nil)
 	ErrOAuthStateCookiePathInvalid     = New(CodeInvalidConfig, "oauth state cookie path is invalid", nil)
 	ErrOAuthStateSecretTooShort        = New(CodeInvalidConfig, "oauth state secret length too short", nil)
+	ErrOAuthStateSecretRequired        = New(CodeInvalidConfig, "oauth state secret is required when providers are configured", nil)
 	ErrOAuthStateCookieNameCollision   = New(CodeInvalidConfig, "oauth state cookie name must not match session or CSRF cookie name", nil)
 
 	// Predefined sentinel errors for Phase 3 Core Auth.

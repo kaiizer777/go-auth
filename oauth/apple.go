@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto"
 	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
@@ -131,6 +132,11 @@ func appleClientSecretJWT(teamID, keyID, clientID, privateKeyPEM string, now tim
 	ecKey, ok := parsed.(*ecdsa.PrivateKey)
 	if !ok {
 		return fail(nil)
+	}
+	// ES256 is P-256 with a 64-byte signature. A P-384 key passes the type
+	// check but mints a 96-byte signature labeled ES256 that can never verify.
+	if ecKey.Curve != elliptic.P256() {
+		return "", errors.New(errors.CodeInvalidConfig, "oauth apple private key must use P-256 for ES256", nil)
 	}
 	header, err := json.Marshal(map[string]string{"alg": "ES256", "kid": keyID})
 	if err != nil {

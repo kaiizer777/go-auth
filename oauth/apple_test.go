@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/kaiizer777/go-auth/config"
+	"github.com/kaiizer777/go-auth/errors"
 )
 
 func appleTestConfig() config.ProviderConfig {
@@ -479,4 +480,31 @@ func TestAppleTokenErrors(t *testing.T) {
 		_, err := p.ExchangeCode(context.Background(), "code", "v")
 		requireProviderError(t, err)
 	})
+}
+
+func TestAppleClientSecretRejectsNonP256(t *testing.T) {
+	t.Parallel()
+	ecKey, err := ecdsa.GenerateKey(elliptic.P384(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate P-384 key: %v", err)
+	}
+	der, err := x509.MarshalPKCS8PrivateKey(ecKey)
+	if err != nil {
+		t.Fatalf("marshal PKCS8: %v", err)
+	}
+	pemKey := string(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der}))
+	_, err = appleClientSecretJWT("TEAM123456", "KEY1234567", "com.example.app", pemKey, time.Now())
+	if err == nil {
+		t.Fatal("P-384 key accepted for ES256; want configuration error")
+	}
+	var appErr *errors.Error
+	if !errors.As(err, &appErr) {
+		t.Fatalf("error type = %T; want *errors.Error", err)
+	}
+	if appErr.Code() != errors.CodeInvalidConfig {
+		t.Fatalf("code = %q; want %q", appErr.Code(), errors.CodeInvalidConfig)
+	}
+	if appErr.HTTPStatus() != http.StatusInternalServerError {
+		t.Fatalf("status = %d; want 500", appErr.HTTPStatus())
+	}
 }

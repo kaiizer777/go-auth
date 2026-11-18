@@ -481,12 +481,28 @@ func (c *Config) Validate() error {
 	if c.OAuth.StateTTL < time.Second {
 		return errors.ErrOAuthStateTTLInvalid
 	}
-	// Explicit secrets shorter than 32 bytes are brute-forceable; empty falls back to a CSPRNG key.
-	if c.OAuth.StateSecret != "" && len(c.OAuth.StateSecret) < 32 {
+	// Explicit secrets shorter than 32 bytes are brute-forceable. Empty is
+	// fail-closed whenever any provider is enabled: the state HMAC must
+	// verify across replicas and restarts, which a per-process fallback key
+	// cannot do. With no providers enabled OAuth is inert and empty stays valid.
+	if c.OAuth.StateSecret == "" {
+		for _, provider := range c.OAuth.Providers {
+			if provider.Enabled {
+				return errors.ErrOAuthStateSecretRequired
+			}
+		}
+	} else if len(c.OAuth.StateSecret) < 32 {
 		return errors.ErrOAuthStateSecretTooShort
 	}
 	if !isToken(c.OAuth.StateCookieName) {
 		return errors.ErrOAuthStateCookieNameInvalid
+	}
+	// Same name + same default path as the session or CSRF cookie means one
+	// cookie slot: issuance overwrites the session cookie and post-success
+	// cleanup wipes the just-minted session. Mirrors the session-vs-CSRF
+	// collision precedent above with a dedicated sentinel.
+	if c.OAuth.StateCookieName == c.SessionCookieName || c.OAuth.StateCookieName == c.CSRFCookieName {
+		return errors.ErrOAuthStateCookieNameCollision
 	}
 	if !isCookiePath(c.OAuth.StateCookiePath) {
 		return errors.ErrOAuthStateCookiePathInvalid

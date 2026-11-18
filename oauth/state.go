@@ -33,13 +33,33 @@ const stateTokenBytes = 32
 // so Part 3 handlers matching on domain codes never see a bare stdlib error.
 var ErrOAuthEntropyReadFailed = errors.New(errors.CodeInternalError, "failed to generate oauth entropy", nil)
 
-// fallbackStateKey is a process-scoped HMAC key used when StateSecret is empty.
-// It is generated once via CSPRNG and never logged.
-var (
-	fallbackStateKey     []byte
-	fallbackStateKeyErr  error
-	fallbackStateKeyOnce sync.Once
-)
+// consumedStates records state tokens that completed validation, keyed by
+// token with the payload expiry. Package-level so every Service instance in
+// this process shares one replay record; entries expire with the state TTL
+// and are swept lazily on access. Replicas do not share this record: pair a
+// configured StateSecret with sticky routing or an external store.
+var consumedStates = struct {
+	sync.Mutex
+	seen map[string]time.Time
+}{seen: map[string]time.Time{}}
+
+// consumeStateToken records token as used through exp. False means the token
+// completed validation before and has not expired: the callback is a replay.
+func consumeStateToken(token string, exp time.Time) bool {
+	now := time.Now()
+	consumedStates.Lock()
+	defer consumedStates.Unlock()
+	for tok, tokExp := range consumedStates.seen {
+		if !now.Before(tokExp) {
+			delete(consumedStates.seen, tok)
+		}
+	}
+	if _, ok := consumedStates.seen[token]; ok {
+		return false
+	}
+	consumedStates.seen[token] = exp
+	return true
+}
 
 // ensureOAuthConfig returns cfg or defaults when nil, normalizing state cookie fields
 // so writers that bypass Config.Validate still emit a safe cookie.
@@ -64,7 +84,6 @@ func ensureOAuthConfig(cfg *config.Config) *config.Config {
 	return &cp
 }
 
-// stateSigningKey resolves the HMAC key: configured StateSecret, else a process-scoped CSPRNG key.
 // isFormPostProvider reports providers whose authorization response arrives
 // as a cross-site POST. Apple forces response_mode=form_post; it is the only
 // such provider, so the check is a single slug until another one appears.
@@ -87,22 +106,14 @@ func stateCookiePolicy(cfg *config.Config, providerID string) (secure bool, same
 	return secure, sameSite
 }
 
+// stateSigningKey resolves the HMAC key. Empty is fail-closed: a per-process
+// fallback key cannot verify state issued by another replica or before a
+// restart, failing in-flight logins at random with no startup warning.
 func stateSigningKey(secret string) ([]byte, error) {
-	if secret != "" {
-		return []byte(secret), nil
+	if secret == "" {
+		return nil, errors.ErrOAuthStateSecretRequired
 	}
-	fallbackStateKeyOnce.Do(func() {
-		key := make([]byte, 32)
-		if _, err := io.ReadFull(rand.Reader, key); err != nil {
-			fallbackStateKeyErr = ErrOAuthEntropyReadFailed
-			return
-		}
-		fallbackStateKey = key
-	})
-	if fallbackStateKeyErr != nil {
-		return nil, fallbackStateKeyErr
-	}
-	return fallbackStateKey, nil
+	return []byte(secret), nil
 }
 
 func signStatePayload(payload OAuthStatePayload, key []byte) (string, error) {
@@ -180,12 +191,14 @@ func SetStateCookie(w http.ResponseWriter, cfg *config.Config, providerID, codeV
 }
 
 // ValidateState checks the state parameter against the signed state cookie.
-// The cookie is cleared only when it belongs to this callback: on success,
-// or when it is owned-but-dead (corrupt value, expired payload). A token
-// mismatch or foreign provider ID leaves the cookie intact, so a stale
-// callback from an older login never destroys a newer login's cookie.
+// The cookie is cleared only when it belongs to this callback: on success
+// (including a replayed success, which the same token owns), or when it is
+// owned-but-dead (corrupt value, expired payload). A token mismatch or
+// foreign provider ID leaves the cookie intact, so a stale callback from an
+// older login never destroys a newer login's cookie. Consumption fires only
+// on a fully validated token, never on mismatch or foreign-provider values.
 // Validation failures return 403 OAUTH_STATE_INVALID without distinguishing
-// the cause.
+// the cause; a missing secret propagates as a 500 server misconfiguration.
 func ValidateState(w http.ResponseWriter, r *http.Request, cfg *config.Config, providerID, stateParam string) (*OAuthStatePayload, error) {
 	cfg = ensureOAuthConfig(cfg)
 	cookie, cookieErr := r.Cookie(cfg.OAuth.StateCookieName)
@@ -194,7 +207,7 @@ func ValidateState(w http.ResponseWriter, r *http.Request, cfg *config.Config, p
 	}
 	key, err := stateSigningKey(cfg.OAuth.StateSecret)
 	if err != nil {
-		return nil, errors.ErrOAuthStateInvalid
+		return nil, err
 	}
 	payload, err := verifyStateSignature(cookie.Value, key)
 	if err != nil {
@@ -213,6 +226,8 @@ func ValidateState(w http.ResponseWriter, r *http.Request, cfg *config.Config, p
 		return nil, errors.ErrOAuthStateInvalid
 	}
 	ClearStateCookie(w, cfg, providerID)
+	if !consumeStateToken(payload.Token, payload.ExpiresAt) {
+		return nil, errors.ErrOAuthStateInvalid
 	}
 	return &payload, nil
 }
@@ -230,7 +245,7 @@ func ClearStateCookie(w http.ResponseWriter, cfg *config.Config, providerID stri
 		MaxAge:   -1, // -1 = delete immediately; 0 = session cookie (wrong for invalidation)
 		Expires:  time.Unix(0, 0).UTC(),
 		HttpOnly: true,
-		Secure:   cfg.SessionCookieSecure,
-		SameSite: http.SameSiteLaxMode,
+		Secure:   secure,
+		SameSite: sameSite,
 	})
 }

@@ -490,8 +490,10 @@ func TestOAuthSecurity_TamperedVerifier502(t *testing.T) {
 
 	state, cookies := secInitiate(t, h, "/auth/oauth/google")
 	sc := secFindCookie(cookies, cfg.OAuth.StateCookieName)
+	// No SetRequireVerifier: the mock binds S256(verifier) to the challenge
+	// observed at authorize time, so the tampered verifier must fail by
+	// default exactly like a real provider.
 	original := secVerifier(t, sc)
-	m.SetRequireVerifier(original)
 
 	req := httptest.NewRequest(http.MethodGet, "/auth/oauth/google/callback?code=c&state="+state, nil)
 	req.AddCookie(sc)
@@ -529,12 +531,29 @@ func TestOAuthSecurity_ReplayFails(t *testing.T) {
 		t.Fatalf("first callback: status = %d; want 302 (%s)", rec.Code, rec.Body.String())
 	}
 
+	// Same state and cookie presented twice: the server-side consumed-state
+	// record rejects the replay before any provider call.
 	rec2, req2 := makeReq()
 	h.ServeHTTP(rec2, req2)
-	if rec2.Code == http.StatusFound || rec2.Code == http.StatusOK {
-		t.Fatalf("replayed code reuse: status = %d; want failure", rec2.Code)
+	if rec2.Code != http.StatusForbidden {
+		t.Fatalf("replayed state reuse: status = %d; want 403 (%s)", rec2.Code, rec2.Body.String())
 	}
-	if code := secErrCode(t, rec2); code != apperrors.CodeOAuthProviderError {
+	if code := secErrCode(t, rec2); code != apperrors.CodeOAuthStateInvalid {
+		t.Fatalf("replay code = %s; want OAUTH_STATE_INVALID", code)
+	}
+
+	// Same provider code under a fresh state reaches the provider, which
+	// rejects the second use of the code itself.
+	state2, cookies2 := secInitiate(t, h, "/auth/oauth/google")
+	sc2 := secFindCookie(cookies2, cfg.OAuth.StateCookieName)
+	req2b := httptest.NewRequest(http.MethodGet, "/auth/oauth/google/callback?code=replay-code&state="+state2, nil)
+	req2b.AddCookie(sc2)
+	rec2b := httptest.NewRecorder()
+	h.ServeHTTP(rec2b, req2b)
+	if rec2b.Code != http.StatusBadGateway {
+		t.Fatalf("replayed code reuse: status = %d; want 502 (%s)", rec2b.Code, rec2b.Body.String())
+	}
+	if code := secErrCode(t, rec2b); code != apperrors.CodeOAuthProviderError {
 		t.Fatalf("replay code = %s; want OAUTH_PROVIDER_ERROR", code)
 	}
 

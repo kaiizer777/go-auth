@@ -1,6 +1,8 @@
 package oauth
 
 import (
+	"encoding/base64"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -135,6 +137,15 @@ func TestSetStateCookie(t *testing.T) {
 			t.Error("cookie HttpOnly = false; want true")
 		}
 	})
+
+	t.Run("nil config without secret fails closed", func(t *testing.T) {
+		t.Parallel()
+		rec := httptest.NewRecorder()
+		// DefaultConfig ships no StateSecret: issuance must refuse rather
+		// than sign with a key no other process can reproduce.
+		_, err := SetStateCookie(rec, nil, "github", "v", "")
+		if !apperrors.Is(err, apperrors.ErrOAuthStateSecretRequired) {
+			t.Fatalf("SetStateCookie(nil) = %v; want ErrOAuthStateSecretRequired", err)
 		}
 	})
 }
@@ -177,11 +188,11 @@ func TestValidateState(t *testing.T) {
 		if !cleared {
 			t.Error("success did not clear state cookie with MaxAge=-1")
 		}
-		// Replay without cookie fails.
-		assertStateInvalid(t, func() error {
-			_, err := ValidateState(httptest.NewRecorder(), stateRequest(nil), cfg, "google", state)
-			return err
-		}())
+		// Replay with the identical cookie still present fails: single-use is
+		// enforced by a server-side consumed-state record, not by the browser
+		// deletion alone. The missing-cookie case stays a separate subtest.
+		_, err := ValidateState(httptest.NewRecorder(), stateRequest(cookie), cfg, "google", state)
+		assertStateInvalid(t, err)
 	})
 
 	t.Run("missing cookie rejected", func(t *testing.T) {
@@ -212,22 +223,40 @@ func TestValidateState(t *testing.T) {
 	t.Run("tampered payload rejected", func(t *testing.T) {
 		t.Parallel()
 		cfg := testStateConfig()
-		_, cookie := issueStateCookie(t, cfg)
+		state, cookie := issueStateCookie(t, cfg)
 		parts := strings.Split(cookie.Value, ".")
-		tampered := "A" + parts[0][1:] + "." + parts[1]
-		cookie.Value = tampered
-		_, err := ValidateState(httptest.NewRecorder(), stateRequest(cookie), cfg, "google", "whatever")
+		raw, err := base64.RawURLEncoding.DecodeString(parts[0])
+		if err != nil {
+			t.Fatalf("decode payload: %v", err)
+		}
+		var decoded OAuthStatePayload
+		if err := json.Unmarshal(raw, &decoded); err != nil {
+			t.Fatalf("unmarshal payload: %v", err)
+		}
+		decoded.CodeVerifier = "tampered-verifier"
+		raw, err = json.Marshal(decoded)
+		if err != nil {
+			t.Fatalf("remarshal payload: %v", err)
+		}
+		cookie.Value = base64.RawURLEncoding.EncodeToString(raw) + "." + parts[1]
+		// Issued token: failure can only come from HMAC verification.
+		_, err = ValidateState(httptest.NewRecorder(), stateRequest(cookie), cfg, "google", state)
 		assertStateInvalid(t, err)
 	})
 
 	t.Run("tampered signature rejected", func(t *testing.T) {
 		t.Parallel()
 		cfg := testStateConfig()
-		_, cookie := issueStateCookie(t, cfg)
+		state, cookie := issueStateCookie(t, cfg)
 		parts := strings.Split(cookie.Value, ".")
-		tampered := parts[0] + "." + "A" + parts[1][1:]
-		cookie.Value = tampered
-		_, err := ValidateState(httptest.NewRecorder(), stateRequest(cookie), cfg, "google", "whatever")
+		sig, err := base64.RawURLEncoding.DecodeString(parts[1])
+		if err != nil {
+			t.Fatalf("decode signature: %v", err)
+		}
+		sig[0] ^= 0xFF
+		cookie.Value = parts[0] + "." + base64.RawURLEncoding.EncodeToString(sig)
+		// Issued token: failure can only come from HMAC verification.
+		_, err = ValidateState(httptest.NewRecorder(), stateRequest(cookie), cfg, "google", state)
 		assertStateInvalid(t, err)
 	})
 

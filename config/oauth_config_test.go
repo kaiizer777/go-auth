@@ -1,6 +1,7 @@
 package config
 
 import (
+	"net/http"
 	"strings"
 	"testing"
 	"time"
@@ -12,6 +13,7 @@ func validOAuthBase() Config {
 	cfg := DefaultConfig()
 	cfg.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
 	cfg.BaseURL = "https://example.com"
+	cfg.OAuth.StateSecret = "test-state-secret-at-least-32-bytes!"
 	return cfg
 }
 
@@ -208,6 +210,33 @@ func TestConfigValidate_OAuth(t *testing.T) {
 				c.OAuth.StateSecret = "x"
 			},
 			wantErr: errors.ErrOAuthStateSecretTooShort,
+		},
+		{
+			name: "enabled provider without state secret rejected",
+			mutate: func(c *Config) {
+				c.OAuth.StateSecret = ""
+				c.OAuth.Providers = enabled("google", ProviderConfig{
+					ClientID:     "gid",
+					ClientSecret: "gsecret",
+					RedirectURL:  "https://example.com/auth/oauth/google/callback",
+				})
+			},
+			wantErr: errors.ErrOAuthStateSecretRequired,
+		},
+		{
+			name: "no providers without secret passes",
+			mutate: func(c *Config) {
+				c.OAuth.StateSecret = ""
+			},
+			wantErr: nil,
+		},
+		{
+			name: "disabled provider without secret passes",
+			mutate: func(c *Config) {
+				c.OAuth.StateSecret = ""
+				c.OAuth.Providers = map[string]ProviderConfig{"google": {}}
+			},
+			wantErr: nil,
 		},
 		{
 			name: "bad state cookie name rejected",

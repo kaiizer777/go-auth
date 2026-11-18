@@ -427,7 +427,7 @@ func TestMigration000006_DownRefusesVersionedDB(t *testing.T) {
 	}
 }
 
-func TestMigration000007_DownRefusesSeededDB(t *testing.T) {
+func TestMigration000007_DownRefusesOnLinkedAccounts(t *testing.T) {
 	data, err := defaultMigrationsFS.ReadFile("migrations/000007_create_oauth_accounts.down.sql")
 	if err != nil {
 		t.Fatalf("failed to read migration 7 down: %v", err)
@@ -437,10 +437,10 @@ func TestMigration000007_DownRefusesSeededDB(t *testing.T) {
 	if !strings.Contains(content, "down refused") {
 		t.Error("migration 7 down must carry the refusal text")
 	}
-	guardIdx := strings.Index(content, "SELECT 1 FROM users")
+	guardIdx := strings.Index(content, "SELECT 1 FROM oauth_accounts")
 	raiseIdx := strings.Index(content, "RAISE EXCEPTION")
 	if guardIdx == -1 {
-		t.Fatal("migration 7 down must gate refusal on data-bearing tables")
+		t.Fatal("migration 7 down must gate refusal on oauth_accounts contents")
 	}
 	if raiseIdx == -1 {
 		t.Fatal("migration 7 down missing RAISE EXCEPTION refusal")
@@ -448,10 +448,10 @@ func TestMigration000007_DownRefusesSeededDB(t *testing.T) {
 	if guardIdx > raiseIdx {
 		t.Errorf("migration 7 data guard (idx %d) must precede refusal (idx %d)", guardIdx, raiseIdx)
 	}
-	for _, table := range []string{"users", "oauth_accounts"} {
-		if !strings.Contains(content, table) {
-			t.Errorf("migration 7 down must guard %s", table)
-		}
+	// Users rows alone must not block rollback: the down drops only
+	// oauth_accounts, so users survive it untouched.
+	if strings.Contains(content, "SELECT 1 FROM users") {
+		t.Error("migration 7 down must not gate refusal on users-row existence")
 	}
 }
 

@@ -1,11 +1,14 @@
 // Package oauthmock fronts httptest token/userinfo servers (plus a JWKS
 // server for apple) while implementing oauth.Provider. The token server
-// enforces an expected verifier and single-use codes so PKCE-tamper and
-// replay paths fail exactly like a real provider with invalid_grant.
+// binds the verifier to the challenge observed at authorize time and
+// enforces single-use codes, so PKCE-tamper and replay paths fail exactly
+// like a real provider with invalid_grant.
 package oauthmock
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -32,6 +35,7 @@ type Mock struct {
 	gotVerifier     string
 	verifierCalls   int
 	seenCodes       map[string]bool
+	challenges      map[string]struct{}
 	requireVerifier string
 	profile         *oauth.UserInfo
 
@@ -52,6 +56,7 @@ func New(id, sub, email string, verified bool) *Mock {
 		id:           id,
 		client:       &http.Client{Timeout: 10 * time.Second},
 		seenCodes:    map[string]bool{},
+		challenges:   map[string]struct{}{},
 		AccessToken:  "mock-at-" + id + "-7f3a9c1e",
 		RefreshToken: "mock-rt-" + id + "-7f3a9c1e",
 		IDToken:      "mock-id-" + id + "-7f3a9c1e",
@@ -72,6 +77,14 @@ func New(id, sub, email string, verified bool) *Mock {
 				return
 			}
 			m.seenCodes[code] = true
+		}
+		// S256 binding: the verifier must match a challenge observed at
+		// authorize time. No recorded challenge means no authorize happened,
+		// which a real provider also rejects.
+		sum := sha256.Sum256([]byte(verifier))
+		if _, ok := m.challenges[base64.RawURLEncoding.EncodeToString(sum[:])]; !ok {
+			http.Error(w, `{"error":"invalid_grant"}`, http.StatusBadRequest)
+			return
 		}
 		if m.requireVerifier != "" && verifier != m.requireVerifier {
 			http.Error(w, `{"error":"invalid_grant"}`, http.StatusBadRequest)
@@ -118,8 +131,13 @@ func (m *Mock) Close() {
 // ID returns the provider slug.
 func (m *Mock) ID() string { return m.id }
 
-// AuthURL returns a fake provider authorization URL.
+// AuthURL returns a fake provider authorization URL and records the
+// code_challenge, so the token server can bind the verifier like a real
+// provider (S256 check) instead of accepting any well-formed verifier.
 func (m *Mock) AuthURL(state, codeChallenge string) string {
+	m.mu.Lock()
+	m.challenges[codeChallenge] = struct{}{}
+	m.mu.Unlock()
 	return "https://provider." + m.id + ".example/auth?state=" + state + "&code_challenge=" + codeChallenge
 }
 
