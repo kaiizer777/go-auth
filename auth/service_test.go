@@ -564,9 +564,18 @@ func TestService_VerifyEmail(t *testing.T) {
 			t.Fatalf("signup failed: %v", err)
 		}
 
-		_, err = svc.VerifyEmail(ctx, db.VerifyEmailRequest{Token: rawToken})
+		verified, err := svc.VerifyEmail(ctx, db.VerifyEmailRequest{Token: rawToken})
 		if err != nil {
 			t.Fatalf("unexpected verification error: %v", err)
+		}
+		if verified == nil {
+			t.Fatal("expected non-nil user on successful verification")
+		}
+		if verified.ID != user.ID {
+			t.Fatalf("verified user ID = %v, want %v", verified.ID, user.ID)
+		}
+		if !verified.EmailVerified {
+			t.Fatal("expected returned user to be verified, got false")
 		}
 
 		// Verify user email_verified flag is true
@@ -759,9 +768,18 @@ func TestService_PasswordReset(t *testing.T) {
 		}
 
 		// Reset password using active tok2
-		_, err = svc.ResetPassword(ctx, db.PasswordResetConfirmRequest{Token: tok2, NewPassword: newPassword})
+		resetUser, err := svc.ResetPassword(ctx, db.PasswordResetConfirmRequest{Token: tok2, NewPassword: newPassword})
 		if err != nil {
 			t.Fatalf("unexpected reset error with active tok2: %v", err)
+		}
+		if resetUser == nil {
+			t.Fatal("expected non-nil user on successful reset")
+		}
+		if resetUser.ID != user.ID {
+			t.Fatalf("reset user ID = %v, want %v", resetUser.ID, user.ID)
+		}
+		if resetUser.CredentialVersion != userBefore.CredentialVersion+1 {
+			t.Fatalf("expected returned credential version %d, got %d", userBefore.CredentialVersion+1, resetUser.CredentialVersion)
 		}
 
 		// Verify login with old password fails

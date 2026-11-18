@@ -269,7 +269,7 @@ func (s *authService) VerifyEmail(ctx context.Context, req db.VerifyEmailRequest
 	}
 
 	var isExpired bool
-	var userID uuid.UUID
+	var verifiedUser db.User
 	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var tok db.VerificationToken
 		if err := tx.Where("token_hash = ?", tokenHash[:]).First(&tok).Error; err != nil {
@@ -292,8 +292,13 @@ func (s *authService) VerifyEmail(ctx context.Context, req db.VerifyEmailRequest
 			return errors.ErrInvalidToken
 		}
 
-		userID = tok.UserID
-		return tx.Model(&db.User{}).Where("id = ?", tok.UserID).Update("email_verified", true).Error
+		if err := tx.Model(&db.User{}).Where("id = ?", tok.UserID).Update("email_verified", true).Error; err != nil {
+			return err
+		}
+		// Load inside the transaction: a post-commit read failure would report
+		// an error for an already-consumed token, making retry impossible.
+		// Here the read failure rolls back instead, preserving retry.
+		return tx.Where("id = ?", tok.UserID).First(&verifiedUser).Error
 	})
 	if err != nil {
 		var appErr *errors.Error
@@ -306,12 +311,7 @@ func (s *authService) VerifyEmail(ctx context.Context, req db.VerifyEmailRequest
 		return nil, errors.ErrTokenExpired
 	}
 
-	var user db.User
-	if err := s.db.WithContext(ctx).Where("id = ?", userID).First(&user).Error; err != nil {
-		return nil, errors.Wrap(err, errors.CodeDatabaseError, "failed to query verified user")
-	}
-
-	return &user, nil
+	return &verifiedUser, nil
 }
 
 // lockForUpdate applies SELECT ... FOR UPDATE on dialects with row locking.
@@ -407,6 +407,7 @@ func (s *authService) ResetPassword(ctx context.Context, req db.PasswordResetCon
 		return nil, errors.Wrap(err, errors.CodeInternalError, "failed to hash password")
 	}
 
+	var resetUser db.User
 	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var lockedUser db.User
 		if err := lockForUpdate(tx).Select("id").Where("id = ?", tok.UserID).First(&lockedUser).Error; err != nil {
@@ -443,7 +444,10 @@ func (s *authService) ResetPassword(ctx context.Context, req db.PasswordResetCon
 		if err := tx.Where("user_id = ?", tok.UserID).Delete(&db.Session{}).Error; err != nil {
 			return err
 		}
-		return nil
+		// Load inside the transaction: a post-commit read failure would report
+		// an error for an already-consumed token, making retry impossible.
+		// Here the read failure rolls back instead, preserving retry.
+		return tx.Where("id = ?", tok.UserID).First(&resetUser).Error
 	})
 	if err != nil {
 		var appErr *errors.Error
@@ -453,12 +457,7 @@ func (s *authService) ResetPassword(ctx context.Context, req db.PasswordResetCon
 		return nil, errors.Wrap(err, errors.CodeDatabaseError, "failed to reset password")
 	}
 
-	var user db.User
-	if err := s.db.WithContext(ctx).Where("id = ?", tok.UserID).First(&user).Error; err != nil {
-		return nil, errors.Wrap(err, errors.CodeDatabaseError, "failed to query password owner")
-	}
-
-	return &user, nil
+	return &resetUser, nil
 }
 
 // emailHookTimeout returns the bound for email hook execution, defaulting to
