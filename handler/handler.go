@@ -163,7 +163,9 @@ func (h *Handler) registerRoutes() {
 			WithAuthLimiters(h.loginLimiter, h.signupLimiter, h.resetLimiter),
 			WithAuthIPLimiters(h.loginIPLimiter, h.signupIPLimiter, h.resetIPLimiter),
 		)
-		csrfMw := csrf.Middleware(&h.cfg)
+		// Pre-auth handlers never consume the Authorization header, so the
+		// bearer exemption must not apply here (login CSRF bypass).
+		csrfMw := csrf.PreAuthMiddleware(&h.cfg)
 		wrap := func(hf http.HandlerFunc) http.Handler { return csrfMw(hf) }
 
 		// Canonical routes:

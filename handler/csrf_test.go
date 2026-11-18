@@ -7,7 +7,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/kaiizer777/go-auth/config"
 	"github.com/kaiizer777/go-auth/db"
 	"github.com/kaiizer777/go-auth/errors"
 )
@@ -94,14 +93,16 @@ func TestGetCSRFToken_NoStore(t *testing.T) {
 }
 
 func TestGetCSRFToken_CookieNameCollisionRejected(t *testing.T) {
-	_, _, h, _ := setupTestEnv(t, func(c *config.Config) {
-		c.CSRFCookieName = c.SessionCookieName
-	})
+	// Validate rejects colliding names at startup; exercise the runtime
+	// guard directly, bypassing construction-time validation.
+	cfg := testConfig()
+	cfg.CSRFCookieName = cfg.SessionCookieName
+	h := &Handler{cfg: cfg}
 	sidVal := strings.Repeat("a", 64)
 	req := httptest.NewRequest(http.MethodGet, "/auth/csrf", nil)
 	req.AddCookie(&http.Cookie{Name: "sid", Value: sidVal})
 	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, req)
+	h.GetCSRFToken(rec, req)
 	if rec.Code != http.StatusInternalServerError {
 		t.Fatalf("expected 500 collision reject, got %d", rec.Code)
 	}
@@ -241,6 +242,22 @@ func TestLogin_XAuthTypeBearerExempt(t *testing.T) {
 	}
 	if code := decodeErrCode(t, rec); code != errors.CodeInvalidCredentials {
 		t.Fatalf("expected INVALID_CREDENTIALS (proof CSRF passed), got %d %s", rec.Code, code)
+	}
+}
+
+func TestLogin_AuthorizationBearerNotExempt(t *testing.T) {
+	_, _, h, _ := setupTestEnv(t)
+	body, _ := json.Marshal(db.LoginRequest{Email: "nobody@example.com", Password: "ValidPassword123#"})
+	req := httptest.NewRequest(http.MethodPost, "/auth/login", strings.NewReader(string(body)))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer [REDACTED]")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("Authorization header must not bypass CSRF on login, got %d", rec.Code)
+	}
+	if code := decodeErrCode(t, rec); code != errors.CodeCSRFTokenMissing {
+		t.Fatalf("expected CSRF_TOKEN_MISSING, got %s", code)
 	}
 }
 

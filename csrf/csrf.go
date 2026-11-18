@@ -64,28 +64,43 @@ func isValidHexToken(s string) bool {
 
 // Middleware enforces Double Submit Cookie CSRF protection.
 func Middleware(cfg *config.Config) func(http.Handler) http.Handler {
+	return middleware(cfg, true)
+}
+
+// PreAuthMiddleware enforces CSRF on pre-auth routes (login, signup, …)
+// without the Authorization-bearer exemption: pre-auth handlers never
+// consume the Authorization header, so any non-empty bearer value would
+// bypass CSRF there. The X-Auth-Type declaration path below is unchanged.
+func PreAuthMiddleware(cfg *config.Config) func(http.Handler) http.Handler {
+	return middleware(cfg, false)
+}
+
+func middleware(cfg *config.Config, bearerExemption bool) func(http.Handler) http.Handler {
 	cfg = ensureConfig(cfg)
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			// Bearer token requests are inherently immune to CSRF — skip only if a non-empty token is present.
-			authHeader := r.Header.Get("Authorization")
-			if authHeader != "" {
-				trimmed := strings.TrimSpace(authHeader)
-				if len(trimmed) > 7 && strings.EqualFold(trimmed[:7], "bearer ") {
-					token := strings.TrimSpace(trimmed[7:])
-					if token != "" {
-						// Declared bearer transport plus a session cookie is
-						// ambiguous and never rides the Authorization exemption.
-						// Exact "bearer" mirrors Login's transport check.
-						if !safeMethods[r.Method] && r.Header.Get("X-Auth-Type") == "bearer" {
-							if c, cookieErr := r.Cookie(cfg.SessionCookieName); cookieErr == nil && c.Value != "" {
-								logViolation(r, string(apperrors.CodeCSRFTokenInvalid))
-								apperrors.WriteHTTP(w, apperrors.ErrCSRFTokenInvalid)
-								return
+			// Pre-auth routes never see this block; see PreAuthMiddleware.
+			if bearerExemption {
+				authHeader := r.Header.Get("Authorization")
+				if authHeader != "" {
+					trimmed := strings.TrimSpace(authHeader)
+					if len(trimmed) > 7 && strings.EqualFold(trimmed[:7], "bearer ") {
+						token := strings.TrimSpace(trimmed[7:])
+						if token != "" {
+							// Declared bearer transport plus a session cookie is
+							// ambiguous and never rides the Authorization exemption.
+							// Exact "bearer" mirrors Login's transport check.
+							if !safeMethods[r.Method] && r.Header.Get("X-Auth-Type") == "bearer" {
+								if c, cookieErr := r.Cookie(cfg.SessionCookieName); cookieErr == nil && c.Value != "" {
+									logViolation(r, string(apperrors.CodeCSRFTokenInvalid))
+									apperrors.WriteHTTP(w, apperrors.ErrCSRFTokenInvalid)
+									return
+								}
 							}
+							next.ServeHTTP(w, r)
+							return
 						}
-						next.ServeHTTP(w, r)
-						return
 					}
 				}
 			}
