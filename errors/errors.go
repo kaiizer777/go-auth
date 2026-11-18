@@ -50,6 +50,10 @@ const (
 	CodeOAuthProviderError        Code = "OAUTH_PROVIDER_ERROR"
 	CodeOAuthAccountAlreadyLinked Code = "OAUTH_ACCOUNT_ALREADY_LINKED"
 	CodeOAuthAccountNotLinked     Code = "OAUTH_ACCOUNT_NOT_LINKED"
+	CodeOAuthCodeInvalid          Code = "OAUTH_CODE_INVALID"
+	CodeOAuthEmailUnverified      Code = "OAUTH_EMAIL_UNVERIFIED"
+	CodeOAuthAccountLinkConflict  Code = "OAUTH_ACCOUNT_LINK_CONFLICT"
+	CodeOAuthProviderNotFound     Code = "OAUTH_PROVIDER_NOT_FOUND"
 
 	// Phase 4 Session errors
 	CodeSessionNotFound Code = "SESSION_NOT_FOUND" // 401
@@ -104,19 +108,19 @@ func (c Code) HTTPStatus() int {
 	switch c {
 	case CodePasswordTooShort, CodePasswordTooLong, CodePasswordTooCommon,
 		CodeInvalidEmail, CodeValidationError, CodeInvalidToken, CodeTokenExpired,
-		CodeOAuthStateInvalid, CodeOAuthCallbackFailed:
+		CodeOAuthCallbackFailed, CodeOAuthCodeInvalid, CodeOAuthEmailUnverified:
 		return http.StatusBadRequest
 	case CodeInvalidCredentials, CodeUnauthenticated,
 		CodeSessionNotFound, CodeSessionExpired, CodeSessionInvalid,
 		CodeMFARequired, CodeMFAInvalidCode:
 		return http.StatusUnauthorized
-	case CodeEmailNotVerified, CodeCSRFTokenMissing, CodeCSRFTokenInvalid:
+	case CodeEmailNotVerified, CodeCSRFTokenMissing, CodeCSRFTokenInvalid, CodeOAuthStateInvalid:
 		return http.StatusForbidden
 	case CodeRateLimitExceeded:
 		return http.StatusTooManyRequests
-	case CodeNotFound, CodeUserNotFound, CodeTokenNotFound, CodeOAuthAccountNotLinked:
+	case CodeNotFound, CodeUserNotFound, CodeTokenNotFound, CodeOAuthAccountNotLinked, CodeOAuthProviderNotFound:
 		return http.StatusNotFound
-	case CodeUserAlreadyExists, CodeEmailAlreadyExists, CodeOAuthAccountAlreadyLinked:
+	case CodeUserAlreadyExists, CodeEmailAlreadyExists, CodeOAuthAccountAlreadyLinked, CodeOAuthAccountLinkConflict:
 		return http.StatusConflict
 	case CodeMethodNotAllowed:
 		return http.StatusMethodNotAllowed
@@ -315,6 +319,14 @@ var (
 	ErrHSTSMaxAgeTooSmall              = New(CodeInvalidConfig, "HSTS max age must be at least one second", nil)
 	ErrReferrerPolicyInvalid           = New(CodeInvalidConfig, "referrer policy is invalid", nil)
 	ErrCSRFCookieMaxAgeInvalid         = New(CodeInvalidConfig, "CSRF cookie max age must be at least one second", nil)
+	ErrOAuthProviderUnknown            = New(CodeInvalidConfig, "unknown oauth provider", nil)
+	ErrOAuthClientIDRequired           = New(CodeInvalidConfig, "oauth provider client ID is required", nil)
+	ErrOAuthRedirectURLRequired        = New(CodeInvalidConfig, "oauth provider redirect URL is required", nil)
+	ErrOAuthClientSecretRequired       = New(CodeInvalidConfig, "oauth provider client secret is required", nil)
+	ErrOAuthStateTTLInvalid            = New(CodeInvalidConfig, "oauth state TTL must be positive", nil)
+	ErrOAuthStateCookieNameInvalid     = New(CodeInvalidConfig, "oauth state cookie name is invalid", nil)
+	ErrOAuthStateCookiePathInvalid     = New(CodeInvalidConfig, "oauth state cookie path is invalid", nil)
+	ErrOAuthStateSecretTooShort        = New(CodeInvalidConfig, "oauth state secret length too short", nil)
 
 	// Predefined sentinel errors for Phase 3 Core Auth.
 	ErrInvalidCredentials = New(CodeInvalidCredentials, "invalid email or password", nil)
@@ -342,6 +354,10 @@ var (
 	ErrOAuthProviderError        = New(CodeOAuthProviderError, "oauth provider error", nil)
 	ErrOAuthAccountAlreadyLinked = New(CodeOAuthAccountAlreadyLinked, "oauth account already linked", nil)
 	ErrOAuthAccountNotLinked     = New(CodeOAuthAccountNotLinked, "oauth account not linked", nil)
+	ErrOAuthCodeInvalid          = New(CodeOAuthCodeInvalid, "oauth code is invalid", nil)
+	ErrOAuthEmailUnverified      = New(CodeOAuthEmailUnverified, "oauth provider email is not verified", nil)
+	ErrOAuthAccountLinkConflict  = New(CodeOAuthAccountLinkConflict, "cannot link oauth identity to unverified local account", nil)
+	ErrOAuthProviderNotFound     = New(CodeOAuthProviderNotFound, "oauth provider not found", nil)
 
 	// Predefined sentinel errors for Phase 4 Session, CSRF, and Rate Limiting.
 	ErrSessionNotFound   = New(CodeSessionNotFound, "Session is invalid or has expired", nil)

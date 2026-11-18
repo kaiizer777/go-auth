@@ -9,5 +9,5 @@
 //   - User info retrieval and profile normalization into canonical user identity.
 //   - Account linking with existing user accounts and prevention of duplicate links
 //     (errors.ErrOAuthAccountAlreadyLinked, errors.ErrOAuthAccountNotLinked).
-//   - Provider configuration integration via config.OAuthConfig.
+//   - Provider configuration integration via config.ProviderConfig.
 package oauth

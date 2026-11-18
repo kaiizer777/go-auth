@@ -177,15 +177,15 @@ func TestMigrations_DownRefusedOnSeededDB(t *testing.T) {
 
 	err = m.Steps(-1)
 	if err == nil {
-		t.Fatal("expected 000006 down to refuse on versioned DB, got nil")
+		t.Fatal("expected 000007 down to refuse on seeded DB, got nil")
 	}
 	if !strings.Contains(err.Error(), "down refused") {
 		t.Fatalf("expected down-refused error, got: %v", err)
 	}
 
-	// The refused down records version 5 dirty and leaves the driver's
+	// The refused down records version 6 dirty and leaves the driver's
 	// connection unusable for unlock, so recover on a fresh migrator: the
-	// script rolled back, the schema is still at 6, and force 6 re-pins it
+	// script rolled back, the schema is still at 7, and force 7 re-pins it
 	// clean. The seed row is removed so the shared DB stays empty.
 	_, _ = m.Close()
 	_ = sqlDB.Close()
@@ -196,16 +196,16 @@ func TestMigrations_DownRefusedOnSeededDB(t *testing.T) {
 		_ = sqlDB2.Close()
 	}()
 
-	if verr, ddirty, verr2 := m2.Version(); verr2 != nil || verr != 5 || !ddirty {
-		t.Fatalf("expected version 5 dirty after refusal, got version=%d dirty=%v err=%v", verr, ddirty, verr2)
+	if verr, ddirty, verr2 := m2.Version(); verr2 != nil || verr != 6 || !ddirty {
+		t.Fatalf("expected version 6 dirty after refusal, got version=%d dirty=%v err=%v", verr, ddirty, verr2)
 	}
-	if ferr := m2.Force(6); ferr != nil {
-		t.Fatalf("m2.Force(6) failed: %v", ferr)
+	if ferr := m2.Force(7); ferr != nil {
+		t.Fatalf("m2.Force(7) failed: %v", ferr)
 	}
 	if _, err := sqlDB2.Exec(`DELETE FROM users WHERE email = 'down-refusal@example.com'`); err != nil {
 		t.Fatalf("failed to remove seed row: %v", err)
 	}
-	if verr, ddirty, verr2 := m2.Version(); verr2 != nil || verr != 6 || ddirty {
-		t.Fatalf("expected version 6 clean after recovery, got version=%d dirty=%v err=%v", verr, ddirty, verr2)
+	if verr, ddirty, verr2 := m2.Version(); verr2 != nil || verr != 7 || ddirty {
+		t.Fatalf("expected version 7 clean after recovery, got version=%d dirty=%v err=%v", verr, ddirty, verr2)
 	}
 }

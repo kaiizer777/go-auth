@@ -784,11 +784,15 @@ func TestSentinels_MFAAndOAuth(t *testing.T) {
 	}{
 		{ErrMFARequired, CodeMFARequired, "mfa verification required", http.StatusUnauthorized},
 		{ErrMFAInvalidCode, CodeMFAInvalidCode, "invalid mfa code", http.StatusUnauthorized},
-		{ErrOAuthStateInvalid, CodeOAuthStateInvalid, "invalid oauth state", http.StatusBadRequest},
+		{ErrOAuthStateInvalid, CodeOAuthStateInvalid, "invalid oauth state", http.StatusForbidden},
 		{ErrOAuthCallbackFailed, CodeOAuthCallbackFailed, "oauth callback failed", http.StatusBadRequest},
 		{ErrOAuthProviderError, CodeOAuthProviderError, "oauth provider error", http.StatusBadGateway},
 		{ErrOAuthAccountAlreadyLinked, CodeOAuthAccountAlreadyLinked, "oauth account already linked", http.StatusConflict},
 		{ErrOAuthAccountNotLinked, CodeOAuthAccountNotLinked, "oauth account not linked", http.StatusNotFound},
+		{ErrOAuthCodeInvalid, CodeOAuthCodeInvalid, "oauth code is invalid", http.StatusBadRequest},
+		{ErrOAuthEmailUnverified, CodeOAuthEmailUnverified, "oauth provider email is not verified", http.StatusBadRequest},
+		{ErrOAuthAccountLinkConflict, CodeOAuthAccountLinkConflict, "cannot link oauth identity to unverified local account", http.StatusConflict},
+		{ErrOAuthProviderNotFound, CodeOAuthProviderNotFound, "oauth provider not found", http.StatusNotFound},
 	}
 
 	for _, tt := range tests {

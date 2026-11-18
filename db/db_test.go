@@ -427,6 +427,34 @@ func TestMigration000006_DownRefusesVersionedDB(t *testing.T) {
 	}
 }
 
+func TestMigration000007_DownRefusesSeededDB(t *testing.T) {
+	data, err := defaultMigrationsFS.ReadFile("migrations/000007_create_oauth_accounts.down.sql")
+	if err != nil {
+		t.Fatalf("failed to read migration 7 down: %v", err)
+	}
+	content := string(data)
+
+	if !strings.Contains(content, "down refused") {
+		t.Error("migration 7 down must carry the refusal text")
+	}
+	guardIdx := strings.Index(content, "SELECT 1 FROM users")
+	raiseIdx := strings.Index(content, "RAISE EXCEPTION")
+	if guardIdx == -1 {
+		t.Fatal("migration 7 down must gate refusal on data-bearing tables")
+	}
+	if raiseIdx == -1 {
+		t.Fatal("migration 7 down missing RAISE EXCEPTION refusal")
+	}
+	if guardIdx > raiseIdx {
+		t.Errorf("migration 7 data guard (idx %d) must precede refusal (idx %d)", guardIdx, raiseIdx)
+	}
+	for _, table := range []string{"users", "oauth_accounts"} {
+		if !strings.Contains(content, table) {
+			t.Errorf("migration 7 down must guard %s", table)
+		}
+	}
+}
+
 func TestMigrations_NoExplicitTransactionWrappers(t *testing.T) {
 	files := []string{
 		"migrations/000001_create_users.up.sql",
@@ -441,6 +469,8 @@ func TestMigrations_NoExplicitTransactionWrappers(t *testing.T) {
 		"migrations/000005_add_session_phase4_columns.down.sql",
 		"migrations/000006_add_credential_version.up.sql",
 		"migrations/000006_add_credential_version.down.sql",
+		"migrations/000007_create_oauth_accounts.up.sql",
+		"migrations/000007_create_oauth_accounts.down.sql",
 	}
 
 	for _, file := range files {

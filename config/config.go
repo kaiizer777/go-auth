@@ -28,40 +28,60 @@ type Argon2Config struct {
 	KeyLength   uint32 // Output bytes. Min: 32. Default: 32
 }
 
-// OAuthConfig defines settings for a third-party OAuth2 / OIDC identity provider.
-type OAuthConfig struct {
+// ProviderConfig defines client credentials and scopes for a single OAuth provider.
+type ProviderConfig struct {
 	ClientID     string
 	ClientSecret string
 	RedirectURL  string
 	Scopes       []string
-	AuthURL      string
-	TokenURL     string
-	UserInfoURL  string
+	Enabled      bool
+
+	// Apple-specific credentials for dynamic ES256 client_secret JWT signing
+	TeamID     string // 10-character Apple Developer Team ID
+	KeyID      string // 10-character Apple Developer Key ID
+	PrivateKey string // PEM-encoded PKCS#8 ECDSA private key (.p8 content)
 }
 
-// LogValue implements slog.LogValuer to ensure ClientSecret is masked in logs.
-func (o OAuthConfig) LogValue() slog.Value {
-	secret := "[REDACTED]"
-	if o.ClientSecret == "" {
-		secret = ""
+// LogValue implements slog.LogValuer to ensure ClientSecret and PrivateKey are masked in logs.
+func (p ProviderConfig) LogValue() slog.Value {
+	secretMasked := "[REDACTED]"
+	if p.ClientSecret == "" {
+		secretMasked = ""
+	}
+	keyMasked := "[REDACTED]"
+	if p.PrivateKey == "" {
+		keyMasked = ""
 	}
 	return slog.GroupValue(
-		slog.String("client_id", o.ClientID),
-		slog.String("client_secret", secret),
-		slog.String("redirect_url", o.RedirectURL),
-		slog.String("auth_url", o.AuthURL),
-		slog.String("token_url", o.TokenURL),
-		slog.String("user_info_url", o.UserInfoURL),
+		slog.String("client_id", p.ClientID),
+		slog.String("client_secret", secretMasked),
+		slog.String("redirect_url", p.RedirectURL),
+		slog.Any("scopes", p.Scopes),
+		slog.Bool("enabled", p.Enabled),
+		slog.String("team_id", p.TeamID),
+		slog.String("key_id", p.KeyID),
+		slog.String("private_key", keyMasked),
 	)
 }
 
 // String implements fmt.Stringer to ensure ClientSecret is masked when printed.
-func (o OAuthConfig) String() string {
+func (p ProviderConfig) String() string {
 	secret := "[REDACTED]"
-	if o.ClientSecret == "" {
+	if p.ClientSecret == "" {
 		secret = ""
 	}
-	return fmt.Sprintf("OAuthConfig{ClientID: %s, ClientSecret: %s, RedirectURL: %s}", o.ClientID, secret, o.RedirectURL)
+	return fmt.Sprintf("ProviderConfig{ClientID: %s, ClientSecret: %s, RedirectURL: %s}", p.ClientID, secret, p.RedirectURL)
+}
+
+// OAuthConfig groups configurations for all external identity providers.
+type OAuthConfig struct {
+	// Providers maps provider ID ("google", "github", "apple") to provider configuration.
+	Providers       map[string]ProviderConfig
+	StateCookieName string        // Default: "oauth_state"
+	StateCookiePath string        // Default: "/" (ensures cookies are sent on /auth/oauth/* and /api/auth/oauth/*)
+	StateTTL        time.Duration // Default: 10 * time.Minute
+	StateSecret     string        // Cryptographic HMAC key for signing state tokens (falls back to startup CSPRNG if empty)
+	CallbackBaseURL string        // e.g. "https://api.example.com"
 }
 
 // SecurityHeadersConfig groups HTTP security header policies.
@@ -150,8 +170,8 @@ type Config struct {
 	// SecurityHeaders groups HTTP security header policies.
 	SecurityHeaders SecurityHeadersConfig
 
-	// OAuth holds optional third-party OAuth2/OIDC provider configurations keyed by provider name.
-	OAuth map[string]OAuthConfig
+	// OAuth holds optional third-party OAuth2/OIDC provider configurations.
+	OAuth OAuthConfig
 
 	// Rate limiting
 	RateLimitLoginWindow  time.Duration // sliding window duration; default 15m
@@ -213,6 +233,12 @@ func DefaultConfig() Config {
 			EnableHSTS:            true,
 			HSTSIncludeSubdomains: true,
 			HSTSPreload:           false,
+		},
+
+		OAuth: OAuthConfig{
+			StateCookieName: "oauth_state",
+			StateCookiePath: "/",
+			StateTTL:        10 * time.Minute,
 		},
 
 		// Rate limiting
@@ -428,6 +454,57 @@ func (c *Config) Validate() error {
 	if c.SessionCookieSameSite == http.SameSiteNoneMode && !c.SessionCookieSecure {
 		return errors.ErrSessionSameSiteNoneInsecure
 	}
+
+	if c.OAuth.StateCookieName == "" {
+		c.OAuth.StateCookieName = "oauth_state"
+	}
+	if c.OAuth.StateCookiePath == "" {
+		c.OAuth.StateCookiePath = "/"
+	}
+	if c.OAuth.StateTTL == 0 {
+		c.OAuth.StateTTL = 10 * time.Minute
+	}
+	// Sub-second TTLs truncate to MaxAge=0 on the wire while Expires stays ahead — reject like CSRF.
+	if c.OAuth.StateTTL < time.Second {
+		return errors.ErrOAuthStateTTLInvalid
+	}
+	// Explicit secrets shorter than 32 bytes are brute-forceable; empty falls back to a CSPRNG key.
+	if c.OAuth.StateSecret != "" && len(c.OAuth.StateSecret) < 32 {
+		return errors.ErrOAuthStateSecretTooShort
+	}
+	if !isToken(c.OAuth.StateCookieName) {
+		return errors.ErrOAuthStateCookieNameInvalid
+	}
+	if !isCookiePath(c.OAuth.StateCookiePath) {
+		return errors.ErrOAuthStateCookiePathInvalid
+	}
+	for id, provider := range c.OAuth.Providers {
+		switch id {
+		case "google", "github", "apple":
+		default:
+			return errors.ErrOAuthProviderUnknown
+		}
+		if !provider.Enabled {
+			continue
+		}
+		if provider.ClientID == "" {
+			return errors.ErrOAuthClientIDRequired
+		}
+		if provider.RedirectURL == "" {
+			return errors.ErrOAuthRedirectURLRequired
+		}
+		switch id {
+		case "google", "github":
+			if provider.ClientSecret == "" {
+				return errors.ErrOAuthClientSecretRequired
+			}
+		case "apple":
+			if provider.ClientSecret == "" &&
+				(provider.TeamID == "" || provider.KeyID == "" || provider.PrivateKey == "") {
+				return errors.ErrOAuthClientSecretRequired
+			}
+		}
+	}
 	if !c.SessionCookieSecure {
 		slog.Warn("SessionCookieSecure is false — not safe for production")
 	}
@@ -590,9 +667,9 @@ func (c Config) LogValue() slog.Value {
 		slog.String("csrf_cookie_name", c.CSRFCookieName),
 		slog.String("csrf_header_name", c.CSRFHeaderName),
 	}
-	if len(c.OAuth) > 0 {
-		oauthAttrs := make([]slog.Attr, 0, len(c.OAuth))
-		for name, provider := range c.OAuth {
+	if len(c.OAuth.Providers) > 0 {
+		oauthAttrs := make([]slog.Attr, 0, len(c.OAuth.Providers))
+		for name, provider := range c.OAuth.Providers {
 			oauthAttrs = append(oauthAttrs, slog.Any(name, provider.LogValue()))
 		}
 		attrs = append(attrs, slog.Attr{
