@@ -630,3 +630,94 @@ func TestAppleStaleJWKSRefreshSuperseded(t *testing.T) {
 		t.Errorf("JWKS fetches = %d; want 3 (prime + stale + newer, no re-fetch)", reqs)
 	}
 }
+
+func TestAppleJoinedCallerMissRefreshes(t *testing.T) {
+	t.Parallel()
+	oldKey := mustRSAKey(t)
+	newKey := mustRSAKey(t)
+	var mu sync.Mutex
+	fetches := 0
+	jwksSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		fetches++
+		n := fetches
+		mu.Unlock()
+		kid, key := "kid-1", oldKey
+		if n >= 2 {
+			kid, key = "kid-2", newKey
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"keys": []any{rsaJWK(&key.PublicKey, kid)}})
+	}))
+	defer jwksSrv.Close()
+
+	p := NewAppleProvider(appleTestConfig())
+	p.jwksURL = jwksSrv.URL
+
+	// Empty cache: the first flight serves the pre-rotation set, so the
+	// caller's kid still misses and one bounded re-refresh must recover it.
+	rotatedToken := mintAppleIDToken(t, newKey, "kid-2", appleFixtureClaims(true))
+	info, err := p.FetchUserInfo(context.Background(), &TokenResponse{IDToken: rotatedToken})
+	if err != nil {
+		t.Fatalf("FetchUserInfo after rotation = %v", err)
+	}
+	if info.ProviderUserID != "apple-sub-123" {
+		t.Errorf("userinfo = %+v; want apple-sub-123", info)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if fetches != 2 {
+		t.Errorf("JWKS fetches = %d; want 2 (shared flight + one bounded re-refresh)", fetches)
+	}
+}
+
+func TestAppleOwnerCancelKeepsSharedFetch(t *testing.T) {
+	t.Parallel()
+	key := mustRSAKey(t)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	var fetches atomic.Int64
+	jwksSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fetches.Add(1)
+		once.Do(func() { close(entered) })
+		<-release
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"keys": []any{rsaJWK(&key.PublicKey, "kid-1")}})
+	}))
+	defer jwksSrv.Close()
+
+	p := NewAppleProvider(appleTestConfig())
+	p.jwksURL = jwksSrv.URL
+
+	ownerCtx, cancelOwner := context.WithCancel(context.Background())
+	defer cancelOwner()
+	ownerDone := make(chan error, 1)
+	go func() {
+		_, err := p.jwksKey(ownerCtx, "kid-1")
+		ownerDone <- err
+	}()
+	<-entered // owner's upstream fetch is in flight
+
+	joining := make(chan struct{})
+	joinerDone := make(chan error, 1)
+	go func() {
+		close(joining)
+		_, err := p.jwksKey(context.Background(), "kid-1")
+		joinerDone <- err
+	}()
+	<-joining
+	time.Sleep(200 * time.Millisecond) // let the joiner attach to the shared flight
+	cancelOwner()                      // must not abort the shared fetch
+	close(release)
+
+	if err := <-joinerDone; err != nil {
+		t.Fatalf("joiner jwksKey = %v; want success after owner cancel", err)
+	}
+	if err := <-ownerDone; err != nil {
+		t.Fatalf("owner jwksKey = %v; want success", err)
+	}
+	if n := fetches.Load(); n != 1 {
+		t.Errorf("JWKS fetches = %d; want 1 (shared flight, no re-fetch)", n)
+	}
+}

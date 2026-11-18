@@ -478,6 +478,12 @@ func TestOAuthCallbackBearerBranch(t *testing.T) {
 			if rec.Code != http.StatusOK {
 				t.Fatalf("status = %d; want 200 (%s)", rec.Code, rec.Body.String())
 			}
+			if got := rec.Header().Get("Cache-Control"); got != "no-store" {
+				t.Errorf("Cache-Control = %q; want no-store", got)
+			}
+			if got := rec.Header().Get("Pragma"); got != "no-cache" {
+				t.Errorf("Pragma = %q; want no-cache", got)
+			}
 			var body struct {
 				UserID    uuid.UUID `json:"user_id"`
 				Token     string    `json:"token"`

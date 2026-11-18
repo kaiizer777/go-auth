@@ -95,7 +95,10 @@ func (h *Handler) OAuthCallback(w http.ResponseWriter, r *http.Request) {
 	if wantsOAuthBearer(r) {
 		// Mirror the password Login bearer contract: raw token in the body,
 		// no session cookie, no CSRF cookie (bearer is CSRF-immune).
+		// Bearer responses carry a raw token; never let caches store them.
 		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Pragma", "no-cache")
 		w.WriteHeader(http.StatusOK)
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"user_id":    sess.UserID,

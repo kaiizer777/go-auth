@@ -297,6 +297,18 @@ func (p *AppleProvider) jwksKey(ctx context.Context, kid string) (*rsa.PublicKey
 		return nil, err
 	}
 	p.mu.RLock()
+	if key, ok := p.jwks[kid]; ok {
+		p.mu.RUnlock()
+		return key, nil
+	}
+	p.mu.RUnlock()
+	// A joiner can share a flight owned by a caller with a different kid
+	// when rotation publishes between the fetch and this lookup; refresh
+	// once more so one transient miss does not fail verification.
+	if err := p.refreshJWKS(ctx); err != nil {
+		return nil, err
+	}
+	p.mu.RLock()
 	defer p.mu.RUnlock()
 	if key, ok := p.jwks[kid]; ok {
 		return key, nil
@@ -309,9 +321,11 @@ func (p *AppleProvider) refreshJWKS(ctx context.Context) error {
 	p.mu.RLock()
 	startGen := p.jwksGen
 	p.mu.RUnlock()
-	ctx, cancel := context.WithTimeout(ctx, oauthHTTPTimeout)
+	// Shared work must not die with one caller: detach the fetch from the
+	// flight owner's cancellation, keeping only the bounded timeout.
+	fetchCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), oauthHTTPTimeout)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, p.jwksURL, nil)
+	req, err := http.NewRequestWithContext(fetchCtx, http.MethodGet, p.jwksURL, nil)
 	if err != nil {
 		return errors.New(errors.CodeOAuthProviderError, "oauth jwks fetch failed", err)
 	}
