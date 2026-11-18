@@ -224,6 +224,25 @@ func TestASVS_CSRF_Boundary(t *testing.T) {
 		}
 	})
 
+	t.Run("bearer login sets no cookies", func(t *testing.T) {
+		rec := asvsRequest(t, app.Handler, cfg, http.MethodPost, "/auth/login", "",
+			db.LoginRequest{Email: email, Password: pass}, nil, "", map[string]string{
+				"X-Auth-Type": "bearer",
+			})
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200 bearer login, got %d: %s", rec.Code, rec.Body.String())
+		}
+		if cookies := rec.Result().Cookies(); len(cookies) != 0 {
+			t.Fatalf("bearer login must not set cookies, got %v", cookies)
+		}
+		var body struct {
+			Token string `json:"token"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil || body.Token == "" {
+			t.Fatalf("bearer login must return a token, got %q err=%v", rec.Body.String(), err)
+		}
+	})
+
 	t.Run("query param never exempt", func(t *testing.T) {
 		rec := asvsRequest(t, app.Handler, cfg, http.MethodPost, "/auth/login?type=bearer", "",
 			db.LoginRequest{Email: email, Password: pass}, nil, "", nil)
@@ -387,6 +406,14 @@ func TestASVS_AntiEnumeration(t *testing.T) {
 	if reset.Code != http.StatusOK {
 		t.Fatalf("unknown reset target: expected 200, got %d: %s", reset.Code, reset.Body.String())
 	}
+	knownReset := asvsRequest(t, app.Handler, cfg, http.MethodPost, "/auth/password/reset-request", "",
+		db.PasswordResetRequest{Email: email}, cookie, token, nil)
+	if knownReset.Code != http.StatusOK {
+		t.Fatalf("known reset target: expected 200, got %d: %s", knownReset.Code, knownReset.Body.String())
+	}
+	if knownReset.Body.String() != reset.Body.String() {
+		t.Fatal("known and unknown reset targets must return identical bodies")
+	}
 
 	missing := asvsRequest(t, app.Handler, cfg, http.MethodPost, "/auth/login", "",
 		db.LoginRequest{Email: "asvs-ghost@example.com", Password: pass}, cookie, token, nil)
@@ -399,6 +426,9 @@ func TestASVS_AntiEnumeration(t *testing.T) {
 		if !strings.Contains(rec.Body.String(), "INVALID_CREDENTIALS") {
 			t.Fatalf("%s login: expected INVALID_CREDENTIALS, got %s", name, rec.Body.String())
 		}
+	}
+	if missing.Body.String() != wrongPass.Body.String() {
+		t.Fatal("missing and wrong-password logins must return identical bodies")
 	}
 }
 
