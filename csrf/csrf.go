@@ -182,12 +182,16 @@ func IssueCookie(w http.ResponseWriter, cfg *config.Config) (string, error) {
 // SameSite: Strict ensures maximum isolation.
 func setCSRFCookie(w http.ResponseWriter, token string, cfg *config.Config) {
 	cfg = ensureConfig(cfg)
+	maxAge := cfg.CSRFCookieMaxAge
+	if maxAge == 0 {
+		maxAge = 24 * time.Hour // documented default; writers may bypass Validate
+	}
 	http.SetCookie(w, &http.Cookie{
 		Name:     cfg.CSRFCookieName,
 		Value:    token,
 		Path:     "/",
-		MaxAge:   int(cfg.CSRFCookieMaxAge.Seconds()),
-		Expires:  time.Now().Add(cfg.CSRFCookieMaxAge),
+		MaxAge:   int(maxAge.Seconds()),
+		Expires:  time.Now().Add(maxAge),
 		HttpOnly: false, // Mandatory false for Double Submit Cookie pattern
 		Secure:   cfg.SessionCookieSecure,
 		SameSite: http.SameSiteStrictMode, // Strict for CSRF cookie

@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 	"testing/iotest"
+	"time"
 
 	"github.com/kaiizer777/go-auth/config"
 )
@@ -172,6 +173,33 @@ func TestCSRF_BearerAuth_SkipsCSRF(t *testing.T) {
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected status 200, got %d", rec.Code)
+	}
+}
+
+func TestCSRF_ZeroMaxAgeDefaultsToDay(t *testing.T) {
+	cfg := testConfig()
+	cfg.CSRFCookieMaxAge = 0
+	rec := httptest.NewRecorder()
+	setCSRFCookie(rec, "dummytoken", cfg)
+	cookies := rec.Result().Cookies()
+	if len(cookies) != 1 {
+		t.Fatalf("expected 1 cookie, got %d", len(cookies))
+	}
+	if cookies[0].MaxAge != 86400 {
+		t.Errorf("expected default MaxAge 86400, got %d", cookies[0].MaxAge)
+	}
+	if time.Until(cookies[0].Expires) < 23*time.Hour {
+		t.Errorf("expected Expires ~24h out, got %v", cookies[0].Expires)
+	}
+}
+
+func TestCSRF_ExplicitMaxAgePreserved(t *testing.T) {
+	cfg := testConfig()
+	cfg.CSRFCookieMaxAge = time.Hour
+	rec := httptest.NewRecorder()
+	setCSRFCookie(rec, "dummytoken", cfg)
+	if got := rec.Result().Cookies()[0].MaxAge; got != 3600 {
+		t.Errorf("expected MaxAge 3600, got %d", got)
 	}
 }
 
