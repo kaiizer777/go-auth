@@ -246,6 +246,9 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 		)
 
 		if sessType == db.SessionTypeBearer {
+			// Bearer responses carry a raw token; never let caches store them.
+			w.Header().Set("Cache-Control", "no-store")
+			w.Header().Set("Pragma", "no-cache")
 			writeJSON(w, http.StatusOK, map[string]any{
 				"user_id":    user.ID,
 				"token":      rawID,

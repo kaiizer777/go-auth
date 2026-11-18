@@ -1601,6 +1601,12 @@ func TestAuthHandler_LoginSessionCreation_CookieAndBearer(t *testing.T) {
 	if recBearer.Code != http.StatusOK {
 		t.Fatalf("bearer login failed: %d", recBearer.Code)
 	}
+	if got := recBearer.Header().Get("Cache-Control"); got != "no-store" {
+		t.Errorf("Cache-Control = %q; want no-store", got)
+	}
+	if got := recBearer.Header().Get("Pragma"); got != "no-cache" {
+		t.Errorf("Pragma = %q; want no-cache", got)
+	}
 	var bearerResp struct {
 		UserID uuid.UUID `json:"user_id"`
 		Token  string    `json:"token"`

@@ -28,40 +28,65 @@ type Argon2Config struct {
 	KeyLength   uint32 // Output bytes. Min: 32. Default: 32
 }
 
-// OAuthConfig defines settings for a third-party OAuth2 / OIDC identity provider.
-type OAuthConfig struct {
+// ProviderConfig defines client credentials and scopes for a single OAuth provider.
+type ProviderConfig struct {
 	ClientID     string
 	ClientSecret string
 	RedirectURL  string
 	Scopes       []string
-	AuthURL      string
-	TokenURL     string
-	UserInfoURL  string
+	Enabled      bool
+
+	// Apple-specific credentials for dynamic ES256 client_secret JWT signing
+	TeamID     string // 10-character Apple Developer Team ID
+	KeyID      string // 10-character Apple Developer Key ID
+	PrivateKey string // PEM-encoded PKCS#8 ECDSA private key (.p8 content)
 }
 
-// LogValue implements slog.LogValuer to ensure ClientSecret is masked in logs.
-func (o OAuthConfig) LogValue() slog.Value {
-	secret := "[REDACTED]"
-	if o.ClientSecret == "" {
-		secret = ""
+// LogValue implements slog.LogValuer to ensure ClientSecret and PrivateKey are masked in logs.
+func (p ProviderConfig) LogValue() slog.Value {
+	secretMasked := "[REDACTED]"
+	if p.ClientSecret == "" {
+		secretMasked = ""
+	}
+	keyMasked := "[REDACTED]"
+	if p.PrivateKey == "" {
+		keyMasked = ""
 	}
 	return slog.GroupValue(
-		slog.String("client_id", o.ClientID),
-		slog.String("client_secret", secret),
-		slog.String("redirect_url", o.RedirectURL),
-		slog.String("auth_url", o.AuthURL),
-		slog.String("token_url", o.TokenURL),
-		slog.String("user_info_url", o.UserInfoURL),
+		slog.String("client_id", p.ClientID),
+		slog.String("client_secret", secretMasked),
+		slog.String("redirect_url", p.RedirectURL),
+		slog.Any("scopes", p.Scopes),
+		slog.Bool("enabled", p.Enabled),
+		slog.String("team_id", p.TeamID),
+		slog.String("key_id", p.KeyID),
+		slog.String("private_key", keyMasked),
 	)
 }
 
 // String implements fmt.Stringer to ensure ClientSecret is masked when printed.
-func (o OAuthConfig) String() string {
+func (p ProviderConfig) String() string {
 	secret := "[REDACTED]"
-	if o.ClientSecret == "" {
+	if p.ClientSecret == "" {
 		secret = ""
 	}
-	return fmt.Sprintf("OAuthConfig{ClientID: %s, ClientSecret: %s, RedirectURL: %s}", o.ClientID, secret, o.RedirectURL)
+	return fmt.Sprintf("ProviderConfig{ClientID: %s, ClientSecret: %s, RedirectURL: %s}", p.ClientID, secret, p.RedirectURL)
+}
+
+// OAuthConfig groups configurations for all external identity providers.
+type OAuthConfig struct {
+	// Providers maps provider ID ("google", "github", "apple") to provider configuration.
+	Providers       map[string]ProviderConfig
+	StateCookieName string        // Default: "oauth_state"
+	StateCookiePath string        // Default: "/" (ensures cookies are sent on /auth/oauth/* and /api/auth/oauth/*)
+	StateTTL        time.Duration // Default: 10 * time.Minute
+	StateSecret     string        // Required when any OAuth provider is enabled; empty fails closed at startup. Min 32 bytes.
+	CallbackBaseURL string        // e.g. "https://api.example.com"
+	// StateCookieSameSite is the base SameSite policy for the OAuth state
+	// cookie on GET-redirect flows. Default: Lax. form_post providers (Apple)
+	// always escalate to None+Secure regardless, since browsers withhold Lax
+	// on cross-site POST navigations.
+	StateCookieSameSite http.SameSite
 }
 
 // SecurityHeadersConfig groups HTTP security header policies.
@@ -150,8 +175,8 @@ type Config struct {
 	// SecurityHeaders groups HTTP security header policies.
 	SecurityHeaders SecurityHeadersConfig
 
-	// OAuth holds optional third-party OAuth2/OIDC provider configurations keyed by provider name.
-	OAuth map[string]OAuthConfig
+	// OAuth holds optional third-party OAuth2/OIDC provider configurations.
+	OAuth OAuthConfig
 
 	// Rate limiting
 	RateLimitLoginWindow  time.Duration // sliding window duration; default 15m
@@ -163,6 +188,8 @@ type Config struct {
 	RateLimitSignupWindow time.Duration // for signup; default 15m
 	RateLimitSignupMax    int           // default 10
 	RateLimitSignupIPMax  int           // max signups per IP in window; default 50
+	RateLimitOAuthWindow  time.Duration // for oauth initiate/callback; default 15m
+	RateLimitOAuthIPMax   int           // max oauth calls per IP in window; default 100
 	RateLimitCleanupTick  time.Duration // how often to prune expired entries; default 5m
 }
 
@@ -215,6 +242,13 @@ func DefaultConfig() Config {
 			HSTSPreload:           false,
 		},
 
+		OAuth: OAuthConfig{
+			StateCookieName:     "oauth_state",
+			StateCookiePath:     "/",
+			StateTTL:            10 * time.Minute,
+			StateCookieSameSite: http.SameSiteLaxMode,
+		},
+
 		// Rate limiting
 		RateLimitLoginWindow:  15 * time.Minute,
 		RateLimitLoginMax:     10,
@@ -225,6 +259,8 @@ func DefaultConfig() Config {
 		RateLimitSignupWindow: 15 * time.Minute,
 		RateLimitSignupMax:    10,
 		RateLimitSignupIPMax:  50,
+		RateLimitOAuthWindow:  15 * time.Minute,
+		RateLimitOAuthIPMax:   100,
 		RateLimitCleanupTick:  5 * time.Minute,
 	}
 }
@@ -428,11 +464,81 @@ func (c *Config) Validate() error {
 	if c.SessionCookieSameSite == http.SameSiteNoneMode && !c.SessionCookieSecure {
 		return errors.ErrSessionSameSiteNoneInsecure
 	}
+
+	if c.OAuth.StateCookieName == "" {
+		c.OAuth.StateCookieName = "oauth_state"
+	}
+	if c.OAuth.StateCookiePath == "" {
+		c.OAuth.StateCookiePath = "/"
+	}
+	if c.OAuth.StateTTL == 0 {
+		c.OAuth.StateTTL = 10 * time.Minute
+	}
+	if c.OAuth.StateCookieSameSite == 0 {
+		c.OAuth.StateCookieSameSite = http.SameSiteLaxMode
+	}
+	// Sub-second TTLs truncate to MaxAge=0 on the wire while Expires stays ahead — reject like CSRF.
+	if c.OAuth.StateTTL < time.Second {
+		return errors.ErrOAuthStateTTLInvalid
+	}
+	// Explicit secrets shorter than 32 bytes are brute-forceable. Empty is
+	// fail-closed whenever any provider is enabled: the state HMAC must
+	// verify across replicas and restarts, which a per-process fallback key
+	// cannot do. With no providers enabled OAuth is inert and empty stays valid.
+	if c.OAuth.StateSecret == "" {
+		for _, provider := range c.OAuth.Providers {
+			if provider.Enabled {
+				return errors.ErrOAuthStateSecretRequired
+			}
+		}
+	} else if len(c.OAuth.StateSecret) < 32 {
+		return errors.ErrOAuthStateSecretTooShort
+	}
+	if !isToken(c.OAuth.StateCookieName) {
+		return errors.ErrOAuthStateCookieNameInvalid
+	}
+	// Same name + same default path as the session or CSRF cookie means one
+	// cookie slot: issuance overwrites the session cookie and post-success
+	// cleanup wipes the just-minted session. Mirrors the session-vs-CSRF
+	// collision precedent above with a dedicated sentinel.
+	if c.OAuth.StateCookieName == c.SessionCookieName || c.OAuth.StateCookieName == c.CSRFCookieName {
+		return errors.ErrOAuthStateCookieNameCollision
+	}
+	if !isCookiePath(c.OAuth.StateCookiePath) {
+		return errors.ErrOAuthStateCookiePathInvalid
+	}
+	for id, provider := range c.OAuth.Providers {
+		switch id {
+		case "google", "github", "apple":
+		default:
+			return errors.ErrOAuthProviderUnknown
+		}
+		if !provider.Enabled {
+			continue
+		}
+		if provider.ClientID == "" {
+			return errors.ErrOAuthClientIDRequired
+		}
+		if provider.RedirectURL == "" {
+			return errors.ErrOAuthRedirectURLRequired
+		}
+		switch id {
+		case "google", "github":
+			if provider.ClientSecret == "" {
+				return errors.ErrOAuthClientSecretRequired
+			}
+		case "apple":
+			if provider.ClientSecret == "" &&
+				(provider.TeamID == "" || provider.KeyID == "" || provider.PrivateKey == "") {
+				return errors.ErrOAuthClientSecretRequired
+			}
+		}
+	}
 	if !c.SessionCookieSecure {
 		slog.Warn("SessionCookieSecure is false — not safe for production")
 	}
 
-	if c.RateLimitLoginWindow < 0 || c.RateLimitResetWindow < 0 || c.RateLimitSignupWindow < 0 || c.RateLimitCleanupTick < 0 {
+	if c.RateLimitLoginWindow < 0 || c.RateLimitResetWindow < 0 || c.RateLimitSignupWindow < 0 || c.RateLimitOAuthWindow < 0 || c.RateLimitCleanupTick < 0 {
 		return errors.ErrRateLimitWindowInvalid
 	}
 	if c.RateLimitLoginWindow == 0 {
@@ -443,6 +549,9 @@ func (c *Config) Validate() error {
 	}
 	if c.RateLimitSignupWindow == 0 {
 		c.RateLimitSignupWindow = 15 * time.Minute
+	}
+	if c.RateLimitOAuthWindow == 0 {
+		c.RateLimitOAuthWindow = 15 * time.Minute
 	}
 	if c.RateLimitCleanupTick == 0 {
 		c.RateLimitCleanupTick = 5 * time.Minute
@@ -466,8 +575,12 @@ func (c *Config) Validate() error {
 	if c.RateLimitSignupIPMax == 0 {
 		c.RateLimitSignupIPMax = c.RateLimitSignupMax * 5
 	}
+	if c.RateLimitOAuthIPMax == 0 {
+		c.RateLimitOAuthIPMax = 100
+	}
 	if c.RateLimitLoginMax < 1 || c.RateLimitResetMax < 1 || c.RateLimitSignupMax < 1 ||
-		c.RateLimitLoginIPMax < 1 || c.RateLimitResetIPMax < 1 || c.RateLimitSignupIPMax < 1 {
+		c.RateLimitLoginIPMax < 1 || c.RateLimitResetIPMax < 1 || c.RateLimitSignupIPMax < 1 ||
+		c.RateLimitOAuthIPMax < 1 {
 		return errors.ErrRateLimitMaxInvalid
 	}
 
@@ -590,9 +703,9 @@ func (c Config) LogValue() slog.Value {
 		slog.String("csrf_cookie_name", c.CSRFCookieName),
 		slog.String("csrf_header_name", c.CSRFHeaderName),
 	}
-	if len(c.OAuth) > 0 {
-		oauthAttrs := make([]slog.Attr, 0, len(c.OAuth))
-		for name, provider := range c.OAuth {
+	if len(c.OAuth.Providers) > 0 {
+		oauthAttrs := make([]slog.Attr, 0, len(c.OAuth.Providers))
+		for name, provider := range c.OAuth.Providers {
 			oauthAttrs = append(oauthAttrs, slog.Any(name, provider.LogValue()))
 		}
 		attrs = append(attrs, slog.Attr{

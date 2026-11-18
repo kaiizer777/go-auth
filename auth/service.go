@@ -234,6 +234,11 @@ func (s *authService) Login(ctx context.Context, req db.LoginRequest) (*db.User,
 
 	match, err := crypto.VerifyPassword(req.Password, user.PasswordHash)
 	if err != nil || !match {
+		if err != nil {
+			// Empty or unusable hash (OAuth-only account): burn dummy Argon2id
+			// work so login timing never reveals the account has no password.
+			_, _ = crypto.VerifyPassword(req.Password, s.dummyHash)
+		}
 		return nil, errors.ErrInvalidCredentials
 	}
 

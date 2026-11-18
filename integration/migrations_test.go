@@ -174,18 +174,23 @@ func TestMigrations_DownRefusedOnSeededDB(t *testing.T) {
 	if _, err := sqlDB.Exec(`INSERT INTO users (email, password_hash, credential_version) VALUES ('down-refusal@example.com', 'hash', 1)`); err != nil {
 		t.Fatalf("failed to seed versioned user: %v", err)
 	}
+	// A linked OAuth identity is the data actually at risk: users rows alone
+	// no longer block the rollback.
+	if _, err := sqlDB.Exec(`INSERT INTO oauth_accounts (user_id, provider_id, provider_user_id, email) SELECT id, 'google', 'down-refusal-sub', 'down-refusal@example.com' FROM users WHERE email = 'down-refusal@example.com'`); err != nil {
+		t.Fatalf("failed to seed linked oauth account: %v", err)
+	}
 
 	err = m.Steps(-1)
 	if err == nil {
-		t.Fatal("expected 000006 down to refuse on versioned DB, got nil")
+		t.Fatal("expected 000007 down to refuse on linked account, got nil")
 	}
 	if !strings.Contains(err.Error(), "down refused") {
 		t.Fatalf("expected down-refused error, got: %v", err)
 	}
 
-	// The refused down records version 5 dirty and leaves the driver's
+	// The refused down records version 6 dirty and leaves the driver's
 	// connection unusable for unlock, so recover on a fresh migrator: the
-	// script rolled back, the schema is still at 6, and force 6 re-pins it
+	// script rolled back, the schema is still at 7, and force 7 re-pins it
 	// clean. The seed row is removed so the shared DB stays empty.
 	_, _ = m.Close()
 	_ = sqlDB.Close()
@@ -196,16 +201,51 @@ func TestMigrations_DownRefusedOnSeededDB(t *testing.T) {
 		_ = sqlDB2.Close()
 	}()
 
-	if verr, ddirty, verr2 := m2.Version(); verr2 != nil || verr != 5 || !ddirty {
-		t.Fatalf("expected version 5 dirty after refusal, got version=%d dirty=%v err=%v", verr, ddirty, verr2)
+	if verr, ddirty, verr2 := m2.Version(); verr2 != nil || verr != 6 || !ddirty {
+		t.Fatalf("expected version 6 dirty after refusal, got version=%d dirty=%v err=%v", verr, ddirty, verr2)
 	}
-	if ferr := m2.Force(6); ferr != nil {
-		t.Fatalf("m2.Force(6) failed: %v", ferr)
+	if ferr := m2.Force(7); ferr != nil {
+		t.Fatalf("m2.Force(7) failed: %v", ferr)
+	}
+	if _, err := sqlDB2.Exec(`DELETE FROM oauth_accounts WHERE provider_user_id = 'down-refusal-sub'`); err != nil {
+		t.Fatalf("failed to remove seed link row: %v", err)
 	}
 	if _, err := sqlDB2.Exec(`DELETE FROM users WHERE email = 'down-refusal@example.com'`); err != nil {
 		t.Fatalf("failed to remove seed row: %v", err)
 	}
-	if verr, ddirty, verr2 := m2.Version(); verr2 != nil || verr != 6 || ddirty {
-		t.Fatalf("expected version 6 clean after recovery, got version=%d dirty=%v err=%v", verr, ddirty, verr2)
+	if verr, ddirty, verr2 := m2.Version(); verr2 != nil || verr != 7 || ddirty {
+		t.Fatalf("expected version 7 clean after recovery, got version=%d dirty=%v err=%v", verr, ddirty, verr2)
+	}
+
+	// Users rows without linked accounts roll back cleanly: the narrowed
+	// guard only fires on oauth_accounts contents, and users survive.
+	if _, err := sqlDB2.Exec(`INSERT INTO users (email, password_hash, credential_version) VALUES ('down-rollback@example.com', 'hash', 1)`); err != nil {
+		t.Fatalf("failed to seed unlinked user: %v", err)
+	}
+	if err := m2.Steps(-1); err != nil {
+		t.Fatalf("users-only 000007 down = %v; want nil", err)
+	}
+	var oauthAccounts int
+	if err := sqlDB2.QueryRow(`SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'oauth_accounts'`).Scan(&oauthAccounts); err != nil {
+		t.Fatalf("querying oauth_accounts table: %v", err)
+	}
+	if oauthAccounts != 0 {
+		t.Fatal("users-only down left oauth_accounts behind")
+	}
+	var users int
+	if err := sqlDB2.QueryRow(`SELECT COUNT(*) FROM users WHERE email = 'down-rollback@example.com'`).Scan(&users); err != nil {
+		t.Fatalf("querying users: %v", err)
+	}
+	if users != 1 {
+		t.Fatalf("users = %d after down; want 1 (down drops only oauth_accounts)", users)
+	}
+	if err := m2.Up(); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("re-applying m2.Up() failed: %v", err)
+	}
+	if _, err := sqlDB2.Exec(`DELETE FROM users WHERE email = 'down-rollback@example.com'`); err != nil {
+		t.Fatalf("failed to remove seed row: %v", err)
+	}
+	if verr, ddirty, verr2 := m2.Version(); verr2 != nil || verr != 7 || ddirty {
+		t.Fatalf("expected version 7 clean after re-up, got version=%d dirty=%v err=%v", verr, ddirty, verr2)
 	}
 }

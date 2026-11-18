@@ -20,6 +20,7 @@ import (
 	"github.com/kaiizer777/go-auth/email"
 	"github.com/kaiizer777/go-auth/errors"
 	"github.com/kaiizer777/go-auth/handler"
+	"github.com/kaiizer777/go-auth/oauth"
 	"github.com/kaiizer777/go-auth/ratelimit"
 	"github.com/kaiizer777/go-auth/session"
 )
@@ -38,6 +39,9 @@ type Auth struct {
 
 	// Session is the session management service.
 	Session session.Service
+
+	// OAuth is the external identity provider and social login service.
+	OAuth oauth.Service
 
 	// SessionHandler is the HTTP handler for session management.
 	SessionHandler *handler.SessionHandler
@@ -94,6 +98,7 @@ func NewWithDB(database *gorm.DB, cfg config.Config) (*Auth, error) {
 	resetIPLimiter := ratelimit.NewLimiter(cfg.RateLimitResetWindow, cfg.RateLimitResetIPMax)
 	signupLimiter := ratelimit.NewLimiter(cfg.RateLimitSignupWindow, cfg.RateLimitSignupMax)
 	signupIPLimiter := ratelimit.NewLimiter(cfg.RateLimitSignupWindow, cfg.RateLimitSignupIPMax)
+	oauthIPLimiter := ratelimit.NewLimiter(cfg.RateLimitOAuthWindow, cfg.RateLimitOAuthIPMax)
 
 	limiterDone := make(chan struct{})
 	cleanupTick := cfg.RateLimitCleanupTick
@@ -106,15 +111,39 @@ func NewWithDB(database *gorm.DB, cfg config.Config) (*Auth, error) {
 	resetIPLimiter.StartCleanup(cleanupTick, limiterDone)
 	signupLimiter.StartCleanup(cleanupTick, limiterDone)
 	signupIPLimiter.StartCleanup(cleanupTick, limiterDone)
+	oauthIPLimiter.StartCleanup(cleanupTick, limiterDone)
 
 	sessHandler := handler.NewSessionHandler(sessionSvc, database, &cfg)
 
-	h := handler.New(database, cfg, authSvc,
+	providers := make(map[string]oauth.Provider)
+	for id, pcfg := range cfg.OAuth.Providers {
+		if !pcfg.Enabled {
+			continue
+		}
+		p, err := oauth.NewProvider(id, pcfg)
+		if err != nil {
+			return nil, err
+		}
+		providers[id] = p
+	}
+	var oauthSvc oauth.Service
+	var oauthOpt handler.Option
+	if len(providers) > 0 {
+		oauthSvc = oauth.NewService(database, sessionSvc, providers, &cfg)
+		oauthOpt = handler.WithOAuthService(oauthSvc, providers)
+	}
+
+	handlerOpts := []handler.Option{
 		handler.WithSessionService(sessionSvc),
 		handler.WithSessionHandler(sessHandler),
 		handler.WithRateLimiters(loginLimiter, resetLimiter, signupLimiter),
 		handler.WithIPRateLimiters(loginIPLimiter, resetIPLimiter, signupIPLimiter),
-	)
+		handler.WithOAuthIPLimiters(oauthIPLimiter),
+	}
+	if oauthOpt != nil {
+		handlerOpts = append(handlerOpts, oauthOpt)
+	}
+	h := handler.New(database, cfg, authSvc, handlerOpts...)
 
 	a := &Auth{
 		db:  database,
@@ -129,6 +158,7 @@ func NewWithDB(database *gorm.DB, cfg config.Config) (*Auth, error) {
 		Handler:         h,
 		Auth:            authSvc,
 		Session:         sessionSvc,
+		OAuth:           oauthSvc,
 		SessionHandler:  sessHandler,
 		loginLimiter:    loginLimiter,
 		loginIPLimiter:  loginIPLimiter,
@@ -227,6 +257,11 @@ func (a *Auth) CSRF(next http.Handler) http.Handler {
 // SessionService returns the configured session service.
 func (a *Auth) SessionService() session.Service {
 	return a.Session
+}
+
+// OAuthService returns the configured OAuth service.
+func (a *Auth) OAuthService() oauth.Service {
+	return a.OAuth
 }
 
 // PurgeExpiredSessions deletes all sessions past their absolute expiration or idle timeout across all users.

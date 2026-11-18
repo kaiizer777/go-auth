@@ -12,6 +12,7 @@ import (
 	"github.com/kaiizer777/go-auth/config"
 	"github.com/kaiizer777/go-auth/csrf"
 	"github.com/kaiizer777/go-auth/errors"
+	"github.com/kaiizer777/go-auth/oauth"
 	"github.com/kaiizer777/go-auth/ratelimit"
 	"github.com/kaiizer777/go-auth/session"
 )
@@ -23,6 +24,8 @@ type Handler struct {
 	cfg             config.Config
 	authSvc         auth.Service
 	sessionSvc      session.Service
+	oauthSvc        oauth.Service
+	oauthProviders  map[string]oauth.Provider
 	sessHandler     *SessionHandler
 	loginLimiter    *ratelimit.Limiter
 	signupLimiter   *ratelimit.Limiter
@@ -30,6 +33,7 @@ type Handler struct {
 	loginIPLimiter  *ratelimit.Limiter
 	signupIPLimiter *ratelimit.Limiter
 	resetIPLimiter  *ratelimit.Limiter
+	oauthIPLimiter  *ratelimit.Limiter
 }
 
 // Option configures optional dependencies for Handler.
@@ -46,6 +50,14 @@ func WithSessionService(svc session.Service) Option {
 func WithSessionHandler(sh *SessionHandler) Option {
 	return func(h *Handler) {
 		h.sessHandler = sh
+	}
+}
+
+// WithOAuthService attaches the OAuth linking service and its providers.
+func WithOAuthService(svc oauth.Service, providers map[string]oauth.Provider) Option {
+	return func(h *Handler) {
+		h.oauthSvc = svc
+		h.oauthProviders = providers
 	}
 }
 
@@ -67,6 +79,15 @@ func WithIPRateLimiters(loginIP, resetIP, signupIP *ratelimit.Limiter) Option {
 	}
 }
 
+// WithOAuthIPLimiters attaches a custom in-memory IP-tier rate limiter for the
+// OAuth initiate/callback routes. No account tier exists: no identity is
+// authenticated before the callback completes.
+func WithOAuthIPLimiters(oauthIP *ratelimit.Limiter) Option {
+	return func(h *Handler) {
+		h.oauthIPLimiter = oauthIP
+	}
+}
+
 // New initializes the handler scaffold, registers routes, and applies CORS middleware.
 func New(db *gorm.DB, cfg config.Config, authSvc auth.Service, opts ...Option) http.Handler {
 	h := &Handler{
@@ -77,6 +98,13 @@ func New(db *gorm.DB, cfg config.Config, authSvc auth.Service, opts ...Option) h
 	}
 	for _, opt := range opts {
 		opt(h)
+	}
+
+	// OAuth limiter default mirrors the login IP tier. Zero Max disables
+	// throttling, matching the login/signup/reset behavior. Mounted routes
+	// stay outside csrf.Middleware: throttling applies as its own wrapper.
+	if h.oauthIPLimiter == nil && h.cfg.RateLimitOAuthIPMax > 0 {
+		h.oauthIPLimiter = ratelimit.NewLimiter(h.cfg.RateLimitOAuthWindow, h.cfg.RateLimitOAuthIPMax)
 	}
 
 	if h.sessionSvc == nil && db != nil {
@@ -225,6 +253,18 @@ func (h *Handler) registerRoutes() {
 		h.mux.Handle("GET /sessions", sessionWrap(h.sessHandler.ListSessions))
 		h.mux.Handle("DELETE /sessions", sessionWrap(h.sessHandler.InvalidateAllSessions))
 		h.mux.Handle("POST /sessions/rotate", sessionWrap(h.sessHandler.RotateSession))
+	}
+
+	if h.oauthSvc != nil {
+		// Mounted RAW outside csrf.Middleware/PreAuthMiddleware: Apple
+		// form_post callbacks carry no CSRF cookie+header, and RFC 6749
+		// state validation in HandleCallback is the CSRF defense.
+		h.mux.HandleFunc("GET /auth/oauth/{provider}", h.OAuthInitiate)
+		h.mux.HandleFunc("GET /auth/oauth/{provider}/callback", h.OAuthCallback)
+		h.mux.HandleFunc("POST /auth/oauth/{provider}/callback", h.OAuthCallback)
+		h.mux.HandleFunc("GET /api/auth/oauth/{provider}", h.OAuthInitiate)
+		h.mux.HandleFunc("GET /api/auth/oauth/{provider}/callback", h.OAuthCallback)
+		h.mux.HandleFunc("POST /api/auth/oauth/{provider}/callback", h.OAuthCallback)
 	}
 }
 

@@ -1401,8 +1401,8 @@ func TestConfig_SecretRedaction_LogValue_String(t *testing.T) {
 		}
 	})
 
-	t.Run("OAuthConfig redacts ClientSecret", func(t *testing.T) {
-		oauthCfg := OAuthConfig{
+	t.Run("ProviderConfig redacts ClientSecret", func(t *testing.T) {
+		oauthCfg := ProviderConfig{
 			ClientID:     "my-client-id",
 			ClientSecret: "top-secret-token",
 			RedirectURL:  "https://example.com/callback",
@@ -1416,15 +1416,15 @@ func TestConfig_SecretRedaction_LogValue_String(t *testing.T) {
 			}
 		}
 		if strings.Contains(secretVal, "top-secret-token") {
-			t.Fatalf("OAuthConfig.LogValue leaked client secret: %q", secretVal)
+			t.Fatalf("ProviderConfig.LogValue leaked client secret: %q", secretVal)
 		}
 		if secretVal != "[REDACTED]" {
-			t.Fatalf("OAuthConfig.LogValue expected [REDACTED], got: %q", secretVal)
+			t.Fatalf("ProviderConfig.LogValue expected [REDACTED], got: %q", secretVal)
 		}
 
 		str := oauthCfg.String()
 		if strings.Contains(str, "top-secret-token") {
-			t.Fatalf("OAuthConfig.String() leaked client secret: %q", str)
+			t.Fatalf("ProviderConfig.String() leaked client secret: %q", str)
 		}
 	})
 }
