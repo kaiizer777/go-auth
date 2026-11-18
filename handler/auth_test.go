@@ -1656,6 +1656,54 @@ func TestAuthHandler_LoginSessionCreation_CookieAndBearer(t *testing.T) {
 	}
 }
 
+func TestAuthHandler_CookieLoginExposesRotatedCSRFToken(t *testing.T) {
+	database, svc, _, _ := setupTestEnv(t)
+	cfg := testConfig()
+	sessSvc := session.NewService(database, &cfg)
+
+	authH := NewAuthHandler(svc,
+		WithAuthSessionService(sessSvc),
+		WithAuthConfig(&cfg),
+	)
+
+	email := "csrf_expose@example.com"
+	pass := "ValidPassword123!"
+	if _, _, err := svc.Signup(context.Background(), db.SignupRequest{Email: email, Password: pass}); err != nil {
+		t.Fatalf("Signup failed: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/auth/login", nil)
+	b, _ := json.Marshal(db.LoginRequest{Email: email, Password: pass})
+	req.Body = io.NopCloser(bytes.NewReader(b))
+	rec := httptest.NewRecorder()
+	authH.Login(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("cookie login failed: %d", rec.Code)
+	}
+	var body struct {
+		CSRFToken string `json:"csrf_token"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode login response: %v", err)
+	}
+	if len(body.CSRFToken) != 64 {
+		t.Fatalf("expected 64-char csrf_token in body, got %q", body.CSRFToken)
+	}
+	var rotated string
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == cfg.CSRFCookieName {
+			rotated = c.Value
+		}
+	}
+	if rotated == "" {
+		t.Fatalf("expected %q cookie to be set", cfg.CSRFCookieName)
+	}
+	if body.CSRFToken != rotated {
+		t.Fatal("body csrf_token must match the rotated CSRF cookie")
+	}
+}
+
 func TestSessionService_StaleMintRejectedAfterVersionBump(t *testing.T) {
 	database, svc, _, _ := setupTestEnv(t)
 	cfg := testConfig()

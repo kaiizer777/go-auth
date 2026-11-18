@@ -260,12 +260,16 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 			cfg = &defaultCfg
 		}
 		session.SetSessionCookie(w, rawID, cfg)
-		if _, err := csrf.IssueCookie(w, cfg); err != nil {
+		// Expose the rotated token in the body: cookie-jar clients cannot
+		// extract the fresh value from the Set-Cookie alone.
+		csrfToken, err := csrf.IssueCookie(w, cfg)
+		if err != nil {
 			slog.ErrorContext(r.Context(), "failed to issue csrf cookie on login", "err", err)
 		}
 		writeJSON(w, http.StatusOK, map[string]any{
-			"user_id": user.ID,
-			"message": "Login successful",
+			"user_id":    user.ID,
+			"csrf_token": csrfToken,
+			"message":    "Login successful",
 		})
 		return
 	}
@@ -322,6 +326,10 @@ func (h *AuthHandler) VerifyEmail(w http.ResponseWriter, r *http.Request) {
 	user, err := h.svc.VerifyEmail(r.Context(), req)
 	if err != nil {
 		errors.WriteJSON(w, err)
+		return
+	}
+	if user == nil {
+		errors.WriteJSON(w, errors.New(errors.CodeInternalError, "email verification succeeded without a user", nil))
 		return
 	}
 	slog.InfoContext(r.Context(), "email_verified",
@@ -417,6 +425,10 @@ func (h *AuthHandler) ResetPassword(w http.ResponseWriter, r *http.Request) {
 	user, err := h.svc.ResetPassword(r.Context(), req)
 	if err != nil {
 		errors.WriteJSON(w, err)
+		return
+	}
+	if user == nil {
+		errors.WriteJSON(w, errors.New(errors.CodeInternalError, "password reset succeeded without a user", nil))
 		return
 	}
 	slog.InfoContext(r.Context(), "password_changed",
