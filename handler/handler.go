@@ -33,6 +33,7 @@ type Handler struct {
 	loginIPLimiter  *ratelimit.Limiter
 	signupIPLimiter *ratelimit.Limiter
 	resetIPLimiter  *ratelimit.Limiter
+	oauthIPLimiter  *ratelimit.Limiter
 }
 
 // Option configures optional dependencies for Handler.
@@ -78,6 +79,15 @@ func WithIPRateLimiters(loginIP, resetIP, signupIP *ratelimit.Limiter) Option {
 	}
 }
 
+// WithOAuthIPLimiters attaches a custom in-memory IP-tier rate limiter for the
+// OAuth initiate/callback routes. No account tier exists: no identity is
+// authenticated before the callback completes.
+func WithOAuthIPLimiters(oauthIP *ratelimit.Limiter) Option {
+	return func(h *Handler) {
+		h.oauthIPLimiter = oauthIP
+	}
+}
+
 // New initializes the handler scaffold, registers routes, and applies CORS middleware.
 func New(db *gorm.DB, cfg config.Config, authSvc auth.Service, opts ...Option) http.Handler {
 	h := &Handler{
@@ -88,6 +98,13 @@ func New(db *gorm.DB, cfg config.Config, authSvc auth.Service, opts ...Option) h
 	}
 	for _, opt := range opts {
 		opt(h)
+	}
+
+	// OAuth limiter default mirrors the login IP tier. Zero Max disables
+	// throttling, matching the login/signup/reset behavior. Mounted routes
+	// stay outside csrf.Middleware: throttling applies as its own wrapper.
+	if h.oauthIPLimiter == nil && h.cfg.RateLimitOAuthIPMax > 0 {
+		h.oauthIPLimiter = ratelimit.NewLimiter(h.cfg.RateLimitOAuthWindow, h.cfg.RateLimitOAuthIPMax)
 	}
 
 	if h.sessionSvc == nil && db != nil {

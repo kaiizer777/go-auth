@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -23,12 +24,14 @@ import (
 
 // stubProvider is a scriptable Provider fake for linking-engine tests.
 type stubProvider struct {
+	mu         sync.Mutex
 	id         string
 	info       *UserInfo
 	infoErr    error
 	exchErr    error
 	gotVerifer string
 	calls      int
+	infoFunc   func() *UserInfo
 }
 
 func (f *stubProvider) ID() string { return f.id }
@@ -38,6 +41,8 @@ func (f *stubProvider) AuthURL(state, codeChallenge string) string {
 }
 
 func (f *stubProvider) ExchangeCode(_ context.Context, code, codeVerifier string) (*TokenResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.exchErr != nil {
 		return nil, f.exchErr
 	}
@@ -49,9 +54,14 @@ func (f *stubProvider) ExchangeCode(_ context.Context, code, codeVerifier string
 }
 
 func (f *stubProvider) FetchUserInfo(_ context.Context, _ *TokenResponse) (*UserInfo, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.calls++
 	if f.infoErr != nil {
 		return nil, f.infoErr
+	}
+	if f.infoFunc != nil {
+		return f.infoFunc(), nil
 	}
 	return f.info, nil
 }
@@ -72,6 +82,14 @@ func serviceTestDB(t *testing.T) *gorm.DB {
 	if err != nil {
 		t.Fatalf("open sqlite: %v", err)
 	}
+	// Single connection serializes concurrent writers (shared-cache memory
+	// SQLite has no busy wait); statement interleaving across goroutines
+	// still occurs, so check-then-act races remain observable.
+	sqlDB, err := database.DB()
+	if err != nil {
+		t.Fatalf("pool: %v", err)
+	}
+	sqlDB.SetMaxOpenConns(1)
 	ddl := `
 	CREATE TABLE IF NOT EXISTS users (
 		id TEXT PRIMARY KEY,
@@ -226,7 +244,7 @@ func TestHandleCallbackState(t *testing.T) {
 		_, cfg, _, svc := setupServiceTest(t, verifiedInfo())
 		state, cookie := mustInitiate(t, svc, cfg, "google")
 		rec, req := callbackRequest(state+"-tampered", cookie)
-		_, _, err := svc.HandleCallback(req.Context(), rec, req, "google", "code-1", state+"-tampered")
+		_, _, _, err := svc.HandleCallback(req.Context(), rec, req, "google", "code-1", state+"-tampered", db.SessionTypeCookie)
 		requireCode(t, err, errors.CodeOAuthStateInvalid, http.StatusForbidden)
 	})
 
@@ -235,7 +253,7 @@ func TestHandleCallbackState(t *testing.T) {
 		_, _, _, svc := setupServiceTest(t, verifiedInfo())
 		rec := httptest.NewRecorder()
 		req := httptest.NewRequest(http.MethodGet, "/auth/oauth/google/callback", nil)
-		_, _, err := svc.HandleCallback(req.Context(), rec, req, "google", "code-1", "whatever")
+		_, _, _, err := svc.HandleCallback(req.Context(), rec, req, "google", "code-1", "whatever", db.SessionTypeCookie)
 		requireCode(t, err, errors.CodeOAuthStateInvalid, http.StatusForbidden)
 	})
 
@@ -244,7 +262,7 @@ func TestHandleCallbackState(t *testing.T) {
 		_, cfg, _, svc := setupServiceTest(t, verifiedInfo())
 		state, cookie := mustInitiate(t, svc, cfg, "google")
 		rec, req := callbackRequest(state, cookie)
-		_, _, err := svc.HandleCallback(req.Context(), rec, req, "google", "", state)
+		_, _, _, err := svc.HandleCallback(req.Context(), rec, req, "google", "", state, db.SessionTypeCookie)
 		requireCode(t, err, errors.CodeOAuthCodeInvalid, http.StatusBadRequest)
 	})
 
@@ -254,7 +272,7 @@ func TestHandleCallbackState(t *testing.T) {
 		stub.exchErr = errors.New(errors.CodeOAuthProviderError, "oauth token exchange failed", nil)
 		state, cookie := mustInitiate(t, svc, cfg, "google")
 		rec, req := callbackRequest(state, cookie)
-		_, _, err := svc.HandleCallback(req.Context(), rec, req, "google", "code-1", state)
+		_, _, _, err := svc.HandleCallback(req.Context(), rec, req, "google", "code-1", state, db.SessionTypeCookie)
 		requireCode(t, err, errors.CodeOAuthProviderError, http.StatusBadGateway)
 	})
 }
@@ -266,7 +284,7 @@ func TestHandleCallbackEmailGate(t *testing.T) {
 			&UserInfo{ProviderID: "google", ProviderUserID: "sub-9", Email: "victim@example.com"})
 		state, cookie := mustInitiate(t, svc, cfg, "google")
 		rec, req := callbackRequest(state, cookie)
-		_, _, err := svc.HandleCallback(req.Context(), rec, req, "google", "code-1", state)
+		_, _, _, err := svc.HandleCallback(req.Context(), rec, req, "google", "code-1", state, db.SessionTypeCookie)
 		requireCode(t, err, errors.CodeOAuthEmailUnverified, http.StatusBadRequest)
 		if n := countRows(t, database, &db.User{}); n != 0 {
 			t.Fatalf("users = %d; want 0", n)
@@ -290,7 +308,7 @@ func TestHandleCallbackLinking(t *testing.T) {
 		}
 		state, cookie := mustInitiate(t, svc, cfg, "google")
 		rec, req := callbackRequest(state, cookie)
-		sess, _, err := svc.HandleCallback(req.Context(), rec, req, "google", "code-1", state)
+		sess, _, _, err := svc.HandleCallback(req.Context(), rec, req, "google", "code-1", state, db.SessionTypeCookie)
 		if err != nil {
 			t.Fatalf("HandleCallback = %v", err)
 		}
@@ -310,7 +328,7 @@ func TestHandleCallbackLinking(t *testing.T) {
 		database, cfg, _, svc := setupServiceTest(t, verifiedInfo())
 		state, cookie := mustInitiate(t, svc, cfg, "google")
 		rec, req := callbackRequest(state, cookie)
-		sess, _, err := svc.HandleCallback(req.Context(), rec, req, "google", "code-1", state)
+		sess, _, _, err := svc.HandleCallback(req.Context(), rec, req, "google", "code-1", state, db.SessionTypeCookie)
 		if err != nil {
 			t.Fatalf("HandleCallback = %v", err)
 		}
@@ -333,7 +351,7 @@ func TestHandleCallbackLinking(t *testing.T) {
 		for i := 0; i < 2; i++ {
 			state, cookie := mustInitiate(t, svc, cfg, "google")
 			rec, req := callbackRequest(state, cookie)
-			sess, _, err := svc.HandleCallback(req.Context(), rec, req, "google", "code-1", state)
+			sess, _, _, err := svc.HandleCallback(req.Context(), rec, req, "google", "code-1", state, db.SessionTypeCookie)
 			if err != nil {
 				t.Fatalf("login %d = %v", i, err)
 			}
@@ -363,7 +381,7 @@ func TestHandleCallbackLinking(t *testing.T) {
 		}
 		state, cookie := mustInitiate(t, svc, cfg, "google")
 		rec, req := callbackRequest(state, cookie)
-		_, _, err := svc.HandleCallback(req.Context(), rec, req, "google", "code-1", state)
+		_, _, _, err := svc.HandleCallback(req.Context(), rec, req, "google", "code-1", state, db.SessionTypeCookie)
 		requireCode(t, err, errors.CodeOAuthAccountLinkConflict, http.StatusConflict)
 		if n := countRows(t, database, &db.OAuthAccount{}); n != 0 {
 			t.Fatalf("oauth_accounts = %d; want 0", n)
@@ -379,7 +397,7 @@ func TestHandleCallbackLinking(t *testing.T) {
 		state, cookie := mustInitiate(t, svc, cfg, "google")
 		rec, req := callbackRequest(state, cookie)
 		before := time.Now()
-		_, _, err := svc.HandleCallback(req.Context(), rec, req, "google", "code-1", state)
+		_, _, _, err := svc.HandleCallback(req.Context(), rec, req, "google", "code-1", state, db.SessionTypeCookie)
 		if err != nil {
 			t.Fatalf("HandleCallback = %v", err)
 		}
@@ -416,7 +434,7 @@ func TestHandleCallbackNilGuards(t *testing.T) {
 	t.Run("nil request rejected without panic", func(t *testing.T) {
 		t.Parallel()
 		_, _, _, svc := setupServiceTest(t, verifiedInfo())
-		_, _, err := svc.HandleCallback(context.Background(), httptest.NewRecorder(), nil, "google", "c", "s")
+		_, _, _, err := svc.HandleCallback(context.Background(), httptest.NewRecorder(), nil, "google", "c", "s", db.SessionTypeCookie)
 		requireCode(t, err, errors.CodeValidationError, http.StatusBadRequest)
 	})
 
@@ -424,7 +442,7 @@ func TestHandleCallbackNilGuards(t *testing.T) {
 		t.Parallel()
 		_, _, _, svc := setupServiceTest(t, verifiedInfo())
 		req := httptest.NewRequest(http.MethodGet, "/auth/oauth/google/callback", nil)
-		_, _, err := svc.HandleCallback(req.Context(), nil, req, "google", "c", "s")
+		_, _, _, err := svc.HandleCallback(req.Context(), nil, req, "google", "c", "s", db.SessionTypeCookie)
 		requireCode(t, err, errors.CodeValidationError, http.StatusBadRequest)
 	})
 }
@@ -504,4 +522,53 @@ func TestLinkOrCreateConcurrent(t *testing.T) {
 			t.Fatalf("oauth_accounts = %d; want 1", n)
 		}
 	})
+}
+
+func TestHandleCallbackConcurrentSameIdentityConverges(t *testing.T) {
+	database, cfg, stub, svc := setupServiceTest(t, verifiedInfo())
+	var n int64
+	stub.infoFunc = func() *UserInfo {
+		i := atomic.AddInt64(&n, 1)
+		return &UserInfo{ProviderID: "google", ProviderUserID: "sub-race",
+			Email: fmt.Sprintf("race-%d@example.com", i), EmailVerified: true}
+	}
+	const workers = 8
+	states := make([]string, workers)
+	cookies := make([]*http.Cookie, workers)
+	for i := 0; i < workers; i++ {
+		states[i], cookies[i] = mustInitiate(t, svc, cfg, "google")
+	}
+	type outcome struct {
+		userID uuid.UUID
+		err    error
+	}
+	results := make([]outcome, workers)
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			rec, req := callbackRequest(states[i], cookies[i])
+			sess, _, _, err := svc.HandleCallback(req.Context(), rec, req, "google", "code-1", states[i], db.SessionTypeCookie)
+			if err == nil && sess != nil {
+				results[i].userID = sess.UserID
+			}
+			results[i].err = err
+		}(i)
+	}
+	wg.Wait()
+	for i, r := range results {
+		if r.err != nil {
+			t.Fatalf("callback %d: %v", i, r.err)
+		}
+		if i > 0 && r.userID != results[0].userID {
+			t.Fatalf("callback %d user %v; want %v", i, r.userID, results[0].userID)
+		}
+	}
+	if n := countRows(t, database, &db.User{}); n != 1 {
+		t.Fatalf("users = %d; want 1 (orphan user committed)", n)
+	}
+	if n := countRows(t, database, &db.OAuthAccount{}); n != 1 {
+		t.Fatalf("links = %d; want 1", n)
+	}
 }

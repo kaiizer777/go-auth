@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"gorm.io/gorm"
@@ -16,6 +17,7 @@ import (
 	"github.com/kaiizer777/go-auth/db"
 	"github.com/kaiizer777/go-auth/errors"
 	"github.com/kaiizer777/go-auth/oauth"
+	"github.com/kaiizer777/go-auth/ratelimit"
 	"github.com/kaiizer777/go-auth/session"
 )
 
@@ -57,7 +59,7 @@ func oauthTestConfig() config.Config {
 	return cfg
 }
 
-func oauthTestEnv(t *testing.T, info *oauth.UserInfo) (*gorm.DB, http.Handler) {
+func oauthTestEnv(t *testing.T, info *oauth.UserInfo, opts ...Option) (*gorm.DB, http.Handler) {
 	t.Helper()
 	database := setupTestDB(t)
 	if err := database.Exec(`CREATE TABLE IF NOT EXISTS oauth_accounts (
@@ -79,9 +81,12 @@ func oauthTestEnv(t *testing.T, info *oauth.UserInfo) (*gorm.DB, http.Handler) {
 	providers := map[string]oauth.Provider{"google": stub, "apple": appleStub}
 	sessionSvc := session.NewService(database, &cfg)
 	oauthSvc := oauth.NewService(database, sessionSvc, providers, &cfg)
+	args := []Option{
 		WithSessionService(sessionSvc),
 		WithOAuthService(oauthSvc, providers),
-	)
+	}
+	args = append(args, opts...)
+	h := New(database, cfg, nil, args...)
 	return database, h
 }
 
@@ -99,6 +104,7 @@ func attachBrowserCookies(req *http.Request, cookies []*http.Cookie) {
 			continue
 		}
 		req.AddCookie(c)
+	}
 }
 
 // driveInitiate performs a real initiate through the router.
@@ -443,6 +449,190 @@ func TestOAuthCallbackRoute(t *testing.T) {
 		}
 		if code := decodeErrCode(t, rec); code != errors.CodeOAuthAccountLinkConflict {
 			t.Fatalf("code = %s; want OAUTH_ACCOUNT_LINK_CONFLICT", code)
+		}
+	})
+}
+
+func TestOAuthCallbackBearerBranch(t *testing.T) {
+	bearerInfo := &oauth.UserInfo{ProviderID: "google", ProviderUserID: "sub-bearer", Email: "bearer@example.com", EmailVerified: true}
+	cases := []struct {
+		name  string
+		apply func(*http.Request)
+	}{
+		{"type query", func(r *http.Request) {
+			q := r.URL.Query()
+			q.Set("type", "bearer")
+			r.URL.RawQuery = q.Encode()
+		}},
+		{"auth type header", func(r *http.Request) { r.Header.Set("X-Auth-Type", "bearer") }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			database, h := oauthTestEnv(t, bearerInfo)
+			state, cookies, _ := driveInitiate(t, h, "/auth/oauth/google")
+			req := httptest.NewRequest(http.MethodGet, "/auth/oauth/google/callback?code=c&state="+state, nil)
+			tc.apply(req)
+			req.AddCookie(stateCookie(t, cookies))
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d; want 200 (%s)", rec.Code, rec.Body.String())
+			}
+			var body struct {
+				UserID    uuid.UUID `json:"user_id"`
+				Token     string    `json:"token"`
+				ExpiresAt time.Time `json:"expires_at"`
+			}
+			if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			if body.Token == "" {
+				t.Fatal("bearer branch returned no token")
+			}
+			cfg := oauthTestConfig()
+			for _, c := range rec.Result().Cookies() {
+				if c.Name == cfg.SessionCookieName {
+					t.Fatal("bearer branch must not set a session cookie")
+				}
+			}
+			svc := session.NewService(database, &cfg)
+			sess, err := svc.GetSession(context.Background(), body.Token)
+			if err != nil {
+				t.Fatalf("bearer token rejected: %v", err)
+			}
+			if sess.Type != db.SessionTypeBearer {
+				t.Fatalf("session type = %q; want bearer", sess.Type)
+			}
+			if sess.UserID != body.UserID {
+				t.Fatal("token session user mismatch")
+			}
+		})
+	}
+}
+
+func TestOAuthCallbackIssuesCSRF(t *testing.T) {
+	csrfInfo := &oauth.UserInfo{ProviderID: "google", ProviderUserID: "sub-csrf", Email: "csrf@example.com", EmailVerified: true}
+
+	t.Run("302 sets CSRF cookie", func(t *testing.T) {
+		_, h := oauthTestEnv(t, csrfInfo)
+		state, cookies, _ := driveInitiate(t, h, "/auth/oauth/google")
+		req := httptest.NewRequest(http.MethodGet, "/auth/oauth/google/callback?code=c&state="+state, nil)
+		req.AddCookie(stateCookie(t, cookies))
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusFound {
+			t.Fatalf("status = %d; want 302 (%s)", rec.Code, rec.Body.String())
+		}
+		cfg := oauthTestConfig()
+		found := ""
+		for _, c := range rec.Result().Cookies() {
+			if c.Name == cfg.CSRFCookieName {
+				found = c.Value
+			}
+		}
+		if found == "" {
+			t.Fatal("302 branch issued no CSRF cookie")
+		}
+	})
+
+	t.Run("JSON returns csrf_token matching cookie", func(t *testing.T) {
+		_, h := oauthTestEnv(t, csrfInfo)
+		state, cookies, _ := driveInitiate(t, h, "/auth/oauth/google")
+		req := httptest.NewRequest(http.MethodGet, "/auth/oauth/google/callback?code=c&state="+state, nil)
+		req.Header.Set("Accept", "application/json")
+		req.AddCookie(stateCookie(t, cookies))
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d; want 200 (%s)", rec.Code, rec.Body.String())
+		}
+		var body struct {
+			CSRFToken string `json:"csrf_token"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if body.CSRFToken == "" {
+			t.Fatal("JSON branch returned no csrf_token")
+		}
+		cfg := oauthTestConfig()
+		cookieVal := ""
+		for _, c := range rec.Result().Cookies() {
+			if c.Name == cfg.CSRFCookieName {
+				cookieVal = c.Value
+			}
+		}
+		if cookieVal == "" {
+			t.Fatal("JSON branch issued no CSRF cookie")
+		}
+		if body.CSRFToken != cookieVal {
+			t.Fatal("csrf_token body does not match CSRF cookie")
+		}
+	})
+}
+
+func TestOAuthCallbackFormPostProviderError(t *testing.T) {
+	_, h := oauthTestEnv(t, &oauth.UserInfo{ProviderID: "google", ProviderUserID: "sub-err", Email: "err@example.com", EmailVerified: true})
+	state, cookies, _ := driveInitiate(t, h, "/auth/oauth/google")
+	form := url.Values{"error": {"access_denied"}, "state": {state}}.Encode()
+	req := httptest.NewRequest(http.MethodPost, "/auth/oauth/google/callback",
+		strings.NewReader(form))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.AddCookie(stateCookie(t, cookies))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d; want 502", rec.Code)
+	}
+	if code := decodeErrCode(t, rec); code != errors.CodeOAuthProviderError {
+		t.Fatalf("code = %s; want OAUTH_PROVIDER_ERROR", code)
+	}
+}
+
+func TestOAuthRateLimited(t *testing.T) {
+	rlInfo := &oauth.UserInfo{ProviderID: "google", ProviderUserID: "sub-rl", Email: "rl@example.com", EmailVerified: true}
+
+	t.Run("initiate throttled per IP", func(t *testing.T) {
+		_, h := oauthTestEnv(t, rlInfo, WithOAuthIPLimiters(ratelimit.NewLimiter(time.Minute, 1)))
+		first := httptest.NewRequest(http.MethodGet, "/auth/oauth/google", nil)
+		firstRec := httptest.NewRecorder()
+		h.ServeHTTP(firstRec, first)
+		if firstRec.Code != http.StatusFound {
+			t.Fatalf("first initiate: status = %d; want 302", firstRec.Code)
+		}
+		second := httptest.NewRequest(http.MethodGet, "/auth/oauth/google", nil)
+		secondRec := httptest.NewRecorder()
+		h.ServeHTTP(secondRec, second)
+		if secondRec.Code != http.StatusTooManyRequests {
+			t.Fatalf("second initiate: status = %d; want 429", secondRec.Code)
+		}
+		if code := decodeErrCode(t, secondRec); code != errors.CodeRateLimitExceeded {
+			t.Fatalf("code = %s; want RATE_LIMIT_EXCEEDED", code)
+		}
+	})
+
+	t.Run("callback throttled per IP", func(t *testing.T) {
+		_, h := oauthTestEnv(t, rlInfo, WithOAuthIPLimiters(ratelimit.NewLimiter(time.Minute, 1)))
+		state, cookies, _ := driveInitiate(t, h, "/auth/oauth/google")
+		req := httptest.NewRequest(http.MethodGet, "/auth/oauth/google/callback?code=c&state="+state, nil)
+		req.AddCookie(stateCookie(t, cookies))
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusTooManyRequests {
+			t.Fatalf("callback: status = %d; want 429", rec.Code)
+		}
+		if code := decodeErrCode(t, rec); code != errors.CodeRateLimitExceeded {
+			t.Fatalf("code = %s; want RATE_LIMIT_EXCEEDED", code)
+		}
+	})
+
+	t.Run("default limiter allows normal use", func(t *testing.T) {
+		_, h := oauthTestEnv(t, rlInfo)
+		req := httptest.NewRequest(http.MethodGet, "/auth/oauth/google", nil)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusFound {
+			t.Fatalf("initiate with default limiter: status = %d; want 302", rec.Code)
 		}
 	})
 }

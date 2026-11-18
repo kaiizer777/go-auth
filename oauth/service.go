@@ -23,8 +23,11 @@ type Service interface {
 	InitiateFlow(w http.ResponseWriter, r *http.Request, providerID string) (string, error)
 
 	// HandleCallback validates state/PKCE, exchanges the code, links/creates the user,
-	// issues a session (cookie already set on w), and returns the session plus redirect target.
-	HandleCallback(ctx context.Context, w http.ResponseWriter, r *http.Request, providerID, code, state string) (*session.Session, string, error)
+	// issues a session, and returns the session, its raw ID, and the redirect target.
+	// sessType selects the minted session transport: cookie sessions are set on w
+	// (cookie callers ignore the raw return); bearer sessions set no cookie and the
+	// caller relays the raw token out of band. Raw IDs are never logged.
+	HandleCallback(ctx context.Context, w http.ResponseWriter, r *http.Request, providerID, code, state string, sessType db.SessionType) (*session.Session, string, string, error)
 }
 
 type service struct {
@@ -112,7 +115,7 @@ func (s *service) HandleCallback(ctx context.Context, w http.ResponseWriter, r *
 	if r != nil {
 		ua = r.UserAgent()
 	}
-	fail := func(reason string, err error) (*session.Session, string, error) {
+	fail := func(reason string, err error) (*session.Session, string, string, error) {
 		attrs := []any{
 			"provider", providerID,
 			"reason", reason,
@@ -126,7 +129,7 @@ func (s *service) HandleCallback(ctx context.Context, w http.ResponseWriter, r *
 			attrs = append(attrs, "error", err.Error())
 		}
 		slog.InfoContext(ctx, "oauth_callback_failure", attrs...)
-		return nil, "", err
+		return nil, "", "", err
 	}
 	if w == nil || r == nil {
 		return fail("invalid_request", errors.New(errors.CodeValidationError, "invalid oauth callback request", nil))
@@ -169,18 +172,21 @@ func (s *service) HandleCallback(ctx context.Context, w http.ResponseWriter, r *
 		return fail("link_failed", err)
 	}
 
-	sess, rawID, err := s.sessionSvc.CreateSession(ctx, user.ID, user.CredentialVersion, db.SessionTypeCookie, ip, ua)
+	sess, rawID, err := s.sessionSvc.CreateSession(ctx, user.ID, user.CredentialVersion, sessType, ip, ua)
 	if err != nil {
 		return fail("session_failed", err)
 	}
-	// The service issues the cookie because it alone holds the raw session
-	// ID, which the Service interface never returns and nothing ever logs.
-	// Moving issuance to the handler would widen the interface to leak the
-	// raw token; w is non-nil by the entry guard above.
-	session.SetSessionCookie(w, rawID, s.cfg)
+	// Cookie sessions are issued here because the service alone holds the raw
+	// ID (w is non-nil by the entry guard above). Bearer sessions set no
+	// cookie: cookie plus declared-bearer transport is ambiguous and is
+	// rejected by the CSRF middleware and the RequireAuth binding. The raw
+	// token returns to the caller, which relays it in the JSON body.
+	if sessType != db.SessionTypeBearer {
+		session.SetSessionCookie(w, rawID, s.cfg)
+	}
 	// ValidateState already cleared the state cookie single-use; clear again
 	// post-issuance so no success path can leave it behind.
-	ClearStateCookie(w, s.cfg)
+	ClearStateCookie(w, s.cfg, providerID)
 
 	// Empty redirect defaults to "/". The handler applies safeOAuthRedirect
 	// to both the 302 and JSON branches, so no absolute URL may pass through.
@@ -213,7 +219,7 @@ func (s *service) HandleCallback(ctx context.Context, w http.ResponseWriter, r *
 			"email", db.NormalizeEmail(user.Email),
 		)
 	}
-	return sess, redirect, nil
+	return sess, rawID, redirect, nil
 }
 
 // isUniqueViolation reports driver-agnostic unique-constraint conflicts:
@@ -307,6 +313,10 @@ func (s *service) linkOrCreate(ctx context.Context, providerID string, info *Use
 	uerr := s.db.WithContext(ctx).Where("LOWER(email) = LOWER(?)", info.Email).First(&existing).Error
 	if uerr == nil {
 		// Pre-hijacking defense: never link onto an unverified local account.
+		// The 409 is permanent by design: it mirrors password signup, which
+		// refuses an already-registered email instead of taking it over, and
+		// no verification-mail or takeover flow exists in this service. The
+		// address stays blocked until the squatting row is removed out of band.
 		if !existing.EmailVerified {
 			return db.User{}, false, false, errors.ErrOAuthAccountLinkConflict
 		}
@@ -336,12 +346,6 @@ func (s *service) linkOrCreate(ctx context.Context, providerID string, info *Use
 		PasswordHash:  "",
 		EmailVerified: true,
 	}
-	if cerr := s.db.WithContext(ctx).Create(&user).Error; cerr != nil {
-		if isUniqueViolation(cerr) {
-			return s.linkRacedUser(ctx, providerID, info)
-		}
-		return db.User{}, false, false, errors.New(errors.CodeInternalError, "failed to create oauth user", cerr)
-	}
 	row := db.OAuthAccount{
 		ID:             uuid.New(),
 		UserID:         user.ID,
@@ -349,11 +353,34 @@ func (s *service) linkOrCreate(ctx context.Context, providerID string, info *Use
 		ProviderUserID: info.ProviderUserID,
 		Email:          info.Email,
 	}
-	if cerr := s.db.WithContext(ctx).Create(&row).Error; cerr != nil {
-		if isUniqueViolation(cerr) {
+	// User + link commit atomically: separate inserts let a cancel land
+	// between them (verified user, no link) or a lost link race orphan the
+	// loser's freshly-committed user. Unique conflicts roll the transaction
+	// back before converging on the winner. Session creation stays
+	// post-commit: cookie issuance cannot roll back. The EmailVerified gate
+	// above is preserved via linkRacedUser, which re-checks it on convergence.
+	userConflict, linkConflict := false, false
+	op := "failed to create oauth user"
+	txErr := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Create(&user).Error; err != nil {
+			userConflict = isUniqueViolation(err)
+			return err
+		}
+		op = "failed to link oauth account"
+		if err := tx.Create(&row).Error; err != nil {
+			linkConflict = isUniqueViolation(err)
+			return err
+		}
+		return nil
+	})
+	if txErr != nil {
+		if userConflict {
+			return s.linkRacedUser(ctx, providerID, info)
+		}
+		if linkConflict {
 			return s.relinkExisting(ctx, providerID, info.ProviderUserID)
 		}
-		return db.User{}, false, false, errors.New(errors.CodeInternalError, "failed to link oauth account", cerr)
+		return db.User{}, false, false, errors.New(errors.CodeInternalError, op, txErr)
 	}
 	return user, true, true, nil
 }

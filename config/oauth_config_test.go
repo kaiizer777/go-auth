@@ -217,6 +217,20 @@ func TestConfigValidate_OAuth(t *testing.T) {
 			wantErr: errors.ErrOAuthStateCookieNameInvalid,
 		},
 		{
+			name: "state cookie name collides with session cookie rejected",
+			mutate: func(c *Config) {
+				c.OAuth.StateCookieName = c.SessionCookieName
+			},
+			wantErr: errors.ErrOAuthStateCookieNameCollision,
+		},
+		{
+			name: "state cookie name collides with CSRF cookie rejected",
+			mutate: func(c *Config) {
+				c.OAuth.StateCookieName = c.CSRFCookieName
+			},
+			wantErr: errors.ErrOAuthStateCookieNameCollision,
+		},
+		{
 			name: "bad state cookie path rejected",
 			mutate: func(c *Config) {
 				c.OAuth.StateCookiePath = "relative/path"

@@ -80,7 +80,7 @@ type OAuthConfig struct {
 	StateCookieName string        // Default: "oauth_state"
 	StateCookiePath string        // Default: "/" (ensures cookies are sent on /auth/oauth/* and /api/auth/oauth/*)
 	StateTTL        time.Duration // Default: 10 * time.Minute
-	StateSecret     string        // Cryptographic HMAC key for signing state tokens (falls back to startup CSPRNG if empty)
+	StateSecret     string        // Required when any OAuth provider is enabled; empty fails closed at startup. Min 32 bytes.
 	CallbackBaseURL string        // e.g. "https://api.example.com"
 	// StateCookieSameSite is the base SameSite policy for the OAuth state
 	// cookie on GET-redirect flows. Default: Lax. form_post providers (Apple)
@@ -188,6 +188,8 @@ type Config struct {
 	RateLimitSignupWindow time.Duration // for signup; default 15m
 	RateLimitSignupMax    int           // default 10
 	RateLimitSignupIPMax  int           // max signups per IP in window; default 50
+	RateLimitOAuthWindow  time.Duration // for oauth initiate/callback; default 15m
+	RateLimitOAuthIPMax   int           // max oauth calls per IP in window; default 100
 	RateLimitCleanupTick  time.Duration // how often to prune expired entries; default 5m
 }
 
@@ -257,6 +259,8 @@ func DefaultConfig() Config {
 		RateLimitSignupWindow: 15 * time.Minute,
 		RateLimitSignupMax:    10,
 		RateLimitSignupIPMax:  50,
+		RateLimitOAuthWindow:  15 * time.Minute,
+		RateLimitOAuthIPMax:   100,
 		RateLimitCleanupTick:  5 * time.Minute,
 	}
 }
@@ -518,7 +522,7 @@ func (c *Config) Validate() error {
 		slog.Warn("SessionCookieSecure is false — not safe for production")
 	}
 
-	if c.RateLimitLoginWindow < 0 || c.RateLimitResetWindow < 0 || c.RateLimitSignupWindow < 0 || c.RateLimitCleanupTick < 0 {
+	if c.RateLimitLoginWindow < 0 || c.RateLimitResetWindow < 0 || c.RateLimitSignupWindow < 0 || c.RateLimitOAuthWindow < 0 || c.RateLimitCleanupTick < 0 {
 		return errors.ErrRateLimitWindowInvalid
 	}
 	if c.RateLimitLoginWindow == 0 {
@@ -529,6 +533,9 @@ func (c *Config) Validate() error {
 	}
 	if c.RateLimitSignupWindow == 0 {
 		c.RateLimitSignupWindow = 15 * time.Minute
+	}
+	if c.RateLimitOAuthWindow == 0 {
+		c.RateLimitOAuthWindow = 15 * time.Minute
 	}
 	if c.RateLimitCleanupTick == 0 {
 		c.RateLimitCleanupTick = 5 * time.Minute
@@ -552,8 +559,12 @@ func (c *Config) Validate() error {
 	if c.RateLimitSignupIPMax == 0 {
 		c.RateLimitSignupIPMax = c.RateLimitSignupMax * 5
 	}
+	if c.RateLimitOAuthIPMax == 0 {
+		c.RateLimitOAuthIPMax = 100
+	}
 	if c.RateLimitLoginMax < 1 || c.RateLimitResetMax < 1 || c.RateLimitSignupMax < 1 ||
-		c.RateLimitLoginIPMax < 1 || c.RateLimitResetIPMax < 1 || c.RateLimitSignupIPMax < 1 {
+		c.RateLimitLoginIPMax < 1 || c.RateLimitResetIPMax < 1 || c.RateLimitSignupIPMax < 1 ||
+		c.RateLimitOAuthIPMax < 1 {
 		return errors.ErrRateLimitMaxInvalid
 	}
 

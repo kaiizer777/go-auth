@@ -98,6 +98,7 @@ func NewWithDB(database *gorm.DB, cfg config.Config) (*Auth, error) {
 	resetIPLimiter := ratelimit.NewLimiter(cfg.RateLimitResetWindow, cfg.RateLimitResetIPMax)
 	signupLimiter := ratelimit.NewLimiter(cfg.RateLimitSignupWindow, cfg.RateLimitSignupMax)
 	signupIPLimiter := ratelimit.NewLimiter(cfg.RateLimitSignupWindow, cfg.RateLimitSignupIPMax)
+	oauthIPLimiter := ratelimit.NewLimiter(cfg.RateLimitOAuthWindow, cfg.RateLimitOAuthIPMax)
 
 	limiterDone := make(chan struct{})
 	cleanupTick := cfg.RateLimitCleanupTick
@@ -110,6 +111,7 @@ func NewWithDB(database *gorm.DB, cfg config.Config) (*Auth, error) {
 	resetIPLimiter.StartCleanup(cleanupTick, limiterDone)
 	signupLimiter.StartCleanup(cleanupTick, limiterDone)
 	signupIPLimiter.StartCleanup(cleanupTick, limiterDone)
+	oauthIPLimiter.StartCleanup(cleanupTick, limiterDone)
 
 	sessHandler := handler.NewSessionHandler(sessionSvc, database, &cfg)
 
@@ -136,6 +138,7 @@ func NewWithDB(database *gorm.DB, cfg config.Config) (*Auth, error) {
 		handler.WithSessionHandler(sessHandler),
 		handler.WithRateLimiters(loginLimiter, resetLimiter, signupLimiter),
 		handler.WithIPRateLimiters(loginIPLimiter, resetIPLimiter, signupIPLimiter),
+		handler.WithOAuthIPLimiters(oauthIPLimiter),
 	}
 	if oauthOpt != nil {
 		handlerOpts = append(handlerOpts, oauthOpt)

@@ -418,7 +418,7 @@ func TestOAuthSecurity_StateRejected(t *testing.T) {
 		req := httptest.NewRequest(http.MethodGet, "/auth/oauth/google/callback", nil)
 		req.AddCookie(cookie)
 		rec := httptest.NewRecorder()
-		_, _, err = svc.HandleCallback(req.Context(), rec, req, "google", "code-1", expiredState)
+		_, _, _, err = svc.HandleCallback(req.Context(), rec, req, "google", "code-1", expiredState, db.SessionTypeCookie)
 		secRequireCode(t, err, apperrors.CodeOAuthStateInvalid, http.StatusForbidden)
 
 		w2 := httptest.NewRecorder()
@@ -427,7 +427,7 @@ func TestOAuthSecurity_StateRejected(t *testing.T) {
 		}
 		req2 := httptest.NewRequest(http.MethodGet, "/auth/oauth/google/callback", nil)
 		req2.AddCookie(secFindCookie(w2.Result().Cookies(), cfg.OAuth.StateCookieName))
-		_, _, err = svc.HandleCallback(req2.Context(), httptest.NewRecorder(), req2, "google", "code-1", "")
+		_, _, _, err = svc.HandleCallback(req2.Context(), httptest.NewRecorder(), req2, "google", "code-1", "", db.SessionTypeCookie)
 		secRequireCode(t, err, apperrors.CodeOAuthStateInvalid, http.StatusForbidden)
 	})
 }
