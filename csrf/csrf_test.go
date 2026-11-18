@@ -469,6 +469,31 @@ func TestCSRF_BearerAuthAmbiguousTransportRejected(t *testing.T) {
 	})
 }
 
+func TestCSRF_XAuthTypeCaseMismatchNotExempt(t *testing.T) {
+	cfg := testConfig()
+	mw := Middleware(cfg)(dummyHandler())
+
+	t.Run("capitalized bearer requires pair", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/resource", nil)
+		req.Header.Set("X-Auth-Type", "Bearer")
+		rec := httptest.NewRecorder()
+		mw.ServeHTTP(rec, req)
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("expected 403 for non-canonical declaration, got %d", rec.Code)
+		}
+	})
+
+	t.Run("exact bearer exempt without pair", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/resource", nil)
+		req.Header.Set("X-Auth-Type", "bearer")
+		rec := httptest.NewRecorder()
+		mw.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200 cookie-free bearer, got %d", rec.Code)
+		}
+	})
+}
+
 func TestCSRF_EntropyFailure(t *testing.T) {
 	origRand := randReader
 	defer func() { randReader = origRand }()

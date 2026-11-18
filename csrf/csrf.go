@@ -110,7 +110,9 @@ func Middleware(cfg *config.Config) func(http.Handler) http.Handler {
 			// Query parameters never confer exemption. A session cookie alongside
 			// the declaration is ambiguous transport and is rejected outright.
 			// Below the safe-method skip: safe methods never 403 here.
-			if strings.EqualFold(r.Header.Get("X-Auth-Type"), "bearer") {
+			// Exact "bearer" mirrors Login's transport check: the exemption
+			// applies only when the handler treats the request as bearer.
+			if r.Header.Get("X-Auth-Type") == "bearer" {
 				if c, cookieErr := r.Cookie(cfg.SessionCookieName); cookieErr == nil && c.Value != "" {
 					logViolation(r, string(apperrors.CodeCSRFTokenInvalid))
 					apperrors.WriteHTTP(w, apperrors.ErrCSRFTokenInvalid)
