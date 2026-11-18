@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/kaiizer777/go-auth/config"
 	"github.com/kaiizer777/go-auth/db"
 	"github.com/kaiizer777/go-auth/errors"
 )
@@ -89,6 +90,30 @@ func TestGetCSRFToken_NoStore(t *testing.T) {
 				t.Fatalf("expected Cache-Control no-store, got %q", got)
 			}
 		})
+	}
+}
+
+func TestGetCSRFToken_CookieNameCollisionRejected(t *testing.T) {
+	_, _, h, _ := setupTestEnv(t, func(c *config.Config) {
+		c.CSRFCookieName = c.SessionCookieName
+	})
+	sidVal := strings.Repeat("a", 64)
+	req := httptest.NewRequest(http.MethodGet, "/auth/csrf", nil)
+	req.AddCookie(&http.Cookie{Name: "sid", Value: sidVal})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500 collision reject, got %d", rec.Code)
+	}
+	// Prod masking collapses 500s to INTERNAL_ERROR; status is the contract.
+	if code := decodeErrCode(t, rec); code != errors.CodeInternalError {
+		t.Fatalf("expected INTERNAL_ERROR, got %s", code)
+	}
+	if strings.Contains(rec.Body.String(), sidVal) {
+		t.Fatal("response must not echo session credential")
+	}
+	if len(rec.Result().Cookies()) != 0 {
+		t.Fatal("colliding config must not set any cookie")
 	}
 }
 
