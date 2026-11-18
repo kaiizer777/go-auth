@@ -311,8 +311,9 @@ var (
 	ErrCSRFHeaderNameInvalid           = New(CodeInvalidConfig, "CSRF header name is invalid", nil)
 	ErrFrameOptionsInvalid             = New(CodeInvalidConfig, "frame options must be DENY or SAMEORIGIN", nil)
 	ErrHSTSMaxAgeNegative              = New(CodeInvalidConfig, "HSTS max age cannot be negative", nil)
+	ErrHSTSMaxAgeTooSmall              = New(CodeInvalidConfig, "HSTS max age must be at least one second", nil)
 	ErrReferrerPolicyInvalid           = New(CodeInvalidConfig, "referrer policy is invalid", nil)
-	ErrCSRFCookieMaxAgeInvalid         = New(CodeInvalidConfig, "CSRF cookie max age must be greater than zero", nil)
+	ErrCSRFCookieMaxAgeInvalid         = New(CodeInvalidConfig, "CSRF cookie max age must be at least one second", nil)
 
 	// Predefined sentinel errors for Phase 3 Core Auth.
 	ErrInvalidCredentials = New(CodeInvalidCredentials, "invalid email or password", nil)

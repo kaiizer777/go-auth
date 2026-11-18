@@ -1444,6 +1444,14 @@ func TestConfigValidate_SecurityHeaders(t *testing.T) {
 		t.Errorf(`HSTSMaxAge err = %v`, err)
 	}
 
+	subSecondHSTS := DefaultConfig()
+	subSecondHSTS.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+	subSecondHSTS.BaseURL = "https://example.com"
+	subSecondHSTS.SecurityHeaders.HSTSMaxAge = 500 * time.Millisecond
+	if err := subSecondHSTS.Validate(); err != errors.ErrHSTSMaxAgeTooSmall {
+		t.Errorf(`sub-second HSTSMaxAge err = %v`, err)
+	}
+
 	badRef := DefaultConfig()
 	badRef.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
 	badRef.BaseURL = "https://example.com"
@@ -1458,5 +1466,13 @@ func TestConfigValidate_SecurityHeaders(t *testing.T) {
 	zeroCSRF.CSRFCookieMaxAge = -time.Second
 	if err := zeroCSRF.Validate(); err != errors.ErrCSRFCookieMaxAgeInvalid {
 		t.Errorf(`CSRFCookieMaxAge err = %v`, err)
+	}
+
+	subSecondCSRF := DefaultConfig()
+	subSecondCSRF.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+	subSecondCSRF.BaseURL = "https://example.com"
+	subSecondCSRF.CSRFCookieMaxAge = 500 * time.Millisecond
+	if err := subSecondCSRF.Validate(); err != errors.ErrCSRFCookieMaxAgeInvalid {
+		t.Errorf(`sub-second CSRFCookieMaxAge err = %v`, err)
 	}
 }

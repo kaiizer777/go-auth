@@ -373,7 +373,8 @@ func (c *Config) Validate() error {
 	if c.CSRFCookieMaxAge == 0 {
 		c.CSRFCookieMaxAge = 24 * time.Hour
 	}
-	if c.CSRFCookieMaxAge <= 0 {
+	// Sub-second ages truncate to MaxAge=0 on the wire and the cookie is discarded.
+	if c.CSRFCookieMaxAge < time.Second {
 		return errors.ErrCSRFCookieMaxAgeInvalid
 	}
 	if c.SecurityHeaders.FrameOptions == "" {
@@ -399,6 +400,11 @@ func (c *Config) Validate() error {
 	}
 	if c.SecurityHeaders.HSTSMaxAge < 0 {
 		return errors.ErrHSTSMaxAgeNegative
+	}
+	// Sub-second ages truncate to max-age=0 and strip the HSTS policy.
+	// Zero was defaulted above, so any remaining sub-second value is explicit.
+	if c.SecurityHeaders.HSTSMaxAge < time.Second {
+		return errors.ErrHSTSMaxAgeTooSmall
 	}
 
 	if c.SessionIdleTimeout == 0 {
