@@ -64,6 +64,34 @@ func TestGetCSRFToken_IssuesMatchingPair(t *testing.T) {
 	}
 }
 
+func TestGetCSRFToken_NoStore(t *testing.T) {
+	_, _, h, _ := setupTestEnv(t)
+	_, token := csrfPair(t, h)
+
+	for _, tc := range []struct {
+		name  string
+		setup func(r *http.Request)
+	}{
+		{"fresh issue", func(r *http.Request) {}},
+		{"reuse valid cookie", func(r *http.Request) {
+			r.AddCookie(&http.Cookie{Name: "csrf_token", Value: token})
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/auth/csrf", nil)
+			tc.setup(req)
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("expected 200, got %d", rec.Code)
+			}
+			if got := rec.Header().Get("Cache-Control"); got != "no-store" {
+				t.Fatalf("expected Cache-Control no-store, got %q", got)
+			}
+		})
+	}
+}
+
 func TestGetCSRFToken_AliasMatches(t *testing.T) {
 	_, _, h, _ := setupTestEnv(t)
 	req := httptest.NewRequest(http.MethodGet, "/api/auth/csrf", nil)

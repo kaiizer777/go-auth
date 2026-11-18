@@ -10,6 +10,8 @@ import (
 // GetCSRFToken issues or refreshes the CSRF double-submit cookie for SPA clients.
 // An already-valid cookie is reused (expiry refreshed) to avoid multi-tab overwrites.
 func (h *Handler) GetCSRFToken(w http.ResponseWriter, r *http.Request) {
+	// Token responses carry the cookie value; never let caches store them.
+	w.Header().Set("Cache-Control", "no-store")
 	cfg := &h.cfg
 	if c, err := r.Cookie(cfg.CSRFCookieName); err == nil && csrf.ValidToken(c.Value) {
 		csrf.SetCookie(w, c.Value, cfg)
