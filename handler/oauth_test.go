@@ -73,14 +73,32 @@ func oauthTestEnv(t *testing.T, info *oauth.UserInfo) (*gorm.DB, http.Handler) {
 	}
 	cfg := oauthTestConfig()
 	stub := &stubOAuthProvider{id: "google", info: info}
+	appleInfo := *info
+	appleInfo.ProviderID = "apple"
+	appleStub := &stubOAuthProvider{id: "apple", info: &appleInfo}
+	providers := map[string]oauth.Provider{"google": stub, "apple": appleStub}
 	sessionSvc := session.NewService(database, &cfg)
-	oauthSvc := oauth.NewService(database, sessionSvc,
-		map[string]oauth.Provider{"google": stub}, &cfg)
-	h := New(database, cfg, nil,
+	oauthSvc := oauth.NewService(database, sessionSvc, providers, &cfg)
 		WithSessionService(sessionSvc),
-		WithOAuthService(oauthSvc, map[string]oauth.Provider{"google": stub}),
+		WithOAuthService(oauthSvc, providers),
 	)
 	return database, h
+}
+
+// attachBrowserCookies forwards initiate cookies the way a browser would: Lax
+// cookies are withheld on cross-site POST (Apple form_post) and Secure
+// cookies need HTTPS. httptest applies no cookie policy, so tests that
+// hand-inject with AddCookie cannot observe a SameSite break.
+func attachBrowserCookies(req *http.Request, cookies []*http.Cookie) {
+	https := req.URL.Scheme == "https" || req.TLS != nil
+	for _, c := range cookies {
+		if c.Secure && !https {
+			continue
+		}
+		if req.Method == http.MethodPost && c.SameSite == http.SameSiteLaxMode {
+			continue
+		}
+		req.AddCookie(c)
 }
 
 // driveInitiate performs a real initiate through the router.
@@ -129,7 +147,22 @@ func TestOAuthInitiateRoute(t *testing.T) {
 		if !c.HttpOnly || c.MaxAge <= 0 {
 			t.Fatalf("state cookie HttpOnly=%v MaxAge=%d; want true/>0", c.HttpOnly, c.MaxAge)
 		}
+		if c.SameSite != http.SameSiteLaxMode {
+			t.Fatalf("GET-flow state cookie SameSite=%v; want Lax", c.SameSite)
+		}
 		_ = state
+	})
+
+	t.Run("apple initiate issues None Secure state cookie", func(t *testing.T) {
+		_, h := oauthTestEnv(t, &oauth.UserInfo{ProviderID: "apple", ProviderUserID: "s", Email: "a@b.c", EmailVerified: true})
+		_, cookies, _ := driveInitiate(t, h, "/auth/oauth/apple")
+		c := stateCookie(t, cookies)
+		if c.SameSite != http.SameSiteNoneMode {
+			t.Fatalf("form_post state cookie SameSite=%v; want None", c.SameSite)
+		}
+		if !c.Secure {
+			t.Fatal("form_post state cookie Secure=false; want true (None requires Secure)")
+		}
 	})
 
 	t.Run("alias initiates identically", func(t *testing.T) {
@@ -276,11 +309,15 @@ func TestOAuthCallbackRoute(t *testing.T) {
 	t.Run("form_post callback succeeds without CSRF tokens", func(t *testing.T) {
 		_, h := oauthTestEnv(t, callbackInfo())
 		// POST alias route with urlencoded body; no CSRF cookie/header attached.
-		state, cookies, _ := driveInitiate(t, h, "/api/auth/oauth/google")
-		req := httptest.NewRequest(http.MethodPost, "/api/auth/oauth/google/callback",
+		state, cookies, _ := driveInitiate(t, h, "/api/auth/oauth/apple")
+		sc := stateCookie(t, cookies)
+		if sc.SameSite != http.SameSiteNoneMode || !sc.Secure {
+			t.Fatalf("form_post state cookie SameSite=%v Secure=%v; want None/true", sc.SameSite, sc.Secure)
+		}
+		req := httptest.NewRequest(http.MethodPost, "https://example.com/api/auth/oauth/apple/callback",
 			strings.NewReader(url.Values{"code": {"c"}, "state": {state}}.Encode()))
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-		req.AddCookie(stateCookie(t, cookies))
+		attachBrowserCookies(req, cookies)
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, req)
 		if rec.Code != http.StatusFound {

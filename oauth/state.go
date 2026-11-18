@@ -58,10 +58,35 @@ func ensureOAuthConfig(cfg *config.Config) *config.Config {
 	if cp.OAuth.StateTTL <= 0 {
 		cp.OAuth.StateTTL = 10 * time.Minute
 	}
+	if cp.OAuth.StateCookieSameSite == 0 {
+		cp.OAuth.StateCookieSameSite = http.SameSiteLaxMode
+	}
 	return &cp
 }
 
 // stateSigningKey resolves the HMAC key: configured StateSecret, else a process-scoped CSPRNG key.
+// isFormPostProvider reports providers whose authorization response arrives
+// as a cross-site POST. Apple forces response_mode=form_post; it is the only
+// such provider, so the check is a single slug until another one appears.
+func isFormPostProvider(providerID string) bool { return providerID == "apple" }
+
+// stateCookiePolicy resolves Secure + SameSite for a provider. GET flows keep
+// the configured base policy (Lax default); form_post flows escalate to
+// None+Secure because browsers withhold Lax on cross-site POST. None forces
+// Secure even when SessionCookieSecure is false: browsers reject None without
+// Secure outright, and Apple mandates HTTPS redirect URLs in production.
+func stateCookiePolicy(cfg *config.Config, providerID string) (secure bool, sameSite http.SameSite) {
+	sameSite = cfg.OAuth.StateCookieSameSite
+	if isFormPostProvider(providerID) {
+		sameSite = http.SameSiteNoneMode
+	}
+	secure = cfg.SessionCookieSecure
+	if sameSite == http.SameSiteNoneMode {
+		secure = true
+	}
+	return secure, sameSite
+}
+
 func stateSigningKey(secret string) ([]byte, error) {
 	if secret != "" {
 		return []byte(secret), nil
@@ -140,26 +165,30 @@ func SetStateCookie(w http.ResponseWriter, cfg *config.Config, providerID, codeV
 	if err != nil {
 		return "", err
 	}
+	secure, sameSite := stateCookiePolicy(cfg, providerID)
 	http.SetCookie(w, &http.Cookie{
 		Name:     cfg.OAuth.StateCookieName,
 		Value:    signed,
 		Path:     cfg.OAuth.StateCookiePath,
 		MaxAge:   int(cfg.OAuth.StateTTL.Seconds()),
 		Expires:  payload.ExpiresAt,
-		HttpOnly: true,                    // mandatory: JS must never inspect verifier or state token
-		Secure:   cfg.SessionCookieSecure, // mirrors session cookie transport policy
-		SameSite: http.SameSiteLaxMode,    // mandatory: top-level GET redirect from provider
+		HttpOnly: true, // mandatory: JS must never inspect verifier or state token
+		Secure:   secure,
+		SameSite: sameSite,
 	})
 	return state, nil
 }
 
 // ValidateState checks the state parameter against the signed state cookie.
-// The cookie is cleared immediately (single-use) regardless of the outcome.
-// Any failure returns 403 OAUTH_STATE_INVALID without distinguishing the cause.
+// The cookie is cleared only when it belongs to this callback: on success,
+// or when it is owned-but-dead (corrupt value, expired payload). A token
+// mismatch or foreign provider ID leaves the cookie intact, so a stale
+// callback from an older login never destroys a newer login's cookie.
+// Validation failures return 403 OAUTH_STATE_INVALID without distinguishing
+// the cause.
 func ValidateState(w http.ResponseWriter, r *http.Request, cfg *config.Config, providerID, stateParam string) (*OAuthStatePayload, error) {
 	cfg = ensureOAuthConfig(cfg)
 	cookie, cookieErr := r.Cookie(cfg.OAuth.StateCookieName)
-	ClearStateCookie(w, cfg)
 	if cookieErr != nil {
 		return nil, errors.ErrOAuthStateInvalid
 	}
@@ -169,24 +198,31 @@ func ValidateState(w http.ResponseWriter, r *http.Request, cfg *config.Config, p
 	}
 	payload, err := verifyStateSignature(cookie.Value, key)
 	if err != nil {
+		// Unverifiable value can never be a live login; sweep it.
+		ClearStateCookie(w, cfg, providerID)
 		return nil, errors.ErrOAuthStateInvalid
 	}
 	if subtle.ConstantTimeCompare([]byte(stateParam), []byte(payload.Token)) != 1 {
 		return nil, errors.ErrOAuthStateInvalid
 	}
 	if time.Now().After(payload.ExpiresAt) {
+		ClearStateCookie(w, cfg, providerID)
 		return nil, errors.ErrOAuthStateInvalid
 	}
 	if payload.ProviderID == "" || payload.ProviderID != providerID {
 		return nil, errors.ErrOAuthStateInvalid
 	}
+	ClearStateCookie(w, cfg, providerID)
+	}
 	return &payload, nil
 }
 
-// ClearStateCookie invalidates the state cookie immediately.
+// ClearStateCookie invalidates the state cookie immediately. providerID keeps
+// the deletion attributes (Secure/SameSite) matched to the issued cookie.
 // MaxAge=-1 means "delete now". MaxAge=0 would mean "session cookie" — never use 0 for deletion.
-func ClearStateCookie(w http.ResponseWriter, cfg *config.Config) {
+func ClearStateCookie(w http.ResponseWriter, cfg *config.Config, providerID string) {
 	cfg = ensureOAuthConfig(cfg)
+	secure, sameSite := stateCookiePolicy(cfg, providerID)
 	http.SetCookie(w, &http.Cookie{
 		Name:     cfg.OAuth.StateCookieName,
 		Value:    "",

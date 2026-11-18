@@ -82,6 +82,11 @@ type OAuthConfig struct {
 	StateTTL        time.Duration // Default: 10 * time.Minute
 	StateSecret     string        // Cryptographic HMAC key for signing state tokens (falls back to startup CSPRNG if empty)
 	CallbackBaseURL string        // e.g. "https://api.example.com"
+	// StateCookieSameSite is the base SameSite policy for the OAuth state
+	// cookie on GET-redirect flows. Default: Lax. form_post providers (Apple)
+	// always escalate to None+Secure regardless, since browsers withhold Lax
+	// on cross-site POST navigations.
+	StateCookieSameSite http.SameSite
 }
 
 // SecurityHeadersConfig groups HTTP security header policies.
@@ -236,9 +241,10 @@ func DefaultConfig() Config {
 		},
 
 		OAuth: OAuthConfig{
-			StateCookieName: "oauth_state",
-			StateCookiePath: "/",
-			StateTTL:        10 * time.Minute,
+			StateCookieName:     "oauth_state",
+			StateCookiePath:     "/",
+			StateTTL:            10 * time.Minute,
+			StateCookieSameSite: http.SameSiteLaxMode,
 		},
 
 		// Rate limiting
@@ -463,6 +469,9 @@ func (c *Config) Validate() error {
 	}
 	if c.OAuth.StateTTL == 0 {
 		c.OAuth.StateTTL = 10 * time.Minute
+	}
+	if c.OAuth.StateCookieSameSite == 0 {
+		c.OAuth.StateCookieSameSite = http.SameSiteLaxMode
 	}
 	// Sub-second TTLs truncate to MaxAge=0 on the wire while Expires stays ahead — reject like CSRF.
 	if c.OAuth.StateTTL < time.Second {

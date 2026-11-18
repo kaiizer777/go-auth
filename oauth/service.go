@@ -104,7 +104,7 @@ func (s *service) InitiateFlow(w http.ResponseWriter, r *http.Request, providerI
 // HandleCallback runs the full decision tree: state validation, code exchange,
 // the mandatory EmailVerified gate (before any DB lookup), account linking or
 // creation, session issuance, and state-cookie cleanup.
-func (s *service) HandleCallback(ctx context.Context, w http.ResponseWriter, r *http.Request, providerID, code, state string) (*session.Session, string, error) {
+func (s *service) HandleCallback(ctx context.Context, w http.ResponseWriter, r *http.Request, providerID, code, state string, sessType db.SessionType) (*session.Session, string, string, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}

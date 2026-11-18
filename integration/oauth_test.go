@@ -117,6 +117,23 @@ func pgCounts(t *testing.T, database *gorm.DB) (users, links, sessions int64) {
 	return users, links, sessions
 }
 
+// pgForwardBrowserCookies forwards initiate cookies the way a browser would:
+// Lax cookies are withheld on cross-site POST (Apple form_post) and Secure
+// cookies need HTTPS. httptest applies no cookie policy, so hand-injecting
+// with AddCookie cannot observe a SameSite break.
+func pgForwardBrowserCookies(req *http.Request, cookies []*http.Cookie) {
+	https := req.URL.Scheme == "https" || req.TLS != nil
+	for _, c := range cookies {
+		if c.Secure && !https {
+			continue
+		}
+		if req.Method == http.MethodPost && c.SameSite == http.SameSiteLaxMode {
+			continue
+		}
+		req.AddCookie(c)
+	}
+}
+
 // pgCallbackGET runs a browser-flow GET callback, requiring 302 + session.
 func pgCallbackGET(t *testing.T, h http.Handler, cfg config.Config, provider, code, state string, stateCookie *http.Cookie) *http.Cookie {
 	t.Helper()
@@ -180,14 +197,21 @@ func TestOAuthPG_E2E_AllProviders(t *testing.T) {
 			if sc == nil || !sc.HttpOnly || sc.MaxAge <= 0 {
 				t.Fatalf("bad state cookie: %+v", sc)
 			}
+			if tc.formPost {
+				if sc.SameSite != http.SameSiteNoneMode || !sc.Secure {
+					t.Fatalf("form_post state cookie SameSite=%v Secure=%v; want None/true", sc.SameSite, sc.Secure)
+				}
+			} else if sc.SameSite != http.SameSiteLaxMode {
+				t.Fatalf("GET-flow state cookie SameSite=%v; want Lax", sc.SameSite)
+			}
 			verifier := pgStateVerifier(t, sc)
 
 			var sid *http.Cookie
 			if tc.formPost {
-				req := httptest.NewRequest(http.MethodPost, "/auth/oauth/"+tc.provider+"/callback",
+				req := httptest.NewRequest(http.MethodPost, "https://example.com/auth/oauth/"+tc.provider+"/callback",
 					strings.NewReader(url.Values{"code": {"code-" + tc.provider}, "state": {state}}.Encode()))
 				req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-				req.AddCookie(sc)
+				pgForwardBrowserCookies(req, cookies)
 				rec := httptest.NewRecorder()
 				h.ServeHTTP(rec, req)
 				if rec.Code != http.StatusFound {

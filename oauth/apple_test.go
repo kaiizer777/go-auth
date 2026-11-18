@@ -17,6 +17,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -220,14 +221,18 @@ func TestAppleIDTokenRejections(t *testing.T) {
 	other := mustRSAKey(t)
 	mk := func(claims map[string]any) string { return mintAppleIDToken(t, Key, "kid-1", claims) }
 	tamper := func(tok string) string {
+		t.Helper()
 		parts := strings.Split(tok, ".")
-		sig := parts[2]
-		if sig[len(sig)-1] == 'A' {
-			sig = sig[:len(sig)-1] + "B"
-		} else {
-			sig = sig[:len(sig)-1] + "A"
+		if len(parts) != 3 {
+			t.Fatalf("id token segments = %d; want 3", len(parts))
 		}
-		return parts[0] + "." + parts[1] + "." + sig
+		sig, err := base64.RawURLEncoding.DecodeString(parts[2])
+		if err != nil || len(sig) == 0 {
+			t.Fatalf("decode signature: %v", err)
+		}
+		sig[0] ^= 0xFF // flip a decoded byte; last-char edits only touch ignored padding bits
+		out := parts[0] + "." + parts[1] + "." + base64.RawURLEncoding.EncodeToString(sig)
+		return out
 	}
 
 	t.Run("tampered signature rejected", func(t *testing.T) {
@@ -309,23 +314,42 @@ func TestAppleIDTokenRejections(t *testing.T) {
 
 func TestAppleUnknownKidRefresh(t *testing.T) {
 	t.Parallel()
+	oldKey := mustRSAKey(t)
 	newKey := mustRSAKey(t)
-	idToken := mintAppleIDToken(t, newKey, "kid-2", appleFixtureClaims(true))
-	tokenSrv, _ := appleMockStack(t, newKey, "kid-2", idToken, nil)
+	staleToken := mintAppleIDToken(t, oldKey, "kid-1", appleFixtureClaims(true))
+	rotatedToken := mintAppleIDToken(t, newKey, "kid-2", appleFixtureClaims(true))
+	tokenSrv, _ := appleMockStack(t, newKey, "kid-2", rotatedToken, nil)
 	defer tokenSrv.Close()
 
-	// JWKS first serves only the stale key, then rotates to the new one.
+	// JWKS serves kid-1 until the test flips rotated, then kid-2.
+	var mu sync.Mutex
+	var fetches int
 	rotated := false
 	jwksSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		rotated = true
+		mu.Lock()
+		fetches++
+		kid, key := "kid-1", oldKey
+		if rotated {
+			kid, key = "kid-2", newKey
+		}
+		mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{"keys": []any{rsaJWK(&newKey.PublicKey, "kid-2")}})
+		_ = json.NewEncoder(w).Encode(map[string]any{"keys": []any{rsaJWK(&key.PublicKey, kid)}})
 	}))
 	defer jwksSrv.Close()
 
 	p := NewAppleProvider(appleTestConfig())
 	p.tokenURL = tokenSrv.URL
 	p.jwksURL = jwksSrv.URL
+
+	// Prime the cache through the real path: kid-1 validates with one fetch.
+	if _, err := p.FetchUserInfo(context.Background(), &TokenResponse{IDToken: staleToken}); err != nil {
+		t.Fatalf("prime kid-1 FetchUserInfo = %v", err)
+	}
+	// Rotate upstream pre-TTL-expiry; the cached set is now stale.
+	mu.Lock()
+	rotated = true
+	mu.Unlock()
 
 	tok, err := p.ExchangeCode(context.Background(), "code123", "verifier123")
 	if err != nil {
@@ -335,8 +359,13 @@ func TestAppleUnknownKidRefresh(t *testing.T) {
 	if err != nil {
 		t.Fatalf("FetchUserInfo after rotation = %v", err)
 	}
-	if !rotated || info.ProviderUserID != "apple-sub-123" {
-		t.Errorf("rotated = %v, userinfo = %+v", rotated, info)
+	if info.ProviderUserID != "apple-sub-123" {
+		t.Errorf("userinfo = %+v; want apple-sub-123", info)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if fetches != 2 {
+		t.Errorf("JWKS fetches = %d; want 2 (prime + refresh-on-miss)", fetches)
 	}
 }
 

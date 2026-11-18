@@ -49,7 +49,7 @@ func (h *Handler) OAuthCallback(w http.ResponseWriter, r *http.Request) {
 		// Bound the form read so a hostile IdP-shaped POST cannot OOM the callback.
 		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 		if err := r.ParseForm(); err != nil {
-			oauth.ClearStateCookie(w, &h.cfg)
+			oauth.ClearStateCookie(w, &h.cfg, providerID)
 			errors.WriteHTTP(w, errors.New(errors.CodeValidationError, "invalid callback form", nil))
 			return
 		}

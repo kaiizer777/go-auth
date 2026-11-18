@@ -22,8 +22,13 @@ func testStateConfig() *config.Config {
 
 func issueStateCookie(t *testing.T, cfg *config.Config) (string, *http.Cookie) {
 	t.Helper()
+	return issueStateCookieFor(t, cfg, "google")
+}
+
+func issueStateCookieFor(t *testing.T, cfg *config.Config, providerID string) (string, *http.Cookie) {
+	t.Helper()
 	rec := httptest.NewRecorder()
-	state, err := SetStateCookie(rec, cfg, "google", "test-code-verifier", "https://app.example.com/post-login")
+	state, err := SetStateCookie(rec, cfg, providerID, "test-code-verifier", "https://app.example.com/post-login")
 	if err != nil {
 		t.Fatalf("SetStateCookie = %v", err)
 	}
@@ -40,6 +45,16 @@ func issueStateCookie(t *testing.T, cfg *config.Config) (string, *http.Cookie) {
 		t.Fatalf("no %q cookie issued", cfg.OAuth.StateCookieName)
 	}
 	return state, found
+}
+
+// clearedStateCookie reports whether rec carries the state deletion cookie.
+func clearedStateCookie(rec *httptest.ResponseRecorder, name string) bool {
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == name && c.MaxAge == -1 {
+			return true
+		}
+	}
+	return false
 }
 
 func stateRequest(cookie *http.Cookie) *http.Request {
@@ -106,24 +121,20 @@ func TestSetStateCookie(t *testing.T) {
 		}
 	})
 
-	t.Run("nil config uses defaults without panic", func(t *testing.T) {
+	t.Run("form_post provider gets None plus forced Secure", func(t *testing.T) {
 		t.Parallel()
-		rec := httptest.NewRecorder()
-		state, err := SetStateCookie(rec, nil, "github", "v", "")
-		if err != nil {
-			t.Fatalf("SetStateCookie(nil) = %v", err)
+		cfg := testStateConfig() // SessionCookieSecure=false on purpose
+		_, cookie := issueStateCookieFor(t, cfg, "apple")
+		if cookie.SameSite != http.SameSiteNoneMode {
+			t.Errorf("cookie SameSite = %v; want None", cookie.SameSite)
 		}
-		if state == "" {
-			t.Error("empty state with nil config")
+		if !cookie.Secure {
+			t.Error("cookie Secure = false; want true (None requires Secure)")
 		}
-		found := false
-		for _, c := range rec.Result().Cookies() {
-			if c.Name == "oauth_state" {
-				found = true
-			}
+		if !cookie.HttpOnly {
+			t.Error("cookie HttpOnly = false; want true")
 		}
-		if !found {
-			t.Error("default oauth_state cookie not issued for nil config")
+	})
 		}
 	})
 }
@@ -251,50 +262,105 @@ func TestValidateState(t *testing.T) {
 		assertStateInvalid(t, err)
 	})
 
-	t.Run("failure still clears cookie", func(t *testing.T) {
+	t.Run("stale callback preserves newer login cookie", func(t *testing.T) {
 		t.Parallel()
 		cfg := testStateConfig()
-		_, cookie := issueStateCookie(t, cfg)
+		_, _ = issueStateCookie(t, cfg)                 // tab 1 login, superseded below
+		newState, newCookie := issueStateCookie(t, cfg) // tab 2 overwrites same-name cookie
 		rec := httptest.NewRecorder()
-		_, _ = ValidateState(rec, stateRequest(cookie), cfg, "google", "wrong-param")
-		cleared := false
-		for _, c := range rec.Result().Cookies() {
-			if c.Name == cfg.OAuth.StateCookieName && c.MaxAge == -1 {
-				cleared = true
-			}
+		_, err := ValidateState(rec, stateRequest(newCookie), cfg, "google", "stale-tab-1-state")
+		assertStateInvalid(t, err)
+		if clearedStateCookie(rec, cfg.OAuth.StateCookieName) {
+			t.Error("stale callback cleared the newer login cookie")
 		}
-		if !cleared {
-			t.Error("failed validation did not clear state cookie")
+		// Newer login still completes afterwards.
+		if _, err := ValidateState(httptest.NewRecorder(), stateRequest(newCookie), cfg, "google", newState); err != nil {
+			t.Fatalf("newer login ValidateState = %v", err)
+		}
+	})
+
+	t.Run("clear scoped to owning callback", func(t *testing.T) {
+		t.Parallel()
+		cfg := testStateConfig()
+		key, err := stateSigningKey(cfg.OAuth.StateSecret)
+		if err != nil {
+			t.Fatalf("stateSigningKey = %v", err)
+		}
+		mustSign := func(p OAuthStatePayload) string {
+			s, err := signStatePayload(p, key)
+			if err != nil {
+				t.Fatalf("signStatePayload = %v", err)
+			}
+			return s
+		}
+		fresh := func(token, provider string, exp time.Time) *http.Cookie {
+			return &http.Cookie{Name: cfg.OAuth.StateCookieName,
+				Value: mustSign(OAuthStatePayload{Token: token, ProviderID: provider, ExpiresAt: exp})}
+		}
+		future := time.Now().Add(time.Hour)
+		for _, tc := range []struct {
+			name     string
+			cookie   *http.Cookie
+			provider string
+			param    string
+			cleared  bool
+		}{
+			{"tampered signature swept", &http.Cookie{Name: cfg.OAuth.StateCookieName, Value: "bad.payload"}, "google", "whatever", true},
+			{"expired owned payload swept", fresh("tok", "google", time.Now().Add(-time.Minute)), "google", "tok", true},
+			{"mismatched token preserved", fresh("tok", "google", future), "google", "other", false},
+			{"foreign provider preserved", fresh("tok", "google", future), "github", "tok", false},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				t.Parallel()
+				rec := httptest.NewRecorder()
+				_, err := ValidateState(rec, stateRequest(tc.cookie), cfg, tc.provider, tc.param)
+				assertStateInvalid(t, err)
+				if got := clearedStateCookie(rec, cfg.OAuth.StateCookieName); got != tc.cleared {
+					t.Errorf("cleared = %v; want %v", got, tc.cleared)
+				}
+			})
 		}
 	})
 }
 
 func TestClearStateCookie(t *testing.T) {
-	t.Run("emits deletion cookie", func(t *testing.T) {
+	t.Run("deletion matches issued policy per provider", func(t *testing.T) {
 		t.Parallel()
 		cfg := testStateConfig()
-		rec := httptest.NewRecorder()
-		ClearStateCookie(rec, cfg)
-		var found *http.Cookie
-		for _, c := range rec.Result().Cookies() {
-			if c.Name == cfg.OAuth.StateCookieName {
-				found = c
+		for _, tc := range []struct {
+			provider string
+			sameSite http.SameSite
+			secure   bool
+		}{
+			{"google", http.SameSiteLaxMode, false},
+			{"apple", http.SameSiteNoneMode, true},
+		} {
+			rec := httptest.NewRecorder()
+			ClearStateCookie(rec, cfg, tc.provider)
+			var found *http.Cookie
+			for _, c := range rec.Result().Cookies() {
+				if c.Name == cfg.OAuth.StateCookieName {
+					found = c
+				}
 			}
-		}
-		if found == nil {
-			t.Fatalf("no %q cookie cleared", cfg.OAuth.StateCookieName)
-		}
-		if found.MaxAge != -1 {
-			t.Errorf("MaxAge = %d; want -1", found.MaxAge)
-		}
-		if !found.HttpOnly {
-			t.Error("HttpOnly = false; want true")
-		}
-		if found.SameSite != http.SameSiteLaxMode {
-			t.Errorf("SameSite = %v; want Lax", found.SameSite)
-		}
-		if found.Path != cfg.OAuth.StateCookiePath {
-			t.Errorf("Path = %q; want %q", found.Path, cfg.OAuth.StateCookiePath)
+			if found == nil {
+				t.Fatalf("%s: no %q cookie cleared", tc.provider, cfg.OAuth.StateCookieName)
+			}
+			if found.MaxAge != -1 {
+				t.Errorf("%s: MaxAge = %d; want -1", tc.provider, found.MaxAge)
+			}
+			if !found.HttpOnly {
+				t.Errorf("%s: HttpOnly = false; want true", tc.provider)
+			}
+			if found.SameSite != tc.sameSite {
+				t.Errorf("%s: SameSite = %v; want %v", tc.provider, found.SameSite, tc.sameSite)
+			}
+			if found.Secure != tc.secure {
+				t.Errorf("%s: Secure = %v; want %v", tc.provider, found.Secure, tc.secure)
+			}
+			if found.Path != cfg.OAuth.StateCookiePath {
+				t.Errorf("%s: Path = %q; want %q", tc.provider, found.Path, cfg.OAuth.StateCookiePath)
+			}
 		}
 	})
 }

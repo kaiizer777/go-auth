@@ -26,6 +26,9 @@ func TestOAuthDefaults(t *testing.T) {
 	if cfg.OAuth.StateTTL != 10*time.Minute {
 		t.Errorf("StateTTL = %v; want 10m", cfg.OAuth.StateTTL)
 	}
+	if cfg.OAuth.StateCookieSameSite != http.SameSiteLaxMode {
+		t.Errorf("StateCookieSameSite = %v; want Lax", cfg.OAuth.StateCookieSameSite)
+	}
 }
 
 func TestConfigValidate_OAuth(t *testing.T) {
@@ -42,10 +45,11 @@ func TestConfigValidate_OAuth(t *testing.T) {
 	}
 
 	tests := []struct {
-		name    string
-		mutate  func(*Config)
-		wantErr *errors.Error
-		wantTTL time.Duration
+		name         string
+		mutate       func(*Config)
+		wantErr      *errors.Error
+		wantTTL      time.Duration
+		wantSameSite http.SameSite
 	}{
 		{
 			name:    "no providers passes",
@@ -191,6 +195,14 @@ func TestConfigValidate_OAuth(t *testing.T) {
 			wantTTL: 10 * time.Minute,
 		},
 		{
+			name: "zero state SameSite defaults to Lax",
+			mutate: func(c *Config) {
+				c.OAuth.StateCookieSameSite = 0
+			},
+			wantErr:      nil,
+			wantSameSite: http.SameSiteLaxMode,
+		},
+		{
 			name: "short state secret rejected",
 			mutate: func(c *Config) {
 				c.OAuth.StateSecret = "x"
@@ -231,6 +243,9 @@ func TestConfigValidate_OAuth(t *testing.T) {
 				}
 				if tt.wantTTL != 0 && cfg.OAuth.StateTTL != tt.wantTTL {
 					t.Fatalf("StateTTL = %v; want %v", cfg.OAuth.StateTTL, tt.wantTTL)
+				}
+				if tt.wantSameSite != 0 && cfg.OAuth.StateCookieSameSite != tt.wantSameSite {
+					t.Fatalf("StateCookieSameSite = %v; want %v", cfg.OAuth.StateCookieSameSite, tt.wantSameSite)
 				}
 				return
 			}
