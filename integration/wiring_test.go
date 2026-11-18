@@ -73,12 +73,23 @@ func TestWiring_EndToEndEmailDispatchAndClose(t *testing.T) {
 	server := httptest.NewServer(authInst.Handler)
 	defer server.Close()
 
+	// Cookie-free API transport declared per CSRF middleware contract.
+	postJSON := func(path string, body []byte) (*http.Response, error) {
+		req, err := http.NewRequest(http.MethodPost, server.URL+path, bytes.NewReader(body))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Auth-Type", "bearer")
+		return http.DefaultClient.Do(req)
+	}
+
 	// 1. POST /auth/signup via HTTP
 	signupBody, _ := json.Marshal(map[string]string{
 		"email":    "wiring@example.com",
 		"password": "CorrectHorseBatteryStaple123!",
 	})
-	resp, err := http.Post(server.URL+"/auth/signup", "application/json", bytes.NewReader(signupBody))
+	resp, err := postJSON("/auth/signup", signupBody)
 	if err != nil {
 		t.Fatalf("signup HTTP request failed: %v", err)
 	}
@@ -110,7 +121,7 @@ func TestWiring_EndToEndEmailDispatchAndClose(t *testing.T) {
 	verifyBody, _ := json.Marshal(map[string]string{
 		"token": vEmail.token,
 	})
-	resp, err = http.Post(server.URL+"/auth/verify", "application/json", bytes.NewReader(verifyBody))
+	resp, err = postJSON("/auth/verify", verifyBody)
 	if err != nil {
 		t.Fatalf("verify HTTP request failed: %v", err)
 	}
@@ -123,7 +134,7 @@ func TestWiring_EndToEndEmailDispatchAndClose(t *testing.T) {
 	resetReqBody, _ := json.Marshal(map[string]string{
 		"email": "wiring@example.com",
 	})
-	resp, err = http.Post(server.URL+"/auth/password/reset-request", "application/json", bytes.NewReader(resetReqBody))
+	resp, err = postJSON("/auth/password/reset-request", resetReqBody)
 	if err != nil {
 		t.Fatalf("password reset request failed: %v", err)
 	}
@@ -152,7 +163,7 @@ func TestWiring_EndToEndEmailDispatchAndClose(t *testing.T) {
 		"token":        prEmail.token,
 		"new_password": "NewWiredPassword123!",
 	})
-	resp, err = http.Post(server.URL+"/auth/password/reset", "application/json", bytes.NewReader(resetConfirmBody))
+	resp, err = postJSON("/auth/password/reset", resetConfirmBody)
 	if err != nil {
 		t.Fatalf("password reset confirmation failed: %v", err)
 	}
@@ -166,7 +177,7 @@ func TestWiring_EndToEndEmailDispatchAndClose(t *testing.T) {
 		"email":    "wiring@example.com",
 		"password": "NewWiredPassword123!",
 	})
-	resp, err = http.Post(server.URL+"/auth/login", "application/json", bytes.NewReader(loginBody))
+	resp, err = postJSON("/auth/login", loginBody)
 	if err != nil {
 		t.Fatalf("login failed: %v", err)
 	}

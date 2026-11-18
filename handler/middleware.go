@@ -94,22 +94,6 @@ func RawIDFromContext(ctx context.Context) (string, bool) {
 	return RawSessionIDFromContext(ctx)
 }
 
-// SecurityHeaders returns HTTP middleware that applies standard defensive headers.
-func SecurityHeaders(cfg *config.Config) func(http.Handler) http.Handler {
-	return func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("X-Content-Type-Options", "nosniff")
-			w.Header().Set("X-Frame-Options", "DENY")
-			w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
-			w.Header().Set("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'")
-			if (cfg != nil && cfg.SessionCookieSecure) || r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https" {
-				w.Header().Set("Strict-Transport-Security", "max-age=63072000; includeSubDomains; preload")
-			}
-			next.ServeHTTP(w, r)
-		})
-	}
-}
-
 type recoveryResponseWriter struct {
 	http.ResponseWriter
 	committed bool

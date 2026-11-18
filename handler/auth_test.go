@@ -161,7 +161,7 @@ func setupTestEnv(t *testing.T, modifyCfg ...func(*config.Config)) (*gorm.DB, au
 	return database, svc, h, capture
 }
 
-func executeRequest(t *testing.T, h http.Handler, method, path string, body any) *httptest.ResponseRecorder {
+func executeRequest(t *testing.T, h http.Handler, method, path string, body any, csrfHeader ...string) *httptest.ResponseRecorder {
 	t.Helper()
 	var bodyReader io.Reader
 	if body != nil {
@@ -182,9 +182,42 @@ func executeRequest(t *testing.T, h http.Handler, method, path string, body any)
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
+	if method != http.MethodGet && method != http.MethodHead && method != http.MethodOptions && method != http.MethodTrace {
+		attachCSRFForTest(t, h, req, csrfHeader...)
+	}
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	return rec
+}
+
+// attachCSRFForTest fetches a CSRF pair via GET /auth/csrf and attaches it.
+// Tests asserting CSRF rejection must build raw requests instead of using executeRequest.
+// Pass the handler cfg's CSRFHeaderName when it differs from DefaultConfig.
+func attachCSRFForTest(t *testing.T, h http.Handler, req *http.Request, csrfHeader ...string) {
+	t.Helper()
+	tokenReq := httptest.NewRequest(http.MethodGet, "/auth/csrf", nil)
+	tokenRec := httptest.NewRecorder()
+	h.ServeHTTP(tokenRec, tokenReq)
+	if tokenRec.Code != http.StatusOK {
+		return
+	}
+	var body struct {
+		CSRFToken string `json:"csrf_token"`
+	}
+	if err := json.Unmarshal(tokenRec.Body.Bytes(), &body); err != nil || body.CSRFToken == "" {
+		return
+	}
+	headerName := config.DefaultConfig().CSRFHeaderName
+	if len(csrfHeader) > 0 && csrfHeader[0] != "" {
+		headerName = csrfHeader[0]
+	}
+	for _, c := range tokenRec.Result().Cookies() {
+		if c.Value == body.CSRFToken {
+			req.AddCookie(c)
+			req.Header.Set(headerName, body.CSRFToken)
+			return
+		}
+	}
 }
 
 func decodeResponseBody[T any](t *testing.T, rec *httptest.ResponseRecorder) T {
@@ -791,9 +824,9 @@ type mockAuthService struct {
 	signupFn               func(ctx context.Context, req db.SignupRequest) (*db.User, string, error)
 	loginFn                func(ctx context.Context, req db.LoginRequest) (*db.User, error)
 	logoutFn               func(ctx context.Context, sessionID string) error
-	verifyEmailFn          func(ctx context.Context, req db.VerifyEmailRequest) error
+	verifyEmailFn          func(ctx context.Context, req db.VerifyEmailRequest) (*db.User, error)
 	requestPasswordResetFn func(ctx context.Context, req db.PasswordResetRequest) (string, error)
-	resetPasswordFn        func(ctx context.Context, req db.PasswordResetConfirmRequest) error
+	resetPasswordFn        func(ctx context.Context, req db.PasswordResetConfirmRequest) (*db.User, error)
 }
 
 func (m *mockAuthService) Signup(ctx context.Context, req db.SignupRequest) (*db.User, string, error) {
@@ -817,11 +850,11 @@ func (m *mockAuthService) Logout(ctx context.Context, sessionID string) error {
 	return nil
 }
 
-func (m *mockAuthService) VerifyEmail(ctx context.Context, req db.VerifyEmailRequest) error {
+func (m *mockAuthService) VerifyEmail(ctx context.Context, req db.VerifyEmailRequest) (*db.User, error) {
 	if m.verifyEmailFn != nil {
 		return m.verifyEmailFn(ctx, req)
 	}
-	return nil
+	return nil, stderrors.New("mockAuthService verifyEmail not implemented")
 }
 
 func (m *mockAuthService) RequestPasswordReset(ctx context.Context, req db.PasswordResetRequest) (string, error) {
@@ -831,11 +864,11 @@ func (m *mockAuthService) RequestPasswordReset(ctx context.Context, req db.Passw
 	return "", nil
 }
 
-func (m *mockAuthService) ResetPassword(ctx context.Context, req db.PasswordResetConfirmRequest) error {
+func (m *mockAuthService) ResetPassword(ctx context.Context, req db.PasswordResetConfirmRequest) (*db.User, error) {
 	if m.resetPasswordFn != nil {
 		return m.resetPasswordFn(ctx, req)
 	}
-	return nil
+	return nil, stderrors.New("mockAuthService resetPassword not implemented")
 }
 
 // Test 15: 500 Error Masking (unexpected internal error produces generic 500 CodeInternalError with "internal server error")
@@ -909,13 +942,18 @@ func TestRoutingAndAliases(t *testing.T) {
 	}
 
 	// Logout route under session protection rejects requests without CSRF / auth -> 403 Forbidden
-	recLogout := executeRequest(t, h, http.MethodPost, "/auth/logout", nil)
+	// Raw requests (no CSRF pair) preserve the original missing-token assertion.
+	rawLogoutReq := httptest.NewRequest(http.MethodPost, "/auth/logout", nil)
+	recLogout := httptest.NewRecorder()
+	h.ServeHTTP(recLogout, rawLogoutReq)
 	if recLogout.Code != http.StatusForbidden {
 		t.Fatalf("expected status 403 for unprotected logout, got %d", recLogout.Code)
 	}
 
 	// Alias route: POST /api/auth/logout -> 403 Forbidden
-	recApiLogout := executeRequest(t, h, http.MethodPost, "/api/auth/logout", nil)
+	rawApiLogoutReq := httptest.NewRequest(http.MethodPost, "/api/auth/logout", nil)
+	recApiLogout := httptest.NewRecorder()
+	h.ServeHTTP(recApiLogout, rawApiLogoutReq)
 	if recApiLogout.Code != http.StatusForbidden {
 		t.Fatalf("expected status 403 on alias for unprotected logout, got %d", recApiLogout.Code)
 	}
@@ -963,6 +1001,7 @@ func TestRequestBodyHardening(t *testing.T) {
 		body := strings.NewReader(`{"email":"user@example.com","password":"validpassword123"} {"trailing": true}`)
 		req := httptest.NewRequest(http.MethodPost, "/auth/signup", body)
 		req.Header.Set("Content-Type", "application/json")
+		attachCSRFForTest(t, h, req)
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, req)
 
@@ -979,6 +1018,7 @@ func TestRequestBodyHardening(t *testing.T) {
 		largeBody := `{"email":"` + strings.Repeat("a", 1024*1024+10) + `@example.com","password":"validpassword123"}`
 		req := httptest.NewRequest(http.MethodPost, "/auth/signup", strings.NewReader(largeBody))
 		req.Header.Set("Content-Type", "application/json")
+		attachCSRFForTest(t, h, req)
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, req)
 
@@ -1267,6 +1307,7 @@ func TestTamperedCookiesAndHeaders(t *testing.T) {
 	for _, tt := range cases {
 		t.Run(tt.name, func(t *testing.T) {
 			req := httptest.NewRequest(http.MethodPost, "/auth/logout", nil)
+			attachCSRFForTest(t, h, req)
 			if tt.cookieName != "" {
 				req.AddCookie(&http.Cookie{Name: tt.cookieName, Value: tt.cookieVal})
 			}
@@ -1294,11 +1335,11 @@ func TestAdversarialPayloadResilience_JSONEndpoints(t *testing.T) {
 		loginFn: func(ctx context.Context, req db.LoginRequest) (*db.User, error) {
 			return nil, nil
 		},
-		verifyEmailFn: func(ctx context.Context, req db.VerifyEmailRequest) error {
-			return nil
+		verifyEmailFn: func(ctx context.Context, req db.VerifyEmailRequest) (*db.User, error) {
+			return nil, nil
 		},
-		resetPasswordFn: func(ctx context.Context, req db.PasswordResetConfirmRequest) error {
-			return nil
+		resetPasswordFn: func(ctx context.Context, req db.PasswordResetConfirmRequest) (*db.User, error) {
+			return nil, nil
 		},
 	}
 	h := New(nil, config.DefaultConfig(), mockSvc)
@@ -1612,6 +1653,54 @@ func TestAuthHandler_LoginSessionCreation_CookieAndBearer(t *testing.T) {
 	}
 	if bumpedSess.CredentialVersion != bumped.CredentialVersion {
 		t.Errorf("bumped session credential version = %d, want %d", bumpedSess.CredentialVersion, bumped.CredentialVersion)
+	}
+}
+
+func TestAuthHandler_CookieLoginExposesRotatedCSRFToken(t *testing.T) {
+	database, svc, _, _ := setupTestEnv(t)
+	cfg := testConfig()
+	sessSvc := session.NewService(database, &cfg)
+
+	authH := NewAuthHandler(svc,
+		WithAuthSessionService(sessSvc),
+		WithAuthConfig(&cfg),
+	)
+
+	email := "csrf_expose@example.com"
+	pass := "ValidPassword123!"
+	if _, _, err := svc.Signup(context.Background(), db.SignupRequest{Email: email, Password: pass}); err != nil {
+		t.Fatalf("Signup failed: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/auth/login", nil)
+	b, _ := json.Marshal(db.LoginRequest{Email: email, Password: pass})
+	req.Body = io.NopCloser(bytes.NewReader(b))
+	rec := httptest.NewRecorder()
+	authH.Login(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("cookie login failed: %d", rec.Code)
+	}
+	var body struct {
+		CSRFToken string `json:"csrf_token"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode login response: %v", err)
+	}
+	if len(body.CSRFToken) != 64 {
+		t.Fatalf("expected 64-char csrf_token in body, got %q", body.CSRFToken)
+	}
+	var rotated string
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == cfg.CSRFCookieName {
+			rotated = c.Value
+		}
+	}
+	if rotated == "" {
+		t.Fatalf("expected %q cookie to be set", cfg.CSRFCookieName)
+	}
+	if body.CSRFToken != rotated {
+		t.Fatal("body csrf_token must match the rotated CSRF cookie")
 	}
 }
 

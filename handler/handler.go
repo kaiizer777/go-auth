@@ -88,7 +88,7 @@ func New(db *gorm.DB, cfg config.Config, authSvc auth.Service, opts ...Option) h
 	}
 
 	h.registerRoutes()
-	return CORS(cfg)(h)
+	return SecurityHeaders(&cfg)(CORS(cfg)(h))
 }
 
 // ServeHTTP handles requests, dispatching to the router and translating 404/405 to standardized JSON responses.
@@ -163,25 +163,34 @@ func (h *Handler) registerRoutes() {
 			WithAuthLimiters(h.loginLimiter, h.signupLimiter, h.resetLimiter),
 			WithAuthIPLimiters(h.loginIPLimiter, h.signupIPLimiter, h.resetIPLimiter),
 		)
+		// Pre-auth handlers never consume the Authorization header, so the
+		// bearer exemption must not apply here (login CSRF bypass).
+		csrfMw := csrf.PreAuthMiddleware(&h.cfg)
+		wrap := func(hf http.HandlerFunc) http.Handler { return csrfMw(hf) }
+
 		// Canonical routes:
-		h.mux.HandleFunc("POST /auth/signup", authH.Signup)
-		h.mux.HandleFunc("POST /auth/login", authH.Login)
+		h.mux.Handle("POST /auth/signup", wrap(authH.Signup))
+		h.mux.Handle("POST /auth/login", wrap(authH.Login))
 		if h.sessHandler == nil || h.sessionSvc == nil {
-			h.mux.HandleFunc("POST /auth/logout", authH.Logout)
+			h.mux.Handle("POST /auth/logout", wrap(authH.Logout))
 		}
-		h.mux.HandleFunc("POST /auth/verify", authH.VerifyEmail)
-		h.mux.HandleFunc("POST /auth/password/reset-request", authH.RequestPasswordReset)
-		h.mux.HandleFunc("POST /auth/password/reset", authH.ResetPassword)
+		h.mux.Handle("POST /auth/verify", wrap(authH.VerifyEmail))
+		h.mux.Handle("POST /auth/password/reset-request", wrap(authH.RequestPasswordReset))
+		h.mux.Handle("POST /auth/password/reset", wrap(authH.ResetPassword))
 
 		// Aliases:
-		h.mux.HandleFunc("POST /api/auth/signup", authH.Signup)
-		h.mux.HandleFunc("POST /api/auth/login", authH.Login)
+		h.mux.Handle("POST /api/auth/signup", wrap(authH.Signup))
+		h.mux.Handle("POST /api/auth/login", wrap(authH.Login))
 		if h.sessHandler == nil || h.sessionSvc == nil {
-			h.mux.HandleFunc("POST /api/auth/logout", authH.Logout)
+			h.mux.Handle("POST /api/auth/logout", wrap(authH.Logout))
 		}
-		h.mux.HandleFunc("POST /api/auth/verify-email", authH.VerifyEmail)
-		h.mux.HandleFunc("POST /api/auth/request-password-reset", authH.RequestPasswordReset)
-		h.mux.HandleFunc("POST /api/auth/reset-password", authH.ResetPassword)
+		h.mux.Handle("POST /api/auth/verify-email", wrap(authH.VerifyEmail))
+		h.mux.Handle("POST /api/auth/request-password-reset", wrap(authH.RequestPasswordReset))
+		h.mux.Handle("POST /api/auth/reset-password", wrap(authH.ResetPassword))
+
+		// Pre-auth token acquisition for SPA clients:
+		h.mux.HandleFunc("GET /auth/csrf", h.GetCSRFToken)
+		h.mux.HandleFunc("GET /api/auth/csrf", h.GetCSRFToken)
 	}
 
 	if h.sessHandler != nil && h.sessionSvc != nil {

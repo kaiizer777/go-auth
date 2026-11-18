@@ -50,7 +50,7 @@ func TestVerification_BYTEAPrimaryKeyAndSuccessfulFlow(t *testing.T) {
 	}
 
 	// 3. Verify email with raw token
-	err = authInst.Auth.VerifyEmail(ctx, db.VerifyEmailRequest{
+	_, err = authInst.Auth.VerifyEmail(ctx, db.VerifyEmailRequest{
 		Token: rawToken,
 	})
 	if err != nil {
@@ -77,7 +77,7 @@ func TestVerification_BYTEAPrimaryKeyAndSuccessfulFlow(t *testing.T) {
 	}
 
 	// 5. Replay attempt: verifying the same token again must fail with CodeInvalidToken
-	err = authInst.Auth.VerifyEmail(ctx, db.VerifyEmailRequest{
+	_, err = authInst.Auth.VerifyEmail(ctx, db.VerifyEmailRequest{
 		Token: rawToken,
 	})
 	if err == nil {
@@ -122,7 +122,7 @@ func TestVerification_ExpiredTokenPurgedAndRejected(t *testing.T) {
 	}
 
 	// Verification attempt on expired token
-	err = authInst.Auth.VerifyEmail(ctx, db.VerifyEmailRequest{
+	_, err = authInst.Auth.VerifyEmail(ctx, db.VerifyEmailRequest{
 		Token: rawToken,
 	})
 	if err == nil {
@@ -171,7 +171,7 @@ func TestVerification_ConcurrentReplayRace(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			err := authInst.Auth.VerifyEmail(context.Background(), db.VerifyEmailRequest{
+			_, err := authInst.Auth.VerifyEmail(context.Background(), db.VerifyEmailRequest{
 				Token: rawToken,
 			})
 			if err == nil {

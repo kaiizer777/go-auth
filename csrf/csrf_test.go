@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 	"testing/iotest"
+	"time"
 
 	"github.com/kaiizer777/go-auth/config"
 )
@@ -172,6 +173,33 @@ func TestCSRF_BearerAuth_SkipsCSRF(t *testing.T) {
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected status 200, got %d", rec.Code)
+	}
+}
+
+func TestCSRF_ZeroMaxAgeDefaultsToDay(t *testing.T) {
+	cfg := testConfig()
+	cfg.CSRFCookieMaxAge = 0
+	rec := httptest.NewRecorder()
+	setCSRFCookie(rec, "dummytoken", cfg)
+	cookies := rec.Result().Cookies()
+	if len(cookies) != 1 {
+		t.Fatalf("expected 1 cookie, got %d", len(cookies))
+	}
+	if cookies[0].MaxAge != 86400 {
+		t.Errorf("expected default MaxAge 86400, got %d", cookies[0].MaxAge)
+	}
+	if time.Until(cookies[0].Expires) < 23*time.Hour {
+		t.Errorf("expected Expires ~24h out, got %v", cookies[0].Expires)
+	}
+}
+
+func TestCSRF_ExplicitMaxAgePreserved(t *testing.T) {
+	cfg := testConfig()
+	cfg.CSRFCookieMaxAge = time.Hour
+	rec := httptest.NewRecorder()
+	setCSRFCookie(rec, "dummytoken", cfg)
+	if got := rec.Result().Cookies()[0].MaxAge; got != 3600 {
+		t.Errorf("expected MaxAge 3600, got %d", got)
 	}
 }
 
@@ -399,6 +427,108 @@ func TestCSRF_InvalidHeaderToken(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestCSRF_BearerAuthAmbiguousTransportRejected(t *testing.T) {
+	cfg := testConfig()
+	mw := Middleware(cfg)(dummyHandler())
+
+	newReq := func(method string) *http.Request {
+		req := httptest.NewRequest(method, "/resource", nil)
+		req.Header.Set("Authorization", "Bearer [REDACTED]")
+		req.Header.Set("X-Auth-Type", "bearer")
+		req.AddCookie(&http.Cookie{Name: cfg.SessionCookieName, Value: "0123456789abcdef0123456789abcdef"})
+		return req
+	}
+
+	t.Run("unsafe rejected", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		mw.ServeHTTP(rec, newReq(http.MethodPost))
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("expected 403 ambiguous transport, got %d", rec.Code)
+		}
+	})
+
+	t.Run("unsafe without session cookie exempt", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/resource", nil)
+		req.Header.Set("Authorization", "Bearer [REDACTED]")
+		req.Header.Set("X-Auth-Type", "bearer")
+		rec := httptest.NewRecorder()
+		mw.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200 cookie-free bearer, got %d", rec.Code)
+		}
+	})
+
+	t.Run("safe with combo skipped", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		mw.ServeHTTP(rec, newReq(http.MethodGet))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200 safe method, got %d", rec.Code)
+		}
+	})
+}
+
+func TestCSRF_XAuthTypeCaseMismatchNotExempt(t *testing.T) {
+	cfg := testConfig()
+	mw := Middleware(cfg)(dummyHandler())
+
+	t.Run("capitalized bearer requires pair", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/resource", nil)
+		req.Header.Set("X-Auth-Type", "Bearer")
+		rec := httptest.NewRecorder()
+		mw.ServeHTTP(rec, req)
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("expected 403 for non-canonical declaration, got %d", rec.Code)
+		}
+	})
+
+	t.Run("exact bearer exempt without pair", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/resource", nil)
+		req.Header.Set("X-Auth-Type", "bearer")
+		rec := httptest.NewRecorder()
+		mw.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200 cookie-free bearer, got %d", rec.Code)
+		}
+	})
+}
+
+func TestPreAuthMiddleware_BearerHeaderNotExempt(t *testing.T) {
+	cfg := testConfig()
+	mw := PreAuthMiddleware(cfg)(dummyHandler())
+
+	t.Run("authorization bearer requires pair", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/resource", nil)
+		req.Header.Set("Authorization", "Bearer [REDACTED]")
+		rec := httptest.NewRecorder()
+		mw.ServeHTTP(rec, req)
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("pre-auth must not honor Authorization exemption, got %d", rec.Code)
+		}
+	})
+
+	t.Run("header declaration still exempt", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/resource", nil)
+		req.Header.Set("X-Auth-Type", "bearer")
+		rec := httptest.NewRecorder()
+		mw.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200 cookie-free bearer declaration, got %d", rec.Code)
+		}
+	})
+
+	t.Run("ambiguous declaration still rejected", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/resource", nil)
+		req.Header.Set("Authorization", "Bearer [REDACTED]")
+		req.Header.Set("X-Auth-Type", "bearer")
+		req.AddCookie(&http.Cookie{Name: cfg.SessionCookieName, Value: "0123456789abcdef0123456789abcdef"})
+		rec := httptest.NewRecorder()
+		mw.ServeHTTP(rec, req)
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("expected 403 ambiguous transport, got %d", rec.Code)
+		}
+	})
 }
 
 func TestCSRF_EntropyFailure(t *testing.T) {

@@ -1094,6 +1094,14 @@ func TestConfig_CookieAndHeaderRFCValidation(t *testing.T) {
 		}
 	})
 
+	t.Run("CSRF cookie name collides with session cookie name", func(t *testing.T) {
+		cfg := baseCfg()
+		cfg.CSRFCookieName = cfg.SessionCookieName
+		if err := cfg.Validate(); !errors.Is(err, errors.ErrCSRFCookieNameCollision) {
+			t.Errorf("Validate() err = %v; want ErrCSRFCookieNameCollision", err)
+		}
+	})
+
 	t.Run("invalid CSRF header name", func(t *testing.T) {
 		invalidHeaders := []string{"Bad Header", "Header:Name", "Header@Name", "Header/Name"}
 		for _, h := range invalidHeaders {
@@ -1419,4 +1427,60 @@ func TestConfig_SecretRedaction_LogValue_String(t *testing.T) {
 			t.Fatalf("OAuthConfig.String() leaked client secret: %q", str)
 		}
 	})
+}
+func TestConfigValidate_SecurityHeaders(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+	cfg.BaseURL = "https://example.com"
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf(`DefaultConfig Validate = %v`, err)
+	}
+
+	badFrame := DefaultConfig()
+	badFrame.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+	badFrame.BaseURL = "https://example.com"
+	badFrame.SecurityHeaders.FrameOptions = `ALLOW`
+	if err := badFrame.Validate(); err != errors.ErrFrameOptionsInvalid {
+		t.Errorf(`FrameOptions err = %v`, err)
+	}
+
+	negHSTS := DefaultConfig()
+	negHSTS.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+	negHSTS.BaseURL = "https://example.com"
+	negHSTS.SecurityHeaders.HSTSMaxAge = -time.Second
+	if err := negHSTS.Validate(); err != errors.ErrHSTSMaxAgeNegative {
+		t.Errorf(`HSTSMaxAge err = %v`, err)
+	}
+
+	subSecondHSTS := DefaultConfig()
+	subSecondHSTS.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+	subSecondHSTS.BaseURL = "https://example.com"
+	subSecondHSTS.SecurityHeaders.HSTSMaxAge = 500 * time.Millisecond
+	if err := subSecondHSTS.Validate(); err != errors.ErrHSTSMaxAgeTooSmall {
+		t.Errorf(`sub-second HSTSMaxAge err = %v`, err)
+	}
+
+	badRef := DefaultConfig()
+	badRef.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+	badRef.BaseURL = "https://example.com"
+	badRef.SecurityHeaders.ReferrerPolicy = `nope`
+	if err := badRef.Validate(); err != errors.ErrReferrerPolicyInvalid {
+		t.Errorf(`ReferrerPolicy err = %v`, err)
+	}
+
+	zeroCSRF := DefaultConfig()
+	zeroCSRF.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+	zeroCSRF.BaseURL = "https://example.com"
+	zeroCSRF.CSRFCookieMaxAge = -time.Second
+	if err := zeroCSRF.Validate(); err != errors.ErrCSRFCookieMaxAgeInvalid {
+		t.Errorf(`CSRFCookieMaxAge err = %v`, err)
+	}
+
+	subSecondCSRF := DefaultConfig()
+	subSecondCSRF.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+	subSecondCSRF.BaseURL = "https://example.com"
+	subSecondCSRF.CSRFCookieMaxAge = 500 * time.Millisecond
+	if err := subSecondCSRF.Validate(); err != errors.ErrCSRFCookieMaxAgeInvalid {
+		t.Errorf(`sub-second CSRFCookieMaxAge err = %v`, err)
+	}
 }

@@ -212,6 +212,8 @@ func setupE2EServerWithConfig(t *testing.T, mutate func(*config.Config)) (*httpt
 
 func postJSON(t *testing.T, client *http.Client, targetURL string, payload any) (*http.Response, map[string]any) {
 	t.Helper()
+	csrfToken := fetchCSRFToken(t, client, targetURL)
+
 	var bodyReader io.Reader
 	if payload != nil {
 		b, err := json.Marshal(payload)
@@ -226,6 +228,7 @@ func postJSON(t *testing.T, client *http.Client, targetURL string, payload any) 
 		t.Fatalf("failed to create POST request: %v", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-CSRF-Token", csrfToken)
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -234,6 +237,41 @@ func postJSON(t *testing.T, client *http.Client, targetURL string, payload any) 
 
 	data := readJSONBody(t, resp)
 	return resp, data
+}
+
+// fetchCSRFToken seeds the client's cookie jar via GET /auth/csrf and returns
+// the double-submit token. Browser-equivalent flow: cookie auto-stored in jar,
+// token echoed in the X-CSRF-Token header on state-changing requests.
+func fetchCSRFToken(t *testing.T, client *http.Client, targetURL string) string {
+	t.Helper()
+	u, err := url.Parse(targetURL)
+	if err != nil {
+		t.Fatalf("failed to parse target URL: %v", err)
+	}
+	csrfURL := (&url.URL{Scheme: u.Scheme, Host: u.Host, Path: "/auth/csrf"}).String()
+
+	req, err := http.NewRequest(http.MethodGet, csrfURL, nil)
+	if err != nil {
+		t.Fatalf("failed to create CSRF token request: %v", err)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("failed to fetch CSRF token: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 from /auth/csrf, got %d", resp.StatusCode)
+	}
+	var result struct {
+		CSRFToken string `json:"csrf_token"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		t.Fatalf("failed to decode CSRF token response: %v", err)
+	}
+	if result.CSRFToken == "" {
+		t.Fatal("expected non-empty CSRF token")
+	}
+	return result.CSRFToken
 }
 
 func getJSON(t *testing.T, client *http.Client, targetURL string) (*http.Response, map[string]any) {

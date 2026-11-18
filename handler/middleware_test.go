@@ -512,11 +512,12 @@ func TestSecurityHeaders_Middleware(t *testing.T) {
 	if got := rec.Header().Get("Referrer-Policy"); got != "strict-origin-when-cross-origin" {
 		t.Errorf("Referrer-Policy = %q, want strict-origin-when-cross-origin", got)
 	}
-	if got := rec.Header().Get("Content-Security-Policy"); got != "default-src 'none'; frame-ancestors 'none'" {
-		t.Errorf("Content-Security-Policy = %q, want default-src 'none'; frame-ancestors 'none'", got)
+	if got := rec.Header().Get("Content-Security-Policy"); got != "default-src 'self'; frame-ancestors 'none'" {
+		t.Errorf("Content-Security-Policy = %q, want default-src 'self'; frame-ancestors 'none'", got)
 	}
-	if got := rec.Header().Get("Strict-Transport-Security"); got != "max-age=63072000; includeSubDomains; preload" {
-		t.Errorf("Strict-Transport-Security = %q, want HSTS header when secure", got)
+	// Cleartext must never carry HSTS even with SessionCookieSecure=true (RFC 6797 7.2).
+	if got := rec.Header().Get("Strict-Transport-Security"); got != "" {
+		t.Errorf("Strict-Transport-Security = %q, want empty on cleartext", got)
 	}
 }
 

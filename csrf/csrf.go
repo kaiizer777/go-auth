@@ -5,12 +5,15 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"io"
+	"log/slog"
 	"net/http"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/kaiizer777/go-auth/config"
 	apperrors "github.com/kaiizer777/go-auth/errors"
+	"github.com/kaiizer777/go-auth/ratelimit"
 )
 
 // randReader is the CSPRNG entropy source for CSRF token generation, package-scoped for unit test injection.
@@ -61,18 +64,43 @@ func isValidHexToken(s string) bool {
 
 // Middleware enforces Double Submit Cookie CSRF protection.
 func Middleware(cfg *config.Config) func(http.Handler) http.Handler {
+	return middleware(cfg, true)
+}
+
+// PreAuthMiddleware enforces CSRF on pre-auth routes (login, signup, …)
+// without the Authorization-bearer exemption: pre-auth handlers never
+// consume the Authorization header, so any non-empty bearer value would
+// bypass CSRF there. The X-Auth-Type declaration path below is unchanged.
+func PreAuthMiddleware(cfg *config.Config) func(http.Handler) http.Handler {
+	return middleware(cfg, false)
+}
+
+func middleware(cfg *config.Config, bearerExemption bool) func(http.Handler) http.Handler {
 	cfg = ensureConfig(cfg)
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			// Bearer token requests are inherently immune to CSRF — skip only if a non-empty token is present.
-			authHeader := r.Header.Get("Authorization")
-			if authHeader != "" {
-				trimmed := strings.TrimSpace(authHeader)
-				if len(trimmed) > 7 && strings.EqualFold(trimmed[:7], "bearer ") {
-					token := strings.TrimSpace(trimmed[7:])
-					if token != "" {
-						next.ServeHTTP(w, r)
-						return
+			// Pre-auth routes never see this block; see PreAuthMiddleware.
+			if bearerExemption {
+				authHeader := r.Header.Get("Authorization")
+				if authHeader != "" {
+					trimmed := strings.TrimSpace(authHeader)
+					if len(trimmed) > 7 && strings.EqualFold(trimmed[:7], "bearer ") {
+						token := strings.TrimSpace(trimmed[7:])
+						if token != "" {
+							// Declared bearer transport plus a session cookie is
+							// ambiguous and never rides the Authorization exemption.
+							// Exact "bearer" mirrors Login's transport check.
+							if !safeMethods[r.Method] && r.Header.Get("X-Auth-Type") == "bearer" {
+								if c, cookieErr := r.Cookie(cfg.SessionCookieName); cookieErr == nil && c.Value != "" {
+									logViolation(r, string(apperrors.CodeCSRFTokenInvalid))
+									apperrors.WriteHTTP(w, apperrors.ErrCSRFTokenInvalid)
+									return
+								}
+							}
+							next.ServeHTTP(w, r)
+							return
+						}
 					}
 				}
 			}
@@ -93,29 +121,50 @@ func Middleware(cfg *config.Config) func(http.Handler) http.Handler {
 				return
 			}
 
+			// Pre-auth bearer flows declare cookie-free transport via header only.
+			// Query parameters never confer exemption. A session cookie alongside
+			// the declaration is ambiguous transport and is rejected outright.
+			// Below the safe-method skip: safe methods never 403 here.
+			// Exact "bearer" mirrors Login's transport check: the exemption
+			// applies only when the handler treats the request as bearer.
+			if r.Header.Get("X-Auth-Type") == "bearer" {
+				if c, cookieErr := r.Cookie(cfg.SessionCookieName); cookieErr == nil && c.Value != "" {
+					logViolation(r, string(apperrors.CodeCSRFTokenInvalid))
+					apperrors.WriteHTTP(w, apperrors.ErrCSRFTokenInvalid)
+					return
+				}
+				next.ServeHTTP(w, r)
+				return
+			}
+
 			// State-changing methods (POST, PUT, PATCH, DELETE) enforce cookie and header.
 			if err != nil || csrfCookie.Value == "" {
+				logViolation(r, string(apperrors.CodeCSRFTokenMissing))
 				apperrors.WriteHTTP(w, apperrors.ErrCSRFTokenMissing)
 				return
 			}
 
 			if !isValidHexToken(csrfCookie.Value) {
+				logViolation(r, string(apperrors.CodeCSRFTokenInvalid))
 				apperrors.WriteHTTP(w, apperrors.ErrCSRFTokenInvalid)
 				return
 			}
 
 			headerToken := r.Header.Get(cfg.CSRFHeaderName)
 			if headerToken == "" {
+				logViolation(r, string(apperrors.CodeCSRFTokenMissing))
 				apperrors.WriteHTTP(w, apperrors.ErrCSRFTokenMissing)
 				return
 			}
 
 			if !isValidHexToken(headerToken) {
+				logViolation(r, string(apperrors.CodeCSRFTokenInvalid))
 				apperrors.WriteHTTP(w, apperrors.ErrCSRFTokenInvalid)
 				return
 			}
 
 			if !secureCompare(csrfCookie.Value, headerToken) {
+				logViolation(r, string(apperrors.CodeCSRFTokenInvalid))
 				apperrors.WriteHTTP(w, apperrors.ErrCSRFTokenInvalid)
 				return
 			}
@@ -150,14 +199,50 @@ func IssueCookie(w http.ResponseWriter, cfg *config.Config) (string, error) {
 // SameSite: Strict ensures maximum isolation.
 func setCSRFCookie(w http.ResponseWriter, token string, cfg *config.Config) {
 	cfg = ensureConfig(cfg)
+	maxAge := cfg.CSRFCookieMaxAge
+	if maxAge == 0 {
+		maxAge = 24 * time.Hour // documented default; writers may bypass Validate
+	}
 	http.SetCookie(w, &http.Cookie{
 		Name:     cfg.CSRFCookieName,
 		Value:    token,
 		Path:     "/",
+		MaxAge:   int(maxAge.Seconds()),
+		Expires:  time.Now().Add(maxAge),
 		HttpOnly: false, // Mandatory false for Double Submit Cookie pattern
 		Secure:   cfg.SessionCookieSecure,
 		SameSite: http.SameSiteStrictMode, // Strict for CSRF cookie
 	})
+}
+
+// ClearCookie invalidates the CSRF token cookie immediately.
+func ClearCookie(w http.ResponseWriter, cfg *config.Config) {
+	cfg = ensureConfig(cfg)
+	http.SetCookie(w, &http.Cookie{
+		Name:     cfg.CSRFCookieName,
+		Value:    "",
+		Path:     "/",
+		MaxAge:   -1,
+		Expires:  time.Unix(0, 0),
+		HttpOnly: false,
+		Secure:   cfg.SessionCookieSecure,
+		SameSite: http.SameSiteStrictMode,
+	})
+}
+
+// ValidToken reports whether s is a well-formed 64-char hex CSRF token.
+func ValidToken(s string) bool {
+	return isValidHexToken(s)
+}
+
+// logViolation records a CSRF rejection. Token values are never emitted.
+func logViolation(r *http.Request, reason string) {
+	slog.WarnContext(r.Context(), "csrf_violation",
+		"ip", ratelimit.ClientIP(r),
+		"user_agent", r.UserAgent(),
+		"path", r.URL.Path,
+		"reason", reason,
+	)
 }
 
 // secureCompare executes constant-time string comparison to prevent timing leaks.

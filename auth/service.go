@@ -25,9 +25,9 @@ type Service interface {
 	Signup(ctx context.Context, req db.SignupRequest) (*db.User, string, error)
 	Login(ctx context.Context, req db.LoginRequest) (*db.User, error)
 	Logout(ctx context.Context, sessionID string) error
-	VerifyEmail(ctx context.Context, req db.VerifyEmailRequest) error
+	VerifyEmail(ctx context.Context, req db.VerifyEmailRequest) (*db.User, error)
 	RequestPasswordReset(ctx context.Context, req db.PasswordResetRequest) (string, error)
-	ResetPassword(ctx context.Context, req db.PasswordResetConfirmRequest) error
+	ResetPassword(ctx context.Context, req db.PasswordResetConfirmRequest) (*db.User, error)
 }
 
 const emailDispatchSemaphoreSize = 128
@@ -258,17 +258,18 @@ func (s *authService) Logout(ctx context.Context, sessionID string) error {
 }
 
 // VerifyEmail consumes a single-use verification token and marks the account verified.
-func (s *authService) VerifyEmail(ctx context.Context, req db.VerifyEmailRequest) error {
+func (s *authService) VerifyEmail(ctx context.Context, req db.VerifyEmailRequest) (*db.User, error) {
 	if err := req.Validate(); err != nil {
-		return err
+		return nil, err
 	}
 
 	tokenHash, err := crypto.HashToken(req.Token)
 	if err != nil {
-		return errors.ErrInvalidToken
+		return nil, errors.ErrInvalidToken
 	}
 
 	var isExpired bool
+	var verifiedUser db.User
 	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var tok db.VerificationToken
 		if err := tx.Where("token_hash = ?", tokenHash[:]).First(&tok).Error; err != nil {
@@ -291,20 +292,26 @@ func (s *authService) VerifyEmail(ctx context.Context, req db.VerifyEmailRequest
 			return errors.ErrInvalidToken
 		}
 
-		return tx.Model(&db.User{}).Where("id = ?", tok.UserID).Update("email_verified", true).Error
+		if err := tx.Model(&db.User{}).Where("id = ?", tok.UserID).Update("email_verified", true).Error; err != nil {
+			return err
+		}
+		// Load inside the transaction: a post-commit read failure would report
+		// an error for an already-consumed token, making retry impossible.
+		// Here the read failure rolls back instead, preserving retry.
+		return tx.Where("id = ?", tok.UserID).First(&verifiedUser).Error
 	})
 	if err != nil {
 		var appErr *errors.Error
 		if errors.As(err, &appErr) && (appErr.Code() == errors.CodeInvalidToken || appErr.Code() == errors.CodeTokenExpired) {
-			return err
+			return nil, err
 		}
-		return errors.Wrap(err, errors.CodeDatabaseError, "failed to verify email")
+		return nil, errors.Wrap(err, errors.CodeDatabaseError, "failed to verify email")
 	}
 	if isExpired {
-		return errors.ErrTokenExpired
+		return nil, errors.ErrTokenExpired
 	}
 
-	return nil
+	return &verifiedUser, nil
 }
 
 // lockForUpdate applies SELECT ... FOR UPDATE on dialects with row locking.
@@ -370,14 +377,14 @@ func (s *authService) RequestPasswordReset(ctx context.Context, req db.PasswordR
 
 // ResetPassword consumes a reset token, updates the password hash, and purges all
 // active password reset tokens for the user (ASVS L1 token invalidation).
-func (s *authService) ResetPassword(ctx context.Context, req db.PasswordResetConfirmRequest) error {
+func (s *authService) ResetPassword(ctx context.Context, req db.PasswordResetConfirmRequest) (*db.User, error) {
 	if err := crypto.ValidatePassword(req.NewPassword, s.cfg.PasswordMinLength, s.cfg.PasswordMaxLength); err != nil {
-		return err
+		return nil, err
 	}
 
 	tokenHash, err := crypto.HashToken(req.Token)
 	if err != nil {
-		return errors.ErrInvalidToken
+		return nil, errors.ErrInvalidToken
 	}
 
 	// Cheap existence/expiry gate before the expensive Argon2id hash: unknown
@@ -385,21 +392,22 @@ func (s *authService) ResetPassword(ctx context.Context, req db.PasswordResetCon
 	var tok db.PasswordResetToken
 	if err := s.db.WithContext(ctx).Where("token_hash = ?", tokenHash[:]).First(&tok).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return errors.ErrInvalidToken
+			return nil, errors.ErrInvalidToken
 		}
-		return errors.Wrap(err, errors.CodeDatabaseError, "failed to query password reset token")
+		return nil, errors.Wrap(err, errors.CodeDatabaseError, "failed to query password reset token")
 	}
 
 	if time.Now().UTC().After(tok.ExpiresAt) {
 		_ = s.db.WithContext(ctx).Where("token_hash = ?", tokenHash[:]).Delete(&db.PasswordResetToken{}).Error
-		return errors.ErrTokenExpired
+		return nil, errors.ErrTokenExpired
 	}
 
 	newHash, err := crypto.HashPassword(req.NewPassword, s.hashParams)
 	if err != nil {
-		return errors.Wrap(err, errors.CodeInternalError, "failed to hash password")
+		return nil, errors.Wrap(err, errors.CodeInternalError, "failed to hash password")
 	}
 
+	var resetUser db.User
 	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var lockedUser db.User
 		if err := lockForUpdate(tx).Select("id").Where("id = ?", tok.UserID).First(&lockedUser).Error; err != nil {
@@ -436,17 +444,20 @@ func (s *authService) ResetPassword(ctx context.Context, req db.PasswordResetCon
 		if err := tx.Where("user_id = ?", tok.UserID).Delete(&db.Session{}).Error; err != nil {
 			return err
 		}
-		return nil
+		// Load inside the transaction: a post-commit read failure would report
+		// an error for an already-consumed token, making retry impossible.
+		// Here the read failure rolls back instead, preserving retry.
+		return tx.Where("id = ?", tok.UserID).First(&resetUser).Error
 	})
 	if err != nil {
 		var appErr *errors.Error
 		if errors.As(err, &appErr) && (appErr.Code() == errors.CodeInvalidToken || appErr.Code() == errors.CodeTokenExpired) {
-			return err
+			return nil, err
 		}
-		return errors.Wrap(err, errors.CodeDatabaseError, "failed to reset password")
+		return nil, errors.Wrap(err, errors.CodeDatabaseError, "failed to reset password")
 	}
 
-	return nil
+	return &resetUser, nil
 }
 
 // emailHookTimeout returns the bound for email hook execution, defaulting to

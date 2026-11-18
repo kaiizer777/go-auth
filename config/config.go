@@ -64,6 +64,18 @@ func (o OAuthConfig) String() string {
 	return fmt.Sprintf("OAuthConfig{ClientID: %s, ClientSecret: %s, RedirectURL: %s}", o.ClientID, secret, o.RedirectURL)
 }
 
+// SecurityHeadersConfig groups HTTP security header policies.
+// Struct fields are ordered largest-to-smallest to eliminate memory alignment padding.
+type SecurityHeadersConfig struct {
+	FrameOptions          string        // Default: "DENY" ("DENY" or "SAMEORIGIN")
+	ReferrerPolicy        string        // Default: "strict-origin-when-cross-origin"
+	ContentSecurityPolicy string        // Default: "default-src 'self'; frame-ancestors 'none'"
+	HSTSMaxAge            time.Duration // Default: 365 * 24 * time.Hour (1 year)
+	EnableHSTS            bool          // Default: true
+	HSTSIncludeSubdomains bool          // Default: true
+	HSTSPreload           bool          // Default: false
+}
+
 // Config holds all database, CORS, connection pool, and email hook settings.
 type Config struct {
 	// DatabaseURL is the PostgreSQL connection string.
@@ -132,6 +144,14 @@ type Config struct {
 	// CSRF
 	CSRFCookieName string // default "csrf_token"
 	CSRFHeaderName string // default "X-CSRF-Token"
+	// CSRFCookieMaxAge is the lifetime of the CSRF double-submit cookie; default 24h.
+	CSRFCookieMaxAge time.Duration
+
+	// SecurityHeaders groups HTTP security header policies.
+	SecurityHeaders SecurityHeadersConfig
+
+	// OAuth holds optional third-party OAuth2/OIDC provider configurations keyed by provider name.
+	OAuth map[string]OAuthConfig
 
 	// Rate limiting
 	RateLimitLoginWindow  time.Duration // sliding window duration; default 15m
@@ -144,9 +164,6 @@ type Config struct {
 	RateLimitSignupMax    int           // default 10
 	RateLimitSignupIPMax  int           // max signups per IP in window; default 50
 	RateLimitCleanupTick  time.Duration // how often to prune expired entries; default 5m
-
-	// OAuth holds optional third-party OAuth2/OIDC provider configurations keyed by provider name.
-	OAuth map[string]OAuthConfig
 }
 
 // DefaultConfig returns safe default settings. AllowedOrigins is intentionally
@@ -159,7 +176,7 @@ func DefaultConfig() Config {
 		ConnMaxLifetime:      time.Hour,
 		ConnMaxIdleTime:      30 * time.Minute,
 		AllowedMethods:       []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
-		AllowedHeaders:       []string{"Authorization", "Content-Type", "X-CSRF-Token"},
+		AllowedHeaders:       []string{"Authorization", "Content-Type", "X-CSRF-Token", "X-Auth-Type"},
 		EmailDispatchTimeout: 10 * time.Second,
 		Argon2: Argon2Config{
 			Memory:      65536,
@@ -184,8 +201,19 @@ func DefaultConfig() Config {
 		SessionCookieSameSite: http.SameSiteLaxMode,
 
 		// CSRF
-		CSRFCookieName: "csrf_token",
-		CSRFHeaderName: "X-CSRF-Token",
+		CSRFCookieName:   "csrf_token",
+		CSRFHeaderName:   "X-CSRF-Token",
+		CSRFCookieMaxAge: 24 * time.Hour,
+
+		SecurityHeaders: SecurityHeadersConfig{
+			FrameOptions:          "DENY",
+			ReferrerPolicy:        "strict-origin-when-cross-origin",
+			ContentSecurityPolicy: "default-src 'self'; frame-ancestors 'none'",
+			HSTSMaxAge:            365 * 24 * time.Hour,
+			EnableHSTS:            true,
+			HSTSIncludeSubdomains: true,
+			HSTSPreload:           false,
+		},
 
 		// Rate limiting
 		RateLimitLoginWindow:  15 * time.Minute,
@@ -341,6 +369,45 @@ func (c *Config) Validate() error {
 	}
 	if !isToken(c.CSRFHeaderName) {
 		return errors.ErrCSRFHeaderNameInvalid
+	}
+	if c.CSRFCookieName == c.SessionCookieName {
+		return errors.ErrCSRFCookieNameCollision
+	}
+	if c.CSRFCookieMaxAge == 0 {
+		c.CSRFCookieMaxAge = 24 * time.Hour
+	}
+	// Sub-second ages truncate to MaxAge=0 on the wire and the cookie is discarded.
+	if c.CSRFCookieMaxAge < time.Second {
+		return errors.ErrCSRFCookieMaxAgeInvalid
+	}
+	if c.SecurityHeaders.FrameOptions == "" {
+		c.SecurityHeaders.FrameOptions = "DENY"
+	}
+	if c.SecurityHeaders.FrameOptions != "DENY" && c.SecurityHeaders.FrameOptions != "SAMEORIGIN" {
+		return errors.ErrFrameOptionsInvalid
+	}
+	if c.SecurityHeaders.ReferrerPolicy == "" {
+		c.SecurityHeaders.ReferrerPolicy = "strict-origin-when-cross-origin"
+	}
+	switch c.SecurityHeaders.ReferrerPolicy {
+	case "no-referrer", "no-referrer-when-downgrade", "origin", "origin-when-cross-origin",
+		"same-origin", "strict-origin", "strict-origin-when-cross-origin", "unsafe-url":
+	default:
+		return errors.ErrReferrerPolicyInvalid
+	}
+	if c.SecurityHeaders.ContentSecurityPolicy == "" {
+		c.SecurityHeaders.ContentSecurityPolicy = "default-src 'self'; frame-ancestors 'none'"
+	}
+	if c.SecurityHeaders.HSTSMaxAge == 0 {
+		c.SecurityHeaders.HSTSMaxAge = 365 * 24 * time.Hour
+	}
+	if c.SecurityHeaders.HSTSMaxAge < 0 {
+		return errors.ErrHSTSMaxAgeNegative
+	}
+	// Sub-second ages truncate to max-age=0 and strip the HSTS policy.
+	// Zero was defaulted above, so any remaining sub-second value is explicit.
+	if c.SecurityHeaders.HSTSMaxAge < time.Second {
+		return errors.ErrHSTSMaxAgeTooSmall
 	}
 
 	if c.SessionIdleTimeout == 0 {
