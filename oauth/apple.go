@@ -24,6 +24,7 @@ import (
 
 	"github.com/kaiizer777/go-auth/config"
 	"github.com/kaiizer777/go-auth/errors"
+	"golang.org/x/sync/singleflight"
 )
 
 const (
@@ -45,6 +46,8 @@ type AppleProvider struct {
 	mu          sync.RWMutex
 	jwks        map[string]*rsa.PublicKey
 	jwksExpires time.Time
+	jwksGen     uint64 // guarded by mu; dropped publishes never move it
+	sf          singleflight.Group
 }
 
 // NewAppleProvider builds an Apple provider with production endpoints.
@@ -278,7 +281,19 @@ func (p *AppleProvider) jwksKey(ctx context.Context, kid string) (*rsa.PublicKey
 	if ok && fresh {
 		return key, nil
 	}
-	if err := p.refreshJWKS(ctx); err != nil {
+	// One expiry yields one upstream fetch: concurrent refreshes share a
+	// single flight, and the winner rechecks the cache under that flight.
+	_, err, _ := p.sf.Do("jwks", func() (any, error) {
+		p.mu.RLock()
+		_, ok := p.jwks[kid]
+		fresh := time.Now().Before(p.jwksExpires)
+		p.mu.RUnlock()
+		if ok && fresh {
+			return nil, nil
+		}
+		return nil, p.refreshJWKS(ctx)
+	})
+	if err != nil {
 		return nil, err
 	}
 	p.mu.RLock()
@@ -291,6 +306,9 @@ func (p *AppleProvider) jwksKey(ctx context.Context, kid string) (*rsa.PublicKey
 
 // refreshJWKS reloads Apple's public keys with a 24h TTL.
 func (p *AppleProvider) refreshJWKS(ctx context.Context) error {
+	p.mu.RLock()
+	startGen := p.jwksGen
+	p.mu.RUnlock()
 	ctx, cancel := context.WithTimeout(ctx, oauthHTTPTimeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, p.jwksURL, nil)
@@ -336,8 +354,12 @@ func (p *AppleProvider) refreshJWKS(ctx context.Context) error {
 		keys[k.Kid] = &rsa.PublicKey{N: new(big.Int).SetBytes(nb), E: e}
 	}
 	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.jwksGen != startGen {
+		return nil // superseded by a newer publish; keep the newer set
+	}
 	p.jwks = keys
 	p.jwksExpires = time.Now().Add(appleJWKSTTL)
-	p.mu.Unlock()
+	p.jwksGen++
 	return nil
 }

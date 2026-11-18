@@ -89,6 +89,7 @@ func serviceTestDB(t *testing.T) *gorm.DB {
 	if err != nil {
 		t.Fatalf("pool: %v", err)
 	}
+	t.Cleanup(func() { _ = sqlDB.Close() })
 	sqlDB.SetMaxOpenConns(1)
 	ddl := `
 	CREATE TABLE IF NOT EXISTS users (

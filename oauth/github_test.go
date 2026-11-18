@@ -45,11 +45,10 @@ func TestGitHubAuthURL(t *testing.T) {
 	}
 }
 
-func githubMockServers(userBody string, emailsBody string, emailsStatus int, captureAccept *string) (*httptest.Server, *httptest.Server) {
+func githubMockServers(t *testing.T, userBody string, emailsBody string, emailsStatus int, captureAccept *capturedValue) (*httptest.Server, *httptest.Server) {
+	t.Helper()
 	tokenSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if captureAccept != nil {
-			*captureAccept = r.Header.Get("Accept")
-		}
+		captureAccept.set(r.Header.Get("Accept"))
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{"access_token": "gh-at", "token_type": "Bearer"})
 	}))
@@ -68,16 +67,18 @@ func githubMockServers(userBody string, emailsBody string, emailsStatus int, cap
 			w.WriteHeader(http.StatusNotFound)
 		}
 	}))
+	t.Cleanup(tokenSrv.Close)
+	t.Cleanup(mux.Close)
 	return tokenSrv, mux
 }
 
 func TestGitHubPublicEmail(t *testing.T) {
 	t.Parallel()
-	var accept string
-	tokenSrv, apiSrv := githubMockServers(
+	accept := &capturedValue{}
+	tokenSrv, apiSrv := githubMockServers(t,
 		`{"id":12345,"login":"octocat","name":"Mona Lisa","email":"mona@github.com","avatar_url":"https://avatars.example.com/u/1"}`,
 		`[{"email":"mona@github.com","primary":true,"verified":true,"visibility":"public"}]`,
-		0, &accept,
+		0, accept,
 	)
 	defer tokenSrv.Close()
 	defer apiSrv.Close()
@@ -94,8 +95,8 @@ func TestGitHubPublicEmail(t *testing.T) {
 	if tok.AccessToken != "gh-at" {
 		t.Errorf("access token = %q", tok.AccessToken)
 	}
-	if accept != "application/json" {
-		t.Errorf("Accept = %q; want application/json", accept)
+	if got := accept.get(); got != "application/json" {
+		t.Errorf("Accept = %q; want application/json", got)
 	}
 
 	info, err := p.FetchUserInfo(context.Background(), tok)
@@ -111,7 +112,7 @@ func TestGitHubPublicEmail(t *testing.T) {
 
 func TestGitHubPrivateEmailFallback(t *testing.T) {
 	t.Parallel()
-	tokenSrv, apiSrv := githubMockServers(
+	tokenSrv, apiSrv := githubMockServers(t,
 		`{"id":6789,"login":"ghost","name":null,"email":null,"avatar_url":"https://avatars.example.com/u/2"}`,
 		`[{"email":"old@example.com","primary":false,"verified":true,"visibility":"private"},`+
 			`{"email":"primary@example.com","primary":true,"verified":true,"visibility":"private"}]`,
@@ -143,7 +144,7 @@ func TestGitHubPrivateEmailFallback(t *testing.T) {
 
 func TestGitHubNoVerifiedEmail(t *testing.T) {
 	t.Parallel()
-	tokenSrv, apiSrv := githubMockServers(
+	tokenSrv, apiSrv := githubMockServers(t,
 		`{"id":42,"login":"unverified","name":"Un V","email":null,"avatar_url":""}`,
 		`[{"email":"x@example.com","primary":true,"verified":false,"visibility":"private"}]`,
 		0, nil,
@@ -203,7 +204,7 @@ func TestGitHubErrors(t *testing.T) {
 
 	t.Run("emails invalid JSON maps to provider error", func(t *testing.T) {
 		t.Parallel()
-		_, apiSrv := githubMockServers(`{"id":7,"login":"x"}`, `broken[`, 0, nil)
+		_, apiSrv := githubMockServers(t, `{"id":7,"login":"x"}`, `broken[`, 0, nil)
 		defer apiSrv.Close()
 		p := NewGitHubProvider(githubTestConfig())
 		p.userURL = apiSrv.URL + "/user"
@@ -214,7 +215,7 @@ func TestGitHubErrors(t *testing.T) {
 
 	t.Run("missing user id rejected", func(t *testing.T) {
 		t.Parallel()
-		_, apiSrv := githubMockServers(`{"login":"noid"}`, `[]`, 0, nil)
+		_, apiSrv := githubMockServers(t, `{"login":"noid"}`, `[]`, 0, nil)
 		defer apiSrv.Close()
 		p := NewGitHubProvider(githubTestConfig())
 		p.userURL = apiSrv.URL + "/user"

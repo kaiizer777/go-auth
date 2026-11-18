@@ -18,6 +18,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -77,14 +78,34 @@ func appleFixtureClaims(email any) map[string]any {
 	}
 }
 
+// capturedValue is a mutex-guarded string written by handler goroutines and
+// read by the test goroutine; the mutex is the happens-before edge.
+type capturedValue struct {
+	mu sync.Mutex
+	v  string
+}
+
+func (c *capturedValue) set(s string) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	c.v = s
+	c.mu.Unlock()
+}
+
+func (c *capturedValue) get() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.v
+}
+
 // appleMockStack serves a token endpoint returning idToken and a JWKS endpoint for Key.
-func appleMockStack(t *testing.T, Key *rsa.PrivateKey, kid, idToken string, captureSecret *string) (*httptest.Server, *httptest.Server) {
+func appleMockStack(t *testing.T, Key *rsa.PrivateKey, kid, idToken string, captureSecret *capturedValue) (*httptest.Server, *httptest.Server) {
 	t.Helper()
 	tokenSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_ = r.ParseForm()
-		if captureSecret != nil {
-			*captureSecret = r.PostForm.Get("client_secret")
-		}
+		captureSecret.set(r.PostForm.Get("client_secret"))
 		for _, k := range []string{"client_id", "code", "grant_type", "redirect_uri", "code_verifier"} {
 			if r.PostForm.Get(k) == "" {
 				http.Error(w, "missing "+k, http.StatusBadRequest)
@@ -101,6 +122,8 @@ func appleMockStack(t *testing.T, Key *rsa.PrivateKey, kid, idToken string, capt
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{"keys": []any{rsaJWK(&Key.PublicKey, kid)}})
 	}))
+	t.Cleanup(tokenSrv.Close)
+	t.Cleanup(jwksSrv.Close)
 	return tokenSrv, jwksSrv
 }
 
@@ -231,8 +254,12 @@ func TestAppleIDTokenRejections(t *testing.T) {
 		if err != nil || len(sig) == 0 {
 			t.Fatalf("decode signature: %v", err)
 		}
+		orig := append([]byte(nil), sig...)
 		sig[0] ^= 0xFF // flip a decoded byte; last-char edits only touch ignored padding bits
 		out := parts[0] + "." + parts[1] + "." + base64.RawURLEncoding.EncodeToString(sig)
+		if rt, err := base64.RawURLEncoding.DecodeString(strings.Split(out, ".")[2]); err != nil || string(rt) == string(orig) {
+			t.Fatalf("tamper left signature bytes unchanged")
+		}
 		return out
 	}
 
@@ -384,8 +411,8 @@ func TestAppleES256ClientSecret(t *testing.T) {
 
 	Key := mustRSAKey(t)
 	idToken := mintAppleIDToken(t, Key, "kid-1", appleFixtureClaims(true))
-	var captured string
-	tokenSrv, jwksSrv := appleMockStack(t, Key, "kid-1", idToken, &captured)
+	captured := &capturedValue{}
+	tokenSrv, jwksSrv := appleMockStack(t, Key, "kid-1", idToken, captured)
 	defer tokenSrv.Close()
 	defer jwksSrv.Close()
 
@@ -400,7 +427,7 @@ func TestAppleES256ClientSecret(t *testing.T) {
 	if _, err := p.ExchangeCode(context.Background(), "code123", "verifier123"); err != nil {
 		t.Fatalf("ExchangeCode = %v", err)
 	}
-	parts := strings.Split(captured, ".")
+	parts := strings.Split(captured.get(), ".")
 	if len(parts) != 3 {
 		t.Fatalf("client_secret segments = %d; want 3", len(parts))
 	}
@@ -506,5 +533,100 @@ func TestAppleClientSecretRejectsNonP256(t *testing.T) {
 	}
 	if appErr.HTTPStatus() != http.StatusInternalServerError {
 		t.Fatalf("status = %d; want 500", appErr.HTTPStatus())
+	}
+}
+
+func TestAppleConcurrentJWKSRefreshCoalesced(t *testing.T) {
+	t.Parallel()
+	key := mustRSAKey(t)
+	idToken := mintAppleIDToken(t, key, "kid-1", appleFixtureClaims(true))
+	var hits atomic.Int64
+	jwksSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"keys": []any{rsaJWK(&key.PublicKey, "kid-1")}})
+	}))
+	defer jwksSrv.Close()
+
+	p := NewAppleProvider(appleTestConfig())
+	p.jwksURL = jwksSrv.URL
+
+	const workers = 16
+	errs := make([]error, workers)
+	var wg sync.WaitGroup
+	for i := range errs {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, errs[i] = p.FetchUserInfo(context.Background(), &TokenResponse{IDToken: idToken})
+		}(i)
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("worker %d FetchUserInfo = %v", i, err)
+		}
+	}
+	if n := hits.Load(); n != 1 {
+		t.Errorf("JWKS fetches = %d; want 1 (shared in-flight refresh)", n)
+	}
+}
+
+func TestAppleStaleJWKSRefreshSuperseded(t *testing.T) {
+	t.Parallel()
+	keyA := mustRSAKey(t)
+	keyB := mustRSAKey(t)
+
+	var mu sync.Mutex
+	reqs := 0
+	started := make(chan struct{})
+	release := make(chan struct{})
+	jwksSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		reqs++
+		n := reqs
+		mu.Unlock()
+		if n == 2 {
+			close(started)
+			<-release
+		}
+		kid, key := "kid-A", keyA
+		if n >= 3 {
+			kid, key = "kid-B", keyB
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"keys": []any{rsaJWK(&key.PublicKey, kid)}})
+	}))
+	defer jwksSrv.Close()
+
+	p := NewAppleProvider(appleTestConfig())
+	p.jwksURL = jwksSrv.URL
+
+	tokenA := mintAppleIDToken(t, keyA, "kid-A", appleFixtureClaims(true))
+	if _, err := p.FetchUserInfo(context.Background(), &TokenResponse{IDToken: tokenA}); err != nil {
+		t.Fatalf("prime kid-A FetchUserInfo = %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- p.refreshJWKS(context.Background()) }()
+	<-started // slow refresh holds the stale fetch open
+	newerErr := p.refreshJWKS(context.Background())
+	close(release)
+	staleErr := <-done
+	if newerErr != nil {
+		t.Fatalf("newer refresh = %v", newerErr)
+	}
+	if staleErr != nil {
+		t.Fatalf("stale refresh = %v", staleErr)
+	}
+
+	// Cache must hold the newer set without another upstream fetch.
+	if _, err := p.jwksKey(context.Background(), "kid-B"); err != nil {
+		t.Fatalf("jwksKey(kid-B) = %v; want newer published set", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if reqs != 3 {
+		t.Errorf("JWKS fetches = %d; want 3 (prime + stale + newer, no re-fetch)", reqs)
 	}
 }
