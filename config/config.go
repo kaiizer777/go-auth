@@ -370,6 +370,9 @@ func (c *Config) Validate() error {
 	if !isToken(c.CSRFHeaderName) {
 		return errors.ErrCSRFHeaderNameInvalid
 	}
+	if c.CSRFCookieName == c.SessionCookieName {
+		return errors.ErrCSRFCookieNameCollision
+	}
 	if c.CSRFCookieMaxAge == 0 {
 		c.CSRFCookieMaxAge = 24 * time.Hour
 	}

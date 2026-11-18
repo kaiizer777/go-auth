@@ -27,7 +27,7 @@ func (h *Handler) GetCSRFToken(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if csrfName == sessName {
-		errors.WriteHTTP(w, errors.New(errors.CodeInvalidConfig, "CSRF cookie name must not match session cookie name", nil))
+		errors.WriteHTTP(w, errors.ErrCSRFCookieNameCollision)
 		return
 	}
 	if c, err := r.Cookie(cfg.CSRFCookieName); err == nil && csrf.ValidToken(c.Value) {

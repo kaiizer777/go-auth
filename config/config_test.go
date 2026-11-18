@@ -1094,6 +1094,14 @@ func TestConfig_CookieAndHeaderRFCValidation(t *testing.T) {
 		}
 	})
 
+	t.Run("CSRF cookie name collides with session cookie name", func(t *testing.T) {
+		cfg := baseCfg()
+		cfg.CSRFCookieName = cfg.SessionCookieName
+		if err := cfg.Validate(); !errors.Is(err, errors.ErrCSRFCookieNameCollision) {
+			t.Errorf("Validate() err = %v; want ErrCSRFCookieNameCollision", err)
+		}
+	})
+
 	t.Run("invalid CSRF header name", func(t *testing.T) {
 		invalidHeaders := []string{"Bad Header", "Header:Name", "Header@Name", "Header/Name"}
 		for _, h := range invalidHeaders {
