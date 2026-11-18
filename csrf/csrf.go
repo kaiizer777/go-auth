@@ -74,6 +74,16 @@ func Middleware(cfg *config.Config) func(http.Handler) http.Handler {
 				if len(trimmed) > 7 && strings.EqualFold(trimmed[:7], "bearer ") {
 					token := strings.TrimSpace(trimmed[7:])
 					if token != "" {
+						// Declared bearer transport plus a session cookie is
+						// ambiguous and never rides the Authorization exemption.
+						// Exact "bearer" mirrors Login's transport check.
+						if !safeMethods[r.Method] && r.Header.Get("X-Auth-Type") == "bearer" {
+							if c, cookieErr := r.Cookie(cfg.SessionCookieName); cookieErr == nil && c.Value != "" {
+								logViolation(r, string(apperrors.CodeCSRFTokenInvalid))
+								apperrors.WriteHTTP(w, apperrors.ErrCSRFTokenInvalid)
+								return
+							}
+						}
 						next.ServeHTTP(w, r)
 						return
 					}
