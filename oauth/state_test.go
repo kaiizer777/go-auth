@@ -3,6 +3,7 @@ package oauth
 import (
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -146,6 +147,18 @@ func TestSetStateCookie(t *testing.T) {
 		_, err := SetStateCookie(rec, nil, "github", "v", "")
 		if !apperrors.Is(err, apperrors.ErrOAuthStateSecretRequired) {
 			t.Fatalf("SetStateCookie(nil) = %v; want ErrOAuthStateSecretRequired", err)
+		}
+	})
+
+	t.Run("token length matches stateTokenLen", func(t *testing.T) {
+		t.Parallel()
+		if stateTokenLen != 43 {
+			t.Fatalf("stateTokenLen = %d; want 43", stateTokenLen)
+		}
+		cfg := testStateConfig()
+		state, _ := issueStateCookie(t, cfg)
+		if len(state) != stateTokenLen {
+			t.Fatalf("len(state) = %d; want %d", len(state), stateTokenLen)
 		}
 	})
 }
@@ -308,6 +321,18 @@ func TestValidateState(t *testing.T) {
 		}
 	})
 
+	t.Run("oversized state param rejected", func(t *testing.T) {
+		t.Parallel()
+		cfg := testStateConfig()
+		_, cookie := issueStateCookie(t, cfg)
+		rec := httptest.NewRecorder()
+		_, err := ValidateState(rec, stateRequest(cookie), cfg, "google", strings.Repeat("a", 1<<20))
+		assertStateInvalid(t, err)
+		if clearedStateCookie(rec, cfg.OAuth.StateCookieName) {
+			t.Error("oversized state param cleared the state cookie; want preserved")
+		}
+	})
+
 	t.Run("clear scoped to owning callback", func(t *testing.T) {
 		t.Parallel()
 		cfg := testStateConfig()
@@ -390,6 +415,63 @@ func TestClearStateCookie(t *testing.T) {
 			if found.Path != cfg.OAuth.StateCookiePath {
 				t.Errorf("%s: Path = %q; want %q", tc.provider, found.Path, cfg.OAuth.StateCookiePath)
 			}
+		}
+	})
+}
+
+func TestConsumeStateTokenSweep(t *testing.T) {
+	// Direct map access needs the package lock, so no t.Parallel here.
+	resetSeen := func() {
+		consumedStates.Lock()
+		consumedStates.seen = map[string]time.Time{}
+		consumedStates.Unlock()
+	}
+	resetSeen()
+	t.Cleanup(resetSeen)
+
+	t.Run("expired entry below threshold is not a replay", func(t *testing.T) {
+		resetSeen()
+		consumedStates.Lock()
+		consumedStates.seen["stale-token"] = time.Now().Add(-time.Minute)
+		size := len(consumedStates.seen)
+		consumedStates.Unlock()
+		if size >= consumedStateSweepThreshold {
+			t.Fatalf("len(seen) = %d; want below the %d threshold", size, consumedStateSweepThreshold)
+		}
+		if !consumeStateToken("stale-token", time.Now().Add(time.Hour)) {
+			t.Fatal("expired entry treated as a replay")
+		}
+	})
+
+	t.Run("sweep fires at the threshold", func(t *testing.T) {
+		resetSeen()
+		past := time.Now().Add(-time.Minute)
+		consumedStates.Lock()
+		for i := 0; i < consumedStateSweepThreshold; i++ {
+			consumedStates.seen[fmt.Sprintf("stale-%d", i)] = past
+		}
+		consumedStates.Unlock()
+		if !consumeStateToken("fresh-token", time.Now().Add(time.Hour)) {
+			t.Fatal("fresh token rejected")
+		}
+		consumedStates.Lock()
+		defer consumedStates.Unlock()
+		if len(consumedStates.seen) != 1 {
+			t.Fatalf("len(seen) = %d; want 1 (stale swept, fresh kept)", len(consumedStates.seen))
+		}
+		if _, ok := consumedStates.seen["fresh-token"]; !ok {
+			t.Fatal("fresh token missing after sweep")
+		}
+	})
+
+	t.Run("replay within TTL rejected", func(t *testing.T) {
+		resetSeen()
+		exp := time.Now().Add(time.Hour)
+		if !consumeStateToken("replay-token", exp) {
+			t.Fatal("first consume rejected")
+		}
+		if consumeStateToken("replay-token", exp) {
+			t.Fatal("replay within TTL accepted")
 		}
 	})
 }

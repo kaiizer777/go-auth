@@ -29,6 +29,10 @@ type OAuthStatePayload struct {
 // stateTokenBytes is the CSPRNG entropy size for state tokens.
 const stateTokenBytes = 32
 
+// stateTokenLen is the issued token width. ValidateState compares against the
+// cookie's own token, not this value, so signed test fixtures stay valid.
+var stateTokenLen = base64.RawURLEncoding.EncodedLen(stateTokenBytes)
+
 // ErrOAuthEntropyReadFailed surfaces CSPRNG failures as a domain 500
 // so Part 3 handlers matching on domain codes never see a bare stdlib error.
 var ErrOAuthEntropyReadFailed = errors.New(errors.CodeInternalError, "failed to generate oauth entropy", nil)
@@ -43,18 +47,26 @@ var consumedStates = struct {
 	seen map[string]time.Time
 }{seen: map[string]time.Time{}}
 
+// consumedStateSweepThreshold bounds the cost of the lazy expiry sweep: below it
+// the map is small enough that a full scan per callback buys nothing.
+const consumedStateSweepThreshold = 1024
+
 // consumeStateToken records token as used through exp. False means the token
 // completed validation before and has not expired: the callback is a replay.
 func consumeStateToken(token string, exp time.Time) bool {
 	now := time.Now()
 	consumedStates.Lock()
 	defer consumedStates.Unlock()
-	for tok, tokExp := range consumedStates.seen {
-		if !now.Before(tokExp) {
-			delete(consumedStates.seen, tok)
+	if len(consumedStates.seen) >= consumedStateSweepThreshold {
+		for tok, tokExp := range consumedStates.seen {
+			if !now.Before(tokExp) {
+				delete(consumedStates.seen, tok)
+			}
 		}
 	}
-	if _, ok := consumedStates.seen[token]; ok {
+	// The current token is always evaluated even when the sweep was skipped,
+	// so an expired entry is never a replay.
+	if prev, ok := consumedStates.seen[token]; ok && now.Before(prev) {
 		return false
 	}
 	consumedStates.seen[token] = exp
@@ -213,6 +225,11 @@ func ValidateState(w http.ResponseWriter, r *http.Request, cfg *config.Config, p
 	if err != nil {
 		// Unverifiable value can never be a live login; sweep it.
 		ClearStateCookie(w, cfg, providerID)
+		return nil, errors.ErrOAuthStateInvalid
+	}
+	if len(stateParam) != len(payload.Token) {
+		// A length mismatch is a token mismatch: no cookie clearing, and no
+		// allocation sized by the caller-controlled parameter.
 		return nil, errors.ErrOAuthStateInvalid
 	}
 	if subtle.ConstantTimeCompare([]byte(stateParam), []byte(payload.Token)) != 1 {
