@@ -5,7 +5,6 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-	"net/mail"
 	"strings"
 
 	"github.com/google/uuid"
@@ -280,18 +279,10 @@ func validateProviderIdentity(info *UserInfo) error {
 	if info.ProviderUserID == "" || len(info.ProviderUserID) > providerFieldMaxLen {
 		return errOAuthProviderIdentityInvalid
 	}
-	if len(info.Email) > providerFieldMaxLen || db.ValidateEmail(info.Email) != nil || !emailIsBareAddress(info.Email) {
+	if len(info.Email) > providerFieldMaxLen || db.ValidateEmail(info.Email) != nil {
 		return errOAuthProviderIdentityInvalid
 	}
 	return nil
-}
-
-// emailIsBareAddress rejects mailbox spellings whose parsed address differs from
-// the raw value. Defensive redundancy: db.ValidateEmail already rejects the
-// space-free display-name form.
-func emailIsBareAddress(email string) bool {
-	addr, err := mail.ParseAddress(email)
-	return err == nil && addr.Address == email
 }
 
 // findLink loads the oauth_accounts row for a provider identity. found=false

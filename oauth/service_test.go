@@ -472,6 +472,27 @@ func TestHandleCallbackEmailGate(t *testing.T) {
 		requireIdentityRows(t, database, 0, 0, 0)
 	})
 
+	t.Run("quoted local part links like a bare address", func(t *testing.T) {
+		t.Parallel()
+		const quoted = `"jane"@example.com`
+		database, cfg, _, svc := setupServiceTest(t,
+			&UserInfo{ProviderID: "google", ProviderUserID: "sub-quoted", Email: quoted, EmailVerified: true})
+		existing := db.User{ID: uuid.New(), Email: quoted, PasswordHash: "hash", EmailVerified: true}
+		if err := database.Create(&existing).Error; err != nil {
+			t.Fatalf("seed user: %v", err)
+		}
+		state, cookie := mustInitiate(t, svc, cfg, "google")
+		rec, req := callbackRequest(state, cookie)
+		sess, _, _, err := svc.HandleCallback(req.Context(), rec, req, "google", "code-1", state, db.SessionTypeCookie)
+		if err != nil {
+			t.Fatalf("HandleCallback = %v; want link, not 502", err)
+		}
+		if sess.UserID != existing.ID {
+			t.Fatalf("session user = %v; want existing %v", sess.UserID, existing.ID)
+		}
+		requireIdentityRows(t, database, 1, 1, 1)
+	})
+
 	t.Run("oversized email rejected as provider error", func(t *testing.T) {
 		database, cfg, _, svc := setupServiceTest(t,
 			&UserInfo{ProviderID: "google", ProviderUserID: "sub-long",
