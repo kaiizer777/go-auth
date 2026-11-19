@@ -363,22 +363,39 @@ func (s *service) linkExisting(ctx context.Context, owner db.User, providerID st
 	return owner, true, nil
 }
 
-// relinkExisting re-reads the link row that won a concurrent insert race and
-// loads its owner. Used when our insert hits the unique constraint.
-func (s *service) relinkExisting(ctx context.Context, providerID, providerUserID string) (db.User, bool, bool, error) {
+// linkedUser resolves the owner of an existing provider link. found=false with
+// a nil error means no link exists yet.
+func (s *service) linkedUser(ctx context.Context, providerID, providerUserID string) (db.User, bool, error) {
 	link, found, err := s.findLink(ctx, providerID, providerUserID)
-	if err != nil || !found {
-		return db.User{}, false, false, errors.New(errors.CodeInternalError, "failed to query oauth account", err)
+	if err != nil {
+		return db.User{}, false, errors.New(errors.CodeInternalError, "failed to query oauth account", err)
+	}
+	if !found {
+		return db.User{}, false, nil
 	}
 	user, err := s.loadLinkedUser(ctx, link)
 	if err != nil {
-		return db.User{}, false, false, err
+		return db.User{}, true, err
+	}
+	return user, true, nil
+}
+
+// relinkExisting re-reads the link row that won a concurrent insert race and
+// loads its owner. Used when our insert hits the unique constraint.
+func (s *service) relinkExisting(ctx context.Context, providerID, providerUserID string) (db.User, bool, bool, error) {
+	user, found, err := s.linkedUser(ctx, providerID, providerUserID)
+	if err != nil || !found {
+		return db.User{}, false, false, errors.New(errors.CodeInternalError, "failed to query oauth account", err)
 	}
 	return user, false, false, nil
 }
 
 // linkRacedUser converges after losing a concurrent user-create race: re-read
-// the winner by normalized email, keep the pre-hijack gate, then link.
+// the winner by normalized email, keep the pre-hijack gate, then link. The 409
+// is permanent by design: it mirrors password signup, which refuses an
+// already-registered email instead of taking it over, and no verification-mail
+// or takeover flow exists here, so the address stays blocked until the squatted
+// row is removed out of band.
 func (s *service) linkRacedUser(ctx context.Context, providerID string, info *UserInfo) (db.User, bool, bool, error) {
 	existing, err := s.findUserByEmail(ctx, info.Email)
 	if err != nil {
@@ -437,44 +454,27 @@ func (s *service) createUserAndLink(ctx context.Context, providerID string, info
 // Concurrent duplicate callbacks converge idempotently: a unique-constraint
 // loss re-reads the winner instead of 500ing.
 func (s *service) linkOrCreate(ctx context.Context, providerID string, info *UserInfo) (db.User, bool, bool, error) {
-	link, found, err := s.findLink(ctx, providerID, info.ProviderUserID)
-	if err != nil {
-		return db.User{}, false, false, errors.New(errors.CodeInternalError, "failed to query oauth account", err)
-	}
-	if found {
-		// Existing link: the owner is authoritative, no new rows.
-		user, uerr := s.loadLinkedUser(ctx, link)
-		if uerr != nil {
-			return db.User{}, false, false, uerr
-		}
-		return user, false, false, nil
+	if user, found, err := s.linkedUser(ctx, providerID, info.ProviderUserID); found || err != nil {
+		return user, false, false, err
 	}
 
-	// No link: the identity fields become the account key, so validate them
-	// before the email lookup, the link row, or the user row are written.
+	// The identity fields become the account key, so validate them before the
+	// email lookup, the link row, or the user row are written.
 	if gerr := validateProviderIdentity(info); gerr != nil {
 		return db.User{}, false, false, gerr
 	}
 
-	// No link: match the local account by normalized email.
 	existing, err := s.findUserByEmail(ctx, info.Email)
-	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
-		return db.User{}, false, false, errors.New(errors.CodeInternalError, "failed to query user", err)
-	}
 	if err == nil {
 		// Pre-hijacking defense: never link onto an unverified local account.
-		// The 409 is permanent by design: it mirrors password signup, which
-		// refuses an already-registered email instead of taking it over, and
-		// no verification-mail or takeover flow exists in this service. The
-		// address stays blocked until the squatted row is removed out of band.
 		if !existing.EmailVerified {
 			return db.User{}, false, false, errors.ErrOAuthAccountLinkConflict
 		}
 		user, linked, lerr := s.linkExisting(ctx, existing, providerID, info)
-		if lerr != nil {
-			return db.User{}, false, false, lerr
-		}
-		return user, linked, false, nil
+		return user, linked, false, lerr
+	}
+	if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return db.User{}, false, false, errors.New(errors.CodeInternalError, "failed to query user", err)
 	}
 	return s.createUserAndLink(ctx, providerID, info)
 }
