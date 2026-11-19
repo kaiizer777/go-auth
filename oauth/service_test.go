@@ -1,11 +1,14 @@
 package oauth
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -200,6 +203,53 @@ func requireCode(t *testing.T, err error, want errors.Code, status int) {
 
 func verifiedInfo() *UserInfo {
 	return &UserInfo{ProviderID: "google", ProviderUserID: "sub-123", Email: "jane@example.com", EmailVerified: true}
+}
+
+// logSink is a mutex-guarded slog writer so captured audit output stays race-clean.
+type logSink struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (s *logSink) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Write(p)
+}
+
+func (s *logSink) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.String()
+}
+
+func (s *logSink) Reset() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.b.Reset()
+}
+
+// captureLogs installs sink as the process default logger until the test ends.
+func captureLogs(t *testing.T) *logSink {
+	t.Helper()
+	sink := &logSink{}
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(sink, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	return sink
+}
+
+func countEvents(logs, msg string) int {
+	return strings.Count(logs, `"msg":"`+msg+`"`)
+}
+
+func runCallback(t *testing.T, svc Service, cfg *config.Config) {
+	t.Helper()
+	state, cookie := mustInitiate(t, svc, cfg, "google")
+	rec, req := callbackRequest(state, cookie)
+	if _, _, _, err := svc.HandleCallback(req.Context(), rec, req, "google", "code-1", state, db.SessionTypeCookie); err != nil {
+		t.Fatalf("HandleCallback = %v", err)
+	}
 }
 
 func TestInitiateFlow(t *testing.T) {
@@ -572,4 +622,89 @@ func TestHandleCallbackConcurrentSameIdentityConverges(t *testing.T) {
 	if n := countRows(t, database, &db.OAuthAccount{}); n != 1 {
 		t.Fatalf("links = %d; want 1", n)
 	}
+}
+
+func TestHandleCallbackAuditFlags(t *testing.T) {
+	t.Run("new identity emits linked and created once", func(t *testing.T) {
+		sink := captureLogs(t)
+		database, cfg, _, svc := setupServiceTest(t, verifiedInfo())
+		runCallback(t, svc, cfg)
+		if n := countEvents(sink.String(), "oauth_account_linked"); n != 1 {
+			t.Fatalf("oauth_account_linked = %d; want 1", n)
+		}
+		if n := countEvents(sink.String(), "oauth_user_created"); n != 1 {
+			t.Fatalf("oauth_user_created = %d; want 1", n)
+		}
+		if n := countRows(t, database, &db.User{}); n != 1 {
+			t.Fatalf("users = %d; want 1", n)
+		}
+		if n := countRows(t, database, &db.OAuthAccount{}); n != 1 {
+			t.Fatalf("links = %d; want 1", n)
+		}
+	})
+
+	t.Run("email link emits linked only", func(t *testing.T) {
+		sink := captureLogs(t)
+		database, cfg, _, svc := setupServiceTest(t, verifiedInfo())
+		existing := db.User{ID: uuid.New(), Email: "jane@example.com", PasswordHash: "hash", EmailVerified: true}
+		if err := database.Create(&existing).Error; err != nil {
+			t.Fatalf("seed user: %v", err)
+		}
+		runCallback(t, svc, cfg)
+		if n := countEvents(sink.String(), "oauth_account_linked"); n != 1 {
+			t.Fatalf("oauth_account_linked = %d; want 1", n)
+		}
+		if n := countEvents(sink.String(), "oauth_user_created"); n != 0 {
+			t.Fatalf("oauth_user_created = %d; want 0", n)
+		}
+	})
+
+	t.Run("repeat link emits neither", func(t *testing.T) {
+		_, cfg, _, svc := setupServiceTest(t, verifiedInfo())
+		runCallback(t, svc, cfg)
+		sink := captureLogs(t)
+		runCallback(t, svc, cfg)
+		if n := countEvents(sink.String(), "oauth_account_linked"); n != 0 {
+			t.Fatalf("oauth_account_linked = %d; want 0", n)
+		}
+		if n := countEvents(sink.String(), "oauth_user_created"); n != 0 {
+			t.Fatalf("oauth_user_created = %d; want 0", n)
+		}
+	})
+
+	t.Run("race loser emits neither", func(t *testing.T) {
+		sink := captureLogs(t)
+		database, _, _, svc := setupServiceTest(t, verifiedInfo())
+		owner := db.User{ID: uuid.New(), Email: "owner@example.com", PasswordHash: "hash", EmailVerified: true}
+		if err := database.Create(&owner).Error; err != nil {
+			t.Fatalf("seed user: %v", err)
+		}
+		link := db.OAuthAccount{ID: uuid.New(), UserID: owner.ID, ProviderID: "google",
+			ProviderUserID: "sub-123", Email: owner.Email}
+		if err := database.Create(&link).Error; err != nil {
+			t.Fatalf("seed link: %v", err)
+		}
+		// Enter the create step directly: the seeded link is exactly what a
+		// concurrent winner leaves behind, so the insert must lose to it.
+		user, linked, created, err := svc.(*service).createUserAndLink(context.Background(), "google", verifiedInfo())
+		if err != nil {
+			t.Fatalf("createUserAndLink = %v", err)
+		}
+		if user.ID != owner.ID || linked || created {
+			t.Fatalf("tuple = (%v,%v,%v); want (%v,false,false)", user.ID, linked, created, owner.ID)
+		}
+		logLinkAudit(context.Background(), "google", user, linked, created)
+		if n := countEvents(sink.String(), "oauth_account_linked"); n != 0 {
+			t.Fatalf("oauth_account_linked = %d; want 0", n)
+		}
+		if n := countEvents(sink.String(), "oauth_user_created"); n != 0 {
+			t.Fatalf("oauth_user_created = %d; want 0", n)
+		}
+		if n := countRows(t, database, &db.User{}); n != 1 {
+			t.Fatalf("users = %d; want 1 (loser's user must roll back)", n)
+		}
+		if n := countRows(t, database, &db.OAuthAccount{}); n != 1 {
+			t.Fatalf("links = %d; want 1", n)
+		}
+	})
 }
