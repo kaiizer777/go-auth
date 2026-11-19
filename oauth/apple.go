@@ -367,6 +367,12 @@ func (p *AppleProvider) refreshJWKS(ctx context.Context) error {
 		}
 		keys[k.Kid] = &rsa.PublicKey{N: new(big.Int).SetBytes(nb), E: e}
 	}
+	if len(keys) == 0 {
+		// An empty or fully-invalid document must not replace a usable cache:
+		// the previous set (or the next retry) stays in force, so a CDN blip
+		// cannot pin an Apple-login outage for the whole TTL.
+		return errors.New(errors.CodeOAuthProviderError, "oauth provider returned invalid response", nil)
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.jwksGen != startGen {

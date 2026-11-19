@@ -721,3 +721,50 @@ func TestAppleOwnerCancelKeepsSharedFetch(t *testing.T) {
 		t.Errorf("JWKS fetches = %d; want 1 (shared flight, no re-fetch)", n)
 	}
 }
+
+func TestAppleEmptyJWKSNotCached(t *testing.T) {
+	t.Parallel()
+	Key := mustRSAKey(t)
+	var mu sync.Mutex
+	publishEmpty := true
+	jwksSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		servingEmpty := publishEmpty
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		if servingEmpty {
+			_, _ = w.Write([]byte(`{"keys":[]}`))
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"keys": []any{rsaJWK(&Key.PublicKey, "kid-1")}})
+	}))
+	defer jwksSrv.Close()
+
+	p := NewAppleProvider(appleTestConfig())
+	p.jwksURL = jwksSrv.URL
+	idToken := mintAppleIDToken(t, Key, "kid-1", appleFixtureClaims(true))
+
+	if _, err := p.FetchUserInfo(context.Background(), &TokenResponse{IDToken: idToken}); err == nil {
+		t.Fatal("empty JWKS accepted; want provider error")
+	} else {
+		requireProviderError(t, err)
+	}
+
+	p.mu.RLock()
+	gen, cached, expires := p.jwksGen, len(p.jwks), p.jwksExpires
+	p.mu.RUnlock()
+	if gen != 0 || cached != 0 || !expires.IsZero() {
+		t.Fatalf("cache touched by empty document: gen=%d keys=%d expires=%v", gen, cached, expires)
+	}
+
+	mu.Lock()
+	publishEmpty = false
+	mu.Unlock()
+	info, err := p.FetchUserInfo(context.Background(), &TokenResponse{IDToken: idToken})
+	if err != nil {
+		t.Fatalf("FetchUserInfo after valid JWKS = %v; want success without TTL wait", err)
+	}
+	if info.ProviderUserID != "apple-sub-123" {
+		t.Fatalf("userinfo = %+v; want apple-sub-123", info)
+	}
+}
