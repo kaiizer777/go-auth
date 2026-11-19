@@ -749,6 +749,72 @@ func TestAppleOwnerCancelKeepsSharedFetch(t *testing.T) {
 	}
 }
 
+func TestAppleParamInvalidJWKSNotCached(t *testing.T) {
+	t.Parallel()
+	Key := mustRSAKey(t)
+	var mu sync.Mutex
+	publishInvalid := true
+	jwksSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		servingInvalid := publishInvalid
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		if servingInvalid {
+			// "AA" decodes to a zero modulus: syntactically valid JWK, unusable key.
+			_, _ = w.Write([]byte(`{"keys":[{"kid":"kid-1","n":"AA","e":"AQAB"}]}`))
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"keys": []any{rsaJWK(&Key.PublicKey, "kid-1")}})
+	}))
+	defer jwksSrv.Close()
+
+	p := NewAppleProvider(appleTestConfig())
+	p.jwksURL = jwksSrv.URL
+	idToken := mintAppleIDToken(t, Key, "kid-1", appleFixtureClaims(true))
+
+	if _, err := p.FetchUserInfo(context.Background(), &TokenResponse{IDToken: idToken}); err == nil {
+		t.Fatal("param-invalid JWKS accepted; want provider error")
+	} else {
+		requireProviderError(t, err)
+	}
+
+	p.mu.RLock()
+	gen, cached, expires := p.jwksGen, len(p.jwks), p.jwksExpires
+	p.mu.RUnlock()
+	if gen != 0 || cached != 0 || !expires.IsZero() {
+		t.Fatalf("cache touched by param-invalid document: gen=%d keys=%d expires=%v", gen, cached, expires)
+	}
+
+	mu.Lock()
+	publishInvalid = false
+	mu.Unlock()
+	info, err := p.FetchUserInfo(context.Background(), &TokenResponse{IDToken: idToken})
+	if err != nil {
+		t.Fatalf("FetchUserInfo after valid JWKS = %v; want success without TTL wait", err)
+	}
+	if info.ProviderUserID != "apple-sub-123" {
+		t.Fatalf("userinfo = %+v; want apple-sub-123", info)
+	}
+
+	// A later invalid document must not replace the now-usable cache either.
+	mu.Lock()
+	publishInvalid = true
+	mu.Unlock()
+	p.mu.RLock()
+	wantExpires := p.jwksExpires
+	p.mu.RUnlock()
+	if _, err := p.jwksKey(context.Background(), "kid-2"); err == nil {
+		t.Fatal("param-invalid JWKS accepted over a usable cache; want provider error")
+	}
+	p.mu.RLock()
+	gen, expires = p.jwksGen, p.jwksExpires
+	_, kept := p.jwks["kid-1"]
+	p.mu.RUnlock()
+	if gen != 1 || !kept || !expires.Equal(wantExpires) {
+		t.Fatalf("usable cache replaced: gen=%d kid-1=%v expires=%v want %v", gen, kept, expires, wantExpires)
+	}
+}
+
 func TestAppleEmptyJWKSNotCached(t *testing.T) {
 	t.Parallel()
 	Key := mustRSAKey(t)

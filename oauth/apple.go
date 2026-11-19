@@ -28,11 +28,12 @@ import (
 )
 
 const (
-	appleAuthEndpoint  = "https://appleid.apple.com/auth/authorize"
-	appleTokenEndpoint = "https://appleid.apple.com/auth/token"
-	appleJWKSEndpoint  = "https://appleid.apple.com/auth/keys"
-	appleIssuer        = "https://appleid.apple.com"
-	appleJWKSTTL       = 24 * time.Hour
+	appleAuthEndpoint   = "https://appleid.apple.com/auth/authorize"
+	appleTokenEndpoint  = "https://appleid.apple.com/auth/token"
+	appleJWKSEndpoint   = "https://appleid.apple.com/auth/keys"
+	appleIssuer         = "https://appleid.apple.com"
+	appleJWKSTTL        = 24 * time.Hour
+	appleMaxRSAExponent = 1<<31 - 1
 )
 
 // AppleProvider implements Sign in with Apple (form_post + RS256 id_token).
@@ -350,22 +351,11 @@ func (p *AppleProvider) refreshJWKS(ctx context.Context) error {
 	}
 	keys := make(map[string]*rsa.PublicKey, len(doc.Keys))
 	for _, k := range doc.Keys {
-		nb, err := base64.RawURLEncoding.DecodeString(k.N)
-		if err != nil {
+		n, e, ok := appleRSAPublicKeyParams(k.N, k.E)
+		if k.Kid == "" || !ok {
 			continue
 		}
-		eb, err := base64.RawURLEncoding.DecodeString(k.E)
-		if err != nil {
-			continue
-		}
-		if k.Kid == "" || len(nb) == 0 || len(eb) == 0 {
-			continue
-		}
-		e := int(new(big.Int).SetBytes(eb).Int64())
-		if e <= 0 {
-			continue
-		}
-		keys[k.Kid] = &rsa.PublicKey{N: new(big.Int).SetBytes(nb), E: e}
+		keys[k.Kid] = &rsa.PublicKey{N: n, E: e}
 	}
 	if len(keys) == 0 {
 		// An empty or fully-invalid document must not replace a usable cache:
@@ -382,4 +372,28 @@ func (p *AppleProvider) refreshJWKS(ctx context.Context) error {
 	p.jwksExpires = time.Now().Add(appleJWKSTTL)
 	p.jwksGen++
 	return nil
+}
+
+// appleRSAPublicKeyParams decodes JWK RSA parameters, reporting false when either
+// is unusable. crypto/rsa accepts only exponent 2..2^31-1, so the exponent is
+// range-checked as a big.Int: Int64 would truncate a larger value into a small
+// positive int and admit an unusable key.
+func appleRSAPublicKeyParams(nRaw, eRaw string) (*big.Int, int, bool) {
+	nb, err := base64.RawURLEncoding.DecodeString(nRaw)
+	if err != nil || len(nb) == 0 {
+		return nil, 0, false
+	}
+	n := new(big.Int).SetBytes(nb)
+	if n.Sign() == 0 {
+		return nil, 0, false
+	}
+	eb, err := base64.RawURLEncoding.DecodeString(eRaw)
+	if err != nil || len(eb) == 0 {
+		return nil, 0, false
+	}
+	e := new(big.Int).SetBytes(eb)
+	if e.Cmp(big.NewInt(2)) < 0 || e.Cmp(big.NewInt(appleMaxRSAExponent)) > 0 {
+		return nil, 0, false
+	}
+	return n, int(e.Int64()), true
 }
