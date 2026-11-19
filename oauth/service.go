@@ -105,8 +105,9 @@ func (s *service) InitiateFlow(w http.ResponseWriter, r *http.Request, providerI
 }
 
 // HandleCallback runs the full decision tree: state validation, code exchange,
-// the mandatory EmailVerified gate (before any DB lookup), account linking or
-// creation, session issuance, and state-cookie cleanup.
+// account linking or creation, session issuance, and state-cookie cleanup. The
+// provider-verified gate lives inside the link path so an already-linked
+// identity never needs an email (Apple omits it after first consent).
 func (s *service) HandleCallback(ctx context.Context, w http.ResponseWriter, r *http.Request, providerID, code, state string, sessType db.SessionType) (*session.Session, string, string, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -125,7 +126,9 @@ func (s *service) HandleCallback(ctx context.Context, w http.ResponseWriter, r *
 		if err != nil {
 			// Provider/transport detail only: exchange/userinfo errors carry
 			// static messages plus wrapped stdlib errors, never codes,
-			// verifiers, or tokens.
+			// verifiers, or tokens. Link-path driver errors may embed a
+			// normalized-email key from the database; that matches the
+			// repo-wide logging convention and is accepted here.
 			attrs = append(attrs, "error", err.Error())
 		}
 		slog.InfoContext(ctx, "oauth_callback_failure", attrs...)
@@ -154,17 +157,23 @@ func (s *service) HandleCallback(ctx context.Context, w http.ResponseWriter, r *
 	if err != nil {
 		return fail("userinfo_failed", err)
 	}
-	// Mandatory gate: unverified provider email aborts before any DB lookup,
-	// so account existence cannot leak via timing or response.
-	if info == nil || !info.EmailVerified {
+	// A nil profile keeps the historical 400: only the provider-verified gate
+	// moved behind the link lookup, and it cannot run without a profile.
+	if info == nil {
 		return fail("email_unverified", errors.ErrOAuthEmailUnverified)
-	}
-	if strings.TrimSpace(info.Email) == "" {
-		return fail("userinfo_invalid", errors.New(errors.CodeOAuthProviderError, "oauth provider returned invalid response", nil))
 	}
 
 	user, linked, created, err := s.linkOrCreate(ctx, providerID, info)
 	if err != nil {
+		// Gate sentinels map to their historical literal reasons before the
+		// code-derived fallback, which stays the producer of UPPER_SNAKE
+		// reasons such as OAUTH_ACCOUNT_LINK_CONFLICT.
+		if errors.Is(err, errors.ErrOAuthEmailUnverified) {
+			return fail("email_unverified", err)
+		}
+		if errors.Is(err, errOAuthProviderIdentityInvalid) {
+			return fail("userinfo_invalid", err)
+		}
 		var appErr *errors.Error
 		if errors.As(err, &appErr) {
 			return fail(string(appErr.Code()), err)
@@ -206,6 +215,13 @@ func (s *service) HandleCallback(ctx context.Context, w http.ResponseWriter, r *
 		"user_agent", ua,
 		"session_id_hash", sess.IDHash,
 	)
+	logLinkAudit(ctx, providerID, user, linked, created)
+	return sess, rawID, redirect, nil
+}
+
+// logLinkAudit emits the audit events implied by the (linked, created) tuple.
+// The tuple is load-bearing: a converged race loser reports neither event.
+func logLinkAudit(ctx context.Context, providerID string, user db.User, linked, created bool) {
 	if linked {
 		slog.InfoContext(ctx, "oauth_account_linked",
 			"provider", providerID,
@@ -219,12 +235,13 @@ func (s *service) HandleCallback(ctx context.Context, w http.ResponseWriter, r *
 			"email", db.NormalizeEmail(user.Email),
 		)
 	}
-	return sess, rawID, redirect, nil
 }
 
 // isUniqueViolation reports driver-agnostic unique-constraint conflicts:
 // gorm.ErrDuplicatedKey where the dialector translates, sqlite's
 // "UNIQUE constraint failed", postgres "duplicate key"/SQLSTATE 23505.
+// Substring matching is deliberate: sqlite and pgx word these differently, and
+// a missed match would turn every convergence path into a 500.
 func isUniqueViolation(err error) bool {
 	if err == nil {
 		return false
@@ -238,127 +255,165 @@ func isUniqueViolation(err error) bool {
 		strings.Contains(msg, "23505")
 }
 
-// relinkExisting re-reads the link row that won a concurrent insert race and
-// loads its owner. Used when our insert hits the unique constraint.
-func (s *service) relinkExisting(ctx context.Context, providerID, providerUserID string) (db.User, bool, bool, error) {
-	var link db.OAuthAccount
-	if err := s.db.WithContext(ctx).
-		Where("provider_id = ? AND provider_user_id = ?", providerID, providerUserID).
-		First(&link).Error; err != nil {
-		return db.User{}, false, false, errors.New(errors.CodeInternalError, "failed to query oauth account", err)
+// errLinkConflict reports a unique-constraint loss on the oauth_accounts insert.
+// Callers converge on the winning row instead of duplicating it; inside
+// createUserAndLink's transaction it also rolls the freshly created user back.
+var errLinkConflict = errors.New(errors.CodeInternalError, "oauth link conflict", nil)
+
+// errOAuthProviderIdentityInvalid rejects identity fields that cannot be stored.
+// It is a distinct sentinel so HandleCallback logs the literal "userinfo_invalid"
+// reason instead of the derived OAUTH_PROVIDER_ERROR.
+var errOAuthProviderIdentityInvalid = errors.New(errors.CodeOAuthProviderError, "oauth provider returned invalid response", nil)
+
+// providerFieldMaxLen matches the VARCHAR(255) columns behind the identity
+// writes: users.email, oauth_accounts.email and oauth_accounts.provider_user_id.
+const providerFieldMaxLen = 255
+
+// validateProviderIdentity gates the no-link paths, which are the only ones that
+// resolve a local account by email. Order is load-bearing: an unverified
+// identity reports OAUTH_EMAIL_UNVERIFIED before any field-validity rejection.
+func validateProviderIdentity(info *UserInfo) error {
+	if !info.EmailVerified {
+		return errors.ErrOAuthEmailUnverified
 	}
+	if info.ProviderUserID == "" || len(info.ProviderUserID) > providerFieldMaxLen {
+		return errOAuthProviderIdentityInvalid
+	}
+	if len(info.Email) > providerFieldMaxLen || db.ValidateEmail(info.Email) != nil {
+		return errOAuthProviderIdentityInvalid
+	}
+	return nil
+}
+
+// findLink loads the oauth_accounts row for a provider identity. found=false
+// with a nil error is the normal no-link case; anything else is a query failure.
+func (s *service) findLink(ctx context.Context, providerID, providerUserID string) (db.OAuthAccount, bool, error) {
+	var link db.OAuthAccount
+	err := s.db.WithContext(ctx).
+		Where("provider_id = ? AND provider_user_id = ?", providerID, providerUserID).
+		First(&link).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return link, false, nil
+	}
+	if err != nil {
+		return link, false, err
+	}
+	return link, true, nil
+}
+
+// loadLinkedUser loads the account owning link. A missing owner is a dangling
+// link row and maps to OAUTH_ACCOUNT_NOT_LINKED.
+func (s *service) loadLinkedUser(ctx context.Context, link db.OAuthAccount) (db.User, error) {
 	var user db.User
 	if err := s.db.WithContext(ctx).Where("id = ?", link.UserID).First(&user).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return db.User{}, false, false, errors.ErrOAuthAccountNotLinked
+			return db.User{}, errors.ErrOAuthAccountNotLinked
 		}
-		return db.User{}, false, false, errors.New(errors.CodeInternalError, "failed to load linked user", err)
+		return db.User{}, errors.New(errors.CodeInternalError, "failed to load linked user", err)
+	}
+	return user, nil
+}
+
+// findUserByEmail resolves the local account owning email. gorm.ErrRecordNotFound
+// is the only expected miss.
+func (s *service) findUserByEmail(ctx context.Context, email string) (db.User, error) {
+	var user db.User
+	err := s.db.WithContext(ctx).Where("LOWER(email) = LOWER(?)", email).First(&user).Error
+	return user, err
+}
+
+// insertLink writes the oauth_accounts row for userID. errLinkConflict means a
+// concurrent callback already claimed (providerID, providerUserID).
+func (s *service) insertLink(ctx context.Context, tx *gorm.DB, userID uuid.UUID, providerID, providerUserID, email string) error {
+	row := db.OAuthAccount{
+		ID:             uuid.New(),
+		UserID:         userID,
+		ProviderID:     providerID,
+		ProviderUserID: providerUserID,
+		Email:          email,
+	}
+	if err := tx.WithContext(ctx).Create(&row).Error; err != nil {
+		if isUniqueViolation(err) {
+			return errLinkConflict
+		}
+		return err
+	}
+	return nil
+}
+
+// linkExisting attaches the provider identity to owner. Losing the unique race
+// converges on the winner's row, which reports linked=false.
+func (s *service) linkExisting(ctx context.Context, owner db.User, providerID string, info *UserInfo) (db.User, bool, error) {
+	if err := s.insertLink(ctx, s.db, owner.ID, providerID, info.ProviderUserID, info.Email); err != nil {
+		if errors.Is(err, errLinkConflict) {
+			user, _, _, rerr := s.relinkExisting(ctx, providerID, info.ProviderUserID)
+			return user, false, rerr
+		}
+		return db.User{}, false, errors.New(errors.CodeInternalError, "failed to link oauth account", err)
+	}
+	return owner, true, nil
+}
+
+// linkedUser resolves the owner of an existing provider link. found=false with
+// a nil error means no link exists yet.
+func (s *service) linkedUser(ctx context.Context, providerID, providerUserID string) (db.User, bool, error) {
+	link, found, err := s.findLink(ctx, providerID, providerUserID)
+	if err != nil {
+		return db.User{}, false, errors.New(errors.CodeInternalError, "failed to query oauth account", err)
+	}
+	if !found {
+		return db.User{}, false, nil
+	}
+	user, err := s.loadLinkedUser(ctx, link)
+	if err != nil {
+		return db.User{}, true, err
+	}
+	return user, true, nil
+}
+
+// relinkExisting re-reads the link row that won a concurrent insert race and
+// loads its owner. Used when our insert hits the unique constraint.
+func (s *service) relinkExisting(ctx context.Context, providerID, providerUserID string) (db.User, bool, bool, error) {
+	user, found, err := s.linkedUser(ctx, providerID, providerUserID)
+	if err != nil || !found {
+		return db.User{}, false, false, errors.New(errors.CodeInternalError, "failed to query oauth account", err)
 	}
 	return user, false, false, nil
 }
 
 // linkRacedUser converges after losing a concurrent user-create race: re-read
-// the winner by normalized email, keep the pre-hijack gate, then link.
+// the winner by normalized email, keep the pre-hijack gate, then link. The 409
+// is permanent by design: it mirrors password signup, which refuses an
+// already-registered email instead of taking it over, and no verification-mail
+// or takeover flow exists here, so the address stays blocked until the squatted
+// row is removed out of band.
 func (s *service) linkRacedUser(ctx context.Context, providerID string, info *UserInfo) (db.User, bool, bool, error) {
-	var existing db.User
-	if err := s.db.WithContext(ctx).Where("LOWER(email) = LOWER(?)", info.Email).First(&existing).Error; err != nil {
+	existing, err := s.findUserByEmail(ctx, info.Email)
+	if err != nil {
 		return db.User{}, false, false, errors.New(errors.CodeInternalError, "failed to query user", err)
 	}
 	if !existing.EmailVerified {
 		return db.User{}, false, false, errors.ErrOAuthAccountLinkConflict
 	}
-	row := db.OAuthAccount{
-		ID:             uuid.New(),
-		UserID:         existing.ID,
-		ProviderID:     providerID,
-		ProviderUserID: info.ProviderUserID,
-		Email:          info.Email,
+	user, linked, err := s.linkExisting(ctx, existing, providerID, info)
+	if err != nil {
+		return db.User{}, false, false, err
 	}
-	if err := s.db.WithContext(ctx).Create(&row).Error; err != nil {
-		if isUniqueViolation(err) {
-			return s.relinkExisting(ctx, providerID, info.ProviderUserID)
-		}
-		return db.User{}, false, false, errors.New(errors.CodeInternalError, "failed to link oauth account", err)
-	}
-	return existing, true, false, nil
+	return user, linked, false, nil
 }
 
-// linkOrCreate executes the linking decision tree. Returns the user plus
-// whether an oauth_accounts row was inserted and whether the user was created.
-// Concurrent duplicate callbacks converge idempotently: a unique-constraint
-// loss re-reads the winner instead of 500ing. The EmailVerified gate above
-// (in HandleCallback) runs before any DB touch and is untouched by this.
-func (s *service) linkOrCreate(ctx context.Context, providerID string, info *UserInfo) (db.User, bool, bool, error) {
-	var link db.OAuthAccount
-	err := s.db.WithContext(ctx).
-		Where("provider_id = ? AND provider_user_id = ?", providerID, info.ProviderUserID).
-		First(&link).Error
-	if err == nil {
-		// Case A: existing link — load the owner, no new rows.
-		var user db.User
-		if uerr := s.db.WithContext(ctx).Where("id = ?", link.UserID).First(&user).Error; uerr != nil {
-			if errors.Is(uerr, gorm.ErrRecordNotFound) {
-				return db.User{}, false, false, errors.ErrOAuthAccountNotLinked
-			}
-			return db.User{}, false, false, errors.New(errors.CodeInternalError, "failed to load linked user", uerr)
-		}
-		return user, false, false, nil
-	}
-	if !errors.Is(err, gorm.ErrRecordNotFound) {
-		return db.User{}, false, false, errors.New(errors.CodeInternalError, "failed to query oauth account", err)
-	}
-
-	// Case B: no link — match local account by normalized email.
-	var existing db.User
-	uerr := s.db.WithContext(ctx).Where("LOWER(email) = LOWER(?)", info.Email).First(&existing).Error
-	if uerr == nil {
-		// Pre-hijacking defense: never link onto an unverified local account.
-		// The 409 is permanent by design: it mirrors password signup, which
-		// refuses an already-registered email instead of taking it over, and
-		// no verification-mail or takeover flow exists in this service. The
-		// address stays blocked until the squatting row is removed out of band.
-		if !existing.EmailVerified {
-			return db.User{}, false, false, errors.ErrOAuthAccountLinkConflict
-		}
-		row := db.OAuthAccount{
-			ID:             uuid.New(),
-			UserID:         existing.ID,
-			ProviderID:     providerID,
-			ProviderUserID: info.ProviderUserID,
-			Email:          info.Email,
-		}
-		if cerr := s.db.WithContext(ctx).Create(&row).Error; cerr != nil {
-			if isUniqueViolation(cerr) {
-				return s.relinkExisting(ctx, providerID, info.ProviderUserID)
-			}
-			return db.User{}, false, false, errors.New(errors.CodeInternalError, "failed to link oauth account", cerr)
-		}
-		return existing, true, false, nil
-	}
-	if !errors.Is(uerr, gorm.ErrRecordNotFound) {
-		return db.User{}, false, false, errors.New(errors.CodeInternalError, "failed to query user", uerr)
-	}
-
-	// Subcase B2: no local account — create verified user plus link row.
+// createUserAndLink creates the verified passwordless user and its link row in
+// one transaction. Separate inserts would let a cancel land between them
+// (verified user, no link) or a lost link race orphan the loser's user. Session
+// creation stays post-commit: cookie issuance cannot roll back. Unique
+// conflicts roll the transaction back before converging on the winner.
+func (s *service) createUserAndLink(ctx context.Context, providerID string, info *UserInfo) (db.User, bool, bool, error) {
 	user := db.User{
 		ID:            uuid.New(),
 		Email:         info.Email,
 		PasswordHash:  "",
 		EmailVerified: true,
 	}
-	row := db.OAuthAccount{
-		ID:             uuid.New(),
-		UserID:         user.ID,
-		ProviderID:     providerID,
-		ProviderUserID: info.ProviderUserID,
-		Email:          info.Email,
-	}
-	// User + link commit atomically: separate inserts let a cancel land
-	// between them (verified user, no link) or a lost link race orphan the
-	// loser's freshly-committed user. Unique conflicts roll the transaction
-	// back before converging on the winner. Session creation stays
-	// post-commit: cookie issuance cannot roll back. The EmailVerified gate
-	// above is preserved via linkRacedUser, which re-checks it on convergence.
 	userConflict, linkConflict := false, false
 	op := "failed to create oauth user"
 	txErr := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
@@ -367,8 +422,8 @@ func (s *service) linkOrCreate(ctx context.Context, providerID string, info *Use
 			return err
 		}
 		op = "failed to link oauth account"
-		if err := tx.Create(&row).Error; err != nil {
-			linkConflict = isUniqueViolation(err)
+		if err := s.insertLink(ctx, tx, user.ID, providerID, info.ProviderUserID, info.Email); err != nil {
+			linkConflict = errors.Is(err, errLinkConflict)
 			return err
 		}
 		return nil
@@ -383,4 +438,34 @@ func (s *service) linkOrCreate(ctx context.Context, providerID string, info *Use
 		return db.User{}, false, false, errors.New(errors.CodeInternalError, op, txErr)
 	}
 	return user, true, true, nil
+}
+
+// linkOrCreate executes the linking decision tree. Returns the user plus
+// whether an oauth_accounts row was inserted and whether the user was created.
+// Concurrent duplicate callbacks converge idempotently: a unique-constraint
+// loss re-reads the winner instead of 500ing.
+func (s *service) linkOrCreate(ctx context.Context, providerID string, info *UserInfo) (db.User, bool, bool, error) {
+	if user, found, err := s.linkedUser(ctx, providerID, info.ProviderUserID); found || err != nil {
+		return user, false, false, err
+	}
+
+	// The identity fields become the account key, so validate them before the
+	// email lookup, the link row, or the user row are written.
+	if gerr := validateProviderIdentity(info); gerr != nil {
+		return db.User{}, false, false, gerr
+	}
+
+	existing, err := s.findUserByEmail(ctx, info.Email)
+	if err == nil {
+		// Pre-hijacking defense: never link onto an unverified local account.
+		if !existing.EmailVerified {
+			return db.User{}, false, false, errors.ErrOAuthAccountLinkConflict
+		}
+		user, linked, lerr := s.linkExisting(ctx, existing, providerID, info)
+		return user, linked, false, lerr
+	}
+	if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return db.User{}, false, false, errors.New(errors.CodeInternalError, "failed to query user", err)
+	}
+	return s.createUserAndLink(ctx, providerID, info)
 }

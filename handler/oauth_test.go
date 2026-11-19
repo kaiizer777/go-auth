@@ -595,6 +595,61 @@ func TestOAuthCallbackFormPostProviderError(t *testing.T) {
 	}
 }
 
+func TestOAuthCallbackCookieJSONSetsNoStore(t *testing.T) {
+	_, h := oauthTestEnv(t, &oauth.UserInfo{ProviderID: "google", ProviderUserID: "sub-nostore-json", Email: "nostore-json@example.com", EmailVerified: true})
+	state, cookies, _ := driveInitiate(t, h, "/auth/oauth/google")
+	req := httptest.NewRequest(http.MethodGet, "/auth/oauth/google/callback?code=c&state="+state, nil)
+	req.Header.Set("Accept", "application/json")
+	req.AddCookie(stateCookie(t, cookies))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d; want 200 (%s)", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("Cache-Control"); got != "no-store" {
+		t.Errorf("Cache-Control = %q; want no-store", got)
+	}
+	if got := rec.Header().Get("Pragma"); got != "no-cache" {
+		t.Errorf("Pragma = %q; want no-cache", got)
+	}
+}
+
+func TestOAuthCallbackRedirectSetsNoStore(t *testing.T) {
+	_, h := oauthTestEnv(t, &oauth.UserInfo{ProviderID: "google", ProviderUserID: "sub-nostore-302", Email: "nostore-302@example.com", EmailVerified: true})
+	state, cookies, _ := driveInitiate(t, h, "/auth/oauth/google")
+	req := httptest.NewRequest(http.MethodGet, "/auth/oauth/google/callback?code=c&state="+state, nil)
+	req.AddCookie(stateCookie(t, cookies))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusFound {
+		t.Fatalf("status = %d; want 302 (%s)", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("Cache-Control"); got != "no-store" {
+		t.Errorf("Cache-Control = %q; want no-store", got)
+	}
+	if got := rec.Header().Get("Pragma"); got != "no-cache" {
+		t.Errorf("Pragma = %q; want no-cache", got)
+	}
+}
+
+func TestOAuthCallbackFailureHasNoCacheHeaders(t *testing.T) {
+	_, h := oauthTestEnv(t, &oauth.UserInfo{ProviderID: "google", ProviderUserID: "sub-nostore-fail", Email: "nostore-fail@example.com"})
+	state, cookies, _ := driveInitiate(t, h, "/auth/oauth/google")
+	req := httptest.NewRequest(http.MethodGet, "/auth/oauth/google/callback?code=c&state="+state, nil)
+	req.AddCookie(stateCookie(t, cookies))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d; want 400 (%s)", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("Cache-Control"); got != "" {
+		t.Errorf("Cache-Control = %q; want empty on failure", got)
+	}
+	if got := rec.Header().Get("Pragma"); got != "" {
+		t.Errorf("Pragma = %q; want empty on failure", got)
+	}
+}
+
 func TestOAuthRateLimited(t *testing.T) {
 	rlInfo := &oauth.UserInfo{ProviderID: "google", ProviderUserID: "sub-rl", Email: "rl@example.com", EmailVerified: true}
 
@@ -641,4 +696,138 @@ func TestOAuthRateLimited(t *testing.T) {
 			t.Fatalf("initiate with default limiter: status = %d; want 302", rec.Code)
 		}
 	})
+}
+
+func TestOAuthTransportSelection(t *testing.T) {
+	t.Run("selector truth table", func(t *testing.T) {
+		cases := []struct {
+			name       string
+			method     string
+			target     string
+			headers    map[string]string
+			body       string
+			wantBearer bool
+			wantJSON   bool
+		}{
+			{"cookie default", http.MethodGet, "/auth/oauth/google/callback",
+				nil, "", false, false},
+			{"bearer header", http.MethodGet, "/auth/oauth/google/callback",
+				map[string]string{"X-Auth-Type": "bearer"}, "", true, true},
+			{"bearer query", http.MethodGet, "/auth/oauth/google/callback?type=bearer",
+				nil, "", true, true},
+			{"json accept", http.MethodGet, "/auth/oauth/google/callback",
+				map[string]string{"Accept": "application/json"}, "", false, true},
+			{"both selectors", http.MethodGet, "/auth/oauth/google/callback?type=bearer",
+				map[string]string{"Accept": "application/json"}, "", true, true},
+			{"post form_post bearer query", http.MethodPost, "/api/auth/oauth/apple/callback?type=bearer",
+				map[string]string{"Content-Type": "application/x-www-form-urlencoded"}, "code=c", true, true},
+			{"post form_post body type ignored", http.MethodPost, "/api/auth/oauth/apple/callback",
+				map[string]string{"Content-Type": "application/x-www-form-urlencoded"}, "code=c&type=bearer", false, false},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				var body *strings.Reader
+				if tc.body != "" {
+					body = strings.NewReader(tc.body)
+				} else {
+					body = strings.NewReader("")
+				}
+				req := httptest.NewRequest(tc.method, tc.target, body)
+				for k, v := range tc.headers {
+					req.Header.Set(k, v)
+				}
+				bearer, wantJSON := oauthTransport(req)
+				if bearer != tc.wantBearer || wantJSON != tc.wantJSON {
+					t.Fatalf("oauthTransport = (%v,%v); want (%v,%v)", bearer, wantJSON, tc.wantBearer, tc.wantJSON)
+				}
+			})
+		}
+	})
+
+	t.Run("post form_post bearer query mints bearer session", func(t *testing.T) {
+		database, h := oauthTestEnv(t,
+			&oauth.UserInfo{ProviderID: "apple", ProviderUserID: "sub-post-bearer", Email: "post-bearer@example.com", EmailVerified: true})
+		state, cookies, _ := driveInitiate(t, h, "/api/auth/oauth/apple")
+		req := httptest.NewRequest(http.MethodPost, "https://example.com/api/auth/oauth/apple/callback?type=bearer",
+			strings.NewReader(url.Values{"code": {"c"}, "state": {state}}.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		attachBrowserCookies(req, cookies)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d; want 200 (%s)", rec.Code, rec.Body.String())
+		}
+		var body struct {
+			Token string `json:"token"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if body.Token == "" {
+			t.Fatal("bearer branch returned no token")
+		}
+		cfg := oauthTestConfig()
+		for _, c := range rec.Result().Cookies() {
+			if c.Name == cfg.SessionCookieName {
+				t.Fatal("bearer branch must not set a session cookie")
+			}
+		}
+		var sessions int64
+		if err := database.Model(&db.Session{}).Count(&sessions).Error; err != nil || sessions != 1 {
+			t.Fatalf("sessions = %d, err = %v; want 1", sessions, err)
+		}
+	})
+}
+
+func TestSafeOAuthRedirect(t *testing.T) {
+	cases := []struct {
+		name   string
+		target string
+		want   string
+	}{
+		{"empty defaults to root", "", "/"},
+		{"absolute url rejected", "http://evil.example/phish", "/"},
+		{"protocol relative rejected", "//evil.example", "/"},
+		{"slash backslash rejected", "/\\evil.example", "/"},
+		{"double backslash rejected", "\\\\evil.example", "/"},
+		{"space prefix rejected", " /path", "/"},
+		{"tab prefix rejected", "\t/path", "/"},
+		{"cr suffix rejected", "/path\r", "/"},
+		{"lf suffix rejected", "/path\n", "/"},
+		{"relative path allowed", "/path", "/path"},
+		{"query string allowed", "/?q=1", "/?q=1"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := safeOAuthRedirect(tc.target); got != tc.want {
+				t.Fatalf("safeOAuthRedirect(%q) = %q; want %q", tc.target, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestOAuthCallbackFormPostOversize(t *testing.T) {
+	_, h := oauthTestEnv(t, &oauth.UserInfo{ProviderID: "google", ProviderUserID: "sub-oversize", Email: "oversize@example.com", EmailVerified: true})
+	state, cookies, _ := driveInitiate(t, h, "/auth/oauth/google")
+	oversized := "code=c&state=" + state + "&pad=" + strings.Repeat("a", 1<<20)
+	req := httptest.NewRequest(http.MethodPost, "/auth/oauth/google/callback", strings.NewReader(oversized))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.AddCookie(stateCookie(t, cookies))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d; want 400 (%s)", rec.Code, rec.Body.String())
+	}
+	if code := decodeErrCode(t, rec); code != errors.CodeValidationError {
+		t.Fatalf("code = %s; want VALIDATION_ERROR", code)
+	}
+	cleared := false
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == "oauth_state" && c.MaxAge == -1 {
+			cleared = true
+		}
+	}
+	if !cleared {
+		t.Fatal("state cookie not cleared on unreadable form")
+	}
 }

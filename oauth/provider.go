@@ -110,21 +110,33 @@ func tokenFromRaw(raw map[string]any) *TokenResponse {
 	return tok
 }
 
-// decodeJSONMap enforces a 2xx status and decodes the body as a JSON object.
-func decodeJSONMap(resp *http.Response) (map[string]any, error) {
+// jsonObjectOrArray is the closed set of provider body shapes: a JSON object
+// (userinfo, token) or an array (GitHub's email list).
+type jsonObjectOrArray interface {
+	map[string]any | []any
+}
+
+// executeJSON sends req and decodes the bounded body into the requested shape.
+// failMsg labels transport failures (token vs userinfo); status and decode
+// failures share the provider-wide messages.
+func executeJSON[T jsonObjectOrArray](req *http.Request, client *http.Client, failMsg string) (T, error) {
+	var out T
+	resp, err := client.Do(req)
+	if err != nil {
+		return out, errors.New(errors.CodeOAuthProviderError, failMsg, err)
+	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, oauthBodyLimit))
-		return nil, errors.New(errors.CodeOAuthProviderError, fmt.Sprintf("oauth provider responded with status %d", resp.StatusCode), nil)
+		return out, errors.New(errors.CodeOAuthProviderError, fmt.Sprintf("oauth provider responded with status %d", resp.StatusCode), nil)
 	}
-	var raw map[string]any
-	if err := json.NewDecoder(io.LimitReader(resp.Body, oauthBodyLimit)).Decode(&raw); err != nil {
-		return nil, errors.New(errors.CodeOAuthProviderError, "oauth provider returned invalid response", err)
+	if err := json.NewDecoder(io.LimitReader(resp.Body, oauthBodyLimit)).Decode(&out); err != nil {
+		return out, errors.New(errors.CodeOAuthProviderError, "oauth provider returned invalid response", err)
 	}
-	if raw == nil {
-		return nil, errors.New(errors.CodeOAuthProviderError, "oauth provider returned invalid response", nil)
+	if out == nil {
+		return out, errors.New(errors.CodeOAuthProviderError, "oauth provider returned invalid response", nil)
 	}
-	return raw, nil
+	return out, nil
 }
 
 // postTokenForm POSTs an x-www-form-urlencoded token request and decodes the JSON response.
@@ -137,11 +149,7 @@ func postTokenForm(ctx context.Context, client *http.Client, endpoint, form stri
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Accept", "application/json")
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, errors.New(errors.CodeOAuthProviderError, "oauth token request failed", err)
-	}
-	raw, err := decodeJSONMap(resp)
+	raw, err := executeJSON[map[string]any](req, client, "oauth token request failed")
 	if err != nil {
 		return nil, err
 	}
@@ -151,10 +159,9 @@ func postTokenForm(ctx context.Context, client *http.Client, endpoint, form stri
 	return tokenFromRaw(raw), nil
 }
 
-// getJSON issues a Bearer-authenticated GET and decodes the body as a JSON object.
-func getJSON(ctx context.Context, client *http.Client, endpoint, accessToken string) (map[string]any, error) {
-	ctx, cancel := context.WithTimeout(ctx, oauthHTTPTimeout)
-	defer cancel()
+// userInfoRequest builds the Bearer-authenticated userinfo GET shared by both
+// response shapes.
+func userInfoRequest(ctx context.Context, endpoint, accessToken string) (*http.Request, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return nil, errors.New(errors.CodeOAuthProviderError, "oauth userinfo request failed", err)
@@ -163,40 +170,27 @@ func getJSON(ctx context.Context, client *http.Client, endpoint, accessToken str
 	if accessToken != "" {
 		req.Header.Set("Authorization", "Bearer "+accessToken)
 	}
-	resp, err := client.Do(req)
+	return req, nil
+}
+
+// getJSON issues a Bearer-authenticated GET and decodes the body as a JSON object.
+func getJSON(ctx context.Context, client *http.Client, endpoint, accessToken string) (map[string]any, error) {
+	ctx, cancel := context.WithTimeout(ctx, oauthHTTPTimeout)
+	defer cancel()
+	req, err := userInfoRequest(ctx, endpoint, accessToken)
 	if err != nil {
-		return nil, errors.New(errors.CodeOAuthProviderError, "oauth userinfo request failed", err)
+		return nil, err
 	}
-	return decodeJSONMap(resp)
+	return executeJSON[map[string]any](req, client, "oauth userinfo request failed")
 }
 
 // getJSONArray issues a Bearer-authenticated GET and decodes the body as a JSON array.
 func getJSONArray(ctx context.Context, client *http.Client, endpoint, accessToken string) ([]any, error) {
 	ctx, cancel := context.WithTimeout(ctx, oauthHTTPTimeout)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	req, err := userInfoRequest(ctx, endpoint, accessToken)
 	if err != nil {
-		return nil, errors.New(errors.CodeOAuthProviderError, "oauth userinfo request failed", err)
+		return nil, err
 	}
-	req.Header.Set("Accept", "application/json")
-	if accessToken != "" {
-		req.Header.Set("Authorization", "Bearer "+accessToken)
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, errors.New(errors.CodeOAuthProviderError, "oauth userinfo request failed", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, oauthBodyLimit))
-		return nil, errors.New(errors.CodeOAuthProviderError, fmt.Sprintf("oauth provider responded with status %d", resp.StatusCode), nil)
-	}
-	var raw []any
-	if err := json.NewDecoder(io.LimitReader(resp.Body, oauthBodyLimit)).Decode(&raw); err != nil {
-		return nil, errors.New(errors.CodeOAuthProviderError, "oauth provider returned invalid response", err)
-	}
-	if raw == nil {
-		return nil, errors.New(errors.CodeOAuthProviderError, "oauth provider returned invalid response", nil)
-	}
-	return raw, nil
+	return executeJSON[[]any](req, client, "oauth userinfo request failed")
 }

@@ -60,7 +60,9 @@ func (h *Handler) OAuthCallback(w http.ResponseWriter, r *http.Request) {
 		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 		if err := r.ParseForm(); err != nil {
 			oauth.ClearStateCookie(w, &h.cfg, providerID)
-			errors.WriteHTTP(w, errors.New(errors.CodeValidationError, "invalid callback form", nil))
+			// Cause kept for operators: errors.WriteJSON rewrites 400-class
+			// bodies from the code, so the wrapped error never reaches the wire.
+			errors.WriteHTTP(w, errors.New(errors.CodeValidationError, "invalid callback form", err))
 			return
 		}
 	}
@@ -82,9 +84,11 @@ func (h *Handler) OAuthCallback(w http.ResponseWriter, r *http.Request) {
 	state := r.FormValue("state")
 
 	// Only explicit bearer selectors mint bearer sessions; the password
-	// Login handler uses the same X-Auth-Type/type=bearer contract.
+	// Login handler uses the same X-Auth-Type/type=bearer contract. One
+	// evaluation covers both the session type and the body shape.
+	bearer, wantJSON := oauthTransport(r)
 	sessType := db.SessionTypeCookie
-	if wantsOAuthBearer(r) {
+	if bearer {
 		sessType = db.SessionTypeBearer
 	}
 	sess, rawToken, redirect, err := h.oauthSvc.HandleCallback(r.Context(), w, r, providerID, code, state, sessType)
@@ -92,7 +96,7 @@ func (h *Handler) OAuthCallback(w http.ResponseWriter, r *http.Request) {
 		errors.WriteHTTP(w, err)
 		return
 	}
-	if wantsOAuthBearer(r) {
+	if bearer {
 		// Mirror the password Login bearer contract: raw token in the body,
 		// no session cookie, no CSRF cookie (bearer is CSRF-immune).
 		// Bearer responses carry a raw token; never let caches store them.
@@ -118,8 +122,12 @@ func (h *Handler) OAuthCallback(w http.ResponseWriter, r *http.Request) {
 	if cerr != nil {
 		slog.ErrorContext(r.Context(), "failed to issue csrf cookie on oauth callback", "error", cerr)
 	}
-	if wantsOAuthJSON(r) {
+	if wantJSON {
+		// The JSON body carries the CSRF token and the per-user redirect:
+		// never let a cache or proxy store a success response.
 		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Pragma", "no-cache")
 		w.WriteHeader(http.StatusOK)
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"user_id":      sess.UserID,
@@ -129,6 +137,8 @@ func (h *Handler) OAuthCallback(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Pragma", "no-cache")
 	http.Redirect(w, r, safeOAuthRedirect(redirect), http.StatusFound)
 }
 
@@ -155,27 +165,16 @@ func (h *Handler) allowOAuth(w http.ResponseWriter, r *http.Request, providerID 
 	return true
 }
 
-// wantsOAuthBearer reports explicit bearer-transport selection. Only these
-// selectors mint a bearer session; a bare Accept: application/json stays
-// cookie-typed so pure-JSON cookie clients never silently become bearer.
-func wantsOAuthBearer(r *http.Request) bool {
-	if r.Header.Get("X-Auth-Type") == "bearer" {
-		return true
+// oauthTransport evaluates the transport selectors once. Explicit bearer wins on
+// the X-Auth-Type header or the type query parameter; Accept: application/json
+// alone only selects the JSON body shape, so a pure-JSON cookie client never
+// silently becomes bearer. The selector is read from the URL even on POST: a
+// form_post body field named "type" is provider-controlled data.
+func oauthTransport(r *http.Request) (bearer, wantJSON bool) {
+	if r.Header.Get("X-Auth-Type") == "bearer" || r.URL.Query().Get("type") == "bearer" {
+		return true, true
 	}
-	return r.URL.Query().Get("type") == "bearer"
-}
-
-// wantsOAuthJSON selects the 200-JSON body shape: explicit bearer flow or a
-// JSON-accepting client. Default browser web flow gets the 302 redirect.
-func wantsOAuthJSON(r *http.Request) bool {
-	if r.Header.Get("X-Auth-Type") == "bearer" {
-		return true
-	}
-	if r.URL.Query().Get("type") == "bearer" {
-		return true
-	}
-	accept := strings.ToLower(r.Header.Get("Accept"))
-	return strings.Contains(accept, "application/json")
+	return false, strings.Contains(strings.ToLower(r.Header.Get("Accept")), "application/json")
 }
 
 // safeOAuthRedirect allows only same-origin redirect targets to avoid turning

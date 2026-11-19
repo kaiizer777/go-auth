@@ -647,3 +647,99 @@ func (s *secLogSink) String() string {
 	defer s.mu.Unlock()
 	return s.b.String()
 }
+
+// secReasons extracts every oauth_callback_failure reason in emission order.
+func secReasons(t *testing.T, logs string) []string {
+	t.Helper()
+	var reasons []string
+	for _, line := range strings.Split(logs, "\n") {
+		if !strings.Contains(line, `"msg":"oauth_callback_failure"`) {
+			continue
+		}
+		var rec struct {
+			Reason string `json:"reason"`
+		}
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			t.Fatalf("decode log line %q: %v", line, err)
+		}
+		reasons = append(reasons, rec.Reason)
+	}
+	return reasons
+}
+
+func TestOAuthSecurity_CallbackFailureReasons(t *testing.T) {
+	cases := []struct {
+		name       string
+		mock       *oauthmock.Mock
+		corrupt    bool
+		seed       func(t *testing.T, database *gorm.DB)
+		query      func(state string) string
+		wantStatus int
+		wantReason string
+	}{
+		{
+			name:       "email_unverified",
+			mock:       oauthmock.New("google", "sub-reason-unverified", "reason-unverified@example.com", false),
+			query:      func(state string) string { return "?code=c&state=" + state },
+			wantStatus: http.StatusBadRequest, wantReason: "email_unverified",
+		},
+		{
+			name:       "userinfo_invalid",
+			mock:       oauthmock.New("google", "sub-reason-padded", " padded@example.com", true),
+			query:      func(state string) string { return "?code=c&state=" + state },
+			wantStatus: http.StatusBadGateway, wantReason: "userinfo_invalid",
+		},
+		{
+			name: "link_conflict",
+			mock: oauthmock.New("google", "sub-reason-conflict", "reason-conflict@example.com", true),
+			seed: func(t *testing.T, database *gorm.DB) {
+				t.Helper()
+				local := db.User{ID: uuid.New(), Email: "reason-conflict@example.com", PasswordHash: "hash", EmailVerified: false}
+				if err := database.Create(&local).Error; err != nil {
+					t.Fatalf("seed local: %v", err)
+				}
+			},
+			query:      func(state string) string { return "?code=c&state=" + state },
+			wantStatus: http.StatusConflict, wantReason: "OAUTH_ACCOUNT_LINK_CONFLICT",
+		},
+		{
+			name:       "provider_error",
+			mock:       oauthmock.New("google", "sub-reason-provider", "reason-provider@example.com", true),
+			query:      func(string) string { return "?error=access_denied" },
+			wantStatus: http.StatusBadGateway, wantReason: "provider_error",
+		},
+		{
+			name:       "exchange_failed",
+			mock:       oauthmock.New("google", "sub-reason-exchange", "reason-exchange@example.com", true),
+			corrupt:    true,
+			query:      func(state string) string { return "?code=c&state=" + state },
+			wantStatus: http.StatusBadGateway, wantReason: "exchange_failed",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			sink := &secLogSink{}
+			prev := slog.Default()
+			slog.SetDefault(slog.New(slog.NewJSONHandler(sink, nil)))
+			t.Cleanup(func() { slog.SetDefault(prev) })
+
+			tc.mock.CorruptVerifier = tc.corrupt
+			h, database, cfg := setupOAuthSecurityApp(t, map[string]*oauthmock.Mock{"google": tc.mock})
+			if tc.seed != nil {
+				tc.seed(t, database)
+			}
+			state, cookies := secInitiate(t, h, "/auth/oauth/google")
+			req := httptest.NewRequest(http.MethodGet, "/auth/oauth/google/callback"+tc.query(state), nil)
+			req.AddCookie(secFindCookie(cookies, cfg.OAuth.StateCookieName))
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+			if rec.Code != tc.wantStatus {
+				t.Fatalf("status = %d; want %d (%s)", rec.Code, tc.wantStatus, rec.Body.String())
+			}
+			reasons := secReasons(t, sink.String())
+			if len(reasons) == 0 || reasons[len(reasons)-1] != tc.wantReason {
+				t.Fatalf("reasons = %v; want last %q", reasons, tc.wantReason)
+			}
+		})
+	}
+}

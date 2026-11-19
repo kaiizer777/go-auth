@@ -1,11 +1,14 @@
 package oauth
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -202,6 +205,83 @@ func verifiedInfo() *UserInfo {
 	return &UserInfo{ProviderID: "google", ProviderUserID: "sub-123", Email: "jane@example.com", EmailVerified: true}
 }
 
+// logSink is a mutex-guarded slog writer so captured audit output stays race-clean.
+type logSink struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (s *logSink) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Write(p)
+}
+
+func (s *logSink) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.String()
+}
+
+func (s *logSink) Reset() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.b.Reset()
+}
+
+// captureLogs installs sink as the process default logger until the test ends.
+func captureLogs(t *testing.T) *logSink {
+	t.Helper()
+	sink := &logSink{}
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(sink, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	return sink
+}
+
+// countEvents counts occurrences of msg in the captured log.
+func countEvents(logs, msg string) int {
+	return strings.Count(logs, `"msg":"`+msg+`"`)
+}
+
+// seedLinkedIdentity inserts a verified owner plus its oauth_accounts row.
+func seedLinkedIdentity(t *testing.T, database *gorm.DB, providerID, providerUserID string) db.User {
+	t.Helper()
+	owner := db.User{ID: uuid.New(), Email: "linked-owner@example.com", PasswordHash: "hash", EmailVerified: true}
+	if err := database.Create(&owner).Error; err != nil {
+		t.Fatalf("seed user: %v", err)
+	}
+	link := db.OAuthAccount{ID: uuid.New(), UserID: owner.ID, ProviderID: providerID,
+		ProviderUserID: providerUserID, Email: owner.Email}
+	if err := database.Create(&link).Error; err != nil {
+		t.Fatalf("seed link: %v", err)
+	}
+	return owner
+}
+
+// requireIdentityRows asserts the users/links/sessions row counts.
+func requireIdentityRows(t *testing.T, database *gorm.DB, users, links, sessions int) {
+	t.Helper()
+	if n := countRows(t, database, &db.User{}); n != int64(users) {
+		t.Fatalf("users = %d; want %d", n, users)
+	}
+	if n := countRows(t, database, &db.OAuthAccount{}); n != int64(links) {
+		t.Fatalf("oauth_accounts = %d; want %d", n, links)
+	}
+	if n := countRows(t, database, &db.Session{}); n != int64(sessions) {
+		t.Fatalf("sessions = %d; want %d", n, sessions)
+	}
+}
+
+func runCallback(t *testing.T, svc Service, cfg *config.Config) {
+	t.Helper()
+	state, cookie := mustInitiate(t, svc, cfg, "google")
+	rec, req := callbackRequest(state, cookie)
+	if _, _, _, err := svc.HandleCallback(req.Context(), rec, req, "google", "code-1", state, db.SessionTypeCookie); err != nil {
+		t.Fatalf("HandleCallback = %v", err)
+	}
+}
+
 func TestInitiateFlow(t *testing.T) {
 	t.Run("sets state cookie and returns provider URL", func(t *testing.T) {
 		t.Parallel()
@@ -296,6 +376,153 @@ func TestHandleCallbackEmailGate(t *testing.T) {
 		if n := countRows(t, database, &db.Session{}); n != 0 {
 			t.Fatalf("sessions = %d; want 0", n)
 		}
+	})
+
+	t.Run("existing link succeeds with email omitted", func(t *testing.T) {
+		sink := captureLogs(t)
+		database, cfg, _, svc := setupServiceTest(t,
+			&UserInfo{ProviderID: "google", ProviderUserID: "sub-123", Email: "", EmailVerified: true})
+		owner := seedLinkedIdentity(t, database, "google", "sub-123")
+		state, cookie := mustInitiate(t, svc, cfg, "google")
+		rec, req := callbackRequest(state, cookie)
+		sess, _, _, err := svc.HandleCallback(req.Context(), rec, req, "google", "code-1", state, db.SessionTypeCookie)
+		if err != nil {
+			t.Fatalf("HandleCallback = %v", err)
+		}
+		if sess.UserID != owner.ID {
+			t.Fatalf("session user = %v; want existing link owner %v", sess.UserID, owner.ID)
+		}
+		requireIdentityRows(t, database, 1, 1, 1)
+		if n := countEvents(sink.String(), "oauth_account_linked"); n != 0 {
+			t.Fatalf("oauth_account_linked = %d; want 0", n)
+		}
+		if n := countEvents(sink.String(), "oauth_user_created"); n != 0 {
+			t.Fatalf("oauth_user_created = %d; want 0", n)
+		}
+	})
+
+	t.Run("existing link succeeds with email unverified", func(t *testing.T) {
+		database, cfg, _, svc := setupServiceTest(t,
+			&UserInfo{ProviderID: "google", ProviderUserID: "sub-123", Email: "victim@example.com"})
+		owner := seedLinkedIdentity(t, database, "google", "sub-123")
+		state, cookie := mustInitiate(t, svc, cfg, "google")
+		rec, req := callbackRequest(state, cookie)
+		sess, _, _, err := svc.HandleCallback(req.Context(), rec, req, "google", "code-1", state, db.SessionTypeCookie)
+		if err != nil {
+			t.Fatalf("HandleCallback = %v", err)
+		}
+		if sess.UserID != owner.ID {
+			t.Fatalf("session user = %v; want existing link owner %v", sess.UserID, owner.ID)
+		}
+		requireIdentityRows(t, database, 1, 1, 1)
+	})
+
+	t.Run("existing link succeeds with empty email", func(t *testing.T) {
+		database, cfg, _, svc := setupServiceTest(t,
+			&UserInfo{ProviderID: "google", ProviderUserID: "sub-123", Email: "   ", EmailVerified: true})
+		owner := seedLinkedIdentity(t, database, "google", "sub-123")
+		state, cookie := mustInitiate(t, svc, cfg, "google")
+		rec, req := callbackRequest(state, cookie)
+		sess, _, _, err := svc.HandleCallback(req.Context(), rec, req, "google", "code-1", state, db.SessionTypeCookie)
+		if err != nil {
+			t.Fatalf("HandleCallback = %v", err)
+		}
+		if sess.UserID != owner.ID {
+			t.Fatalf("session user = %v; want existing link owner %v", sess.UserID, owner.ID)
+		}
+		requireIdentityRows(t, database, 1, 1, 1)
+	})
+
+	t.Run("no link unverified email writes zero rows", func(t *testing.T) {
+		database, cfg, _, svc := setupServiceTest(t,
+			&UserInfo{ProviderID: "google", ProviderUserID: "sub-9", Email: "victim@example.com"})
+		state, cookie := mustInitiate(t, svc, cfg, "google")
+		rec, req := callbackRequest(state, cookie)
+		_, _, _, err := svc.HandleCallback(req.Context(), rec, req, "google", "code-1", state, db.SessionTypeCookie)
+		requireCode(t, err, errors.CodeOAuthEmailUnverified, http.StatusBadRequest)
+		requireIdentityRows(t, database, 0, 0, 0)
+	})
+
+	t.Run("nil userinfo keeps the 400", func(t *testing.T) {
+		database, cfg, _, svc := setupServiceTest(t, nil)
+		state, cookie := mustInitiate(t, svc, cfg, "google")
+		rec, req := callbackRequest(state, cookie)
+		_, _, _, err := svc.HandleCallback(req.Context(), rec, req, "google", "code-1", state, db.SessionTypeCookie)
+		requireCode(t, err, errors.CodeOAuthEmailUnverified, http.StatusBadRequest)
+		requireIdentityRows(t, database, 0, 0, 0)
+	})
+
+	t.Run("padded email rejected as provider error", func(t *testing.T) {
+		database, cfg, _, svc := setupServiceTest(t,
+			&UserInfo{ProviderID: "google", ProviderUserID: "sub-pad", Email: " jane@example.com", EmailVerified: true})
+		state, cookie := mustInitiate(t, svc, cfg, "google")
+		rec, req := callbackRequest(state, cookie)
+		_, _, _, err := svc.HandleCallback(req.Context(), rec, req, "google", "code-1", state, db.SessionTypeCookie)
+		requireCode(t, err, errors.CodeOAuthProviderError, http.StatusBadGateway)
+		requireIdentityRows(t, database, 0, 0, 0)
+	})
+
+	t.Run("display name email rejected as provider error", func(t *testing.T) {
+		database, cfg, _, svc := setupServiceTest(t,
+			&UserInfo{ProviderID: "google", ProviderUserID: "sub-name", Email: "Jane<jane@example.com>", EmailVerified: true})
+		state, cookie := mustInitiate(t, svc, cfg, "google")
+		rec, req := callbackRequest(state, cookie)
+		_, _, _, err := svc.HandleCallback(req.Context(), rec, req, "google", "code-1", state, db.SessionTypeCookie)
+		requireCode(t, err, errors.CodeOAuthProviderError, http.StatusBadGateway)
+		requireIdentityRows(t, database, 0, 0, 0)
+	})
+
+	t.Run("quoted local part links like a bare address", func(t *testing.T) {
+		t.Parallel()
+		const quoted = `"jane"@example.com`
+		database, cfg, _, svc := setupServiceTest(t,
+			&UserInfo{ProviderID: "google", ProviderUserID: "sub-quoted", Email: quoted, EmailVerified: true})
+		existing := db.User{ID: uuid.New(), Email: quoted, PasswordHash: "hash", EmailVerified: true}
+		if err := database.Create(&existing).Error; err != nil {
+			t.Fatalf("seed user: %v", err)
+		}
+		state, cookie := mustInitiate(t, svc, cfg, "google")
+		rec, req := callbackRequest(state, cookie)
+		sess, _, _, err := svc.HandleCallback(req.Context(), rec, req, "google", "code-1", state, db.SessionTypeCookie)
+		if err != nil {
+			t.Fatalf("HandleCallback = %v; want link, not 502", err)
+		}
+		if sess.UserID != existing.ID {
+			t.Fatalf("session user = %v; want existing %v", sess.UserID, existing.ID)
+		}
+		requireIdentityRows(t, database, 1, 1, 1)
+	})
+
+	t.Run("oversized email rejected as provider error", func(t *testing.T) {
+		database, cfg, _, svc := setupServiceTest(t,
+			&UserInfo{ProviderID: "google", ProviderUserID: "sub-long",
+				Email: strings.Repeat("a", 246) + "@example.com", EmailVerified: true})
+		state, cookie := mustInitiate(t, svc, cfg, "google")
+		rec, req := callbackRequest(state, cookie)
+		_, _, _, err := svc.HandleCallback(req.Context(), rec, req, "google", "code-1", state, db.SessionTypeCookie)
+		requireCode(t, err, errors.CodeOAuthProviderError, http.StatusBadGateway)
+		requireIdentityRows(t, database, 0, 0, 0)
+	})
+
+	t.Run("blank provider user id rejected as provider error", func(t *testing.T) {
+		database, cfg, _, svc := setupServiceTest(t,
+			&UserInfo{ProviderID: "google", ProviderUserID: "", Email: "jane@example.com", EmailVerified: true})
+		state, cookie := mustInitiate(t, svc, cfg, "google")
+		rec, req := callbackRequest(state, cookie)
+		_, _, _, err := svc.HandleCallback(req.Context(), rec, req, "google", "code-1", state, db.SessionTypeCookie)
+		requireCode(t, err, errors.CodeOAuthProviderError, http.StatusBadGateway)
+		requireIdentityRows(t, database, 0, 0, 0)
+	})
+
+	t.Run("oversized provider user id rejected as provider error", func(t *testing.T) {
+		database, cfg, _, svc := setupServiceTest(t,
+			&UserInfo{ProviderID: "google", ProviderUserID: strings.Repeat("s", 256),
+				Email: "jane@example.com", EmailVerified: true})
+		state, cookie := mustInitiate(t, svc, cfg, "google")
+		rec, req := callbackRequest(state, cookie)
+		_, _, _, err := svc.HandleCallback(req.Context(), rec, req, "google", "code-1", state, db.SessionTypeCookie)
+		requireCode(t, err, errors.CodeOAuthProviderError, http.StatusBadGateway)
+		requireIdentityRows(t, database, 0, 0, 0)
 	})
 }
 
@@ -572,4 +799,89 @@ func TestHandleCallbackConcurrentSameIdentityConverges(t *testing.T) {
 	if n := countRows(t, database, &db.OAuthAccount{}); n != 1 {
 		t.Fatalf("links = %d; want 1", n)
 	}
+}
+
+func TestHandleCallbackAuditFlags(t *testing.T) {
+	t.Run("new identity emits linked and created once", func(t *testing.T) {
+		sink := captureLogs(t)
+		database, cfg, _, svc := setupServiceTest(t, verifiedInfo())
+		runCallback(t, svc, cfg)
+		if n := countEvents(sink.String(), "oauth_account_linked"); n != 1 {
+			t.Fatalf("oauth_account_linked = %d; want 1", n)
+		}
+		if n := countEvents(sink.String(), "oauth_user_created"); n != 1 {
+			t.Fatalf("oauth_user_created = %d; want 1", n)
+		}
+		if n := countRows(t, database, &db.User{}); n != 1 {
+			t.Fatalf("users = %d; want 1", n)
+		}
+		if n := countRows(t, database, &db.OAuthAccount{}); n != 1 {
+			t.Fatalf("links = %d; want 1", n)
+		}
+	})
+
+	t.Run("email link emits linked only", func(t *testing.T) {
+		sink := captureLogs(t)
+		database, cfg, _, svc := setupServiceTest(t, verifiedInfo())
+		existing := db.User{ID: uuid.New(), Email: "jane@example.com", PasswordHash: "hash", EmailVerified: true}
+		if err := database.Create(&existing).Error; err != nil {
+			t.Fatalf("seed user: %v", err)
+		}
+		runCallback(t, svc, cfg)
+		if n := countEvents(sink.String(), "oauth_account_linked"); n != 1 {
+			t.Fatalf("oauth_account_linked = %d; want 1", n)
+		}
+		if n := countEvents(sink.String(), "oauth_user_created"); n != 0 {
+			t.Fatalf("oauth_user_created = %d; want 0", n)
+		}
+	})
+
+	t.Run("repeat link emits neither", func(t *testing.T) {
+		_, cfg, _, svc := setupServiceTest(t, verifiedInfo())
+		runCallback(t, svc, cfg)
+		sink := captureLogs(t)
+		runCallback(t, svc, cfg)
+		if n := countEvents(sink.String(), "oauth_account_linked"); n != 0 {
+			t.Fatalf("oauth_account_linked = %d; want 0", n)
+		}
+		if n := countEvents(sink.String(), "oauth_user_created"); n != 0 {
+			t.Fatalf("oauth_user_created = %d; want 0", n)
+		}
+	})
+
+	t.Run("race loser emits neither", func(t *testing.T) {
+		sink := captureLogs(t)
+		database, _, _, svc := setupServiceTest(t, verifiedInfo())
+		owner := db.User{ID: uuid.New(), Email: "owner@example.com", PasswordHash: "hash", EmailVerified: true}
+		if err := database.Create(&owner).Error; err != nil {
+			t.Fatalf("seed user: %v", err)
+		}
+		link := db.OAuthAccount{ID: uuid.New(), UserID: owner.ID, ProviderID: "google",
+			ProviderUserID: "sub-123", Email: owner.Email}
+		if err := database.Create(&link).Error; err != nil {
+			t.Fatalf("seed link: %v", err)
+		}
+		// Enter the create step directly: the seeded link is exactly what a
+		// concurrent winner leaves behind, so the insert must lose to it.
+		user, linked, created, err := svc.(*service).createUserAndLink(context.Background(), "google", verifiedInfo())
+		if err != nil {
+			t.Fatalf("createUserAndLink = %v", err)
+		}
+		if user.ID != owner.ID || linked || created {
+			t.Fatalf("tuple = (%v,%v,%v); want (%v,false,false)", user.ID, linked, created, owner.ID)
+		}
+		logLinkAudit(context.Background(), "google", user, linked, created)
+		if n := countEvents(sink.String(), "oauth_account_linked"); n != 0 {
+			t.Fatalf("oauth_account_linked = %d; want 0", n)
+		}
+		if n := countEvents(sink.String(), "oauth_user_created"); n != 0 {
+			t.Fatalf("oauth_user_created = %d; want 0", n)
+		}
+		if n := countRows(t, database, &db.User{}); n != 1 {
+			t.Fatalf("users = %d; want 1 (loser's user must roll back)", n)
+		}
+		if n := countRows(t, database, &db.OAuthAccount{}); n != 1 {
+			t.Fatalf("links = %d; want 1", n)
+		}
+	})
 }

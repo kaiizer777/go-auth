@@ -332,6 +332,33 @@ func TestAppleIDTokenRejections(t *testing.T) {
 		requireProviderError(t, err)
 	})
 
+	t.Run("alg none rejected", func(t *testing.T) {
+		t.Parallel()
+		_, jwksSrv := appleMockStack(t, Key, "kid-1", "", nil)
+		defer jwksSrv.Close()
+		p := NewAppleProvider(appleTestConfig())
+		p.jwksURL = jwksSrv.URL
+		parts := strings.Split(mk(appleFixtureClaims(true)), ".")
+		header, err := json.Marshal(map[string]any{"alg": "none", "kid": "kid-1", "typ": "JWT"})
+		if err != nil {
+			t.Fatalf("marshal header: %v", err)
+		}
+		unsigned := base64.RawURLEncoding.EncodeToString(header) + "." + parts[1] + "."
+		_, err = p.FetchUserInfo(context.Background(), &TokenResponse{IDToken: unsigned})
+		requireProviderError(t, err)
+	})
+
+	t.Run("empty kid rejected", func(t *testing.T) {
+		t.Parallel()
+		_, jwksSrv := appleMockStack(t, Key, "kid-1", "", nil)
+		defer jwksSrv.Close()
+		p := NewAppleProvider(appleTestConfig())
+		p.jwksURL = jwksSrv.URL
+		noKid := mintAppleIDToken(t, Key, "", appleFixtureClaims(true))
+		_, err := p.FetchUserInfo(context.Background(), &TokenResponse{IDToken: noKid})
+		requireProviderError(t, err)
+	})
+
 	t.Run("empty id token rejected", func(t *testing.T) {
 		t.Parallel()
 		p := NewAppleProvider(appleTestConfig())
@@ -719,5 +746,209 @@ func TestAppleOwnerCancelKeepsSharedFetch(t *testing.T) {
 	}
 	if n := fetches.Load(); n != 1 {
 		t.Errorf("JWKS fetches = %d; want 1 (shared flight, no re-fetch)", n)
+	}
+}
+
+func TestAppleParamInvalidJWKSNotCached(t *testing.T) {
+	t.Parallel()
+	Key := mustRSAKey(t)
+	var mu sync.Mutex
+	publishInvalid := true
+	jwksSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		servingInvalid := publishInvalid
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		if servingInvalid {
+			// "AA" decodes to a zero modulus: syntactically valid JWK, unusable key.
+			_, _ = w.Write([]byte(`{"keys":[{"kid":"kid-1","n":"AA","e":"AQAB"}]}`))
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"keys": []any{rsaJWK(&Key.PublicKey, "kid-1")}})
+	}))
+	defer jwksSrv.Close()
+
+	p := NewAppleProvider(appleTestConfig())
+	p.jwksURL = jwksSrv.URL
+	idToken := mintAppleIDToken(t, Key, "kid-1", appleFixtureClaims(true))
+
+	if _, err := p.FetchUserInfo(context.Background(), &TokenResponse{IDToken: idToken}); err == nil {
+		t.Fatal("param-invalid JWKS accepted; want provider error")
+	} else {
+		requireProviderError(t, err)
+	}
+
+	p.mu.RLock()
+	gen, cached, expires := p.jwksGen, len(p.jwks), p.jwksExpires
+	p.mu.RUnlock()
+	if gen != 0 || cached != 0 || !expires.IsZero() {
+		t.Fatalf("cache touched by param-invalid document: gen=%d keys=%d expires=%v", gen, cached, expires)
+	}
+
+	mu.Lock()
+	publishInvalid = false
+	mu.Unlock()
+	info, err := p.FetchUserInfo(context.Background(), &TokenResponse{IDToken: idToken})
+	if err != nil {
+		t.Fatalf("FetchUserInfo after valid JWKS = %v; want success without TTL wait", err)
+	}
+	if info.ProviderUserID != "apple-sub-123" {
+		t.Fatalf("userinfo = %+v; want apple-sub-123", info)
+	}
+
+	// A later invalid document must not replace the now-usable cache either.
+	mu.Lock()
+	publishInvalid = true
+	mu.Unlock()
+	p.mu.RLock()
+	wantExpires := p.jwksExpires
+	p.mu.RUnlock()
+	if _, err := p.jwksKey(context.Background(), "kid-2"); err == nil {
+		t.Fatal("param-invalid JWKS accepted over a usable cache; want provider error")
+	}
+	p.mu.RLock()
+	gen, expires = p.jwksGen, p.jwksExpires
+	_, kept := p.jwks["kid-1"]
+	p.mu.RUnlock()
+	if gen != 1 || !kept || !expires.Equal(wantExpires) {
+		t.Fatalf("usable cache replaced: gen=%d kid-1=%v expires=%v want %v", gen, kept, expires, wantExpires)
+	}
+}
+
+func TestAppleEmptyJWKSNotCached(t *testing.T) {
+	t.Parallel()
+	Key := mustRSAKey(t)
+	var mu sync.Mutex
+	publishEmpty := true
+	jwksSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		servingEmpty := publishEmpty
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		if servingEmpty {
+			_, _ = w.Write([]byte(`{"keys":[]}`))
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"keys": []any{rsaJWK(&Key.PublicKey, "kid-1")}})
+	}))
+	defer jwksSrv.Close()
+
+	p := NewAppleProvider(appleTestConfig())
+	p.jwksURL = jwksSrv.URL
+	idToken := mintAppleIDToken(t, Key, "kid-1", appleFixtureClaims(true))
+
+	if _, err := p.FetchUserInfo(context.Background(), &TokenResponse{IDToken: idToken}); err == nil {
+		t.Fatal("empty JWKS accepted; want provider error")
+	} else {
+		requireProviderError(t, err)
+	}
+
+	p.mu.RLock()
+	gen, cached, expires := p.jwksGen, len(p.jwks), p.jwksExpires
+	p.mu.RUnlock()
+	if gen != 0 || cached != 0 || !expires.IsZero() {
+		t.Fatalf("cache touched by empty document: gen=%d keys=%d expires=%v", gen, cached, expires)
+	}
+
+	mu.Lock()
+	publishEmpty = false
+	mu.Unlock()
+	info, err := p.FetchUserInfo(context.Background(), &TokenResponse{IDToken: idToken})
+	if err != nil {
+		t.Fatalf("FetchUserInfo after valid JWKS = %v; want success without TTL wait", err)
+	}
+	if info.ProviderUserID != "apple-sub-123" {
+		t.Fatalf("userinfo = %+v; want apple-sub-123", info)
+	}
+}
+
+// assertInvalidJWKSDocNotCached primes the cache with a usable key, then serves
+// doc (for a kid the cache does not hold) and asserts the document is rejected
+// without displacing the primed set.
+func assertInvalidJWKSDocNotCached(t *testing.T, Key *rsa.PrivateKey, doc string) {
+	t.Helper()
+	validDoc, err := json.Marshal(map[string]any{"keys": []any{rsaJWK(&Key.PublicKey, "kid-1")}})
+	if err != nil {
+		t.Fatalf("marshal valid jwks: %v", err)
+	}
+	var serveInvalid atomic.Bool
+	jwksSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if serveInvalid.Load() {
+			_, _ = w.Write([]byte(doc))
+			return
+		}
+		_, _ = w.Write(validDoc)
+	}))
+	t.Cleanup(jwksSrv.Close)
+
+	p := NewAppleProvider(appleTestConfig())
+	p.jwksURL = jwksSrv.URL
+	if _, err := p.jwksKey(context.Background(), "kid-1"); err != nil {
+		t.Fatalf("prime jwks cache: %v", err)
+	}
+	p.mu.RLock()
+	wantExpires := p.jwksExpires
+	p.mu.RUnlock()
+
+	serveInvalid.Store(true)
+	if _, err := p.jwksKey(context.Background(), "kid-2"); err == nil {
+		t.Fatal("invalid JWKS accepted; want provider error")
+	} else {
+		requireProviderError(t, err)
+	}
+
+	p.mu.RLock()
+	gen, expires := p.jwksGen, p.jwksExpires
+	_, kept := p.jwks["kid-1"]
+	p.mu.RUnlock()
+	if gen != 1 || !kept || !expires.Equal(wantExpires) {
+		t.Fatalf("usable cache replaced: gen=%d kid-1=%v expires=%v want %v", gen, kept, expires, wantExpires)
+	}
+}
+
+func TestAppleImplausibleModulusJWKSNotCached(t *testing.T) {
+	t.Parallel()
+	Key := mustRSAKey(t)
+	doc := func(n string) string {
+		return `{"keys":[{"kid":"kid-2","n":"` + n + `","e":"AQAB"}]}`
+	}
+	tests := []struct {
+		name string
+		n    string
+	}{
+		{name: "modulus one", n: base64.RawURLEncoding.EncodeToString([]byte{1})},
+		{name: "modulus two", n: base64.RawURLEncoding.EncodeToString([]byte{2})},
+		{name: "2047-bit modulus", n: base64.RawURLEncoding.EncodeToString(new(big.Int).Lsh(big.NewInt(1), 2046).Bytes())},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			assertInvalidJWKSDocNotCached(t, Key, doc(tt.n))
+		})
+	}
+}
+
+func TestAppleExponentBoundsJWKSNotCached(t *testing.T) {
+	t.Parallel()
+	Key := mustRSAKey(t)
+	n := base64.RawURLEncoding.EncodeToString(Key.N.Bytes())
+	doc := func(e string) string {
+		return `{"keys":[{"kid":"kid-2","n":"` + n + `","e":"` + e + `"}]}`
+	}
+	tests := []struct {
+		name string
+		e    string
+	}{
+		{name: "zero exponent", e: base64.RawURLEncoding.EncodeToString([]byte{0})},
+		{name: "exponent one", e: base64.RawURLEncoding.EncodeToString([]byte{1})},
+		{name: "exponent above int32 max", e: base64.RawURLEncoding.EncodeToString(new(big.Int).Lsh(big.NewInt(1), 33).Bytes())},
+		{name: "undecodable exponent", e: "AQAB!"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			assertInvalidJWKSDocNotCached(t, Key, doc(tt.e))
+		})
 	}
 }
