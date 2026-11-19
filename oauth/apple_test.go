@@ -861,3 +861,70 @@ func TestAppleEmptyJWKSNotCached(t *testing.T) {
 		t.Fatalf("userinfo = %+v; want apple-sub-123", info)
 	}
 }
+
+// assertInvalidJWKSDocNotCached primes the cache with a usable key, then serves
+// doc (for a kid the cache does not hold) and asserts the document is rejected
+// without displacing the primed set.
+func assertInvalidJWKSDocNotCached(t *testing.T, Key *rsa.PrivateKey, doc string) {
+	t.Helper()
+	validDoc, err := json.Marshal(map[string]any{"keys": []any{rsaJWK(&Key.PublicKey, "kid-1")}})
+	if err != nil {
+		t.Fatalf("marshal valid jwks: %v", err)
+	}
+	var serveInvalid atomic.Bool
+	jwksSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if serveInvalid.Load() {
+			_, _ = w.Write([]byte(doc))
+			return
+		}
+		_, _ = w.Write(validDoc)
+	}))
+	t.Cleanup(jwksSrv.Close)
+
+	p := NewAppleProvider(appleTestConfig())
+	p.jwksURL = jwksSrv.URL
+	if _, err := p.jwksKey(context.Background(), "kid-1"); err != nil {
+		t.Fatalf("prime jwks cache: %v", err)
+	}
+	p.mu.RLock()
+	wantExpires := p.jwksExpires
+	p.mu.RUnlock()
+
+	serveInvalid.Store(true)
+	if _, err := p.jwksKey(context.Background(), "kid-2"); err == nil {
+		t.Fatal("invalid JWKS accepted; want provider error")
+	} else {
+		requireProviderError(t, err)
+	}
+
+	p.mu.RLock()
+	gen, expires := p.jwksGen, p.jwksExpires
+	_, kept := p.jwks["kid-1"]
+	p.mu.RUnlock()
+	if gen != 1 || !kept || !expires.Equal(wantExpires) {
+		t.Fatalf("usable cache replaced: gen=%d kid-1=%v expires=%v want %v", gen, kept, expires, wantExpires)
+	}
+}
+
+func TestAppleImplausibleModulusJWKSNotCached(t *testing.T) {
+	t.Parallel()
+	Key := mustRSAKey(t)
+	doc := func(n string) string {
+		return `{"keys":[{"kid":"kid-2","n":"` + n + `","e":"AQAB"}]}`
+	}
+	tests := []struct {
+		name string
+		n    string
+	}{
+		{name: "modulus one", n: base64.RawURLEncoding.EncodeToString([]byte{1})},
+		{name: "modulus two", n: base64.RawURLEncoding.EncodeToString([]byte{2})},
+		{name: "2047-bit modulus", n: base64.RawURLEncoding.EncodeToString(new(big.Int).Lsh(big.NewInt(1), 2046).Bytes())},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			assertInvalidJWKSDocNotCached(t, Key, doc(tt.n))
+		})
+	}
+}

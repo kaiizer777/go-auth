@@ -33,6 +33,7 @@ const (
 	appleJWKSEndpoint   = "https://appleid.apple.com/auth/keys"
 	appleIssuer         = "https://appleid.apple.com"
 	appleJWKSTTL        = 24 * time.Hour
+	appleMinRSABits     = 2048
 	appleMaxRSAExponent = 1<<31 - 1
 )
 
@@ -384,7 +385,9 @@ func appleRSAPublicKeyParams(nRaw, eRaw string) (*big.Int, int, bool) {
 		return nil, 0, false
 	}
 	n := new(big.Int).SetBytes(nb)
-	if n.Sign() == 0 {
+	// Apple signs with 2048-bit RSA; a shorter modulus is never usable and must
+	// not count toward the all-invalid-document cache guard.
+	if n.BitLen() < appleMinRSABits {
 		return nil, 0, false
 	}
 	eb, err := base64.RawURLEncoding.DecodeString(eRaw)
