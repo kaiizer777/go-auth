@@ -697,3 +697,84 @@ func TestOAuthRateLimited(t *testing.T) {
 		}
 	})
 }
+
+func TestOAuthTransportSelection(t *testing.T) {
+	t.Run("selector truth table", func(t *testing.T) {
+		cases := []struct {
+			name       string
+			method     string
+			target     string
+			headers    map[string]string
+			body       string
+			wantBearer bool
+			wantJSON   bool
+		}{
+			{"cookie default", http.MethodGet, "/auth/oauth/google/callback",
+				nil, "", false, false},
+			{"bearer header", http.MethodGet, "/auth/oauth/google/callback",
+				map[string]string{"X-Auth-Type": "bearer"}, "", true, true},
+			{"bearer query", http.MethodGet, "/auth/oauth/google/callback?type=bearer",
+				nil, "", true, true},
+			{"json accept", http.MethodGet, "/auth/oauth/google/callback",
+				map[string]string{"Accept": "application/json"}, "", false, true},
+			{"both selectors", http.MethodGet, "/auth/oauth/google/callback?type=bearer",
+				map[string]string{"Accept": "application/json"}, "", true, true},
+			{"post form_post bearer query", http.MethodPost, "/api/auth/oauth/apple/callback?type=bearer",
+				map[string]string{"Content-Type": "application/x-www-form-urlencoded"}, "code=c", true, true},
+			{"post form_post body type ignored", http.MethodPost, "/api/auth/oauth/apple/callback",
+				map[string]string{"Content-Type": "application/x-www-form-urlencoded"}, "code=c&type=bearer", false, false},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				var body *strings.Reader
+				if tc.body != "" {
+					body = strings.NewReader(tc.body)
+				} else {
+					body = strings.NewReader("")
+				}
+				req := httptest.NewRequest(tc.method, tc.target, body)
+				for k, v := range tc.headers {
+					req.Header.Set(k, v)
+				}
+				bearer, wantJSON := oauthTransport(req)
+				if bearer != tc.wantBearer || wantJSON != tc.wantJSON {
+					t.Fatalf("oauthTransport = (%v,%v); want (%v,%v)", bearer, wantJSON, tc.wantBearer, tc.wantJSON)
+				}
+			})
+		}
+	})
+
+	t.Run("post form_post bearer query mints bearer session", func(t *testing.T) {
+		database, h := oauthTestEnv(t,
+			&oauth.UserInfo{ProviderID: "apple", ProviderUserID: "sub-post-bearer", Email: "post-bearer@example.com", EmailVerified: true})
+		state, cookies, _ := driveInitiate(t, h, "/api/auth/oauth/apple")
+		req := httptest.NewRequest(http.MethodPost, "https://example.com/api/auth/oauth/apple/callback?type=bearer",
+			strings.NewReader(url.Values{"code": {"c"}, "state": {state}}.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		attachBrowserCookies(req, cookies)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d; want 200 (%s)", rec.Code, rec.Body.String())
+		}
+		var body struct {
+			Token string `json:"token"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if body.Token == "" {
+			t.Fatal("bearer branch returned no token")
+		}
+		cfg := oauthTestConfig()
+		for _, c := range rec.Result().Cookies() {
+			if c.Name == cfg.SessionCookieName {
+				t.Fatal("bearer branch must not set a session cookie")
+			}
+		}
+		var sessions int64
+		if err := database.Model(&db.Session{}).Count(&sessions).Error; err != nil || sessions != 1 {
+			t.Fatalf("sessions = %d, err = %v; want 1", sessions, err)
+		}
+	})
+}
