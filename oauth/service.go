@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/mail"
 	"strings"
 
 	"github.com/google/uuid"
@@ -105,8 +106,9 @@ func (s *service) InitiateFlow(w http.ResponseWriter, r *http.Request, providerI
 }
 
 // HandleCallback runs the full decision tree: state validation, code exchange,
-// the mandatory EmailVerified gate (before any DB lookup), account linking or
-// creation, session issuance, and state-cookie cleanup.
+// account linking or creation, session issuance, and state-cookie cleanup. The
+// provider-verified gate lives inside the link path so an already-linked
+// identity never needs an email (Apple omits it after first consent).
 func (s *service) HandleCallback(ctx context.Context, w http.ResponseWriter, r *http.Request, providerID, code, state string, sessType db.SessionType) (*session.Session, string, string, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -154,17 +156,23 @@ func (s *service) HandleCallback(ctx context.Context, w http.ResponseWriter, r *
 	if err != nil {
 		return fail("userinfo_failed", err)
 	}
-	// Mandatory gate: unverified provider email aborts before any DB lookup,
-	// so account existence cannot leak via timing or response.
-	if info == nil || !info.EmailVerified {
+	// A nil profile keeps the historical 400: only the provider-verified gate
+	// moved behind the link lookup, and it cannot run without a profile.
+	if info == nil {
 		return fail("email_unverified", errors.ErrOAuthEmailUnverified)
-	}
-	if strings.TrimSpace(info.Email) == "" {
-		return fail("userinfo_invalid", errors.New(errors.CodeOAuthProviderError, "oauth provider returned invalid response", nil))
 	}
 
 	user, linked, created, err := s.linkOrCreate(ctx, providerID, info)
 	if err != nil {
+		// Gate sentinels map to their historical literal reasons before the
+		// code-derived fallback, which stays the producer of UPPER_SNAKE
+		// reasons such as OAUTH_ACCOUNT_LINK_CONFLICT.
+		if errors.Is(err, errors.ErrOAuthEmailUnverified) {
+			return fail("email_unverified", err)
+		}
+		if errors.Is(err, errOAuthProviderIdentityInvalid) {
+			return fail("userinfo_invalid", err)
+		}
 		var appErr *errors.Error
 		if errors.As(err, &appErr) {
 			return fail(string(appErr.Code()), err)
@@ -250,6 +258,39 @@ func isUniqueViolation(err error) bool {
 // Callers converge on the winning row instead of duplicating it; inside
 // createUserAndLink's transaction it also rolls the freshly created user back.
 var errLinkConflict = errors.New(errors.CodeInternalError, "oauth link conflict", nil)
+
+// errOAuthProviderIdentityInvalid rejects identity fields that cannot be stored.
+// It is a distinct sentinel so HandleCallback logs the literal "userinfo_invalid"
+// reason instead of the derived OAUTH_PROVIDER_ERROR.
+var errOAuthProviderIdentityInvalid = errors.New(errors.CodeOAuthProviderError, "oauth provider returned invalid response", nil)
+
+// providerFieldMaxLen matches the VARCHAR(255) columns behind the identity
+// writes: users.email, oauth_accounts.email and oauth_accounts.provider_user_id.
+const providerFieldMaxLen = 255
+
+// validateProviderIdentity gates the no-link paths, which are the only ones that
+// resolve a local account by email. Order is load-bearing: an unverified
+// identity reports OAUTH_EMAIL_UNVERIFIED before any field-validity rejection.
+func validateProviderIdentity(info *UserInfo) error {
+	if !info.EmailVerified {
+		return errors.ErrOAuthEmailUnverified
+	}
+	if info.ProviderUserID == "" || len(info.ProviderUserID) > providerFieldMaxLen {
+		return errOAuthProviderIdentityInvalid
+	}
+	if len(info.Email) > providerFieldMaxLen || db.ValidateEmail(info.Email) != nil || !emailIsBareAddress(info.Email) {
+		return errOAuthProviderIdentityInvalid
+	}
+	return nil
+}
+
+// emailIsBareAddress rejects mailbox spellings whose parsed address differs from
+// the raw value. Defensive redundancy: db.ValidateEmail already rejects the
+// space-free display-name form.
+func emailIsBareAddress(email string) bool {
+	addr, err := mail.ParseAddress(email)
+	return err == nil && addr.Address == email
+}
 
 // findLink loads the oauth_accounts row for a provider identity. found=false
 // with a nil error is the normal no-link case; anything else is a query failure.
@@ -405,6 +446,12 @@ func (s *service) linkOrCreate(ctx context.Context, providerID string, info *Use
 			return db.User{}, false, false, uerr
 		}
 		return user, false, false, nil
+	}
+
+	// No link: the identity fields become the account key, so validate them
+	// before the email lookup, the link row, or the user row are written.
+	if gerr := validateProviderIdentity(info); gerr != nil {
+		return db.User{}, false, false, gerr
 	}
 
 	// No link: match the local account by normalized email.
