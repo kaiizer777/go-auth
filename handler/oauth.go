@@ -119,7 +119,11 @@ func (h *Handler) OAuthCallback(w http.ResponseWriter, r *http.Request) {
 		slog.ErrorContext(r.Context(), "failed to issue csrf cookie on oauth callback", "error", cerr)
 	}
 	if wantsOAuthJSON(r) {
+		// The JSON body carries the CSRF token and the per-user redirect:
+		// never let a cache or proxy store a success response.
 		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Pragma", "no-cache")
 		w.WriteHeader(http.StatusOK)
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"user_id":      sess.UserID,
@@ -129,6 +133,8 @@ func (h *Handler) OAuthCallback(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Pragma", "no-cache")
 	http.Redirect(w, r, safeOAuthRedirect(redirect), http.StatusFound)
 }
 

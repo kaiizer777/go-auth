@@ -595,6 +595,61 @@ func TestOAuthCallbackFormPostProviderError(t *testing.T) {
 	}
 }
 
+func TestOAuthCallbackCookieJSONSetsNoStore(t *testing.T) {
+	_, h := oauthTestEnv(t, &oauth.UserInfo{ProviderID: "google", ProviderUserID: "sub-nostore-json", Email: "nostore-json@example.com", EmailVerified: true})
+	state, cookies, _ := driveInitiate(t, h, "/auth/oauth/google")
+	req := httptest.NewRequest(http.MethodGet, "/auth/oauth/google/callback?code=c&state="+state, nil)
+	req.Header.Set("Accept", "application/json")
+	req.AddCookie(stateCookie(t, cookies))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d; want 200 (%s)", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("Cache-Control"); got != "no-store" {
+		t.Errorf("Cache-Control = %q; want no-store", got)
+	}
+	if got := rec.Header().Get("Pragma"); got != "no-cache" {
+		t.Errorf("Pragma = %q; want no-cache", got)
+	}
+}
+
+func TestOAuthCallbackRedirectSetsNoStore(t *testing.T) {
+	_, h := oauthTestEnv(t, &oauth.UserInfo{ProviderID: "google", ProviderUserID: "sub-nostore-302", Email: "nostore-302@example.com", EmailVerified: true})
+	state, cookies, _ := driveInitiate(t, h, "/auth/oauth/google")
+	req := httptest.NewRequest(http.MethodGet, "/auth/oauth/google/callback?code=c&state="+state, nil)
+	req.AddCookie(stateCookie(t, cookies))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusFound {
+		t.Fatalf("status = %d; want 302 (%s)", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("Cache-Control"); got != "no-store" {
+		t.Errorf("Cache-Control = %q; want no-store", got)
+	}
+	if got := rec.Header().Get("Pragma"); got != "no-cache" {
+		t.Errorf("Pragma = %q; want no-cache", got)
+	}
+}
+
+func TestOAuthCallbackFailureHasNoCacheHeaders(t *testing.T) {
+	_, h := oauthTestEnv(t, &oauth.UserInfo{ProviderID: "google", ProviderUserID: "sub-nostore-fail", Email: "nostore-fail@example.com"})
+	state, cookies, _ := driveInitiate(t, h, "/auth/oauth/google")
+	req := httptest.NewRequest(http.MethodGet, "/auth/oauth/google/callback?code=c&state="+state, nil)
+	req.AddCookie(stateCookie(t, cookies))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d; want 400 (%s)", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("Cache-Control"); got != "" {
+		t.Errorf("Cache-Control = %q; want empty on failure", got)
+	}
+	if got := rec.Header().Get("Pragma"); got != "" {
+		t.Errorf("Pragma = %q; want empty on failure", got)
+	}
+}
+
 func TestOAuthRateLimited(t *testing.T) {
 	rlInfo := &oauth.UserInfo{ProviderID: "google", ProviderUserID: "sub-rl", Email: "rl@example.com", EmailVerified: true}
 
