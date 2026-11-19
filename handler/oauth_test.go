@@ -778,3 +778,56 @@ func TestOAuthTransportSelection(t *testing.T) {
 		}
 	})
 }
+
+func TestSafeOAuthRedirect(t *testing.T) {
+	cases := []struct {
+		name   string
+		target string
+		want   string
+	}{
+		{"empty defaults to root", "", "/"},
+		{"absolute url rejected", "http://evil.example/phish", "/"},
+		{"protocol relative rejected", "//evil.example", "/"},
+		{"slash backslash rejected", "/\\evil.example", "/"},
+		{"double backslash rejected", "\\\\evil.example", "/"},
+		{"space prefix rejected", " /path", "/"},
+		{"tab prefix rejected", "\t/path", "/"},
+		{"cr suffix rejected", "/path\r", "/"},
+		{"lf suffix rejected", "/path\n", "/"},
+		{"relative path allowed", "/path", "/path"},
+		{"query string allowed", "/?q=1", "/?q=1"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := safeOAuthRedirect(tc.target); got != tc.want {
+				t.Fatalf("safeOAuthRedirect(%q) = %q; want %q", tc.target, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestOAuthCallbackFormPostOversize(t *testing.T) {
+	_, h := oauthTestEnv(t, &oauth.UserInfo{ProviderID: "google", ProviderUserID: "sub-oversize", Email: "oversize@example.com", EmailVerified: true})
+	state, cookies, _ := driveInitiate(t, h, "/auth/oauth/google")
+	oversized := "code=c&state=" + state + "&pad=" + strings.Repeat("a", 1<<20)
+	req := httptest.NewRequest(http.MethodPost, "/auth/oauth/google/callback", strings.NewReader(oversized))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.AddCookie(stateCookie(t, cookies))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d; want 400 (%s)", rec.Code, rec.Body.String())
+	}
+	if code := decodeErrCode(t, rec); code != errors.CodeValidationError {
+		t.Fatalf("code = %s; want VALIDATION_ERROR", code)
+	}
+	cleared := false
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == "oauth_state" && c.MaxAge == -1 {
+			cleared = true
+		}
+	}
+	if !cleared {
+		t.Fatal("state cookie not cleared on unreadable form")
+	}
+}

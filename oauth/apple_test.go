@@ -332,6 +332,33 @@ func TestAppleIDTokenRejections(t *testing.T) {
 		requireProviderError(t, err)
 	})
 
+	t.Run("alg none rejected", func(t *testing.T) {
+		t.Parallel()
+		_, jwksSrv := appleMockStack(t, Key, "kid-1", "", nil)
+		defer jwksSrv.Close()
+		p := NewAppleProvider(appleTestConfig())
+		p.jwksURL = jwksSrv.URL
+		parts := strings.Split(mk(appleFixtureClaims(true)), ".")
+		header, err := json.Marshal(map[string]any{"alg": "none", "kid": "kid-1", "typ": "JWT"})
+		if err != nil {
+			t.Fatalf("marshal header: %v", err)
+		}
+		unsigned := base64.RawURLEncoding.EncodeToString(header) + "." + parts[1] + "."
+		_, err = p.FetchUserInfo(context.Background(), &TokenResponse{IDToken: unsigned})
+		requireProviderError(t, err)
+	})
+
+	t.Run("empty kid rejected", func(t *testing.T) {
+		t.Parallel()
+		_, jwksSrv := appleMockStack(t, Key, "kid-1", "", nil)
+		defer jwksSrv.Close()
+		p := NewAppleProvider(appleTestConfig())
+		p.jwksURL = jwksSrv.URL
+		noKid := mintAppleIDToken(t, Key, "", appleFixtureClaims(true))
+		_, err := p.FetchUserInfo(context.Background(), &TokenResponse{IDToken: noKid})
+		requireProviderError(t, err)
+	})
+
 	t.Run("empty id token rejected", func(t *testing.T) {
 		t.Parallel()
 		p := NewAppleProvider(appleTestConfig())

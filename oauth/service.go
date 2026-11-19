@@ -127,7 +127,9 @@ func (s *service) HandleCallback(ctx context.Context, w http.ResponseWriter, r *
 		if err != nil {
 			// Provider/transport detail only: exchange/userinfo errors carry
 			// static messages plus wrapped stdlib errors, never codes,
-			// verifiers, or tokens.
+			// verifiers, or tokens. Link-path driver errors may embed a
+			// normalized-email key from the database; that matches the
+			// repo-wide logging convention and is accepted here.
 			attrs = append(attrs, "error", err.Error())
 		}
 		slog.InfoContext(ctx, "oauth_callback_failure", attrs...)

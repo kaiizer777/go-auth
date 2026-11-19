@@ -341,3 +341,21 @@ func TestOAuthPG_ConcurrentCallbacksConverge(t *testing.T) {
 		t.Fatalf("users=%d links=%d sessions=%d; want 1/1/%d", users, links, sessions, n)
 	}
 }
+
+// TestOAuthPG_CaseInsensitiveEmailUnique pins the LOWER(email) unique index the
+// OAuth email-match path relies on, using real PostgreSQL rather than sqlite.
+func TestOAuthPG_CaseInsensitiveEmailUnique(t *testing.T) {
+	database, _ := setupDB(t)
+
+	first := db.User{ID: uuid.New(), Email: "Case-A@example.com", PasswordHash: "hash", EmailVerified: true}
+	if err := database.Create(&first).Error; err != nil {
+		t.Fatalf("seed first user: %v", err)
+	}
+	second := db.User{ID: uuid.New(), Email: "case-a@example.com", PasswordHash: "hash", EmailVerified: true}
+	if err := database.Create(&second).Error; err == nil {
+		t.Fatal("case-variant duplicate email accepted; want idx_users_email_lower violation")
+	}
+	if users, _, _ := pgCounts(t, database); users != 1 {
+		t.Fatalf("users = %d; want 1", users)
+	}
+}
