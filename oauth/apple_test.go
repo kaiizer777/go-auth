@@ -928,3 +928,27 @@ func TestAppleImplausibleModulusJWKSNotCached(t *testing.T) {
 		})
 	}
 }
+
+func TestAppleExponentBoundsJWKSNotCached(t *testing.T) {
+	t.Parallel()
+	Key := mustRSAKey(t)
+	n := base64.RawURLEncoding.EncodeToString(Key.N.Bytes())
+	doc := func(e string) string {
+		return `{"keys":[{"kid":"kid-2","n":"` + n + `","e":"` + e + `"}]}`
+	}
+	tests := []struct {
+		name string
+		e    string
+	}{
+		{name: "zero exponent", e: base64.RawURLEncoding.EncodeToString([]byte{0})},
+		{name: "exponent one", e: base64.RawURLEncoding.EncodeToString([]byte{1})},
+		{name: "exponent above int32 max", e: base64.RawURLEncoding.EncodeToString(new(big.Int).Lsh(big.NewInt(1), 33).Bytes())},
+		{name: "undecodable exponent", e: "AQAB!"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			assertInvalidJWKSDocNotCached(t, Key, doc(tt.e))
+		})
+	}
+}
