@@ -11,9 +11,12 @@
 //
 // Linking policy: a provider identity links to an existing account only when
 // the provider asserts a verified email that matches a verified local account;
-// otherwise the flow creates a verified passwordless user. An identity that is
-// already linked resolves its owner without an email, because providers such
-// as Apple only return one on first consent.
+// a verified email with no matching local account creates a verified
+// passwordless user. A verified email matching an unverified local account is
+// refused with a conflict (pre-hijack defense), and an unverified provider email
+// is rejected outright. An identity that is already linked resolves its owner
+// without an email, because providers such as Apple only return one on first
+// consent.
 //
 // The consumed-state record is process-local. A multi-replica deployment needs
 // sticky routing per in-flight login or an external store; otherwise two
