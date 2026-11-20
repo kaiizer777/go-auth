@@ -138,7 +138,7 @@ func (h *Handler) HandleTotpVerify(w http.ResponseWriter, r *http.Request) {
 
 	ip := realIP(r)
 
-	// Step 1: Rate limit by client IP
+	// Step 1: Rate limit by client IP before token lookup
 	if h.totpLimiter != nil {
 		ipKey := ratelimit.TOTPIPKey(ip)
 		if !h.totpLimiter.Allow(ipKey) {
@@ -158,24 +158,18 @@ func (h *Handler) HandleTotpVerify(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Step 2: Rate limit by User ID
-	if h.totpLimiter != nil {
-		userKey := ratelimit.TOTPUserKey(token.UserID.String())
-		if !h.totpLimiter.Allow(userKey) {
-			slog.WarnContext(r.Context(), "rate_limit_exceeded",
-				"user_id", token.UserID.String(),
-				"endpoint", r.URL.Path,
-			)
-			ratelimit.WriteRateLimitError(w, h.totpLimiter.RetryAfter(userKey))
+	// Verify the TOTP code (VerifyCode validates user-level rate limit and code)
+	if err := h.totpSvc.VerifyCode(r.Context(), token.UserID.String(), code, ""); err != nil {
+		if _, attemptErr := h.totpSvc.RecordTokenAttempt(r.Context(), tokenStr); attemptErr != nil {
+			errors.WriteHTTP(w, attemptErr)
 			return
 		}
-	}
-
-	// Verify the TOTP code
-	if err := h.totpSvc.VerifyCode(r.Context(), token.UserID.String(), code, ip); err != nil {
-		_, _ = h.totpSvc.RecordTokenAttempt(r.Context(), tokenStr)
 		errors.WriteHTTP(w, err)
 		return
+	}
+
+	if h.totpLimiter != nil {
+		h.totpLimiter.Reset(ratelimit.TOTPIPKey(ip))
 	}
 
 	// Consume challenge token (hard delete) and retrieve user
@@ -213,7 +207,7 @@ func (h *Handler) HandleTotpBackup(w http.ResponseWriter, r *http.Request) {
 
 	ip := realIP(r)
 
-	// Step 1: Rate limit by client IP
+	// Step 1: Rate limit by client IP before token lookup
 	if h.totpLimiter != nil {
 		ipKey := ratelimit.TOTPIPKey(ip)
 		if !h.totpLimiter.Allow(ipKey) {
@@ -233,24 +227,18 @@ func (h *Handler) HandleTotpBackup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Step 2: Rate limit by User ID
-	if h.totpLimiter != nil {
-		userKey := ratelimit.TOTPUserKey(token.UserID.String())
-		if !h.totpLimiter.Allow(userKey) {
-			slog.WarnContext(r.Context(), "rate_limit_exceeded",
-				"user_id", token.UserID.String(),
-				"endpoint", r.URL.Path,
-			)
-			ratelimit.WriteRateLimitError(w, h.totpLimiter.RetryAfter(userKey))
+	// Verify the backup code (VerifyBackupCode validates user-level rate limit and code)
+	if err := h.totpSvc.VerifyBackupCode(r.Context(), token.UserID.String(), backupCode, ""); err != nil {
+		if _, attemptErr := h.totpSvc.RecordTokenAttempt(r.Context(), tokenStr); attemptErr != nil {
+			errors.WriteHTTP(w, attemptErr)
 			return
 		}
-	}
-
-	// Verify the backup code
-	if err := h.totpSvc.VerifyBackupCode(r.Context(), token.UserID.String(), backupCode, ip); err != nil {
-		_, _ = h.totpSvc.RecordTokenAttempt(r.Context(), tokenStr)
 		errors.WriteHTTP(w, err)
 		return
+	}
+
+	if h.totpLimiter != nil {
+		h.totpLimiter.Reset(ratelimit.TOTPIPKey(ip))
 	}
 
 	// Consume challenge token (hard delete) and retrieve user
