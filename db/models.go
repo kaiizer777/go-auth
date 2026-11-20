@@ -130,3 +130,75 @@ func (o OAuthAccount) LogValue() slog.Value {
 		slog.Time("updated_at", o.UpdatedAt),
 	)
 }
+
+// TotpSecret represents an enrolled TOTP two-factor configuration for a user.
+type TotpSecret struct {
+	ID              uuid.UUID `gorm:"primaryKey;type:uuid;default:uuid_generate_v4()"`
+	UserID          uuid.UUID `gorm:"type:uuid;not null;uniqueIndex:uq_totp_secrets_user_id"`
+	EncryptedSecret []byte    `gorm:"type:bytea;not null" json:"-"`
+	BackupCodes     []byte    `gorm:"type:jsonb;not null;default:'[]'"`
+	Enabled         bool      `gorm:"not null;default:false"`
+	CreatedAt       time.Time
+	UpdatedAt       time.Time
+}
+
+// TableName returns the table name for TotpSecret.
+func (TotpSecret) TableName() string { return "totp_secrets" }
+
+// LogValue implements slog.LogValuer to prevent TOTP secret and backup code leakage in logs.
+func (t TotpSecret) LogValue() slog.Value {
+	return slog.GroupValue(
+		slog.String("id", t.ID.String()),
+		slog.String("user_id", t.UserID.String()),
+		slog.String("encrypted_secret", "[REDACTED]"),
+		slog.String("backup_codes", "[REDACTED]"),
+		slog.Bool("enabled", t.Enabled),
+		slog.Time("created_at", t.CreatedAt),
+		slog.Time("updated_at", t.UpdatedAt),
+	)
+}
+
+// TotpUsedCode tracks consumed TOTP verification codes to enforce single-use replay protection.
+type TotpUsedCode struct {
+	ID     uuid.UUID `gorm:"primaryKey;type:uuid;default:uuid_generate_v4()"`
+	UserID uuid.UUID `gorm:"type:uuid;not null;uniqueIndex:uq_totp_used_codes_user_code,composite:user_code"`
+	CodeHash []byte  `gorm:"type:bytea;not null;uniqueIndex:uq_totp_used_codes_user_code,composite:user_code" json:"-"`
+	UsedAt time.Time `gorm:"not null;index:idx_totp_used_codes_user_used_at"`
+}
+
+// TableName returns the table name for TotpUsedCode.
+func (TotpUsedCode) TableName() string { return "totp_used_codes" }
+
+// LogValue implements slog.LogValuer to prevent code hash leakage in logs.
+func (c TotpUsedCode) LogValue() slog.Value {
+	return slog.GroupValue(
+		slog.String("id", c.ID.String()),
+		slog.String("user_id", c.UserID.String()),
+		slog.String("code_hash", "[REDACTED]"),
+		slog.Time("used_at", c.UsedAt),
+	)
+}
+
+// TwoFactorToken represents an ephemeral challenge token issued pending 2FA completion.
+// INVARIANT: Soft deletes are strictly banned on security tokens; hard delete only.
+type TwoFactorToken struct {
+	ID        uuid.UUID `gorm:"primaryKey;type:uuid;default:uuid_generate_v4()"`
+	UserID    uuid.UUID `gorm:"type:uuid;not null;index:idx_two_factor_tokens_user_id"`
+	TokenHash []byte    `gorm:"type:bytea;uniqueIndex:uq_two_factor_tokens_token_hash;not null" json:"-"`
+	ExpiresAt time.Time `gorm:"not null;index:idx_two_factor_tokens_expires_at"`
+	Attempts  int       `gorm:"not null;default:0"`
+}
+
+// TableName returns the table name for TwoFactorToken.
+func (TwoFactorToken) TableName() string { return "two_factor_tokens" }
+
+// LogValue implements slog.LogValuer to prevent challenge token hash leakage in logs.
+func (t TwoFactorToken) LogValue() slog.Value {
+	return slog.GroupValue(
+		slog.String("id", t.ID.String()),
+		slog.String("user_id", t.UserID.String()),
+		slog.String("token_hash", "[REDACTED]"),
+		slog.Time("expires_at", t.ExpiresAt),
+		slog.Int("attempts", t.Attempts),
+	)
+}
