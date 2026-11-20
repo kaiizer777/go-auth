@@ -7,12 +7,13 @@ require (
 	github.com/golang-migrate/migrate/v4 v4.20.1
 	github.com/google/uuid v1.6.0
 	github.com/jackc/pgx/v5 v5.13.0
+	github.com/pquerna/otp v1.4.0
 	gorm.io/driver/postgres v1.6.3
 	gorm.io/gorm v1.31.2
-	github.com/pquerna/otp v1.4.0
 )
 
 require (
+	github.com/boombuler/barcode v1.0.1-0.20190219062509-6c824513bacc // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/glebarez/go-sqlite v1.21.2 // indirect
 	github.com/mattn/go-isatty v0.0.17 // indirect
