@@ -642,5 +642,164 @@ func TestDisableTOTP_WithCode(t *testing.T) {
 	}
 }
 
+func TestDisableTOTP_BothCredentialsValid(t *testing.T) {
+	t.Parallel()
+
+	database := setupTestDB(t)
+	plainPassword := "StrongPassword#2026"
+	hash, err := crypto.HashPassword(plainPassword, crypto.DefaultHashParams())
+	if err != nil {
+		t.Fatalf("HashPassword failed: %v", err)
+	}
+
+	user := db.User{
+		ID:            uuid.New(),
+		Email:         "both_auth@example.com",
+		PasswordHash:  hash,
+		EmailVerified: true,
+		CreatedAt:     time.Now(),
+		UpdatedAt:     time.Now(),
+	}
+	if err := database.Create(&user).Error; err != nil {
+		t.Fatalf("failed to create user: %v", err)
+	}
+
+	svc := NewService(database, config.TOTPConfig{EncryptionKey: validTestHexKey()}, nil, nil)
+	resp, err := svc.Enroll(context.Background(), user.ID.String())
+	if err != nil {
+		t.Fatalf("Enroll failed: %v", err)
+	}
+	code, err := ptotp.GenerateCode(resp.Secret, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("GenerateCode failed: %v", err)
+	}
+	_, err = svc.ConfirmEnrollment(context.Background(), user.ID.String(), code)
+	if err != nil {
+		t.Fatalf("ConfirmEnrollment failed: %v", err)
+	}
+
+	// Disable with both valid password AND valid fresh code
+	freshCode, err := ptotp.GenerateCode(resp.Secret, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("GenerateCode failed: %v", err)
+	}
+
+	err = svc.DisableTOTP(context.Background(), user.ID.String(), plainPassword, freshCode)
+	if err != nil {
+		t.Fatalf("DisableTOTP failed with both valid credentials: %v", err)
+	}
+
+	enabled, err := svc.Status(context.Background(), user.ID.String())
+	if err != nil || enabled {
+		t.Fatalf("expected enabled=false, got %v, err=%v", enabled, err)
+	}
+}
+
+func TestVerifyBackupCode_DualRateLimit(t *testing.T) {
+	t.Parallel()
+
+	database := setupTestDB(t)
+	user := createTestUser(t, database, "backup_rl@example.com", true)
+	limiter := ratelimit.NewLimiter(time.Minute, 2)
+	svc := NewService(database, config.TOTPConfig{EncryptionKey: validTestHexKey()}, limiter, nil)
+
+	ip := "10.0.0.1"
+	_ = svc.VerifyBackupCode(context.Background(), user.ID.String(), "INVALID1", ip)
+	_ = svc.VerifyBackupCode(context.Background(), user.ID.String(), "INVALID2", ip)
+
+	err := svc.VerifyBackupCode(context.Background(), user.ID.String(), "INVALID3", ip)
+	if !errors.Is(err, apperrors.ErrTOTPRateLimitExceeded) {
+		t.Fatalf("expected ErrTOTPRateLimitExceeded, got %v", err)
+	}
+}
+
+func TestEnroll_InvalidEncryptionKey(t *testing.T) {
+	t.Parallel()
+
+	database := setupTestDB(t)
+	user := createTestUser(t, database, "bad_key@example.com", true)
+	// Invalid 16-hex key
+	svc := NewService(database, config.TOTPConfig{EncryptionKey: "bad-key"}, nil, nil)
+
+	_, err := svc.Enroll(context.Background(), user.ID.String())
+	if !errors.Is(err, apperrors.ErrTOTPEncryptionKeyInvalid) {
+		t.Fatalf("expected ErrTOTPEncryptionKeyInvalid, got %v", err)
+	}
+}
+
+func TestHelperAliases(t *testing.T) {
+	t.Parallel()
+
+	database := setupTestDB(t)
+	plainPassword := "SecretPass#4321"
+	hash, _ := crypto.HashPassword(plainPassword, crypto.DefaultHashParams())
+	user := db.User{
+		ID:            uuid.New(),
+		Email:         "alias_test@example.com",
+		PasswordHash:  hash,
+		EmailVerified: true,
+		CreatedAt:     time.Now(),
+		UpdatedAt:     time.Now(),
+	}
+	if err := database.Create(&user).Error; err != nil {
+		t.Fatalf("failed to create user: %v", err)
+	}
+
+	svc := NewService(database, config.TOTPConfig{EncryptionKey: validTestHexKey()}, nil, nil)
+	concrete := svc.(*totpService)
+
+	// IsTotpEnabled alias
+	enabled, err := concrete.IsTotpEnabled(context.Background(), user.ID)
+	if err != nil || enabled {
+		t.Fatalf("expected enabled=false, got %v, err=%v", enabled, err)
+	}
+
+	// EnrollTotp alias
+	resp, err := concrete.EnrollTotp(context.Background(), user.ID)
+	if err != nil {
+		t.Fatalf("EnrollTotp failed: %v", err)
+	}
+
+	// Confirm
+	code, _ := ptotp.GenerateCode(resp.Secret, time.Now().UTC())
+	_, err = svc.ConfirmEnrollment(context.Background(), user.ID.String(), code)
+	if err != nil {
+		t.Fatalf("ConfirmEnrollment failed: %v", err)
+	}
+
+	// VerifyTotp alias with drift
+	driftCode, _ := ptotp.GenerateCode(resp.Secret, time.Now().UTC().Add(25*time.Second))
+	if driftCode == code {
+		driftCode, _ = ptotp.GenerateCode(resp.Secret, time.Now().UTC().Add(30*time.Second))
+	}
+	err = concrete.VerifyTotp(context.Background(), user.ID, driftCode)
+	if err != nil {
+		t.Fatalf("VerifyTotp alias failed: %v", err)
+	}
+
+	// GenerateTwoFactorToken & ValidateTwoFactorToken aliases
+	rawToken, err := concrete.GenerateTwoFactorToken(context.Background(), user.ID)
+	if err != nil {
+		t.Fatalf("GenerateTwoFactorToken failed: %v", err)
+	}
+	valUID, err := concrete.ValidateTwoFactorToken(context.Background(), rawToken)
+	if err != nil || valUID != user.ID {
+		t.Fatalf("ValidateTwoFactorToken failed: valUID=%s, err=%v", valUID, err)
+	}
+
+	// ConsumeTwoFactorToken alias
+	err = concrete.ConsumeTwoFactorToken(context.Background(), rawToken)
+	if err != nil {
+		t.Fatalf("ConsumeTwoFactorToken failed: %v", err)
+	}
+
+	// DisableTotp alias
+	err = concrete.DisableTotp(context.Background(), user.ID, plainPassword, "")
+	if err != nil {
+		t.Fatalf("DisableTotp alias failed: %v", err)
+	}
+}
+
+
 
 
