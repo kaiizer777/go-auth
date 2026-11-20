@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -101,6 +102,40 @@ type SecurityHeadersConfig struct {
 	HSTSPreload           bool          // Default: false
 }
 
+// TOTPConfig groups configuration settings for RFC 6238 TOTP two-factor authentication.
+type TOTPConfig struct {
+	EncryptionKey        string        // 64-hex AES-256 key (32 bytes)
+	Issuer               string        // App name / issuer for OTP URI; default "go-auth"
+	ChallengeTokenTTL    time.Duration // Default: 10m; valid range: 1m–30m
+	AttemptWindow        time.Duration // Default: 5m; min: 1m
+	MaxAttemptsPerWindow int           // Default: 5; min: 1
+}
+
+// LogValue implements slog.LogValuer to prevent secret encryption key leakage in logs.
+func (t TOTPConfig) LogValue() slog.Value {
+	keyMasked := "[REDACTED]"
+	if t.EncryptionKey == "" {
+		keyMasked = ""
+	}
+	return slog.GroupValue(
+		slog.String("encryption_key", keyMasked),
+		slog.String("issuer", t.Issuer),
+		slog.Duration("challenge_token_ttl", t.ChallengeTokenTTL),
+		slog.Duration("attempt_window", t.AttemptWindow),
+		slog.Int("max_attempts_per_window", t.MaxAttemptsPerWindow),
+	)
+}
+
+// DefaultTOTPConfig returns safe production defaults for TOTP configuration.
+func DefaultTOTPConfig() TOTPConfig {
+	return TOTPConfig{
+		Issuer:               "go-auth",
+		ChallengeTokenTTL:    10 * time.Minute,
+		MaxAttemptsPerWindow: 5,
+		AttemptWindow:        5 * time.Minute,
+	}
+}
+
 // Config holds all database, CORS, connection pool, and email hook settings.
 type Config struct {
 	// DatabaseURL is the PostgreSQL connection string.
@@ -178,6 +213,9 @@ type Config struct {
 	// OAuth holds optional third-party OAuth2/OIDC provider configurations.
 	OAuth OAuthConfig
 
+	// TOTP holds RFC 6238 TOTP two-factor authentication configuration.
+	TOTP TOTPConfig
+
 	// Rate limiting
 	RateLimitLoginWindow  time.Duration // sliding window duration; default 15m
 	RateLimitLoginMax     int           // max attempts in window; default 10
@@ -248,6 +286,8 @@ func DefaultConfig() Config {
 			StateTTL:            10 * time.Minute,
 			StateCookieSameSite: http.SameSiteLaxMode,
 		},
+
+		TOTP: DefaultTOTPConfig(),
 
 		// Rate limiting
 		RateLimitLoginWindow:  15 * time.Minute,
@@ -532,6 +572,46 @@ func (c *Config) Validate() error {
 				(provider.TeamID == "" || provider.KeyID == "" || provider.PrivateKey == "") {
 				return errors.ErrOAuthClientSecretRequired
 			}
+		}
+	}
+
+	if c.TOTP.Issuer == "" {
+		c.TOTP.Issuer = "go-auth"
+	}
+	if c.TOTP.EncryptionKey != "" {
+		if len(c.TOTP.EncryptionKey) != 64 {
+			return errors.ErrTOTPEncryptionKeyInvalid
+		}
+		if _, err := hex.DecodeString(c.TOTP.EncryptionKey); err != nil {
+			return errors.ErrTOTPEncryptionKeyInvalid
+		}
+		if c.TOTP.ChallengeTokenTTL < time.Minute || c.TOTP.ChallengeTokenTTL > 30*time.Minute {
+			return errors.ErrTOTPChallengeTokenTTLInvalid
+		}
+		if c.TOTP.MaxAttemptsPerWindow < 1 {
+			return errors.ErrTOTPMaxAttemptsInvalid
+		}
+		if c.TOTP.AttemptWindow < time.Minute {
+			return errors.ErrTOTPAttemptWindowInvalid
+		}
+	} else {
+		if c.TOTP.ChallengeTokenTTL == 0 {
+			c.TOTP.ChallengeTokenTTL = 10 * time.Minute
+		}
+		if c.TOTP.MaxAttemptsPerWindow == 0 {
+			c.TOTP.MaxAttemptsPerWindow = 5
+		}
+		if c.TOTP.AttemptWindow == 0 {
+			c.TOTP.AttemptWindow = 5 * time.Minute
+		}
+		if c.TOTP.ChallengeTokenTTL < 0 || (c.TOTP.ChallengeTokenTTL > 0 && c.TOTP.ChallengeTokenTTL < time.Minute) || c.TOTP.ChallengeTokenTTL > 30*time.Minute {
+			return errors.ErrTOTPChallengeTokenTTLInvalid
+		}
+		if c.TOTP.MaxAttemptsPerWindow < 0 {
+			return errors.ErrTOTPMaxAttemptsInvalid
+		}
+		if c.TOTP.AttemptWindow < 0 || (c.TOTP.AttemptWindow > 0 && c.TOTP.AttemptWindow < time.Minute) {
+			return errors.ErrTOTPAttemptWindowInvalid
 		}
 	}
 	if !c.SessionCookieSecure {
