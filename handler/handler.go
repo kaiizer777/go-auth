@@ -2,9 +2,11 @@ package handler
 
 import (
 	"bytes"
+	"log/slog"
 	"mime"
 	"net/http"
 	"strings"
+	"time"
 
 	"gorm.io/gorm"
 
@@ -15,6 +17,7 @@ import (
 	"github.com/kaiizer777/go-auth/oauth"
 	"github.com/kaiizer777/go-auth/ratelimit"
 	"github.com/kaiizer777/go-auth/session"
+	"github.com/kaiizer777/go-auth/totp"
 )
 
 // Handler maintains the HTTP router, database connection, and configuration.
@@ -34,6 +37,8 @@ type Handler struct {
 	signupIPLimiter *ratelimit.Limiter
 	resetIPLimiter  *ratelimit.Limiter
 	oauthIPLimiter  *ratelimit.Limiter
+	totpSvc         totp.Service
+	totpLimiter     *ratelimit.Limiter
 }
 
 // Option configures optional dependencies for Handler.
@@ -88,6 +93,20 @@ func WithOAuthIPLimiters(oauthIP *ratelimit.Limiter) Option {
 	}
 }
 
+// WithTotpService attaches a TOTP two-factor authentication service to the Handler.
+func WithTotpService(svc totp.Service) Option {
+	return func(h *Handler) {
+		h.totpSvc = svc
+	}
+}
+
+// WithTotpLimiter attaches a custom in-memory rate limiter for TOTP verification.
+func WithTotpLimiter(limiter *ratelimit.Limiter) Option {
+	return func(h *Handler) {
+		h.totpLimiter = limiter
+	}
+}
+
 // New initializes the handler scaffold, registers routes, and applies CORS middleware.
 func New(db *gorm.DB, cfg config.Config, authSvc auth.Service, opts ...Option) http.Handler {
 	h := &Handler{
@@ -113,6 +132,18 @@ func New(db *gorm.DB, cfg config.Config, authSvc auth.Service, opts ...Option) h
 
 	if h.sessHandler == nil && h.sessionSvc != nil {
 		h.sessHandler = NewSessionHandler(h.sessionSvc, db, &cfg)
+	}
+
+	if h.totpLimiter == nil && h.cfg.TOTP.MaxAttemptsPerWindow > 0 {
+		window := h.cfg.TOTP.AttemptWindow
+		if window <= 0 {
+			window = 5 * time.Minute
+		}
+		h.totpLimiter = ratelimit.NewLimiter(window, h.cfg.TOTP.MaxAttemptsPerWindow)
+	}
+
+	if h.totpSvc == nil && db != nil && cfg.TOTP.EncryptionKey != "" {
+		h.totpSvc = totp.NewService(db, cfg.TOTP, h.totpLimiter, slog.Default())
 	}
 
 	h.registerRoutes()
