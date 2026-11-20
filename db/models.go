@@ -160,10 +160,10 @@ func (t TotpSecret) LogValue() slog.Value {
 
 // TotpUsedCode tracks consumed TOTP verification codes to enforce single-use replay protection.
 type TotpUsedCode struct {
-	ID     uuid.UUID `gorm:"primaryKey;type:uuid;default:uuid_generate_v4()"`
-	UserID uuid.UUID `gorm:"type:uuid;not null;uniqueIndex:uq_totp_used_codes_user_code,composite:user_code"`
-	CodeHash []byte  `gorm:"type:bytea;not null;uniqueIndex:uq_totp_used_codes_user_code,composite:user_code" json:"-"`
-	UsedAt time.Time `gorm:"not null;index:idx_totp_used_codes_user_used_at"`
+	ID       uuid.UUID `gorm:"primaryKey;type:uuid;default:uuid_generate_v4()"`
+	UserID   uuid.UUID `gorm:"type:uuid;not null;uniqueIndex:uq_totp_used_codes_user_code,composite:user_code"`
+	CodeHash []byte    `gorm:"type:bytea;not null;uniqueIndex:uq_totp_used_codes_user_code,composite:user_code" json:"-"`
+	UsedAt   time.Time `gorm:"not null;index:idx_totp_used_codes_user_used_at"`
 }
 
 // TableName returns the table name for TotpUsedCode.

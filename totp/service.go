@@ -712,5 +712,3 @@ func (s *totpService) ConsumeTwoFactorToken(ctx context.Context, rawToken string
 func (s *totpService) DisableTotp(ctx context.Context, userID uuid.UUID, password, code string) error {
 	return s.DisableTOTP(ctx, userID.String(), password, code)
 }
-
-
