@@ -325,3 +325,81 @@ func TestTokenAndSessionHashesJSONOmission(t *testing.T) {
 		t.Errorf("json.Marshal(PasswordResetToken) leaked TokenHash: %s", string(prtData))
 	}
 }
+
+func TestTOTPModels_TableNameAndMasking(t *testing.T) {
+	t.Parallel()
+
+	// 1. TableName tests
+	if (TotpSecret{}).TableName() != "totp_secrets" {
+		t.Errorf("TotpSecret.TableName() = %q; want \"totp_secrets\"", (TotpSecret{}).TableName())
+	}
+	if (TotpUsedCode{}).TableName() != "totp_used_codes" {
+		t.Errorf("TotpUsedCode.TableName() = %q; want \"totp_used_codes\"", (TotpUsedCode{}).TableName())
+	}
+	if (TwoFactorToken{}).TableName() != "two_factor_tokens" {
+		t.Errorf("TwoFactorToken.TableName() = %q; want \"two_factor_tokens\"", (TwoFactorToken{}).TableName())
+	}
+
+	// 2. Invariant: TwoFactorToken MUST NOT have DeletedAt (hard delete only)
+	if _, ok := reflect.TypeOf(TwoFactorToken{}).FieldByName("DeletedAt"); ok {
+		t.Fatal("CRITICAL INVARIANT VIOLATION: TwoFactorToken contains DeletedAt; soft deletes are banned on security tokens")
+	}
+
+	// 3. JSON tags check: sensitive fields omitted
+	secretField, ok := reflect.TypeOf(TotpSecret{}).FieldByName("EncryptedSecret")
+	if !ok || secretField.Tag.Get("json") != "-" {
+		t.Errorf("TotpSecret EncryptedSecret json tag = %q; want \"-\"", secretField.Tag.Get("json"))
+	}
+
+	codeHashField, ok := reflect.TypeOf(TotpUsedCode{}).FieldByName("CodeHash")
+	if !ok || codeHashField.Tag.Get("json") != "-" {
+		t.Errorf("TotpUsedCode CodeHash json tag = %q; want \"-\"", codeHashField.Tag.Get("json"))
+	}
+
+	tokenHashField, ok := reflect.TypeOf(TwoFactorToken{}).FieldByName("TokenHash")
+	if !ok || tokenHashField.Tag.Get("json") != "-" {
+		t.Errorf("TwoFactorToken TokenHash json tag = %q; want \"-\"", tokenHashField.Tag.Get("json"))
+	}
+
+	// 4. slog.LogValuer masking tests
+	ts := TotpSecret{
+		ID:              uuid.New(),
+		UserID:          uuid.New(),
+		EncryptedSecret: []byte("super-secret-totp-blob"),
+		BackupCodes:     []byte(`["argon2id-phc-hash"]`),
+		Enabled:         true,
+	}
+	for _, a := range ts.LogValue().Group() {
+		if a.Key == "encrypted_secret" && a.Value.String() != "[REDACTED]" {
+			t.Errorf("TotpSecret EncryptedSecret not redacted: %s", a.Value.String())
+		}
+		if a.Key == "backup_codes" && a.Value.String() != "[REDACTED]" {
+			t.Errorf("TotpSecret BackupCodes not redacted: %s", a.Value.String())
+		}
+	}
+
+	tuc := TotpUsedCode{
+		ID:       uuid.New(),
+		UserID:   uuid.New(),
+		CodeHash: []byte("sha256-code-hash"),
+		UsedAt:   time.Now(),
+	}
+	for _, a := range tuc.LogValue().Group() {
+		if a.Key == "code_hash" && a.Value.String() != "[REDACTED]" {
+			t.Errorf("TotpUsedCode CodeHash not redacted: %s", a.Value.String())
+		}
+	}
+
+	tft := TwoFactorToken{
+		ID:        uuid.New(),
+		UserID:    uuid.New(),
+		TokenHash: []byte("sha256-two-factor-token-hash"),
+		ExpiresAt: time.Now().Add(10 * time.Minute),
+		Attempts:  2,
+	}
+	for _, a := range tft.LogValue().Group() {
+		if a.Key == "token_hash" && a.Value.String() != "[REDACTED]" {
+			t.Errorf("TwoFactorToken TokenHash not redacted: %s", a.Value.String())
+		}
+	}
+}
