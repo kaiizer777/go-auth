@@ -2,7 +2,11 @@ package totp
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
 	"time"
@@ -13,6 +17,7 @@ import (
 	"github.com/kaiizer777/go-auth/config"
 	"github.com/kaiizer777/go-auth/db"
 	apperrors "github.com/kaiizer777/go-auth/errors"
+	"github.com/kaiizer777/go-auth/ratelimit"
 )
 
 // EnrollmentResponse contains the provisioning details returned when a user initiates TOTP enrollment.
@@ -283,32 +288,243 @@ func (s *totpService) ConfirmEnrollment(ctx context.Context, userID, code string
 
 // CreateChallengeToken generates and persists an ephemeral challenge token.
 func (s *totpService) CreateChallengeToken(ctx context.Context, userID string) (string, error) {
-	return "", nil
+	uid, err := s.parseUUID(userID)
+	if err != nil {
+		return "", err
+	}
+
+	var user db.User
+	if err := s.db.WithContext(ctx).Where("id = ?", uid).First(&user).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return "", apperrors.ErrUserNotFound
+		}
+		return "", err
+	}
+
+	tokenBytes := make([]byte, 32)
+	if _, err := rand.Read(tokenBytes); err != nil {
+		return "", fmt.Errorf("totp: failed to generate token entropy: %w", err)
+	}
+	rawToken := hex.EncodeToString(tokenBytes)
+
+	tokenHash := sha256.Sum256([]byte(rawToken))
+
+	ttl := s.cfg.ChallengeTokenTTL
+	if ttl <= 0 {
+		ttl = 10 * time.Minute
+	}
+	expiresAt := time.Now().Add(ttl)
+
+	tokenRecord := db.TwoFactorToken{
+		ID:        uuid.New(),
+		UserID:    uid,
+		TokenHash: tokenHash[:],
+		ExpiresAt: expiresAt,
+		Attempts:  0,
+	}
+	if err := s.db.WithContext(ctx).Create(&tokenRecord).Error; err != nil {
+		return "", err
+	}
+
+	return rawToken, nil
 }
 
 // ValidateChallengeToken verifies challenge token validity without destroying it.
 func (s *totpService) ValidateChallengeToken(ctx context.Context, rawToken string) (*db.TwoFactorToken, error) {
-	return nil, nil
+	rawToken = strings.TrimSpace(rawToken)
+	if rawToken == "" {
+		return nil, apperrors.ErrTwoFactorTokenInvalid
+	}
+
+	tokenHash := sha256.Sum256([]byte(rawToken))
+
+	var token db.TwoFactorToken
+	err := s.db.WithContext(ctx).Where("token_hash = ?", tokenHash[:]).First(&token).Error
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, apperrors.ErrTwoFactorTokenInvalid
+		}
+		return nil, err
+	}
+
+	if time.Now().After(token.ExpiresAt) {
+		s.db.WithContext(ctx).Where("id = ?", token.ID).Delete(&db.TwoFactorToken{})
+		return nil, apperrors.ErrTwoFactorTokenExpired
+	}
+
+	maxAttempts := s.cfg.MaxAttemptsPerWindow
+	if maxAttempts <= 0 {
+		maxAttempts = 5
+	}
+	if token.Attempts >= maxAttempts {
+		s.db.WithContext(ctx).Where("id = ?", token.ID).Delete(&db.TwoFactorToken{})
+		return nil, apperrors.ErrTwoFactorMaxAttemptsExceeded
+	}
+
+	return &token, nil
 }
 
 // RecordTokenAttempt atomically increments the attempt counter on a challenge token.
 func (s *totpService) RecordTokenAttempt(ctx context.Context, rawToken string) (int, error) {
-	return 0, nil
+	rawToken = strings.TrimSpace(rawToken)
+	if rawToken == "" {
+		return 0, apperrors.ErrTwoFactorTokenInvalid
+	}
+
+	tokenHash := sha256.Sum256([]byte(rawToken))
+
+	var token db.TwoFactorToken
+	err := s.db.WithContext(ctx).Where("token_hash = ?", tokenHash[:]).First(&token).Error
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return 0, apperrors.ErrTwoFactorTokenInvalid
+		}
+		return 0, err
+	}
+
+	if time.Now().After(token.ExpiresAt) {
+		s.db.WithContext(ctx).Where("id = ?", token.ID).Delete(&db.TwoFactorToken{})
+		return 0, apperrors.ErrTwoFactorTokenExpired
+	}
+
+	newAttempts := token.Attempts + 1
+	maxAttempts := s.cfg.MaxAttemptsPerWindow
+	if maxAttempts <= 0 {
+		maxAttempts = 5
+	}
+
+	if newAttempts >= maxAttempts {
+		s.db.WithContext(ctx).Where("id = ?", token.ID).Delete(&db.TwoFactorToken{})
+		return newAttempts, apperrors.ErrTwoFactorMaxAttemptsExceeded
+	}
+
+	if err := s.db.WithContext(ctx).Model(&db.TwoFactorToken{}).Where("id = ?", token.ID).Update("attempts", newAttempts).Error; err != nil {
+		return 0, err
+	}
+
+	return newAttempts, nil
 }
 
 // VerifyCode verifies a TOTP code against the user's active secret.
 func (s *totpService) VerifyCode(ctx context.Context, userID, code, clientIP string) error {
-	return nil
-}
+	if clientIP != "" && s.limiter != nil {
+		if !s.limiter.Allow(ratelimit.TOTPIPKey(clientIP)) {
+			return apperrors.ErrTOTPRateLimitExceeded
+		}
+	}
+	if userID != "" && s.limiter != nil {
+		if !s.limiter.Allow(ratelimit.TOTPUserKey(userID)) {
+			return apperrors.ErrTOTPRateLimitExceeded
+		}
+	}
 
-// VerifyBackupCode validates and consumes a backup code.
-func (s *totpService) VerifyBackupCode(ctx context.Context, userID, backupCode, clientIP string) error {
+	uid, err := s.parseUUID(userID)
+	if err != nil {
+		return err
+	}
+
+	var secretRecord db.TotpSecret
+	err = s.db.WithContext(ctx).Where("user_id = ? AND enabled = true", uid).First(&secretRecord).Error
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return apperrors.ErrTOTPNotEnrolled
+		}
+		return err
+	}
+
+	trimmedCode := strings.TrimSpace(code)
+	codeHash := CodeHash(trimmedCode, uid.String())
+
+	var usedCount int64
+	cutoff := time.Now().Add(-90 * time.Second)
+	err = s.db.WithContext(ctx).Model(&db.TotpUsedCode{}).Where("user_id = ? AND code_hash = ? AND used_at > ?", uid, codeHash, cutoff).Count(&usedCount).Error
+	if err != nil {
+		return err
+	}
+	if usedCount > 0 {
+		return apperrors.ErrTOTPCodeReplayed
+	}
+
+	crypt, err := s.getCrypto()
+	if err != nil {
+		return err
+	}
+
+	rawSecretBytes, err := crypt.Decrypt(secretRecord.EncryptedSecret)
+	if err != nil {
+		return err
+	}
+
+	valid, err := ValidateCode(trimmedCode, string(rawSecretBytes))
+	if err != nil || !valid {
+		return apperrors.ErrTOTPCodeInvalid
+	}
+
+	usedRecord := db.TotpUsedCode{
+		ID:       uuid.New(),
+		UserID:   uid,
+		CodeHash: codeHash,
+		UsedAt:   time.Now(),
+	}
+	if err := s.db.WithContext(ctx).Create(&usedRecord).Error; err != nil {
+		return apperrors.ErrTOTPCodeReplayed
+	}
+
+	if s.limiter != nil {
+		if clientIP != "" {
+			s.limiter.Reset(ratelimit.TOTPIPKey(clientIP))
+		}
+		if userID != "" {
+			s.limiter.Reset(ratelimit.TOTPUserKey(userID))
+		}
+	}
+
+	s.logger.InfoContext(ctx, "totp code verified", slog.String("event", "totp_verified"), slog.String("user_id", uid.String()))
+
 	return nil
 }
 
 // ConsumeChallengeToken hard-deletes the token and returns the associated user.
 func (s *totpService) ConsumeChallengeToken(ctx context.Context, rawToken string) (*db.User, error) {
-	return nil, nil
+	rawToken = strings.TrimSpace(rawToken)
+	if rawToken == "" {
+		return nil, apperrors.ErrTwoFactorTokenInvalid
+	}
+
+	tokenHash := sha256.Sum256([]byte(rawToken))
+
+	var token db.TwoFactorToken
+	err := s.db.WithContext(ctx).Where("token_hash = ?", tokenHash[:]).First(&token).Error
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, apperrors.ErrTwoFactorTokenInvalid
+		}
+		return nil, err
+	}
+
+	if time.Now().After(token.ExpiresAt) {
+		s.db.WithContext(ctx).Where("id = ?", token.ID).Delete(&db.TwoFactorToken{})
+		return nil, apperrors.ErrTwoFactorTokenExpired
+	}
+
+	if err := s.db.WithContext(ctx).Where("id = ?", token.ID).Delete(&db.TwoFactorToken{}).Error; err != nil {
+		return nil, err
+	}
+
+	var user db.User
+	if err := s.db.WithContext(ctx).Where("id = ?", token.UserID).First(&user).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, apperrors.ErrUserNotFound
+		}
+		return nil, err
+	}
+
+	return &user, nil
+}
+
+// VerifyBackupCode validates and consumes a backup code.
+func (s *totpService) VerifyBackupCode(ctx context.Context, userID, backupCode, clientIP string) error {
+	return nil
 }
 
 // DisableTOTP verifies user credentials and removes 2FA configuration.

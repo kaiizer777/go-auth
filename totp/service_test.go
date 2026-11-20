@@ -16,6 +16,7 @@ import (
 	"github.com/kaiizer777/go-auth/config"
 	"github.com/kaiizer777/go-auth/db"
 	apperrors "github.com/kaiizer777/go-auth/errors"
+	"github.com/kaiizer777/go-auth/ratelimit"
 )
 
 func setupTestDB(t *testing.T) *gorm.DB {
@@ -242,4 +243,225 @@ func TestConfirmEnrollment_Lifecycle(t *testing.T) {
 		t.Fatalf("expected ErrTOTPAlreadyEnabled, got %v", err)
 	}
 }
+
+func TestChallengeToken_Lifecycle(t *testing.T) {
+	t.Parallel()
+
+	database := setupTestDB(t)
+	user := createTestUser(t, database, "charlie@example.com", true)
+	cfg := config.TOTPConfig{
+		EncryptionKey:        validTestHexKey(),
+		ChallengeTokenTTL:    5 * time.Minute,
+		MaxAttemptsPerWindow: 3,
+	}
+	svc := NewService(database, cfg, nil, nil)
+
+	rawToken, err := svc.CreateChallengeToken(context.Background(), user.ID.String())
+	if err != nil {
+		t.Fatalf("CreateChallengeToken failed: %v", err)
+	}
+	if len(rawToken) != 64 {
+		t.Fatalf("expected 64 hex char token, got len %d", len(rawToken))
+	}
+
+	// Non-destructive validation
+	tok, err := svc.ValidateChallengeToken(context.Background(), rawToken)
+	if err != nil {
+		t.Fatalf("ValidateChallengeToken failed: %v", err)
+	}
+	if tok.UserID != user.ID {
+		t.Fatalf("expected token user %s, got %s", user.ID, tok.UserID)
+	}
+	if tok.Attempts != 0 {
+		t.Fatalf("expected 0 attempts, got %d", tok.Attempts)
+	}
+
+	// Record attempt
+	attempts, err := svc.RecordTokenAttempt(context.Background(), rawToken)
+	if err != nil {
+		t.Fatalf("RecordTokenAttempt failed: %v", err)
+	}
+	if attempts != 1 {
+		t.Fatalf("expected attempt 1, got %d", attempts)
+	}
+
+	// Validate again: token still present, attempts is 1
+	tok2, err := svc.ValidateChallengeToken(context.Background(), rawToken)
+	if err != nil || tok2.Attempts != 1 {
+		t.Fatalf("expected token attempts=1, got attempts=%d, err=%v", tok2.Attempts, err)
+	}
+
+	// Consume token
+	consumedUser, err := svc.ConsumeChallengeToken(context.Background(), rawToken)
+	if err != nil {
+		t.Fatalf("ConsumeChallengeToken failed: %v", err)
+	}
+	if consumedUser.ID != user.ID {
+		t.Fatalf("expected user %s, got %s", user.ID, consumedUser.ID)
+	}
+
+	// Subsequent validation must fail because token was hard-deleted
+	_, err = svc.ValidateChallengeToken(context.Background(), rawToken)
+	if !errors.Is(err, apperrors.ErrTwoFactorTokenInvalid) {
+		t.Fatalf("expected ErrTwoFactorTokenInvalid after consume, got %v", err)
+	}
+}
+
+func TestChallengeToken_Expiry(t *testing.T) {
+	t.Parallel()
+
+	database := setupTestDB(t)
+	user := createTestUser(t, database, "expired@example.com", true)
+	cfg := config.TOTPConfig{
+		EncryptionKey:        validTestHexKey(),
+		ChallengeTokenTTL:    5 * time.Minute,
+		MaxAttemptsPerWindow: 3,
+	}
+	svc := NewService(database, cfg, nil, nil)
+
+	rawToken, err := svc.CreateChallengeToken(context.Background(), user.ID.String())
+	if err != nil {
+		t.Fatalf("CreateChallengeToken failed: %v", err)
+	}
+
+	// Manually set expiration to past
+	if err := database.Model(&db.TwoFactorToken{}).Where("user_id = ?", user.ID).Update("expires_at", time.Now().Add(-1*time.Minute)).Error; err != nil {
+		t.Fatalf("failed to update expires_at: %v", err)
+	}
+
+	_, err = svc.ValidateChallengeToken(context.Background(), rawToken)
+	if !errors.Is(err, apperrors.ErrTwoFactorTokenExpired) {
+		t.Fatalf("expected ErrTwoFactorTokenExpired, got %v", err)
+	}
+
+	// Subsequent check must return ErrTwoFactorTokenInvalid as token was hard-deleted
+	_, err = svc.ValidateChallengeToken(context.Background(), rawToken)
+	if !errors.Is(err, apperrors.ErrTwoFactorTokenInvalid) {
+		t.Fatalf("expected ErrTwoFactorTokenInvalid, got %v", err)
+	}
+}
+
+func TestChallengeToken_AttemptExhaustion(t *testing.T) {
+	t.Parallel()
+
+	database := setupTestDB(t)
+	user := createTestUser(t, database, "attempts@example.com", true)
+	cfg := config.TOTPConfig{
+		EncryptionKey:        validTestHexKey(),
+		ChallengeTokenTTL:    5 * time.Minute,
+		MaxAttemptsPerWindow: 2,
+	}
+	svc := NewService(database, cfg, nil, nil)
+
+	rawToken, err := svc.CreateChallengeToken(context.Background(), user.ID.String())
+	if err != nil {
+		t.Fatalf("CreateChallengeToken failed: %v", err)
+	}
+
+	att1, err := svc.RecordTokenAttempt(context.Background(), rawToken)
+	if err != nil || att1 != 1 {
+		t.Fatalf("expected att=1, got att=%d, err=%v", att1, err)
+	}
+
+	att2, err := svc.RecordTokenAttempt(context.Background(), rawToken)
+	if !errors.Is(err, apperrors.ErrTwoFactorMaxAttemptsExceeded) {
+		t.Fatalf("expected ErrTwoFactorMaxAttemptsExceeded on reaching max, got %v", err)
+	}
+	if att2 != 2 {
+		t.Fatalf("expected att=2, got %d", att2)
+	}
+
+	// Token must have been hard deleted
+	_, err = svc.ValidateChallengeToken(context.Background(), rawToken)
+	if !errors.Is(err, apperrors.ErrTwoFactorTokenInvalid) {
+		t.Fatalf("expected ErrTwoFactorTokenInvalid after exhaustion, got %v", err)
+	}
+}
+
+func TestVerifyCode_LifecycleAndReplay(t *testing.T) {
+	t.Parallel()
+
+	database := setupTestDB(t)
+	user := createTestUser(t, database, "verify@example.com", true)
+	svc := NewService(database, config.TOTPConfig{EncryptionKey: validTestHexKey()}, nil, nil)
+
+	// User not enrolled -> ErrTOTPNotEnrolled
+	err := svc.VerifyCode(context.Background(), user.ID.String(), "123456", "127.0.0.1")
+	if !errors.Is(err, apperrors.ErrTOTPNotEnrolled) {
+		t.Fatalf("expected ErrTOTPNotEnrolled, got %v", err)
+	}
+
+	// Enroll & confirm
+	resp, err := svc.Enroll(context.Background(), user.ID.String())
+	if err != nil {
+		t.Fatalf("Enroll failed: %v", err)
+	}
+	code, err := ptotp.GenerateCode(resp.Secret, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("GenerateCode failed: %v", err)
+	}
+	_, err = svc.ConfirmEnrollment(context.Background(), user.ID.String(), code)
+	if err != nil {
+		t.Fatalf("ConfirmEnrollment failed: %v", err)
+	}
+
+	// Generate a fresh code (or same code if within window)
+	// Because confirm recorded 'code' into used_codes, using the exact same code should trigger replay!
+	err = svc.VerifyCode(context.Background(), user.ID.String(), code, "127.0.0.1")
+	if !errors.Is(err, apperrors.ErrTOTPCodeReplayed) {
+		t.Fatalf("expected ErrTOTPCodeReplayed for confirmed code, got %v", err)
+	}
+
+	// Invalid code -> ErrTOTPCodeInvalid
+	err = svc.VerifyCode(context.Background(), user.ID.String(), "000000", "127.0.0.1")
+	if !errors.Is(err, apperrors.ErrTOTPCodeInvalid) {
+		t.Fatalf("expected ErrTOTPCodeInvalid, got %v", err)
+	}
+
+	// Drift code: generate code for t + 25s (within skew=1 window of 30s)
+	driftCode, err := ptotp.GenerateCode(resp.Secret, time.Now().UTC().Add(25*time.Second))
+	if err != nil {
+		t.Fatalf("GenerateCode failed: %v", err)
+	}
+
+	// If driftCode happens to equal initial code (same 30s bucket), add 30s
+	if driftCode == code {
+		driftCode, err = ptotp.GenerateCode(resp.Secret, time.Now().UTC().Add(30*time.Second))
+		if err != nil {
+			t.Fatalf("GenerateCode failed: %v", err)
+		}
+	}
+
+	err = svc.VerifyCode(context.Background(), user.ID.String(), driftCode, "127.0.0.1")
+	if err != nil {
+		t.Fatalf("VerifyCode failed on drift code: %v", err)
+	}
+
+	// Replay drift code
+	err = svc.VerifyCode(context.Background(), user.ID.String(), driftCode, "127.0.0.1")
+	if !errors.Is(err, apperrors.ErrTOTPCodeReplayed) {
+		t.Fatalf("expected ErrTOTPCodeReplayed on replay, got %v", err)
+	}
+}
+
+func TestVerifyCode_DualRateLimit(t *testing.T) {
+	t.Parallel()
+
+	database := setupTestDB(t)
+	user := createTestUser(t, database, "ratelimit@example.com", true)
+	// Limiter allowing 2 requests
+	limiter := ratelimit.NewLimiter(time.Minute, 2)
+	svc := NewService(database, config.TOTPConfig{EncryptionKey: validTestHexKey()}, limiter, nil)
+
+	// IP rate limit trigger: 2 attempts succeed/fail normally, 3rd blocked
+	ip := "192.168.1.100"
+	_ = svc.VerifyCode(context.Background(), user.ID.String(), "000001", ip)
+	_ = svc.VerifyCode(context.Background(), user.ID.String(), "000002", ip)
+
+	err := svc.VerifyCode(context.Background(), user.ID.String(), "000003", ip)
+	if !errors.Is(err, apperrors.ErrTOTPRateLimitExceeded) {
+		t.Fatalf("expected ErrTOTPRateLimitExceeded on 3rd attempt from same IP, got %v", err)
+	}
+}
+
 
