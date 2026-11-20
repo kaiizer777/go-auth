@@ -471,6 +471,8 @@ func TestMigrations_NoExplicitTransactionWrappers(t *testing.T) {
 		"migrations/000006_add_credential_version.down.sql",
 		"migrations/000007_create_oauth_accounts.up.sql",
 		"migrations/000007_create_oauth_accounts.down.sql",
+		"migrations/000008_create_totp.up.sql",
+		"migrations/000008_create_totp.down.sql",
 	}
 
 	for _, file := range files {

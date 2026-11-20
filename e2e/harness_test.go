@@ -89,7 +89,7 @@ func (c *emailCapture) nextResetToken(t *testing.T, timeout time.Duration) strin
 
 func truncateTables(t *testing.T, db *sql.DB) {
 	t.Helper()
-	_, err := db.Exec("TRUNCATE TABLE users, sessions, verification_tokens, password_reset_tokens CASCADE")
+	_, err := db.Exec("TRUNCATE TABLE users, sessions, verification_tokens, password_reset_tokens, oauth_accounts, totp_secrets, totp_used_codes, two_factor_tokens CASCADE")
 	if err != nil {
 		t.Fatalf("failed to truncate tables: %v", err)
 	}
