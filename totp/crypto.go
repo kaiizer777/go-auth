@@ -1,12 +1,15 @@
 package totp
 
 import (
+	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"fmt"
+	"image/png"
 	"io"
 	"time"
 
@@ -90,19 +93,37 @@ func (c *Crypto) Decrypt(blob []byte) ([]byte, error) {
 	return plaintext, nil
 }
 
-// GenerateSecret generates an RFC 6238 compliant base32 TOTP secret and otpauth URI.
-func GenerateSecret(issuer, accountName string) (secret string, uri string, err error) {
-	key, err := ptotp.Generate(ptotp.GenerateOpts{
+// GenerateKey generates an RFC 6238 compliant base32 TOTP key.
+func GenerateKey(issuer, accountName string) (*otp.Key, error) {
+	return ptotp.Generate(ptotp.GenerateOpts{
 		Issuer:      issuer,
 		AccountName: accountName,
 		Period:      30,
 		Digits:      otp.DigitsSix,
 		Algorithm:   otp.AlgorithmSHA1,
 	})
+}
+
+// GenerateSecret generates an RFC 6238 compliant base32 TOTP secret and otpauth URI.
+func GenerateSecret(issuer, accountName string) (secret string, uri string, err error) {
+	key, err := GenerateKey(issuer, accountName)
 	if err != nil {
 		return "", "", fmt.Errorf("totp: failed to generate secret: %w", err)
 	}
 	return key.Secret(), key.URL(), nil
+}
+
+// GenerateQRCodeDataURI generates a PNG QR code data URI from a TOTP key.
+func GenerateQRCodeDataURI(key *otp.Key, width, height int) (string, error) {
+	img, err := key.Image(width, height)
+	if err != nil {
+		return "", fmt.Errorf("totp: failed to generate qr image: %w", err)
+	}
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
+		return "", fmt.Errorf("totp: failed to encode qr png: %w", err)
+	}
+	return "data:image/png;base64," + base64.StdEncoding.EncodeToString(buf.Bytes()), nil
 }
 
 // ValidateCode validates a 6-digit TOTP code against a base32 secret at the current UTC time with Skew=1.

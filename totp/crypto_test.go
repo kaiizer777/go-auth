@@ -237,6 +237,24 @@ func TestGenerateSecret(t *testing.T) {
 	}
 }
 
+func TestGenerateQRCodeDataURI(t *testing.T) {
+	t.Parallel()
+
+	key, err := GenerateKey("go-auth", "user@example.com")
+	if err != nil {
+		t.Fatalf("GenerateKey failed: %v", err)
+	}
+
+	dataURI, err := GenerateQRCodeDataURI(key, 200, 200)
+	if err != nil {
+		t.Fatalf("GenerateQRCodeDataURI failed: %v", err)
+	}
+
+	if !strings.HasPrefix(dataURI, "data:image/png;base64,") {
+		t.Fatalf("expected data:image/png;base64 prefix, got %s", dataURI[:30])
+	}
+}
+
 func TestValidateCodeCurrentStep(t *testing.T) {
 	t.Parallel()
 
