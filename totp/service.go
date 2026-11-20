@@ -2,7 +2,9 @@ package totp
 
 import (
 	"context"
+	"errors"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -120,12 +122,163 @@ func (s *totpService) parseUUID(userID string) (uuid.UUID, error) {
 
 // Enroll initiates TOTP setup for a user.
 func (s *totpService) Enroll(ctx context.Context, userID string) (*EnrollmentResponse, error) {
-	return nil, nil
+	uid, err := s.parseUUID(userID)
+	if err != nil {
+		return nil, err
+	}
+
+	var user db.User
+	if err := s.db.WithContext(ctx).Where("id = ?", uid).First(&user).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, apperrors.ErrUserNotFound
+		}
+		return nil, err
+	}
+
+	if !user.EmailVerified {
+		return nil, apperrors.ErrEmailNotVerified
+	}
+
+	var existing db.TotpSecret
+	err = s.db.WithContext(ctx).Where("user_id = ?", uid).First(&existing).Error
+	if err == nil {
+		if existing.Enabled {
+			return nil, apperrors.ErrTOTPAlreadyEnabled
+		}
+		// Clear pending unconfirmed secret to allow idempotency/retry
+		if err := s.db.WithContext(ctx).Where("user_id = ? AND enabled = false", uid).Delete(&db.TotpSecret{}).Error; err != nil {
+			return nil, err
+		}
+	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, err
+	}
+
+	crypt, err := s.getCrypto()
+	if err != nil {
+		return nil, err
+	}
+
+	key, err := GenerateKey(s.cfg.Issuer, user.Email)
+	if err != nil {
+		return nil, err
+	}
+
+	encSecret, err := crypt.Encrypt([]byte(key.Secret()))
+	if err != nil {
+		return nil, err
+	}
+
+	qrCode, err := GenerateQRCodeDataURI(key, 200, 200)
+	if err != nil {
+		return nil, err
+	}
+
+	secretRecord := db.TotpSecret{
+		ID:              uuid.New(),
+		UserID:          uid,
+		EncryptedSecret: encSecret,
+		BackupCodes:     []byte("[]"),
+		Enabled:         false,
+	}
+	if err := s.db.WithContext(ctx).Create(&secretRecord).Error; err != nil {
+		return nil, err
+	}
+
+	return &EnrollmentResponse{
+		Secret: key.Secret(),
+		OTPURI: key.URL(),
+		QRCode: qrCode,
+	}, nil
 }
 
 // ConfirmEnrollment verifies the initial code, enables TOTP, and returns 10 backup codes.
 func (s *totpService) ConfirmEnrollment(ctx context.Context, userID, code string) ([]string, error) {
-	return nil, nil
+	uid, err := s.parseUUID(userID)
+	if err != nil {
+		return nil, err
+	}
+
+	var pending db.TotpSecret
+	err = s.db.WithContext(ctx).Where("user_id = ? AND enabled = false", uid).First(&pending).Error
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			var active db.TotpSecret
+			if s.db.WithContext(ctx).Where("user_id = ? AND enabled = true", uid).First(&active).Error == nil {
+				return nil, apperrors.ErrTOTPAlreadyEnabled
+			}
+			return nil, apperrors.ErrTOTPNotEnrolled
+		}
+		return nil, err
+	}
+
+	crypt, err := s.getCrypto()
+	if err != nil {
+		return nil, err
+	}
+
+	rawSecretBytes, err := crypt.Decrypt(pending.EncryptedSecret)
+	if err != nil {
+		return nil, err
+	}
+
+	trimmedCode := strings.TrimSpace(code)
+	valid, err := ValidateCode(trimmedCode, string(rawSecretBytes))
+	if err != nil || !valid {
+		return nil, apperrors.ErrTOTPCodeInvalid
+	}
+
+	codeHash := CodeHash(trimmedCode, uid.String())
+	var usedCount int64
+	cutoff := time.Now().Add(-90 * time.Second)
+	err = s.db.WithContext(ctx).Model(&db.TotpUsedCode{}).Where("user_id = ? AND code_hash = ? AND used_at > ?", uid, codeHash, cutoff).Count(&usedCount).Error
+	if err != nil {
+		return nil, err
+	}
+	if usedCount > 0 {
+		return nil, apperrors.ErrTOTPCodeReplayed
+	}
+
+	backupCodes, err := GenerateBackupCodes()
+	if err != nil {
+		return nil, err
+	}
+
+	hashedCodesJSON, err := HashBackupCodes(backupCodes)
+	if err != nil {
+		return nil, err
+	}
+
+	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		usedRecord := db.TotpUsedCode{
+			ID:       uuid.New(),
+			UserID:   uid,
+			CodeHash: codeHash,
+			UsedAt:   time.Now(),
+		}
+		if err := tx.Create(&usedRecord).Error; err != nil {
+			return apperrors.ErrTOTPCodeReplayed
+		}
+
+		res := tx.Model(&db.TotpSecret{}).Where("id = ? AND enabled = false", pending.ID).Updates(map[string]interface{}{
+			"enabled":      true,
+			"backup_codes": hashedCodesJSON,
+			"updated_at":   time.Now(),
+		})
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected == 0 {
+			return apperrors.ErrTOTPAlreadyEnabled
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	s.logger.InfoContext(ctx, "totp enrollment confirmed", slog.String("event", "totp_confirmed"), slog.String("user_id", uid.String()))
+
+	return backupCodes, nil
 }
 
 // CreateChallengeToken generates and persists an ephemeral challenge token.
@@ -165,7 +318,17 @@ func (s *totpService) DisableTOTP(ctx context.Context, userID, password, code st
 
 // Status checks whether TOTP is enabled for a user.
 func (s *totpService) Status(ctx context.Context, userID string) (bool, error) {
-	return false, nil
+	uid, err := s.parseUUID(userID)
+	if err != nil {
+		return false, err
+	}
+
+	var count int64
+	err = s.db.WithContext(ctx).Model(&db.TotpSecret{}).Where("user_id = ? AND enabled = true", uid).Count(&count).Error
+	if err != nil {
+		return false, err
+	}
+	return count > 0, nil
 }
 
 // IsTotpEnabled is a UUID-friendly helper for Status.
