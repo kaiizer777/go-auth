@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
@@ -14,6 +15,7 @@ import (
 	"gorm.io/gorm"
 
 	"github.com/kaiizer777/go-auth/config"
+	"github.com/kaiizer777/go-auth/crypto"
 	"github.com/kaiizer777/go-auth/db"
 	apperrors "github.com/kaiizer777/go-auth/errors"
 	"github.com/kaiizer777/go-auth/ratelimit"
@@ -463,5 +465,182 @@ func TestVerifyCode_DualRateLimit(t *testing.T) {
 		t.Fatalf("expected ErrTOTPRateLimitExceeded on 3rd attempt from same IP, got %v", err)
 	}
 }
+
+func TestVerifyBackupCode_Lifecycle(t *testing.T) {
+	t.Parallel()
+
+	database := setupTestDB(t)
+	user := createTestUser(t, database, "backup_user@example.com", true)
+	svc := NewService(database, config.TOTPConfig{EncryptionKey: validTestHexKey()}, nil, nil)
+
+	// User not enrolled -> ErrTOTPNotEnrolled
+	err := svc.VerifyBackupCode(context.Background(), user.ID.String(), "ABCDEF12", "127.0.0.1")
+	if !errors.Is(err, apperrors.ErrTOTPNotEnrolled) {
+		t.Fatalf("expected ErrTOTPNotEnrolled, got %v", err)
+	}
+
+	// Enroll & confirm
+	resp, err := svc.Enroll(context.Background(), user.ID.String())
+	if err != nil {
+		t.Fatalf("Enroll failed: %v", err)
+	}
+	code, err := ptotp.GenerateCode(resp.Secret, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("GenerateCode failed: %v", err)
+	}
+	backupCodes, err := svc.ConfirmEnrollment(context.Background(), user.ID.String(), code)
+	if err != nil || len(backupCodes) != 10 {
+		t.Fatalf("ConfirmEnrollment failed: %v", err)
+	}
+
+	// Invalid backup code -> ErrBackupCodeInvalid
+	err = svc.VerifyBackupCode(context.Background(), user.ID.String(), "INVALID1", "127.0.0.1")
+	if !errors.Is(err, apperrors.ErrBackupCodeInvalid) {
+		t.Fatalf("expected ErrBackupCodeInvalid, got %v", err)
+	}
+
+	// Consume first code -> success
+	err = svc.VerifyBackupCode(context.Background(), user.ID.String(), backupCodes[0], "127.0.0.1")
+	if err != nil {
+		t.Fatalf("VerifyBackupCode failed on code 0: %v", err)
+	}
+
+	// Re-verify first code -> ErrBackupCodeInvalid (already consumed!)
+	err = svc.VerifyBackupCode(context.Background(), user.ID.String(), backupCodes[0], "127.0.0.1")
+	if !errors.Is(err, apperrors.ErrBackupCodeInvalid) {
+		t.Fatalf("expected ErrBackupCodeInvalid on re-using consumed code, got %v", err)
+	}
+
+	// Consume second code with lowercase/trim -> success
+	err = svc.VerifyBackupCode(context.Background(), user.ID.String(), " "+strings.ToLower(backupCodes[1])+" ", "127.0.0.1")
+	if err != nil {
+		t.Fatalf("VerifyBackupCode failed on normalized code 1: %v", err)
+	}
+}
+
+func TestDisableTOTP_WithPassword(t *testing.T) {
+	t.Parallel()
+
+	database := setupTestDB(t)
+	plainPassword := "SecretPass#1234"
+	hash, err := crypto.HashPassword(plainPassword, crypto.DefaultHashParams())
+	if err != nil {
+		t.Fatalf("HashPassword failed: %v", err)
+	}
+
+	user := db.User{
+		ID:            uuid.New(),
+		Email:         "disable_pw@example.com",
+		PasswordHash:  hash,
+		EmailVerified: true,
+		CreatedAt:     time.Now(),
+		UpdatedAt:     time.Now(),
+	}
+	if err := database.Create(&user).Error; err != nil {
+		t.Fatalf("failed to create user: %v", err)
+	}
+
+	svc := NewService(database, config.TOTPConfig{EncryptionKey: validTestHexKey()}, nil, nil)
+
+	// Disable when not enrolled -> ErrTOTPNotEnrolled
+	err = svc.DisableTOTP(context.Background(), user.ID.String(), plainPassword, "")
+	if !errors.Is(err, apperrors.ErrTOTPNotEnrolled) {
+		t.Fatalf("expected ErrTOTPNotEnrolled, got %v", err)
+	}
+
+	// Enroll & confirm
+	resp, err := svc.Enroll(context.Background(), user.ID.String())
+	if err != nil {
+		t.Fatalf("Enroll failed: %v", err)
+	}
+	code, err := ptotp.GenerateCode(resp.Secret, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("GenerateCode failed: %v", err)
+	}
+	_, err = svc.ConfirmEnrollment(context.Background(), user.ID.String(), code)
+	if err != nil {
+		t.Fatalf("ConfirmEnrollment failed: %v", err)
+	}
+
+	// Also create a challenge token to verify cascade deletion
+	_, err = svc.CreateChallengeToken(context.Background(), user.ID.String())
+	if err != nil {
+		t.Fatalf("CreateChallengeToken failed: %v", err)
+	}
+
+	// Disable with wrong password -> ErrInvalidCredentials
+	err = svc.DisableTOTP(context.Background(), user.ID.String(), "WrongPassword#9999", "")
+	if !errors.Is(err, apperrors.ErrInvalidCredentials) {
+		t.Fatalf("expected ErrInvalidCredentials, got %v", err)
+	}
+
+	// Disable with correct password -> success
+	err = svc.DisableTOTP(context.Background(), user.ID.String(), plainPassword, "")
+	if err != nil {
+		t.Fatalf("DisableTOTP failed: %v", err)
+	}
+
+	// Status should be false
+	enabled, err := svc.Status(context.Background(), user.ID.String())
+	if err != nil || enabled {
+		t.Fatalf("expected enabled=false, got %v, err=%v", enabled, err)
+	}
+
+	// Records deleted
+	var count int64
+	database.Model(&db.TotpSecret{}).Where("user_id = ?", user.ID).Count(&count)
+	if count != 0 {
+		t.Fatalf("expected 0 totp_secrets, got %d", count)
+	}
+	database.Model(&db.TwoFactorToken{}).Where("user_id = ?", user.ID).Count(&count)
+	if count != 0 {
+		t.Fatalf("expected 0 two_factor_tokens, got %d", count)
+	}
+}
+
+func TestDisableTOTP_WithCode(t *testing.T) {
+	t.Parallel()
+
+	database := setupTestDB(t)
+	user := createTestUser(t, database, "disable_code@example.com", true)
+	svc := NewService(database, config.TOTPConfig{EncryptionKey: validTestHexKey()}, nil, nil)
+
+	resp, err := svc.Enroll(context.Background(), user.ID.String())
+	if err != nil {
+		t.Fatalf("Enroll failed: %v", err)
+	}
+	code, err := ptotp.GenerateCode(resp.Secret, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("GenerateCode failed: %v", err)
+	}
+	_, err = svc.ConfirmEnrollment(context.Background(), user.ID.String(), code)
+	if err != nil {
+		t.Fatalf("ConfirmEnrollment failed: %v", err)
+	}
+
+	// Generate fresh code for disabling
+	freshCode, err := ptotp.GenerateCode(resp.Secret, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("GenerateCode failed: %v", err)
+	}
+
+	// Empty credentials -> ErrInvalidCredentials
+	err = svc.DisableTOTP(context.Background(), user.ID.String(), "", "")
+	if !errors.Is(err, apperrors.ErrInvalidCredentials) {
+		t.Fatalf("expected ErrInvalidCredentials on empty auth, got %v", err)
+	}
+
+	// Disable with valid TOTP code -> success
+	err = svc.DisableTOTP(context.Background(), user.ID.String(), "", freshCode)
+	if err != nil {
+		t.Fatalf("DisableTOTP failed: %v", err)
+	}
+
+	enabled, err := svc.Status(context.Background(), user.ID.String())
+	if err != nil || enabled {
+		t.Fatalf("expected enabled=false, got %v, err=%v", enabled, err)
+	}
+}
+
 
 

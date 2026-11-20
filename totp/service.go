@@ -15,6 +15,7 @@ import (
 	"gorm.io/gorm"
 
 	"github.com/kaiizer777/go-auth/config"
+	"github.com/kaiizer777/go-auth/crypto"
 	"github.com/kaiizer777/go-auth/db"
 	apperrors "github.com/kaiizer777/go-auth/errors"
 	"github.com/kaiizer777/go-auth/ratelimit"
@@ -524,11 +525,136 @@ func (s *totpService) ConsumeChallengeToken(ctx context.Context, rawToken string
 
 // VerifyBackupCode validates and consumes a backup code.
 func (s *totpService) VerifyBackupCode(ctx context.Context, userID, backupCode, clientIP string) error {
+	if clientIP != "" && s.limiter != nil {
+		if !s.limiter.Allow(ratelimit.TOTPIPKey(clientIP)) {
+			return apperrors.ErrTOTPRateLimitExceeded
+		}
+	}
+	if userID != "" && s.limiter != nil {
+		if !s.limiter.Allow(ratelimit.TOTPUserKey(userID)) {
+			return apperrors.ErrTOTPRateLimitExceeded
+		}
+	}
+
+	uid, err := s.parseUUID(userID)
+	if err != nil {
+		return err
+	}
+
+	var secretRecord db.TotpSecret
+	err = s.db.WithContext(ctx).Where("user_id = ? AND enabled = true", uid).First(&secretRecord).Error
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return apperrors.ErrTOTPNotEnrolled
+		}
+		return err
+	}
+
+	trimmedCode := strings.TrimSpace(backupCode)
+	updatedJSON, matched, err := VerifyAndConsumeBackupCode(secretRecord.BackupCodes, trimmedCode)
+	if err != nil || !matched {
+		return apperrors.ErrBackupCodeInvalid
+	}
+
+	res := s.db.WithContext(ctx).Model(&db.TotpSecret{}).Where("id = ? AND enabled = true", secretRecord.ID).Updates(map[string]interface{}{
+		"backup_codes": updatedJSON,
+		"updated_at":   time.Now(),
+	})
+	if res.Error != nil {
+		return res.Error
+	}
+	if res.RowsAffected == 0 {
+		return apperrors.ErrTOTPNotEnrolled
+	}
+
+	if s.limiter != nil {
+		if clientIP != "" {
+			s.limiter.Reset(ratelimit.TOTPIPKey(clientIP))
+		}
+		if userID != "" {
+			s.limiter.Reset(ratelimit.TOTPUserKey(userID))
+		}
+	}
+
+	s.logger.InfoContext(ctx, "backup code consumed", slog.String("event", "backup_code_used"), slog.String("user_id", uid.String()))
+
 	return nil
 }
 
 // DisableTOTP verifies user credentials and removes 2FA configuration.
 func (s *totpService) DisableTOTP(ctx context.Context, userID, password, code string) error {
+	uid, err := s.parseUUID(userID)
+	if err != nil {
+		return err
+	}
+
+	var user db.User
+	err = s.db.WithContext(ctx).Where("id = ?", uid).First(&user).Error
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return apperrors.ErrUserNotFound
+		}
+		return err
+	}
+
+	var secretRecord db.TotpSecret
+	err = s.db.WithContext(ctx).Where("user_id = ? AND enabled = true", uid).First(&secretRecord).Error
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return apperrors.ErrTOTPNotEnrolled
+		}
+		return err
+	}
+
+	trimmedPassword := strings.TrimSpace(password)
+	trimmedCode := strings.TrimSpace(code)
+	if trimmedPassword == "" && trimmedCode == "" {
+		return apperrors.ErrInvalidCredentials
+	}
+
+	var authed bool
+	if trimmedPassword != "" {
+		match, err := crypto.VerifyPassword(trimmedPassword, user.PasswordHash)
+		if err == nil && match {
+			authed = true
+		}
+	}
+
+	if !authed && trimmedCode != "" {
+		crypt, err := s.getCrypto()
+		if err == nil {
+			rawSecretBytes, err := crypt.Decrypt(secretRecord.EncryptedSecret)
+			if err == nil {
+				valid, err := ValidateCode(trimmedCode, string(rawSecretBytes))
+				if err == nil && valid {
+					authed = true
+				}
+			}
+		}
+	}
+
+	if !authed {
+		return apperrors.ErrInvalidCredentials
+	}
+
+	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Where("user_id = ?", uid).Delete(&db.TotpSecret{}).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("user_id = ?", uid).Delete(&db.TotpUsedCode{}).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("user_id = ?", uid).Delete(&db.TwoFactorToken{}).Error; err != nil {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+
+	s.logger.InfoContext(ctx, "totp disabled", slog.String("event", "totp_disabled"), slog.String("user_id", uid.String()))
+
 	return nil
 }
 
