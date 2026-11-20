@@ -120,10 +120,10 @@ func ValidateCodeAtTime(code, secret string, t time.Time) (bool, error) {
 	})
 }
 
-// CodeHash calculates a SHA-256 digest of (code + userID) to prevent cross-user replay attacks.
+// CodeHash calculates a SHA-256 digest of (code + ":" + userID) to prevent cross-user replay attacks.
 // It returns the 32-byte raw hash suitable for storage in totp_used_codes.code_hash (BYTEA).
 func CodeHash(code, userID string) []byte {
-	h := sha256.Sum256([]byte(code + userID))
+	h := sha256.Sum256([]byte(code + ":" + userID))
 	return h[:]
 }
 

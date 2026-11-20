@@ -578,6 +578,16 @@ func (c *Config) Validate() error {
 	if c.TOTP.Issuer == "" {
 		c.TOTP.Issuer = "go-auth"
 	}
+	if c.TOTP.ChallengeTokenTTL == 0 {
+		c.TOTP.ChallengeTokenTTL = 10 * time.Minute
+	}
+	if c.TOTP.MaxAttemptsPerWindow == 0 {
+		c.TOTP.MaxAttemptsPerWindow = 5
+	}
+	if c.TOTP.AttemptWindow == 0 {
+		c.TOTP.AttemptWindow = 5 * time.Minute
+	}
+
 	if c.TOTP.EncryptionKey != "" {
 		if len(c.TOTP.EncryptionKey) != 64 {
 			return errors.ErrTOTPEncryptionKeyInvalid
@@ -585,34 +595,16 @@ func (c *Config) Validate() error {
 		if _, err := hex.DecodeString(c.TOTP.EncryptionKey); err != nil {
 			return errors.ErrTOTPEncryptionKeyInvalid
 		}
-		if c.TOTP.ChallengeTokenTTL < time.Minute || c.TOTP.ChallengeTokenTTL > 30*time.Minute {
-			return errors.ErrTOTPChallengeTokenTTLInvalid
-		}
-		if c.TOTP.MaxAttemptsPerWindow < 1 {
-			return errors.ErrTOTPMaxAttemptsInvalid
-		}
-		if c.TOTP.AttemptWindow < time.Minute {
-			return errors.ErrTOTPAttemptWindowInvalid
-		}
-	} else {
-		if c.TOTP.ChallengeTokenTTL == 0 {
-			c.TOTP.ChallengeTokenTTL = 10 * time.Minute
-		}
-		if c.TOTP.MaxAttemptsPerWindow == 0 {
-			c.TOTP.MaxAttemptsPerWindow = 5
-		}
-		if c.TOTP.AttemptWindow == 0 {
-			c.TOTP.AttemptWindow = 5 * time.Minute
-		}
-		if c.TOTP.ChallengeTokenTTL < 0 || (c.TOTP.ChallengeTokenTTL > 0 && c.TOTP.ChallengeTokenTTL < time.Minute) || c.TOTP.ChallengeTokenTTL > 30*time.Minute {
-			return errors.ErrTOTPChallengeTokenTTLInvalid
-		}
-		if c.TOTP.MaxAttemptsPerWindow < 0 {
-			return errors.ErrTOTPMaxAttemptsInvalid
-		}
-		if c.TOTP.AttemptWindow < 0 || (c.TOTP.AttemptWindow > 0 && c.TOTP.AttemptWindow < time.Minute) {
-			return errors.ErrTOTPAttemptWindowInvalid
-		}
+	}
+
+	if c.TOTP.ChallengeTokenTTL < time.Minute || c.TOTP.ChallengeTokenTTL > 30*time.Minute {
+		return errors.ErrTOTPChallengeTokenTTLInvalid
+	}
+	if c.TOTP.MaxAttemptsPerWindow < 1 {
+		return errors.ErrTOTPMaxAttemptsInvalid
+	}
+	if c.TOTP.AttemptWindow < time.Minute {
+		return errors.ErrTOTPAttemptWindowInvalid
 	}
 	if !c.SessionCookieSecure {
 		slog.Warn("SessionCookieSecure is false — not safe for production")

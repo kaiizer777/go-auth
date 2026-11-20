@@ -810,6 +810,42 @@ func TestSentinels_MFAAndOAuth(t *testing.T) {
 	}
 }
 
+func TestSentinels_Phase7TOTP(t *testing.T) {
+	tests := []struct {
+		err         *Error
+		wantCode    Code
+		wantMessage string
+		wantStatus  int
+	}{
+		{ErrTOTPNotEnrolled, CodeTOTPNotEnrolled, "user has no active totp enrollment", http.StatusBadRequest},
+		{ErrTOTPAlreadyEnabled, CodeTOTPAlreadyEnabled, "totp is already enabled for this user", http.StatusConflict},
+		{ErrTOTPCodeInvalid, CodeTOTPCodeInvalid, "totp code is invalid", http.StatusBadRequest},
+		{ErrTOTPCodeReplayed, CodeTOTPCodeReplayed, "totp code has already been used in this window", http.StatusBadRequest},
+		{ErrBackupCodeInvalid, CodeTOTPBackupCodeInvalid, "backup code is invalid", http.StatusBadRequest},
+		{ErrTwoFactorTokenInvalid, CodeTwoFactorTokenInvalid, "two factor challenge token is invalid", http.StatusUnauthorized},
+		{ErrTwoFactorTokenExpired, CodeTwoFactorTokenExpired, "two factor challenge token has expired", http.StatusUnauthorized},
+		{ErrTwoFactorMaxAttemptsExceeded, CodeTwoFactorMaxAttemptsExceeded, "maximum verification attempts exceeded", http.StatusTooManyRequests},
+		{ErrTOTPRateLimitExceeded, CodeTOTPRateLimitExceeded, "totp verification rate limit exceeded", http.StatusTooManyRequests},
+	}
+
+	for _, tt := range tests {
+		t.Run(string(tt.wantCode), func(t *testing.T) {
+			if tt.err.Code() != tt.wantCode {
+				t.Errorf("Code() = %q; want %q", tt.err.Code(), tt.wantCode)
+			}
+			if tt.err.Message() != tt.wantMessage {
+				t.Errorf("Message() = %q; want %q", tt.err.Message(), tt.wantMessage)
+			}
+			if got := tt.err.HTTPStatus(); got != tt.wantStatus {
+				t.Errorf("HTTPStatus() = %d; want %d", got, tt.wantStatus)
+			}
+			if !Is(tt.err, tt.err) {
+				t.Error("expected sentinel to match itself via Is")
+			}
+		})
+	}
+}
+
 func TestWrapOverride(t *testing.T) {
 	t.Run("nil cause returns nil", func(t *testing.T) {
 		if got := WrapOverride(nil, CodeInvalidCredentials, "ignored"); got != nil {

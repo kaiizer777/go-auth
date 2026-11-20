@@ -328,10 +328,7 @@ func TestValidateCodeWrong(t *testing.T) {
 		t.Fatalf("GenerateSecret failed: %v", err)
 	}
 
-	valid, err := ValidateCode("000000", secret)
-	if err != nil {
-		// ptotp may return err or valid=false for invalid codes
-	}
+	valid, _ := ValidateCode("000000", secret)
 	if valid {
 		t.Error("arbitrary invalid code 000000 accepted")
 	}
@@ -363,6 +360,13 @@ func TestCodeHashDistinct(t *testing.T) {
 	}
 	if bytes.Equal(h1, h3) {
 		t.Error("different codes produced identical hash")
+	}
+
+	// Delimiter prevents concatenation ambiguity: ("12", "34") vs ("1", "234")
+	h4 := CodeHash("12", "34")
+	h5 := CodeHash("1", "234")
+	if bytes.Equal(h4, h5) {
+		t.Error("delimiter failure: ambiguous concatenation produced identical code hash")
 	}
 }
 

@@ -144,7 +144,7 @@ func (c Code) HTTPStatus() int {
 		return http.StatusOK
 	case CodeNotFound, CodeUserNotFound, CodeTokenNotFound, CodeOAuthAccountNotLinked, CodeOAuthProviderNotFound:
 		return http.StatusNotFound
-	case CodeUserAlreadyExists, CodeEmailAlreadyExists, CodeOAuthAccountAlreadyLinked, CodeOAuthAccountLinkConflict:
+	case CodeUserAlreadyExists, CodeEmailAlreadyExists, CodeOAuthAccountAlreadyLinked, CodeOAuthAccountLinkConflict, CodeTOTPAlreadyEnabled:
 		return http.StatusConflict
 	case CodeMethodNotAllowed:
 		return http.StatusMethodNotAllowed

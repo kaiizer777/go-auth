@@ -92,13 +92,6 @@ func TestConfigValidate_TOTP(t *testing.T) {
 			wantErr: errors.ErrTOTPChallengeTokenTTLInvalid,
 		},
 		{
-			name: "max attempts under 1 fails",
-			mutate: func(c *Config) {
-				c.TOTP.MaxAttemptsPerWindow = 0
-			},
-			wantErr: errors.ErrTOTPMaxAttemptsInvalid,
-		},
-		{
 			name: "negative max attempts fails",
 			mutate: func(c *Config) {
 				c.TOTP.MaxAttemptsPerWindow = -1
@@ -134,6 +127,34 @@ func TestConfigValidate_TOTP(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestConfigValidate_TOTP_ZeroDefaultsWithKey(t *testing.T) {
+	t.Parallel()
+
+	cfg := Config{
+		DatabaseURL: "postgres://user:pass@localhost:5432/testdb",
+		BaseURL:     "https://example.com",
+		TOTP: TOTPConfig{
+			EncryptionKey: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+		},
+	}
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("expected valid config with defaulted TOTP auxiliary fields, got: %v", err)
+	}
+	if cfg.TOTP.Issuer != "go-auth" {
+		t.Errorf("Issuer = %q; want go-auth", cfg.TOTP.Issuer)
+	}
+	if cfg.TOTP.ChallengeTokenTTL != 10*time.Minute {
+		t.Errorf("ChallengeTokenTTL = %v; want 10m", cfg.TOTP.ChallengeTokenTTL)
+	}
+	if cfg.TOTP.MaxAttemptsPerWindow != 5 {
+		t.Errorf("MaxAttemptsPerWindow = %d; want 5", cfg.TOTP.MaxAttemptsPerWindow)
+	}
+	if cfg.TOTP.AttemptWindow != 5*time.Minute {
+		t.Errorf("AttemptWindow = %v; want 5m", cfg.TOTP.AttemptWindow)
 	}
 }
 
