@@ -78,6 +78,11 @@ const (
 	CodeTwoFactorMaxAttemptsExceeded Code = "TWO_FACTOR_MAX_ATTEMPTS_EXCEEDED" // 429
 	CodeTOTPRateLimitExceeded        Code = "TOTP_RATE_LIMIT_EXCEEDED"         // 429
 
+	// Phase 8 Multi-Database Storage Abstraction
+	CodeDatabaseUnsupported    Code = "DATABASE_UNSUPPORTED"    // 400
+	CodeTransactionUnsupported Code = "TRANSACTION_UNSUPPORTED" // 501
+	CodeDatabaseAdapterFailed  Code = "DATABASE_ADAPTER_FAILED" // 500
+
 	// Casing aliases
 	CodeTotpNotEnrolled       = CodeTOTPNotEnrolled
 	CodeTotpAlreadyEnabled    = CodeTOTPAlreadyEnabled
@@ -128,8 +133,13 @@ func (c Code) HTTPStatus() int {
 	case CodePasswordTooShort, CodePasswordTooLong, CodePasswordTooCommon,
 		CodeInvalidEmail, CodeValidationError, CodeInvalidToken, CodeTokenExpired,
 		CodeOAuthCallbackFailed, CodeOAuthCodeInvalid, CodeOAuthEmailUnverified,
-		CodeTOTPNotEnrolled, CodeTOTPCodeInvalid, CodeTOTPCodeReplayed, CodeTOTPBackupCodeInvalid:
+		CodeTOTPNotEnrolled, CodeTOTPCodeInvalid, CodeTOTPCodeReplayed, CodeTOTPBackupCodeInvalid,
+		CodeDatabaseUnsupported:
 		return http.StatusBadRequest
+	case CodeTransactionUnsupported:
+		return http.StatusNotImplemented
+	case CodeDatabaseAdapterFailed:
+		return http.StatusInternalServerError
 	case CodeInvalidCredentials, CodeUnauthenticated,
 		CodeSessionNotFound, CodeSessionExpired, CodeSessionInvalid,
 		CodeMFARequired, CodeMFAInvalidCode,
@@ -354,6 +364,10 @@ var (
 	ErrTOTPChallengeTokenTTLInvalid    = New(CodeInvalidConfig, "totp challenge token TTL must be between 1m and 30m", nil)
 	ErrTOTPMaxAttemptsInvalid          = New(CodeInvalidConfig, "totp max attempts must be at least 1", nil)
 	ErrTOTPAttemptWindowInvalid        = New(CodeInvalidConfig, "totp attempt window must be at least 1m", nil)
+	ErrInvalidConfig                   = New(CodeInvalidConfig, "invalid configuration", nil)
+	ErrDatabaseUnsupported             = New(CodeDatabaseUnsupported, "unsupported database type", nil)
+	ErrTransactionUnsupported          = New(CodeTransactionUnsupported, "transactions not supported by storage engine", nil)
+	ErrDatabaseAdapterFailed           = New(CodeDatabaseAdapterFailed, "failed to initialize database adapter", nil)
 
 	// Predefined sentinel errors for Phase 3 Core Auth.
 	ErrInvalidCredentials = New(CodeInvalidCredentials, "invalid email or password", nil)

@@ -13,6 +13,7 @@ import (
 	"github.com/kaiizer777/go-auth/auth"
 	"github.com/kaiizer777/go-auth/config"
 	"github.com/kaiizer777/go-auth/csrf"
+	"github.com/kaiizer777/go-auth/db"
 	"github.com/kaiizer777/go-auth/errors"
 	"github.com/kaiizer777/go-auth/oauth"
 	"github.com/kaiizer777/go-auth/ratelimit"
@@ -24,6 +25,7 @@ import (
 type Handler struct {
 	mux             *http.ServeMux
 	db              *gorm.DB
+	store           db.Store
 	cfg             config.Config
 	authSvc         auth.Service
 	sessionSvc      session.Service
@@ -43,6 +45,13 @@ type Handler struct {
 
 // Option configures optional dependencies for Handler.
 type Option func(*Handler)
+
+// WithStore attaches a db.Store to the Handler.
+func WithStore(store db.Store) Option {
+	return func(h *Handler) {
+		h.store = store
+	}
+}
 
 // WithSessionService attaches a session service to the Handler.
 func WithSessionService(svc session.Service) Option {
@@ -201,6 +210,16 @@ func MethodNotAllowedHandler() http.Handler {
 func (h *Handler) registerRoutes() {
 	// Base routes mounted in Phase 1; additional auth routes mount in subsequent phases.
 	h.mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
+		if h.store != nil {
+			if err := h.store.Ping(r.Context()); err != nil {
+				errors.WriteJSON(w, errors.New(errors.CodeDatabaseUnavailable, "database unavailable", nil))
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"status":"ok"}`))
+			return
+		}
 		if h.db == nil {
 			errors.WriteJSON(w, errors.New(errors.CodeDatabaseUnavailable, "database unavailable", nil))
 			return

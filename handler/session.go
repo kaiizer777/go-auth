@@ -20,6 +20,7 @@ import (
 type SessionHandler struct {
 	sessionSvc session.Service
 	db         *gorm.DB
+	store      db.Store
 	cfg        *config.Config
 }
 
@@ -32,6 +33,19 @@ func NewSessionHandler(sessionSvc session.Service, gormDB *gorm.DB, cfg *config.
 	return &SessionHandler{
 		sessionSvc: sessionSvc,
 		db:         gormDB,
+		cfg:        cfg,
+	}
+}
+
+// NewSessionHandlerWithStore constructs a concrete SessionHandler backed by a db.Store.
+func NewSessionHandlerWithStore(sessionSvc session.Service, store db.Store, cfg *config.Config) *SessionHandler {
+	if cfg == nil {
+		defaultCfg := config.DefaultConfig()
+		cfg = &defaultCfg
+	}
+	return &SessionHandler{
+		sessionSvc: sessionSvc,
+		store:      store,
 		cfg:        cfg,
 	}
 }

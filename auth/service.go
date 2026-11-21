@@ -5,17 +5,16 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"log/slog"
-	"strings"
 	"sync"
 	"time"
 
 	"gorm.io/gorm"
-	"gorm.io/gorm/clause"
 
 	"github.com/google/uuid"
 	"github.com/kaiizer777/go-auth/config"
 	"github.com/kaiizer777/go-auth/crypto"
 	"github.com/kaiizer777/go-auth/db"
+	gormstore "github.com/kaiizer777/go-auth/db/gorm"
 	"github.com/kaiizer777/go-auth/email"
 	"github.com/kaiizer777/go-auth/errors"
 )
@@ -39,7 +38,7 @@ const emailDispatchPendingSize = 256
 
 type authService struct {
 	cfg               config.Config
-	db                *gorm.DB
+	store             db.Store
 	hooks             email.Hooks
 	dummyHash         string
 	hashParams        crypto.HashParams
@@ -49,13 +48,13 @@ type authService struct {
 	onPreRecoveryLock func()
 }
 
-// New constructs a new concrete auth Service.
-func New(cfg config.Config, database *gorm.DB, hooks email.Hooks) (Service, error) {
+// NewWithStore constructs a new concrete auth Service using an abstract db.Store.
+func NewWithStore(cfg config.Config, store db.Store, hooks email.Hooks) (Service, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, errors.Wrap(err, errors.CodeInvalidConfig, "invalid config")
 	}
-	if database == nil {
-		return nil, errors.New(errors.CodeDatabaseError, "database connection is required", nil)
+	if store == nil {
+		return nil, errors.New(errors.CodeDatabaseError, "store is required", nil)
 	}
 
 	hashParams := crypto.HashParams{
@@ -73,13 +72,21 @@ func New(cfg config.Config, database *gorm.DB, hooks email.Hooks) (Service, erro
 
 	return &authService{
 		cfg:             cfg,
-		db:              database,
+		store:           store,
 		hooks:           hooks,
 		dummyHash:       dummyHash,
 		hashParams:      hashParams,
 		emailSem:        make(chan struct{}, emailDispatchSemaphoreSize),
 		emailPendingSem: make(chan struct{}, emailDispatchPendingSize),
 	}, nil
+}
+
+// New constructs a new concrete auth Service using a GORM database connection.
+func New(cfg config.Config, database *gorm.DB, hooks email.Hooks) (Service, error) {
+	if database == nil {
+		return nil, errors.New(errors.CodeDatabaseError, "database connection is required", nil)
+	}
+	return NewWithStore(cfg, gormstore.New(database), hooks)
 }
 
 // Signup registers a new user, hashes credentials with Argon2id, creates a verification
@@ -93,9 +100,8 @@ func (s *authService) Signup(ctx context.Context, req db.SignupRequest) (*db.Use
 		return nil, "", err
 	}
 
-	var existing db.User
-	err := s.db.WithContext(ctx).Where("LOWER(email) = LOWER(?)", req.Email).First(&existing).Error
-	if err == nil {
+	existing, err := s.store.Users().GetByEmail(ctx, req.Email)
+	if err == nil && existing != nil {
 		// Recovery: if the account is still unverified (e.g. a dropped
 		// verification email), bind the new (caller-supplied) password to a
 		// fresh verification token so an attacker-set password on the original
@@ -110,8 +116,8 @@ func (s *authService) Signup(ctx context.Context, req db.SignupRequest) (*db.Use
 
 			// Re-check under the lock to avoid racing recoveries overwriting
 			// each other's password/token state.
-			var latest db.User
-			if rerr := s.db.WithContext(ctx).Where("id = ?", existing.ID).First(&latest).Error; rerr == nil {
+			latest, rerr := s.store.Users().GetByID(ctx, existing.ID)
+			if rerr == nil && latest != nil {
 				existing = latest
 			}
 			if !existing.EmailVerified {
@@ -125,32 +131,37 @@ func (s *authService) Signup(ctx context.Context, req db.SignupRequest) (*db.Use
 				}
 				now := time.Now().UTC()
 				var updated bool
-				if terr := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-					res := tx.Model(&db.User{}).Where("id = ? AND email_verified = ?", existing.ID, false).Updates(map[string]any{
-						"password_hash":      passwordHash,
-						"credential_version": gorm.Expr("credential_version + 1"),
-					})
-					if res.Error != nil {
-						return res.Error
-					}
-					if res.RowsAffected == 0 {
-						// Already verified or updated concurrently
-						return nil
-					}
-					updated = true
-					if err := tx.Where("user_id = ?", existing.ID).Delete(&db.VerificationToken{}).Error; err != nil {
+				if terr := s.store.Transaction(ctx, func(txStore db.Store) error {
+					user, err := txStore.Users().GetByIDForUpdate(ctx, existing.ID)
+					if err != nil {
 						return err
 					}
-					if err := tx.Where("user_id = ?", existing.ID).Delete(&db.Session{}).Error; err != nil {
+					if user.EmailVerified {
+						return nil
+					}
+					if err := txStore.Users().UpdatePassword(ctx, user.ID, passwordHash); err != nil {
+						return err
+					}
+					if _, err := txStore.Users().IncrementCredentialVersion(ctx, user.ID); err != nil {
+						return err
+					}
+					if err := txStore.VerificationTokens().DeleteByUserID(ctx, user.ID); err != nil {
+						return err
+					}
+					if err := txStore.Sessions().DeleteByUserID(ctx, user.ID); err != nil {
 						return err
 					}
 					tok := db.VerificationToken{
 						TokenHash: tokenHash[:],
-						UserID:    existing.ID,
+						UserID:    user.ID,
 						ExpiresAt: now.Add(s.cfg.VerificationTokenExpiry),
 						CreatedAt: now,
 					}
-					return tx.Create(&tok).Error
+					if err := txStore.VerificationTokens().Create(ctx, &tok); err != nil {
+						return err
+					}
+					updated = true
+					return nil
 				}); terr != nil {
 					return nil, "", errors.Wrap(terr, errors.CodeDatabaseError, "failed to update unverified account")
 				}
@@ -165,7 +176,7 @@ func (s *authService) Signup(ctx context.Context, req db.SignupRequest) (*db.Use
 		_, _ = crypto.HashPassword(req.Password, s.hashParams)
 		return nil, "", nil
 	}
-	if !errors.Is(err, gorm.ErrRecordNotFound) {
+	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
 		return nil, "", errors.Wrap(err, errors.CodeDatabaseError, "failed to query user")
 	}
 
@@ -194,16 +205,15 @@ func (s *authService) Signup(ctx context.Context, req db.SignupRequest) (*db.Use
 		CreatedAt: now,
 	}
 
-	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		if err := tx.Create(&user).Error; err != nil {
+	err = s.store.Transaction(ctx, func(txStore db.Store) error {
+		if err := txStore.Users().Create(ctx, &user); err != nil {
 			return err
 		}
 		tok.UserID = user.ID
-		return tx.Create(&tok).Error
+		return txStore.VerificationTokens().Create(ctx, &tok)
 	})
 	if err != nil {
-		var existingUser db.User
-		if queryErr := s.db.WithContext(ctx).Where("LOWER(email) = LOWER(?)", req.Email).First(&existingUser).Error; queryErr == nil {
+		if existingUser, queryErr := s.store.Users().GetByEmail(ctx, req.Email); queryErr == nil && existingUser != nil {
 			// Anti-enumeration parity: concurrent signup succeeded
 			_, _ = crypto.HashPassword(req.Password, s.hashParams)
 			return nil, "", nil
@@ -222,8 +232,7 @@ func (s *authService) Login(ctx context.Context, req db.LoginRequest) (*db.User,
 		return nil, err
 	}
 
-	var user db.User
-	err := s.db.WithContext(ctx).Where("LOWER(email) = LOWER(?)", req.Email).First(&user).Error
+	user, err := s.store.Users().GetByEmail(ctx, req.Email)
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			_, _ = crypto.VerifyPassword(req.Password, s.dummyHash)
@@ -246,7 +255,7 @@ func (s *authService) Login(ctx context.Context, req db.LoginRequest) (*db.User,
 		return nil, errors.ErrEmailNotVerified
 	}
 
-	return &user, nil
+	return user, nil
 }
 
 // Logout invalidates the active session by hashed token.
@@ -256,7 +265,7 @@ func (s *authService) Logout(ctx context.Context, sessionID string) error {
 	}
 	sum := sha256.Sum256([]byte(sessionID))
 	idHash := hex.EncodeToString(sum[:])
-	if err := s.db.WithContext(ctx).Where("id_hash = ?", idHash).Delete(&db.Session{}).Error; err != nil {
+	if _, err := s.store.Sessions().DeleteByIDHash(ctx, idHash); err != nil {
 		return errors.Wrap(err, errors.CodeDatabaseError, "failed to delete session")
 	}
 	return nil
@@ -275,9 +284,9 @@ func (s *authService) VerifyEmail(ctx context.Context, req db.VerifyEmailRequest
 
 	var isExpired bool
 	var verifiedUser db.User
-	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		var tok db.VerificationToken
-		if err := tx.Where("token_hash = ?", tokenHash[:]).First(&tok).Error; err != nil {
+	err = s.store.Transaction(ctx, func(txStore db.Store) error {
+		tok, err := txStore.VerificationTokens().GetByTokenHash(ctx, tokenHash[:])
+		if err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
 				return errors.ErrInvalidToken
 			}
@@ -286,24 +295,27 @@ func (s *authService) VerifyEmail(ctx context.Context, req db.VerifyEmailRequest
 
 		if time.Now().UTC().After(tok.ExpiresAt) {
 			isExpired = true
-			return tx.Where("token_hash = ?", tokenHash[:]).Delete(&db.VerificationToken{}).Error
+			_, err := txStore.VerificationTokens().Delete(ctx, tokenHash[:])
+			return err
 		}
 
-		res := tx.Where("token_hash = ?", tokenHash[:]).Delete(&db.VerificationToken{})
-		if res.Error != nil {
-			return res.Error
+		rows, err := txStore.VerificationTokens().Delete(ctx, tokenHash[:])
+		if err != nil {
+			return err
 		}
-		if res.RowsAffected == 0 {
+		if rows == 0 {
 			return errors.ErrInvalidToken
 		}
 
-		if err := tx.Model(&db.User{}).Where("id = ?", tok.UserID).Update("email_verified", true).Error; err != nil {
+		if err := txStore.Users().SetEmailVerified(ctx, tok.UserID, true); err != nil {
 			return err
 		}
-		// Load inside the transaction: a post-commit read failure would report
-		// an error for an already-consumed token, making retry impossible.
-		// Here the read failure rolls back instead, preserving retry.
-		return tx.Where("id = ?", tok.UserID).First(&verifiedUser).Error
+		u, err := txStore.Users().GetByID(ctx, tok.UserID)
+		if err != nil {
+			return err
+		}
+		verifiedUser = *u
+		return nil
 	})
 	if err != nil {
 		var appErr *errors.Error
@@ -319,14 +331,6 @@ func (s *authService) VerifyEmail(ctx context.Context, req db.VerifyEmailRequest
 	return &verifiedUser, nil
 }
 
-// lockForUpdate applies SELECT ... FOR UPDATE on dialects with row locking.
-func lockForUpdate(tx *gorm.DB) *gorm.DB {
-	if strings.Contains(strings.ToLower(tx.Name()), "sqlite") {
-		return tx
-	}
-	return tx.Clauses(clause.Locking{Strength: "UPDATE"})
-}
-
 // RequestPasswordReset initiates a password reset flow, generating a single-use token.
 // Non-existent emails trigger anti-enumeration parity operations and return silent success.
 func (s *authService) RequestPasswordReset(ctx context.Context, req db.PasswordResetRequest) (string, error) {
@@ -334,43 +338,44 @@ func (s *authService) RequestPasswordReset(ctx context.Context, req db.PasswordR
 		return "", err
 	}
 
-	var user db.User
-	err := s.db.WithContext(ctx).Where("LOWER(email) = LOWER(?)", req.Email).First(&user).Error
+	user, err := s.store.Users().GetByEmail(ctx, req.Email)
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			_, _, _ = crypto.GenerateToken()
 			// Anti-enumeration timing parity: perform a simulated DB query to equalize latency with found branch
-			var dummy db.PasswordResetToken
-			_ = s.db.WithContext(ctx).Where("user_id = ?", uuid.Nil).First(&dummy).Error
+			var dummyToken []byte
+			_, _ = s.store.PasswordResetTokens().GetByTokenHash(ctx, dummyToken)
 			return "", nil
 		}
 		return "", errors.Wrap(err, errors.CodeDatabaseError, "failed to query user")
 	}
 
-	rawToken, tokenHash, err := crypto.GenerateToken()
-	if err != nil {
-		return "", errors.Wrap(err, errors.CodeInternalError, "failed to generate password reset token")
-	}
-
-	now := time.Now().UTC()
-	resetToken := db.PasswordResetToken{
-		TokenHash: tokenHash[:],
-		UserID:    user.ID,
-		ExpiresAt: now.Add(s.cfg.PasswordResetTokenExpiry),
-		CreatedAt: now,
-	}
-
+	var rawToken string
 	// Invalidate prior unconsumed reset tokens. Serialize per-user via a row lock
 	// on the user record so concurrent requests under READ COMMITTED cannot race.
-	if terr := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		var lockedUser db.User
-		if err := lockForUpdate(tx).Select("id").Where("id = ?", user.ID).First(&lockedUser).Error; err != nil {
+	if terr := s.store.Transaction(ctx, func(txStore db.Store) error {
+		if _, err := txStore.Users().GetByIDForUpdate(ctx, user.ID); err != nil {
 			return err
 		}
-		if err := tx.Where("user_id = ?", user.ID).Delete(&db.PasswordResetToken{}).Error; err != nil {
+		if err := txStore.PasswordResetTokens().DeleteByUserID(ctx, user.ID); err != nil {
 			return err
 		}
-		return tx.Create(&resetToken).Error
+
+		tok, tokenHash, gerr := crypto.GenerateToken()
+		if gerr != nil {
+			return errors.Wrap(gerr, errors.CodeInternalError, "failed to generate password reset token")
+		}
+		rawToken = tok
+
+		now := time.Now().UTC()
+		resetToken := db.PasswordResetToken{
+			TokenHash: tokenHash[:],
+			UserID:    user.ID,
+			ExpiresAt: now.Add(s.cfg.PasswordResetTokenExpiry),
+			CreatedAt: now,
+		}
+
+		return txStore.PasswordResetTokens().Create(ctx, &resetToken)
 	}); terr != nil {
 		return "", errors.Wrap(terr, errors.CodeDatabaseError, "failed to create password reset token")
 	}
@@ -394,8 +399,8 @@ func (s *authService) ResetPassword(ctx context.Context, req db.PasswordResetCon
 
 	// Cheap existence/expiry gate before the expensive Argon2id hash: unknown
 	// or expired tokens must not trigger a ~64MiB hashing operation.
-	var tok db.PasswordResetToken
-	if err := s.db.WithContext(ctx).Where("token_hash = ?", tokenHash[:]).First(&tok).Error; err != nil {
+	tok, err := s.store.PasswordResetTokens().GetByTokenHash(ctx, tokenHash[:])
+	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return nil, errors.ErrInvalidToken
 		}
@@ -403,7 +408,7 @@ func (s *authService) ResetPassword(ctx context.Context, req db.PasswordResetCon
 	}
 
 	if time.Now().UTC().After(tok.ExpiresAt) {
-		_ = s.db.WithContext(ctx).Where("token_hash = ?", tokenHash[:]).Delete(&db.PasswordResetToken{}).Error
+		_, _ = s.store.PasswordResetTokens().Delete(ctx, tokenHash[:])
 		return nil, errors.ErrTokenExpired
 	}
 
@@ -413,46 +418,44 @@ func (s *authService) ResetPassword(ctx context.Context, req db.PasswordResetCon
 	}
 
 	var resetUser db.User
-	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		var lockedUser db.User
-		if err := lockForUpdate(tx).Select("id").Where("id = ?", tok.UserID).First(&lockedUser).Error; err != nil {
+	err = s.store.Transaction(ctx, func(txStore db.Store) error {
+		if _, err := txStore.Users().GetByIDForUpdate(ctx, tok.UserID); err != nil {
 			return err
 		}
 
-		res := tx.Where("token_hash = ? AND expires_at > ?", tokenHash[:], time.Now().UTC()).Delete(&db.PasswordResetToken{})
-		if res.Error != nil {
-			return res.Error
+		consumed, err := txStore.PasswordResetTokens().ConsumeToken(ctx, tokenHash[:], time.Now().UTC())
+		if err != nil {
+			return err
 		}
-		if res.RowsAffected == 0 {
-			var count int64
-			if err := tx.Model(&db.PasswordResetToken{}).Where("token_hash = ?", tokenHash[:]).Count(&count).Error; err != nil {
-				return err
-			}
-			if count > 0 {
-				_ = tx.Where("token_hash = ?", tokenHash[:]).Delete(&db.PasswordResetToken{}).Error
+		if !consumed {
+			if countTok, _ := txStore.PasswordResetTokens().GetByTokenHash(ctx, tokenHash[:]); countTok != nil {
+				_, _ = txStore.PasswordResetTokens().Delete(ctx, tokenHash[:])
 				return errors.ErrTokenExpired
 			}
 			return errors.ErrInvalidToken
 		}
 
-		if err := tx.Model(&db.User{}).Where("id = ?", tok.UserID).Updates(map[string]any{
-			"password_hash":      newHash,
-			"credential_version": gorm.Expr("credential_version + 1"),
-		}).Error; err != nil {
+		if err := txStore.Users().UpdatePassword(ctx, tok.UserID, newHash); err != nil {
+			return err
+		}
+		if _, err := txStore.Users().IncrementCredentialVersion(ctx, tok.UserID); err != nil {
 			return err
 		}
 
-		if err := tx.Where("user_id = ?", tok.UserID).Delete(&db.PasswordResetToken{}).Error; err != nil {
+		if err := txStore.PasswordResetTokens().DeleteByUserID(ctx, tok.UserID); err != nil {
 			return err
 		}
 
-		if err := tx.Where("user_id = ?", tok.UserID).Delete(&db.Session{}).Error; err != nil {
+		if err := txStore.Sessions().DeleteByUserID(ctx, tok.UserID); err != nil {
 			return err
 		}
-		// Load inside the transaction: a post-commit read failure would report
-		// an error for an already-consumed token, making retry impossible.
-		// Here the read failure rolls back instead, preserving retry.
-		return tx.Where("id = ?", tok.UserID).First(&resetUser).Error
+
+		u, err := txStore.Users().GetByID(ctx, tok.UserID)
+		if err != nil {
+			return err
+		}
+		resetUser = *u
+		return nil
 	})
 	if err != nil {
 		var appErr *errors.Error

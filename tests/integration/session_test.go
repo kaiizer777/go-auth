@@ -540,8 +540,8 @@ func TestIdleTimeoutEnforced_Integration(t *testing.T) {
 // Elapsed time past SessionAbsoluteMaxAge triggers 401 SESSION_EXPIRED even if kept active
 func TestAbsoluteTimeoutEnforced_Integration(t *testing.T) {
 	app, _, cfg := setupIntegrationApp(t, func(c *config.Config) {
-		c.SessionIdleTimeout = 80 * time.Millisecond
-		c.SessionAbsoluteMaxAge = 150 * time.Millisecond
+		c.SessionIdleTimeout = 150 * time.Millisecond
+		c.SessionAbsoluteMaxAge = 250 * time.Millisecond
 	})
 
 	email := "abs_timeout@example.com"
@@ -557,8 +557,8 @@ func TestAbsoluteTimeoutEnforced_Integration(t *testing.T) {
 	app.Handler.ServeHTTP(rec, loginReq)
 	c := readCookieFromResponse(rec.Result(), cfg.SessionCookieName)
 
-	// Keep session active before idle timeout expires (first keep-alive at 50ms)
-	time.Sleep(50 * time.Millisecond)
+	// Keep session active before idle timeout expires (first keep-alive at 60ms)
+	time.Sleep(60 * time.Millisecond)
 	keepAliveReq := httptest.NewRequest(http.MethodGet, "/auth/session", nil)
 	keepAliveReq.AddCookie(c)
 	keepAliveRec := httptest.NewRecorder()
@@ -567,8 +567,8 @@ func TestAbsoluteTimeoutEnforced_Integration(t *testing.T) {
 		t.Fatalf("expected 200 OK on first keep-alive request, got %d", keepAliveRec.Code)
 	}
 
-	// Second keep-alive at 100ms to ensure idle timeout (80ms) never elapses before absolute timeout (150ms)
-	time.Sleep(50 * time.Millisecond)
+	// Second keep-alive at 120ms to ensure idle timeout (150ms) never elapses before absolute timeout (250ms)
+	time.Sleep(60 * time.Millisecond)
 	keepAliveReq2 := httptest.NewRequest(http.MethodGet, "/auth/session", nil)
 	keepAliveReq2.AddCookie(c)
 	keepAliveRec2 := httptest.NewRecorder()
@@ -577,8 +577,8 @@ func TestAbsoluteTimeoutEnforced_Integration(t *testing.T) {
 		t.Fatalf("expected 200 OK on second keep-alive request, got %d", keepAliveRec2.Code)
 	}
 
-	// Wait until absolute timeout elapses (total elapsed: ~160ms > 150ms, but only 60ms since last keep-alive < 80ms idle)
-	time.Sleep(60 * time.Millisecond)
+	// Wait until absolute timeout elapses (total elapsed: ~260ms > 250ms, but only 140ms since last keep-alive < 150ms idle)
+	time.Sleep(140 * time.Millisecond)
 
 	getReq := httptest.NewRequest(http.MethodGet, "/auth/session", nil)
 	getReq.AddCookie(c)
