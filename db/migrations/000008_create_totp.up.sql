@@ -11,7 +11,6 @@ CREATE TABLE IF NOT EXISTS totp_secrets (
     CONSTRAINT uq_totp_secrets_user_id UNIQUE (user_id)
 );
 
-CREATE INDEX IF NOT EXISTS idx_totp_secrets_user_id ON totp_secrets(user_id);
 
 CREATE TABLE IF NOT EXISTS totp_used_codes (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),

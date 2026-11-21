@@ -351,6 +351,11 @@ func TestTOTPModels_TableNameAndMasking(t *testing.T) {
 		t.Errorf("TotpSecret EncryptedSecret json tag = %q; want \"-\"", secretField.Tag.Get("json"))
 	}
 
+	backupCodesField, ok := reflect.TypeOf(TotpSecret{}).FieldByName("BackupCodes")
+	if !ok || backupCodesField.Tag.Get("json") != "-" {
+		t.Errorf("TotpSecret BackupCodes json tag = %q; want \"-\"", backupCodesField.Tag.Get("json"))
+	}
+
 	codeHashField, ok := reflect.TypeOf(TotpUsedCode{}).FieldByName("CodeHash")
 	if !ok || codeHashField.Tag.Get("json") != "-" {
 		t.Errorf("TotpUsedCode CodeHash json tag = %q; want \"-\"", codeHashField.Tag.Get("json"))
@@ -359,6 +364,25 @@ func TestTOTPModels_TableNameAndMasking(t *testing.T) {
 	tokenHashField, ok := reflect.TypeOf(TwoFactorToken{}).FieldByName("TokenHash")
 	if !ok || tokenHashField.Tag.Get("json") != "-" {
 		t.Errorf("TwoFactorToken TokenHash json tag = %q; want \"-\"", tokenHashField.Tag.Get("json"))
+	}
+
+	// Verify json.Marshal does not leak EncryptedSecret or BackupCodes
+	tsMarshal := TotpSecret{
+		ID:              uuid.New(),
+		UserID:          uuid.New(),
+		EncryptedSecret: []byte("super-secret-totp-blob"),
+		BackupCodes:     []byte(`["argon2id-phc-hash"]`),
+		Enabled:         true,
+	}
+	tsData, err := json.Marshal(tsMarshal)
+	if err != nil {
+		t.Fatalf("json.Marshal(tsMarshal) failed: %v", err)
+	}
+	if strings.Contains(string(tsData), "EncryptedSecret") || strings.Contains(string(tsData), "super-secret-totp-blob") {
+		t.Errorf("TotpSecret JSON marshaling leaked EncryptedSecret: %s", string(tsData))
+	}
+	if strings.Contains(string(tsData), "BackupCodes") || strings.Contains(string(tsData), "argon2id-phc-hash") {
+		t.Errorf("TotpSecret JSON marshaling leaked BackupCodes: %s", string(tsData))
 	}
 
 	// 4. slog.LogValuer masking tests

@@ -350,3 +350,70 @@ func TestMigration000008_UpAndDown(t *testing.T) {
 		t.Fatalf("restoring 000008 up failed: %v", err)
 	}
 }
+
+func TestMigration000008_DownRefusedOnSeededDB(t *testing.T) {
+	dbURL := resolveDatabaseURL()
+
+	testDB, err := sql.Open("pgx", dbURL)
+	if err != nil {
+		if os.Getenv("CI") != "" {
+			t.Fatalf("CI: failed to open postgres connection: %v", err)
+		}
+		t.Skipf("Postgres not available, skipping: %v", err)
+	}
+	pingCtx, pingCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer pingCancel()
+	if err := testDB.PingContext(pingCtx); err != nil {
+		_ = testDB.Close()
+		if os.Getenv("CI") != "" {
+			t.Fatalf("CI: PostgreSQL connection failed: %v", err)
+		}
+		t.Skipf("Postgres not available, skipping: %v", err)
+	}
+	_ = testDB.Close()
+
+	m, sqlDB := newMigrator(t, dbURL)
+	defer func() {
+		_, _ = m.Close()
+		_ = sqlDB.Close()
+	}()
+
+	if err := m.Migrate(8); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("m.Migrate(8) failed: %v", err)
+	}
+
+	if _, err := sqlDB.Exec(`INSERT INTO users (email, password_hash, credential_version) VALUES ('totp-down-refusal@example.com', 'hash', 1)`); err != nil {
+		t.Fatalf("failed to seed user: %v", err)
+	}
+	if _, err := sqlDB.Exec(`INSERT INTO totp_secrets (user_id, encrypted_secret, backup_codes, enabled) SELECT id, '\x010203', '[]', true FROM users WHERE email = 'totp-down-refusal@example.com'`); err != nil {
+		t.Fatalf("failed to seed totp secret: %v", err)
+	}
+
+	err = m.Steps(-1)
+	if err == nil {
+		t.Fatal("expected 000008 down to refuse on seeded totp_secrets, got nil")
+	}
+	if !strings.Contains(err.Error(), "down refused") {
+		t.Fatalf("expected down-refused error, got: %v", err)
+	}
+
+	// Recovery
+	_, _ = m.Close()
+	_ = sqlDB.Close()
+
+	m2, sqlDB2 := newMigrator(t, dbURL)
+	defer func() {
+		_, _ = m2.Close()
+		_ = sqlDB2.Close()
+	}()
+
+	if ferr := m2.Force(8); ferr != nil {
+		t.Fatalf("m2.Force(8) failed: %v", ferr)
+	}
+	if _, err := sqlDB2.Exec(`DELETE FROM totp_secrets WHERE user_id IN (SELECT id FROM users WHERE email = 'totp-down-refusal@example.com')`); err != nil {
+		t.Fatalf("failed to remove seed totp row: %v", err)
+	}
+	if _, err := sqlDB2.Exec(`DELETE FROM users WHERE email = 'totp-down-refusal@example.com'`); err != nil {
+		t.Fatalf("failed to remove seed user row: %v", err)
+	}
+}

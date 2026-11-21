@@ -446,6 +446,65 @@ func TestVerifyCode_LifecycleAndReplay(t *testing.T) {
 	}
 }
 
+func TestVerifyCode_CyclicCodeReuseAfterSlidingTTL(t *testing.T) {
+	t.Parallel()
+
+	database := setupTestDB(t)
+	user := createTestUser(t, database, "cyclic@example.com", true)
+	svc := NewService(database, config.TOTPConfig{EncryptionKey: validTestHexKey()}, nil, nil)
+
+	resp, err := svc.Enroll(context.Background(), user.ID.String())
+	if err != nil {
+		t.Fatalf("Enroll failed: %v", err)
+	}
+	code, err := ptotp.GenerateCode(resp.Secret, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("GenerateCode failed: %v", err)
+	}
+	_, err = svc.ConfirmEnrollment(context.Background(), user.ID.String(), code)
+	if err != nil {
+		t.Fatalf("ConfirmEnrollment failed: %v", err)
+	}
+
+	driftCode, err := ptotp.GenerateCode(resp.Secret, time.Now().UTC().Add(25*time.Second))
+	if err != nil || driftCode == code {
+		driftCode, err = ptotp.GenerateCode(resp.Secret, time.Now().UTC().Add(30*time.Second))
+		if err != nil {
+			t.Fatalf("GenerateCode failed: %v", err)
+		}
+	}
+
+	// Seed an expired used_code record (e.g. from 10 minutes ago) with the same code hash
+	oldCodeHash := CodeHash(driftCode, user.ID.String())
+	oldRecord := db.TotpUsedCode{
+		ID:       uuid.New(),
+		UserID:   user.ID,
+		CodeHash: oldCodeHash,
+		UsedAt:   time.Now().Add(-10 * time.Minute),
+	}
+	if err := database.Create(&oldRecord).Error; err != nil {
+		t.Fatalf("failed to seed expired used_code: %v", err)
+	}
+
+	// Verification must succeed and evict the expired record without unique constraint collision
+	err = svc.VerifyCode(context.Background(), user.ID.String(), driftCode, "127.0.0.1")
+	if err != nil {
+		t.Fatalf("VerifyCode failed on cyclic code after sliding TTL: %v", err)
+	}
+
+	var expiredCount int64
+	database.Model(&db.TotpUsedCode{}).Where("id = ?", oldRecord.ID).Count(&expiredCount)
+	if expiredCount != 0 {
+		t.Fatalf("expected expired totp_used_code to be pruned, found %d", expiredCount)
+	}
+
+	// Immediate replay within active window must be rejected
+	err = svc.VerifyCode(context.Background(), user.ID.String(), driftCode, "127.0.0.1")
+	if !errors.Is(err, apperrors.ErrTOTPCodeReplayed) {
+		t.Fatalf("expected ErrTOTPCodeReplayed on replay, got %v", err)
+	}
+}
+
 func TestVerifyCode_DualRateLimit(t *testing.T) {
 	t.Parallel()
 

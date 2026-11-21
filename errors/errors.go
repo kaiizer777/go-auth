@@ -73,7 +73,6 @@ const (
 	CodeTOTPCodeInvalid              Code = "TOTP_CODE_INVALID"                // 400
 	CodeTOTPCodeReplayed             Code = "TOTP_CODE_REPLAYED"               // 400
 	CodeTOTPBackupCodeInvalid        Code = "TOTP_BACKUP_CODE_INVALID"         // 400
-	CodeTwoFactorRequired            Code = "TWO_FACTOR_REQUIRED"              // 200
 	CodeTwoFactorTokenInvalid        Code = "TWO_FACTOR_TOKEN_INVALID"         // 401
 	CodeTwoFactorTokenExpired        Code = "TWO_FACTOR_TOKEN_EXPIRED"         // 401
 	CodeTwoFactorMaxAttemptsExceeded Code = "TWO_FACTOR_MAX_ATTEMPTS_EXCEEDED" // 429
@@ -140,8 +139,6 @@ func (c Code) HTTPStatus() int {
 		return http.StatusForbidden
 	case CodeRateLimitExceeded, CodeTwoFactorMaxAttemptsExceeded, CodeTOTPRateLimitExceeded:
 		return http.StatusTooManyRequests
-	case CodeTwoFactorRequired:
-		return http.StatusOK
 	case CodeNotFound, CodeUserNotFound, CodeTokenNotFound, CodeOAuthAccountNotLinked, CodeOAuthProviderNotFound:
 		return http.StatusNotFound
 	case CodeUserAlreadyExists, CodeEmailAlreadyExists, CodeOAuthAccountAlreadyLinked, CodeOAuthAccountLinkConflict, CodeTOTPAlreadyEnabled:

@@ -136,7 +136,7 @@ type TotpSecret struct {
 	ID              uuid.UUID `gorm:"primaryKey;type:uuid;default:uuid_generate_v4()"`
 	UserID          uuid.UUID `gorm:"type:uuid;not null;uniqueIndex:uq_totp_secrets_user_id"`
 	EncryptedSecret []byte    `gorm:"type:bytea;not null" json:"-"`
-	BackupCodes     []byte    `gorm:"type:jsonb;not null;default:'[]'"`
+	BackupCodes     []byte    `gorm:"type:jsonb;not null;default:'[]'" json:"-"`
 	Enabled         bool      `gorm:"not null;default:false"`
 	CreatedAt       time.Time
 	UpdatedAt       time.Time

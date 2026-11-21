@@ -255,6 +255,11 @@ func (s *totpService) ConfirmEnrollment(ctx context.Context, userID, code string
 	}
 
 	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		// Evict expired replay records outside sliding 90s window to avoid cyclic collision lockout
+		if err := tx.Where("user_id = ? AND used_at < ?", uid, cutoff).Delete(&db.TotpUsedCode{}).Error; err != nil {
+			return err
+		}
+
 		usedRecord := db.TotpUsedCode{
 			ID:       uuid.New(),
 			UserID:   uid,
@@ -461,14 +466,25 @@ func (s *totpService) VerifyCode(ctx context.Context, userID, code, clientIP str
 		return apperrors.ErrTOTPCodeInvalid
 	}
 
-	usedRecord := db.TotpUsedCode{
-		ID:       uuid.New(),
-		UserID:   uid,
-		CodeHash: codeHash,
-		UsedAt:   time.Now(),
-	}
-	if err := s.db.WithContext(ctx).Create(&usedRecord).Error; err != nil {
-		return apperrors.ErrTOTPCodeReplayed
+	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		// Evict expired replay records outside sliding 90s window to avoid cyclic collision lockout
+		if err := tx.Where("user_id = ? AND used_at < ?", uid, cutoff).Delete(&db.TotpUsedCode{}).Error; err != nil {
+			return err
+		}
+
+		usedRecord := db.TotpUsedCode{
+			ID:       uuid.New(),
+			UserID:   uid,
+			CodeHash: codeHash,
+			UsedAt:   time.Now(),
+		}
+		if err := tx.Create(&usedRecord).Error; err != nil {
+			return apperrors.ErrTOTPCodeReplayed
+		}
+		return nil
+	})
+	if err != nil {
+		return err
 	}
 
 	if s.limiter != nil {
