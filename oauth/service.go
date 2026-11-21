@@ -12,6 +12,7 @@ import (
 
 	"github.com/kaiizer777/go-auth/config"
 	"github.com/kaiizer777/go-auth/db"
+	gormstore "github.com/kaiizer777/go-auth/db/gorm"
 	"github.com/kaiizer777/go-auth/errors"
 	"github.com/kaiizer777/go-auth/session"
 )
@@ -31,10 +32,19 @@ type Service interface {
 }
 
 type service struct {
-	db         *gorm.DB
+	store      db.Store
 	sessionSvc session.Service
 	providers  map[string]Provider
 	cfg        *config.Config
+}
+
+// NewServiceWithStore wires the OAuth linking engine using an abstract db.Store.
+func NewServiceWithStore(store db.Store, sessionSvc session.Service, providers map[string]Provider, cfg *config.Config) Service {
+	if cfg == nil {
+		defaultCfg := config.DefaultConfig()
+		cfg = &defaultCfg
+	}
+	return &service{store: store, sessionSvc: sessionSvc, providers: providers, cfg: cfg}
 }
 
 // NewService wires the OAuth linking engine. cfg is the full app config: state
@@ -44,7 +54,7 @@ func NewService(gormDB *gorm.DB, sessionSvc session.Service, providers map[strin
 		defaultCfg := config.DefaultConfig()
 		cfg = &defaultCfg
 	}
-	return &service{db: gormDB, sessionSvc: sessionSvc, providers: providers, cfg: cfg}
+	return NewServiceWithStore(gormstore.New(gormDB), sessionSvc, providers, cfg)
 }
 
 // clientIP extracts the remote IP, stripping the port. Direct-connection IP for v1.
@@ -288,43 +298,45 @@ func validateProviderIdentity(info *UserInfo) error {
 // findLink loads the oauth_accounts row for a provider identity. found=false
 // with a nil error is the normal no-link case; anything else is a query failure.
 func (s *service) findLink(ctx context.Context, providerID, providerUserID string) (db.OAuthAccount, bool, error) {
-	var link db.OAuthAccount
-	err := s.db.WithContext(ctx).
-		Where("provider_id = ? AND provider_user_id = ?", providerID, providerUserID).
-		First(&link).Error
+	link, err := s.store.OAuthAccounts().GetByProvider(ctx, providerID, providerUserID)
 	if errors.Is(err, gorm.ErrRecordNotFound) {
-		return link, false, nil
+		return db.OAuthAccount{}, false, nil
 	}
 	if err != nil {
-		return link, false, err
+		return db.OAuthAccount{}, false, err
 	}
-	return link, true, nil
+	if link == nil {
+		return db.OAuthAccount{}, false, nil
+	}
+	return *link, true, nil
 }
 
 // loadLinkedUser loads the account owning link. A missing owner is a dangling
 // link row and maps to OAUTH_ACCOUNT_NOT_LINKED.
 func (s *service) loadLinkedUser(ctx context.Context, link db.OAuthAccount) (db.User, error) {
-	var user db.User
-	if err := s.db.WithContext(ctx).Where("id = ?", link.UserID).First(&user).Error; err != nil {
+	user, err := s.store.Users().GetByID(ctx, link.UserID)
+	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return db.User{}, errors.ErrOAuthAccountNotLinked
 		}
 		return db.User{}, errors.New(errors.CodeInternalError, "failed to load linked user", err)
 	}
-	return user, nil
+	return *user, nil
 }
 
 // findUserByEmail resolves the local account owning email. gorm.ErrRecordNotFound
 // is the only expected miss.
 func (s *service) findUserByEmail(ctx context.Context, email string) (db.User, error) {
-	var user db.User
-	err := s.db.WithContext(ctx).Where("LOWER(email) = LOWER(?)", email).First(&user).Error
-	return user, err
+	user, err := s.store.Users().GetByEmail(ctx, email)
+	if err != nil {
+		return db.User{}, err
+	}
+	return *user, nil
 }
 
 // insertLink writes the oauth_accounts row for userID. errLinkConflict means a
 // concurrent callback already claimed (providerID, providerUserID).
-func (s *service) insertLink(ctx context.Context, tx *gorm.DB, userID uuid.UUID, providerID, providerUserID, email string) error {
+func (s *service) insertLink(ctx context.Context, accountStore db.OAuthAccountStore, userID uuid.UUID, providerID, providerUserID, email string) error {
 	row := db.OAuthAccount{
 		ID:             uuid.New(),
 		UserID:         userID,
@@ -332,7 +344,7 @@ func (s *service) insertLink(ctx context.Context, tx *gorm.DB, userID uuid.UUID,
 		ProviderUserID: providerUserID,
 		Email:          email,
 	}
-	if err := tx.WithContext(ctx).Create(&row).Error; err != nil {
+	if err := accountStore.Create(ctx, &row); err != nil {
 		if isUniqueViolation(err) {
 			return errLinkConflict
 		}
@@ -344,7 +356,7 @@ func (s *service) insertLink(ctx context.Context, tx *gorm.DB, userID uuid.UUID,
 // linkExisting attaches the provider identity to owner. Losing the unique race
 // converges on the winner's row, which reports linked=false.
 func (s *service) linkExisting(ctx context.Context, owner db.User, providerID string, info *UserInfo) (db.User, bool, error) {
-	if err := s.insertLink(ctx, s.db, owner.ID, providerID, info.ProviderUserID, info.Email); err != nil {
+	if err := s.insertLink(ctx, s.store.OAuthAccounts(), owner.ID, providerID, info.ProviderUserID, info.Email); err != nil {
 		if errors.Is(err, errLinkConflict) {
 			user, _, _, rerr := s.relinkExisting(ctx, providerID, info.ProviderUserID)
 			return user, false, rerr
@@ -416,13 +428,13 @@ func (s *service) createUserAndLink(ctx context.Context, providerID string, info
 	}
 	userConflict, linkConflict := false, false
 	op := "failed to create oauth user"
-	txErr := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		if err := tx.Create(&user).Error; err != nil {
+	txErr := s.store.Transaction(ctx, func(txStore db.Store) error {
+		if err := txStore.Users().Create(ctx, &user); err != nil {
 			userConflict = isUniqueViolation(err)
 			return err
 		}
 		op = "failed to link oauth account"
-		if err := s.insertLink(ctx, tx, user.ID, providerID, info.ProviderUserID, info.Email); err != nil {
+		if err := s.insertLink(ctx, txStore.OAuthAccounts(), user.ID, providerID, info.ProviderUserID, info.Email); err != nil {
 			linkConflict = errors.Is(err, errLinkConflict)
 			return err
 		}

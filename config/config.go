@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -146,10 +147,47 @@ func DefaultTOTPConfig() TOTPConfig {
 	}
 }
 
+// DatabaseType specifies the supported persistence backend dialect.
+type DatabaseType string
+
+const (
+	DatabaseTypePostgres DatabaseType = "postgres"
+	DatabaseTypeMySQL    DatabaseType = "mysql"
+	DatabaseTypeMongo    DatabaseType = "mongodb"
+	DatabaseTypeMongoDB  DatabaseType = "mongodb"
+)
+
+// MySQLConfig holds dialect-specific settings for MySQL/MariaDB connections.
+type MySQLConfig struct {
+	Collation string
+}
+
+// MongoDBConfig holds dialect-specific settings for MongoDB connections.
+type MongoDBConfig struct {
+	Database               string
+	DatabaseName           string
+	ConnectTimeout         time.Duration
+	ServerSelectionTimeout time.Duration
+	MaxConnIdleTime        time.Duration
+}
+
+// MongoConfig is an alias for MongoDBConfig for backward compatibility.
+type MongoConfig = MongoDBConfig
+
 // Config holds all database, CORS, connection pool, and email hook settings.
 type Config struct {
-	// DatabaseURL is the PostgreSQL connection string.
+	// DatabaseType specifies the persistence backend ("postgres", "mysql", "mongodb").
+	// Default is "postgres".
+	DatabaseType DatabaseType
+	// DatabaseURL is the database connection string or DSN.
 	DatabaseURL string
+	// MySQL holds configuration specific to MySQL.
+	MySQL MySQLConfig
+	// Mongo holds configuration specific to MongoDB.
+	// Deprecated: Prefer MongoDB.
+	Mongo MongoConfig
+	// MongoDB holds configuration specific to MongoDB.
+	MongoDB MongoDBConfig
 	// MigrationsPath is the path to database migration files or empty for embedded defaults.
 	MigrationsPath string
 
@@ -245,6 +283,7 @@ type Config struct {
 // empty so callers must explicitly declare trusted origins.
 func DefaultConfig() Config {
 	return Config{
+		DatabaseType:         DatabaseTypePostgres,
 		MigrationsPath:       "db/migrations",
 		MaxOpenConns:         25,
 		MaxIdleConns:         10,
@@ -290,6 +329,12 @@ func DefaultConfig() Config {
 			HSTSPreload:           false,
 		},
 
+		MongoDB: MongoDBConfig{
+			ConnectTimeout:         10 * time.Second,
+			ServerSelectionTimeout: 10 * time.Second,
+			MaxConnIdleTime:        30 * time.Minute,
+		},
+
 		OAuth: OAuthConfig{
 			StateCookieName:     "oauth_state",
 			StateCookiePath:     "/",
@@ -317,17 +362,112 @@ func DefaultConfig() Config {
 
 // Validate ensures required fields are set and connection parameters are sane.
 func (c *Config) Validate() error {
-	if c.DatabaseURL == "" {
-		return errors.ErrDatabaseURLRequired
+	if c.DatabaseType == "" {
+		c.DatabaseType = DatabaseTypePostgres
 	}
-	lowerURL := strings.ToLower(c.DatabaseURL)
-	if strings.HasPrefix(lowerURL, "postgres://") || strings.HasPrefix(lowerURL, "postgresql://") {
-		parsedDBURL, err := url.Parse(c.DatabaseURL)
-		if err != nil || (parsedDBURL.Host == "" && parsedDBURL.Query().Get("host") == "") || parsedDBURL.Query().Has("socket") {
+	switch c.DatabaseType {
+	case DatabaseTypePostgres:
+		if c.DatabaseURL == "" {
+			return errors.ErrDatabaseURLRequired
+		}
+		lowerURL := strings.ToLower(c.DatabaseURL)
+		if strings.HasPrefix(lowerURL, "postgres://") || strings.HasPrefix(lowerURL, "postgresql://") {
+			parsedDBURL, err := url.Parse(c.DatabaseURL)
+			if err != nil || (parsedDBURL.Host == "" && parsedDBURL.Query().Get("host") == "") || parsedDBURL.Query().Has("socket") {
+				return errors.ErrDatabaseURLInvalid
+			}
+		} else if urlSchemePrefixRegex.MatchString(c.DatabaseURL) || !dsnParamRegex.MatchString(c.DatabaseURL) {
 			return errors.ErrDatabaseURLInvalid
 		}
-	} else if urlSchemePrefixRegex.MatchString(c.DatabaseURL) || !dsnParamRegex.MatchString(c.DatabaseURL) {
-		return errors.ErrDatabaseURLInvalid
+	case DatabaseTypeMySQL:
+		if c.DatabaseURL == "" {
+			return errors.ErrDatabaseURLRequired
+		}
+		if !strings.Contains(strings.ToLower(c.DatabaseURL), "parsetime=true") {
+			return errors.ErrDatabaseURLInvalid
+		}
+		if c.MaxOpenConns == 0 {
+			c.MaxOpenConns = 25
+		}
+		if c.MaxOpenConns < 1 {
+			return errors.ErrMaxOpenConnsNegative
+		}
+	case DatabaseTypeMongo, "mongo":
+		if c.DatabaseURL == "" {
+			return errors.ErrDatabaseURLRequired
+		}
+		lowerURL := strings.ToLower(c.DatabaseURL)
+		if !strings.HasPrefix(lowerURL, "mongodb://") && !strings.HasPrefix(lowerURL, "mongodb+srv://") {
+			return errors.ErrDatabaseURLInvalid
+		}
+		parsedURL, err := url.Parse(c.DatabaseURL)
+		if err != nil {
+			return errors.ErrDatabaseURLInvalid
+		}
+
+		q := parsedURL.Query()
+		for _, param := range []string{"connectTimeoutMS", "serverSelectionTimeoutMS", "timeoutMS", "wtimeoutMS"} {
+			if val := q.Get(param); val != "" {
+				parsedVal, err := strconv.Atoi(val)
+				if err != nil || parsedVal <= 0 {
+					return errors.ErrInvalidConfig
+				}
+			}
+		}
+		if val := q.Get("maxIdleTimeMS"); val != "" {
+			parsedVal, err := strconv.Atoi(val)
+			if err != nil || parsedVal < 0 {
+				return errors.ErrInvalidConfig
+			}
+		}
+
+		if c.MongoDB.Database == "" {
+			if c.MongoDB.DatabaseName != "" {
+				c.MongoDB.Database = c.MongoDB.DatabaseName
+			} else if c.Mongo.Database != "" {
+				c.MongoDB.Database = c.Mongo.Database
+			} else if c.Mongo.DatabaseName != "" {
+				c.MongoDB.Database = c.Mongo.DatabaseName
+			} else if dbName := strings.Trim(parsedURL.Path, "/"); dbName != "" {
+				c.MongoDB.Database = dbName
+			}
+		}
+		if c.MongoDB.ConnectTimeout == 0 && c.Mongo.ConnectTimeout != 0 {
+			c.MongoDB.ConnectTimeout = c.Mongo.ConnectTimeout
+		}
+		if c.MongoDB.ServerSelectionTimeout == 0 && c.Mongo.ServerSelectionTimeout != 0 {
+			c.MongoDB.ServerSelectionTimeout = c.Mongo.ServerSelectionTimeout
+		}
+		if c.MongoDB.MaxConnIdleTime == 0 && c.Mongo.MaxConnIdleTime != 0 {
+			c.MongoDB.MaxConnIdleTime = c.Mongo.MaxConnIdleTime
+		}
+
+		if c.MongoDB.ConnectTimeout == 0 {
+			c.MongoDB.ConnectTimeout = 10 * time.Second
+		}
+		if c.MongoDB.ServerSelectionTimeout == 0 {
+			c.MongoDB.ServerSelectionTimeout = 10 * time.Second
+		}
+		if c.MongoDB.MaxConnIdleTime == 0 {
+			c.MongoDB.MaxConnIdleTime = 30 * time.Minute
+		}
+
+		if c.MongoDB.Database == "" {
+			return errors.ErrInvalidConfig
+		}
+		if c.MongoDB.ConnectTimeout <= 0 {
+			return errors.ErrInvalidConfig
+		}
+		if c.MongoDB.ServerSelectionTimeout <= 0 {
+			return errors.ErrInvalidConfig
+		}
+		if c.MongoDB.MaxConnIdleTime < 0 {
+			return errors.ErrInvalidConfig
+		}
+
+		c.Mongo = c.MongoDB
+	default:
+		return errors.ErrDatabaseUnsupported
 	}
 	if c.BaseURL == "" {
 		return errors.ErrBaseURLRequired
@@ -717,6 +857,7 @@ var (
 	urlSchemePrefixRegex = regexp.MustCompile(`^(?:[a-zA-Z][a-zA-Z0-9+.-]*:)?//`)
 	dsnSecretRegex       = regexp.MustCompile(`(?i)\b(password|pass|token|secret|api_key|apikey|sslpassword)\b(\s*=\s*)(?:'(?:\\.|[^'\\])*'|"(?:\\.|[^"\\])*"|\S+)`)
 	userinfoRegex        = regexp.MustCompile(`://([^:]+):([^@]+)@`)
+	mysqlUserinfoRegex   = regexp.MustCompile(`(^|[^\w/])([a-zA-Z0-9_\-\.]+):([^@]+)@`)
 )
 
 func isSecretParam(k string) bool {
@@ -762,6 +903,7 @@ func RedactURL(rawURL string) string {
 	// Fallback for non-standard connection strings or DSNs containing passwords/secrets
 	cleaned := dsnSecretRegex.ReplaceAllString(rawURL, "${1}${2}REDACTED")
 	cleaned = userinfoRegex.ReplaceAllString(cleaned, "://${1}:REDACTED@")
+	cleaned = mysqlUserinfoRegex.ReplaceAllString(cleaned, "${1}${2}:REDACTED@")
 	return cleaned
 }
 

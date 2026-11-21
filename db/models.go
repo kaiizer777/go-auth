@@ -5,17 +5,26 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"gorm.io/gorm"
 )
 
 // User represents an authenticated account record in the database.
 type User struct {
-	ID                uuid.UUID `gorm:"primaryKey;type:uuid;default:uuid_generate_v4()"`
+	ID                uuid.UUID `gorm:"primaryKey;type:varchar(36)"`
 	Email             string    `gorm:"type:varchar(255);uniqueIndex;not null"`
 	PasswordHash      string    `gorm:"type:text;not null" json:"-"`
 	CredentialVersion int       `gorm:"not null;default:0"`
 	EmailVerified     bool      `gorm:"default:false;not null"`
 	CreatedAt         time.Time
 	UpdatedAt         time.Time
+}
+
+// BeforeCreate hook generates a new UUID if none is set.
+func (u *User) BeforeCreate(tx *gorm.DB) error {
+	if u.ID == uuid.Nil {
+		u.ID = uuid.New()
+	}
+	return nil
 }
 
 // LogValue implements slog.LogValuer to prevent credential leakage in logs.
@@ -44,8 +53,8 @@ const (
 
 // Session represents an active authenticated user session.
 type Session struct {
-	ID                uuid.UUID   `gorm:"primaryKey;type:uuid;default:uuid_generate_v4()"`
-	UserID            uuid.UUID   `gorm:"type:uuid;not null;index:idx_sessions_user_id"`
+	ID                uuid.UUID   `gorm:"primaryKey;type:varchar(36)"`
+	UserID            uuid.UUID   `gorm:"type:varchar(36);not null;index:idx_sessions_user_id"`
 	IDHash            string      `gorm:"column:id_hash;type:char(64);uniqueIndex;not null" json:"-"`
 	SessionType       SessionType `gorm:"type:varchar(10);not null;default:'cookie'"`
 	IPAddress         string      `gorm:"type:varchar(45);not null;default:''"`
@@ -56,13 +65,21 @@ type Session struct {
 	CreatedAt         time.Time   `gorm:"autoCreateTime"`
 }
 
+// BeforeCreate hook generates a new UUID if none is set.
+func (s *Session) BeforeCreate(tx *gorm.DB) error {
+	if s.ID == uuid.Nil {
+		s.ID = uuid.New()
+	}
+	return nil
+}
+
 // TableName returns the table name for Session.
 func (Session) TableName() string { return "sessions" }
 
 // VerificationToken represents an email verification token record.
 type VerificationToken struct {
-	TokenHash []byte    `gorm:"primaryKey;column:token_hash;type:bytea" json:"-"`
-	UserID    uuid.UUID `gorm:"type:uuid;not null;index:idx_verification_tokens_user_id"`
+	TokenHash []byte    `gorm:"primaryKey;column:token_hash" json:"-"`
+	UserID    uuid.UUID `gorm:"type:varchar(36);not null;index:idx_verification_tokens_user_id"`
 	ExpiresAt time.Time `gorm:"not null"`
 	CreatedAt time.Time
 }
@@ -82,8 +99,8 @@ func (v VerificationToken) LogValue() slog.Value {
 
 // PasswordResetToken represents a single-use password reset token record.
 type PasswordResetToken struct {
-	TokenHash []byte    `gorm:"primaryKey;column:token_hash;type:bytea" json:"-"`
-	UserID    uuid.UUID `gorm:"type:uuid;not null;index:idx_password_reset_tokens_user_id"`
+	TokenHash []byte    `gorm:"primaryKey;column:token_hash" json:"-"`
+	UserID    uuid.UUID `gorm:"type:varchar(36);not null;index:idx_password_reset_tokens_user_id"`
 	ExpiresAt time.Time `gorm:"not null"`
 	CreatedAt time.Time
 }
@@ -106,13 +123,21 @@ func (p PasswordResetToken) LogValue() slog.Value {
 // uq_oauth_accounts_provider_uid composite constraint (migration 000007),
 // not by the single-column indexes below.
 type OAuthAccount struct {
-	ID             uuid.UUID `gorm:"primaryKey;type:uuid;default:uuid_generate_v4()"`
-	UserID         uuid.UUID `gorm:"type:uuid;not null;index"`
+	ID             uuid.UUID `gorm:"primaryKey;type:varchar(36)"`
+	UserID         uuid.UUID `gorm:"type:varchar(36);not null;index"`
 	ProviderID     string    `gorm:"type:varchar(32);not null"`
 	ProviderUserID string    `gorm:"type:varchar(255);not null"`
 	Email          string    `gorm:"type:varchar(255);not null;index"`
 	CreatedAt      time.Time
 	UpdatedAt      time.Time
+}
+
+// BeforeCreate hook generates a new UUID if none is set.
+func (o *OAuthAccount) BeforeCreate(tx *gorm.DB) error {
+	if o.ID == uuid.Nil {
+		o.ID = uuid.New()
+	}
+	return nil
 }
 
 // TableName returns the table name for OAuthAccount.
@@ -133,13 +158,21 @@ func (o OAuthAccount) LogValue() slog.Value {
 
 // TotpSecret represents an enrolled TOTP two-factor configuration for a user.
 type TotpSecret struct {
-	ID              uuid.UUID `gorm:"primaryKey;type:uuid;default:uuid_generate_v4()"`
-	UserID          uuid.UUID `gorm:"type:uuid;not null;uniqueIndex:uq_totp_secrets_user_id"`
-	EncryptedSecret []byte    `gorm:"type:bytea;not null" json:"-"`
-	BackupCodes     []byte    `gorm:"type:jsonb;not null;default:'[]'" json:"-"`
+	ID              uuid.UUID `gorm:"primaryKey;type:varchar(36)"`
+	UserID          uuid.UUID `gorm:"type:varchar(36);not null;uniqueIndex:uq_totp_secrets_user_id"`
+	EncryptedSecret []byte    `gorm:"not null" json:"-"`
+	BackupCodes     []byte    `gorm:"not null;default:'[]'" json:"-"`
 	Enabled         bool      `gorm:"not null;default:false"`
 	CreatedAt       time.Time
 	UpdatedAt       time.Time
+}
+
+// BeforeCreate hook generates a new UUID if none is set.
+func (t *TotpSecret) BeforeCreate(tx *gorm.DB) error {
+	if t.ID == uuid.Nil {
+		t.ID = uuid.New()
+	}
+	return nil
 }
 
 // TableName returns the table name for TotpSecret.
@@ -160,10 +193,18 @@ func (t TotpSecret) LogValue() slog.Value {
 
 // TotpUsedCode tracks consumed TOTP verification codes to enforce single-use replay protection.
 type TotpUsedCode struct {
-	ID       uuid.UUID `gorm:"primaryKey;type:uuid;default:uuid_generate_v4()"`
-	UserID   uuid.UUID `gorm:"type:uuid;not null;uniqueIndex:uq_totp_used_codes_user_code,composite:user_code"`
-	CodeHash []byte    `gorm:"type:bytea;not null;uniqueIndex:uq_totp_used_codes_user_code,composite:user_code" json:"-"`
+	ID       uuid.UUID `gorm:"primaryKey;type:varchar(36)"`
+	UserID   uuid.UUID `gorm:"type:varchar(36);not null;uniqueIndex:uq_totp_used_codes_user_code,composite:user_code"`
+	CodeHash []byte    `gorm:"not null;uniqueIndex:uq_totp_used_codes_user_code,composite:user_code" json:"-"`
 	UsedAt   time.Time `gorm:"not null;index:idx_totp_used_codes_user_used_at"`
+}
+
+// BeforeCreate hook generates a new UUID if none is set.
+func (c *TotpUsedCode) BeforeCreate(tx *gorm.DB) error {
+	if c.ID == uuid.Nil {
+		c.ID = uuid.New()
+	}
+	return nil
 }
 
 // TableName returns the table name for TotpUsedCode.
@@ -182,11 +223,19 @@ func (c TotpUsedCode) LogValue() slog.Value {
 // TwoFactorToken represents an ephemeral challenge token issued pending 2FA completion.
 // INVARIANT: Soft deletes are strictly banned on security tokens; hard delete only.
 type TwoFactorToken struct {
-	ID        uuid.UUID `gorm:"primaryKey;type:uuid;default:uuid_generate_v4()"`
-	UserID    uuid.UUID `gorm:"type:uuid;not null;index:idx_two_factor_tokens_user_id"`
-	TokenHash []byte    `gorm:"type:bytea;uniqueIndex:uq_two_factor_tokens_token_hash;not null" json:"-"`
+	ID        uuid.UUID `gorm:"primaryKey;type:varchar(36)"`
+	UserID    uuid.UUID `gorm:"type:varchar(36);not null;index:idx_two_factor_tokens_user_id"`
+	TokenHash []byte    `gorm:"uniqueIndex:uq_two_factor_tokens_token_hash;not null" json:"-"`
 	ExpiresAt time.Time `gorm:"not null;index:idx_two_factor_tokens_expires_at"`
 	Attempts  int       `gorm:"not null;default:0"`
+}
+
+// BeforeCreate hook generates a new UUID if none is set.
+func (t *TwoFactorToken) BeforeCreate(tx *gorm.DB) error {
+	if t.ID == uuid.Nil {
+		t.ID = uuid.New()
+	}
+	return nil
 }
 
 // TableName returns the table name for TwoFactorToken.
