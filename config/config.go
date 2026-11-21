@@ -164,11 +164,12 @@ type MySQLConfig struct {
 
 // MongoDBConfig holds dialect-specific settings for MongoDB connections.
 type MongoDBConfig struct {
-	Database               string
-	DatabaseName           string
-	ConnectTimeout         time.Duration
-	ServerSelectionTimeout time.Duration
-	MaxConnIdleTime        time.Duration
+	Database                   string
+	DatabaseName               string
+	ConnectTimeout             time.Duration
+	ServerSelectionTimeout     time.Duration
+	MaxConnIdleTime            time.Duration
+	AllowNonTransactionalMongo bool
 }
 
 // MongoConfig is an alias for MongoDBConfig for backward compatibility.
@@ -440,6 +441,9 @@ func (c *Config) Validate() error {
 		}
 		if c.MongoDB.MaxConnIdleTime == 0 && c.Mongo.MaxConnIdleTime != 0 {
 			c.MongoDB.MaxConnIdleTime = c.Mongo.MaxConnIdleTime
+		}
+		if !c.MongoDB.AllowNonTransactionalMongo && c.Mongo.AllowNonTransactionalMongo {
+			c.MongoDB.AllowNonTransactionalMongo = true
 		}
 
 		if c.MongoDB.ConnectTimeout == 0 {

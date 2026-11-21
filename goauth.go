@@ -18,6 +18,7 @@ import (
 	"github.com/kaiizer777/go-auth/csrf"
 	"github.com/kaiizer777/go-auth/db"
 	gormstore "github.com/kaiizer777/go-auth/db/gorm"
+	mongostore "github.com/kaiizer777/go-auth/db/mongo"
 	"github.com/kaiizer777/go-auth/email"
 	"github.com/kaiizer777/go-auth/errors"
 	"github.com/kaiizer777/go-auth/handler"
@@ -64,7 +65,12 @@ type Auth struct {
 	closeOnce       sync.Once
 }
 
-var dbConnectFn = db.Connect
+var (
+	dbConnectFn    = db.Connect
+	mongoConnectFn = func(cfg config.Config) (db.Store, error) {
+		return mongostore.Connect(cfg)
+	}
+)
 
 // NewWithStore initializes Auth using an existing db.Store.
 func NewWithStore(store db.Store, cfg config.Config) (*Auth, error) {
@@ -237,7 +243,11 @@ func New(cfg config.Config) (*Auth, error) {
 		}
 		return a, nil
 	case config.DatabaseTypeMongo, "mongo":
-		return nil, errors.Wrap(errors.ErrDatabaseAdapterFailed, errors.CodeDatabaseAdapterFailed, "mongodb adapter not yet implemented")
+		store, err := mongoConnectFn(cfg)
+		if err != nil {
+			return nil, errors.Wrap(err, errors.CodeDatabaseError, "goauth: failed to connect to mongodb")
+		}
+		return NewWithStore(store, cfg)
 	default:
 		return nil, errors.Wrap(errors.ErrDatabaseUnsupported, errors.CodeDatabaseUnsupported, "unsupported database type: "+string(cfg.DatabaseType))
 	}
