@@ -13,6 +13,7 @@ import (
 
 	"github.com/google/uuid"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 
 	"github.com/kaiizer777/go-auth/config"
 	"github.com/kaiizer777/go-auth/crypto"
@@ -51,6 +52,15 @@ type Service interface {
 	ConsumeChallengeToken(ctx context.Context, rawToken string) (*db.User, error)
 	DisableTOTP(ctx context.Context, userID, password, code string) error
 	Status(ctx context.Context, userID string) (bool, error)
+
+	// UUID-friendly helper methods
+	IsTotpEnabled(ctx context.Context, userID uuid.UUID) (bool, error)
+	EnrollTotp(ctx context.Context, userID uuid.UUID) (*EnrollmentResponse, error)
+	VerifyTotp(ctx context.Context, userID uuid.UUID, code string) error
+	GenerateTwoFactorToken(ctx context.Context, userID uuid.UUID) (string, error)
+	ValidateTwoFactorToken(ctx context.Context, rawToken string) (uuid.UUID, error)
+	ConsumeTwoFactorToken(ctx context.Context, rawToken string) error
+	DisableTotp(ctx context.Context, userID uuid.UUID, password, code string) error
 }
 
 // TotpService is an exported alias for Service to support alternate naming conventions.
@@ -199,6 +209,12 @@ func (s *totpService) Enroll(ctx context.Context, userID string) (*EnrollmentRes
 
 // ConfirmEnrollment verifies the initial code, enables TOTP, and returns 10 backup codes.
 func (s *totpService) ConfirmEnrollment(ctx context.Context, userID, code string) ([]string, error) {
+	if userID != "" && s.limiter != nil {
+		if !s.limiter.Allow(ratelimit.TOTPUserKey(userID)) {
+			return nil, apperrors.ErrTOTPRateLimitExceeded
+		}
+	}
+
 	uid, err := s.parseUUID(userID)
 	if err != nil {
 		return nil, err
@@ -285,6 +301,10 @@ func (s *totpService) ConfirmEnrollment(ctx context.Context, userID, code string
 	})
 	if err != nil {
 		return nil, err
+	}
+
+	if s.limiter != nil && userID != "" {
+		s.limiter.Reset(ratelimit.TOTPUserKey(userID))
 	}
 
 	s.logger.InfoContext(ctx, "totp enrollment confirmed", slog.String("event", "totp_confirmed"), slog.String("user_id", uid.String()))
@@ -379,33 +399,53 @@ func (s *totpService) RecordTokenAttempt(ctx context.Context, rawToken string) (
 
 	tokenHash := sha256.Sum256([]byte(rawToken))
 
-	var token db.TwoFactorToken
-	err := s.db.WithContext(ctx).Where("token_hash = ?", tokenHash[:]).First(&token).Error
-	if err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return 0, apperrors.ErrTwoFactorTokenInvalid
+	var (
+		newAttempts int
+		resErr      error
+	)
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var token db.TwoFactorToken
+		query := tx
+		if tx.Dialector != nil && !strings.Contains(strings.ToLower(tx.Dialector.Name()), "sqlite") {
+			query = query.Clauses(clause.Locking{Strength: "UPDATE"})
 		}
+		if err := query.Where("token_hash = ?", tokenHash[:]).First(&token).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				resErr = apperrors.ErrTwoFactorTokenInvalid
+				return nil
+			}
+			return err
+		}
+
+		if time.Now().After(token.ExpiresAt) {
+			if err := tx.Where("id = ?", token.ID).Delete(&db.TwoFactorToken{}).Error; err != nil {
+				return err
+			}
+			resErr = apperrors.ErrTwoFactorTokenExpired
+			return nil
+		}
+
+		maxAttempts := s.cfg.MaxAttemptsPerWindow
+		if maxAttempts <= 0 {
+			maxAttempts = 5
+		}
+
+		newAttempts = token.Attempts + 1
+		if newAttempts >= maxAttempts {
+			if err := tx.Where("id = ?", token.ID).Delete(&db.TwoFactorToken{}).Error; err != nil {
+				return err
+			}
+			resErr = apperrors.ErrTwoFactorMaxAttemptsExceeded
+			return nil
+		}
+
+		return tx.Model(&db.TwoFactorToken{}).Where("id = ?", token.ID).Update("attempts", gorm.Expr("attempts + 1")).Error
+	})
+	if err != nil {
 		return 0, err
 	}
-
-	if time.Now().After(token.ExpiresAt) {
-		s.db.WithContext(ctx).Where("id = ?", token.ID).Delete(&db.TwoFactorToken{})
-		return 0, apperrors.ErrTwoFactorTokenExpired
-	}
-
-	newAttempts := token.Attempts + 1
-	maxAttempts := s.cfg.MaxAttemptsPerWindow
-	if maxAttempts <= 0 {
-		maxAttempts = 5
-	}
-
-	if newAttempts >= maxAttempts {
-		s.db.WithContext(ctx).Where("id = ?", token.ID).Delete(&db.TwoFactorToken{})
-		return newAttempts, apperrors.ErrTwoFactorMaxAttemptsExceeded
-	}
-
-	if err := s.db.WithContext(ctx).Model(&db.TwoFactorToken{}).Where("id = ?", token.ID).Update("attempts", newAttempts).Error; err != nil {
-		return 0, err
+	if resErr != nil {
+		return newAttempts, resErr
 	}
 
 	return newAttempts, nil
@@ -524,8 +564,12 @@ func (s *totpService) ConsumeChallengeToken(ctx context.Context, rawToken string
 		return nil, apperrors.ErrTwoFactorTokenExpired
 	}
 
-	if err := s.db.WithContext(ctx).Where("id = ?", token.ID).Delete(&db.TwoFactorToken{}).Error; err != nil {
-		return nil, err
+	res := s.db.WithContext(ctx).Where("id = ?", token.ID).Delete(&db.TwoFactorToken{})
+	if res.Error != nil {
+		return nil, res.Error
+	}
+	if res.RowsAffected != 1 {
+		return nil, apperrors.ErrTwoFactorTokenInvalid
 	}
 
 	var user db.User
@@ -557,30 +601,43 @@ func (s *totpService) VerifyBackupCode(ctx context.Context, userID, backupCode, 
 		return err
 	}
 
-	var secretRecord db.TotpSecret
-	err = s.db.WithContext(ctx).Where("user_id = ? AND enabled = true", uid).First(&secretRecord).Error
-	if err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return apperrors.ErrTOTPNotEnrolled
-		}
-		return err
-	}
-
 	trimmedCode := strings.TrimSpace(backupCode)
-	updatedJSON, matched, err := VerifyAndConsumeBackupCode(secretRecord.BackupCodes, trimmedCode)
-	if err != nil || !matched {
+	if trimmedCode == "" {
 		return apperrors.ErrBackupCodeInvalid
 	}
 
-	res := s.db.WithContext(ctx).Model(&db.TotpSecret{}).Where("id = ? AND enabled = true", secretRecord.ID).Updates(map[string]interface{}{
-		"backup_codes": updatedJSON,
-		"updated_at":   time.Now(),
+	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var secretRecord db.TotpSecret
+		query := tx
+		if tx.Dialector != nil && !strings.Contains(strings.ToLower(tx.Dialector.Name()), "sqlite") {
+			query = query.Clauses(clause.Locking{Strength: "UPDATE"})
+		}
+		if err := query.Where("user_id = ? AND enabled = true", uid).First(&secretRecord).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return apperrors.ErrTOTPNotEnrolled
+			}
+			return err
+		}
+
+		updatedJSON, matched, err := VerifyAndConsumeBackupCode(secretRecord.BackupCodes, trimmedCode)
+		if err != nil || !matched {
+			return apperrors.ErrBackupCodeInvalid
+		}
+
+		res := tx.Model(&db.TotpSecret{}).Where("id = ? AND enabled = true", secretRecord.ID).Updates(map[string]interface{}{
+			"backup_codes": updatedJSON,
+			"updated_at":   time.Now(),
+		})
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected == 0 {
+			return apperrors.ErrTOTPNotEnrolled
+		}
+		return nil
 	})
-	if res.Error != nil {
-		return res.Error
-	}
-	if res.RowsAffected == 0 {
-		return apperrors.ErrTOTPNotEnrolled
+	if err != nil {
+		return err
 	}
 
 	if s.limiter != nil {
@@ -636,6 +693,8 @@ func (s *totpService) DisableTOTP(ctx context.Context, userID, password, code st
 		}
 	}
 
+	var codeUsed bool
+	var codeHash []byte
 	if !authed && trimmedCode != "" {
 		crypt, err := s.getCrypto()
 		if err == nil {
@@ -643,7 +702,18 @@ func (s *totpService) DisableTOTP(ctx context.Context, userID, password, code st
 			if err == nil {
 				valid, err := ValidateCode(trimmedCode, string(rawSecretBytes))
 				if err == nil && valid {
+					codeHash = CodeHash(trimmedCode, uid.String())
+					var usedCount int64
+					cutoff := time.Now().Add(-90 * time.Second)
+					err = s.db.WithContext(ctx).Model(&db.TotpUsedCode{}).Where("user_id = ? AND code_hash = ? AND used_at > ?", uid, codeHash, cutoff).Count(&usedCount).Error
+					if err != nil {
+						return err
+					}
+					if usedCount > 0 {
+						return apperrors.ErrTOTPCodeReplayed
+					}
 					authed = true
+					codeUsed = true
 				}
 			}
 		}
@@ -657,8 +727,20 @@ func (s *totpService) DisableTOTP(ctx context.Context, userID, password, code st
 		if err := tx.Where("user_id = ?", uid).Delete(&db.TotpSecret{}).Error; err != nil {
 			return err
 		}
-		if err := tx.Where("user_id = ?", uid).Delete(&db.TotpUsedCode{}).Error; err != nil {
+		cutoff := time.Now().Add(-90 * time.Second)
+		if err := tx.Where("user_id = ? AND used_at < ?", uid, cutoff).Delete(&db.TotpUsedCode{}).Error; err != nil {
 			return err
+		}
+		if codeUsed {
+			usedRecord := db.TotpUsedCode{
+				ID:       uuid.New(),
+				UserID:   uid,
+				CodeHash: codeHash,
+				UsedAt:   time.Now(),
+			}
+			if err := tx.Create(&usedRecord).Error; err != nil {
+				return apperrors.ErrTOTPCodeReplayed
+			}
 		}
 		if err := tx.Where("user_id = ?", uid).Delete(&db.TwoFactorToken{}).Error; err != nil {
 			return err

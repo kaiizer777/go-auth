@@ -85,6 +85,16 @@ func (h *Handler) HandleTotpConfirm(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	ip := realIP(r)
+	if h.totpLimiter != nil {
+		ipKey := ratelimit.TOTPIPKey(ip)
+		if !h.totpLimiter.Allow(ipKey) {
+			slog.WarnContext(r.Context(), "rate_limit_exceeded", "ip", ip, "endpoint", r.URL.Path)
+			ratelimit.WriteRateLimitError(w, h.totpLimiter.RetryAfter(ipKey))
+			return
+		}
+	}
+
 	req, ok := decodeJSON[totpConfirmRequest](w, r)
 	if !ok {
 		return
@@ -102,9 +112,13 @@ func (h *Handler) HandleTotpConfirm(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if h.totpLimiter != nil {
+		h.totpLimiter.Reset(ratelimit.TOTPIPKey(ip))
+	}
+
 	slog.InfoContext(r.Context(), "totp_confirmed",
 		"user_id", userID.String(),
-		"ip", realIP(r),
+		"ip", ip,
 	)
 
 	writeJSON(w, http.StatusOK, map[string]any{

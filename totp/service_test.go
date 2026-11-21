@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -28,6 +30,12 @@ func setupTestDB(t *testing.T) *gorm.DB {
 	if err != nil {
 		t.Fatalf("failed to open in-memory sqlite db: %v", err)
 	}
+
+	sqlDB, err := database.DB()
+	if err != nil {
+		t.Fatalf("pool: %v", err)
+	}
+	sqlDB.SetMaxOpenConns(1)
 
 	ddl := `
 	CREATE TABLE IF NOT EXISTS users (
@@ -677,8 +685,10 @@ func TestDisableTOTP_WithCode(t *testing.T) {
 		t.Fatalf("ConfirmEnrollment failed: %v", err)
 	}
 
-	// Generate fresh code for disabling
-	freshCode, err := ptotp.GenerateCode(resp.Secret, time.Now().UTC())
+	// Generate fresh code for disabling in next time window (+1 step, within skew=1)
+	now := time.Now().UTC()
+	nextStepTime := time.Unix((now.Unix()/30+1)*30+5, 0).UTC()
+	freshCode, err := ptotp.GenerateCode(resp.Secret, nextStepTime)
 	if err != nil {
 		t.Fatalf("GenerateCode failed: %v", err)
 	}
@@ -738,7 +748,9 @@ func TestDisableTOTP_BothCredentialsValid(t *testing.T) {
 	}
 
 	// Disable with both valid password AND valid fresh code
-	freshCode, err := ptotp.GenerateCode(resp.Secret, time.Now().UTC())
+	now := time.Now().UTC()
+	nextStepTime := time.Unix((now.Unix()/30+1)*30+5, 0).UTC()
+	freshCode, err := ptotp.GenerateCode(resp.Secret, nextStepTime)
 	if err != nil {
 		t.Fatalf("GenerateCode failed: %v", err)
 	}
@@ -805,16 +817,15 @@ func TestHelperAliases(t *testing.T) {
 	}
 
 	svc := NewService(database, config.TOTPConfig{EncryptionKey: validTestHexKey()}, nil, nil)
-	concrete := svc.(*totpService)
 
-	// IsTotpEnabled alias
-	enabled, err := concrete.IsTotpEnabled(context.Background(), user.ID)
+	// IsTotpEnabled alias (verified on Service interface directly)
+	enabled, err := svc.IsTotpEnabled(context.Background(), user.ID)
 	if err != nil || enabled {
 		t.Fatalf("expected enabled=false, got %v, err=%v", enabled, err)
 	}
 
 	// EnrollTotp alias
-	resp, err := concrete.EnrollTotp(context.Background(), user.ID)
+	resp, err := svc.EnrollTotp(context.Background(), user.ID)
 	if err != nil {
 		t.Fatalf("EnrollTotp failed: %v", err)
 	}
@@ -831,30 +842,253 @@ func TestHelperAliases(t *testing.T) {
 	if driftCode == code {
 		driftCode, _ = ptotp.GenerateCode(resp.Secret, time.Now().UTC().Add(30*time.Second))
 	}
-	err = concrete.VerifyTotp(context.Background(), user.ID, driftCode)
+	err = svc.VerifyTotp(context.Background(), user.ID, driftCode)
 	if err != nil {
 		t.Fatalf("VerifyTotp alias failed: %v", err)
 	}
 
 	// GenerateTwoFactorToken & ValidateTwoFactorToken aliases
-	rawToken, err := concrete.GenerateTwoFactorToken(context.Background(), user.ID)
+	rawToken, err := svc.GenerateTwoFactorToken(context.Background(), user.ID)
 	if err != nil {
 		t.Fatalf("GenerateTwoFactorToken failed: %v", err)
 	}
-	valUID, err := concrete.ValidateTwoFactorToken(context.Background(), rawToken)
+	valUID, err := svc.ValidateTwoFactorToken(context.Background(), rawToken)
 	if err != nil || valUID != user.ID {
 		t.Fatalf("ValidateTwoFactorToken failed: valUID=%s, err=%v", valUID, err)
 	}
 
 	// ConsumeTwoFactorToken alias
-	err = concrete.ConsumeTwoFactorToken(context.Background(), rawToken)
+	err = svc.ConsumeTwoFactorToken(context.Background(), rawToken)
 	if err != nil {
 		t.Fatalf("ConsumeTwoFactorToken failed: %v", err)
 	}
 
 	// DisableTotp alias
-	err = concrete.DisableTotp(context.Background(), user.ID, plainPassword, "")
+	err = svc.DisableTotp(context.Background(), user.ID, plainPassword, "")
 	if err != nil {
 		t.Fatalf("DisableTotp alias failed: %v", err)
+	}
+}
+
+func TestVerifyBackupCode_ConcurrentRedemption(t *testing.T) {
+	t.Parallel()
+
+	database := setupTestDB(t)
+	user := createTestUser(t, database, "backup_concurrency@example.com", true)
+	svc := NewService(database, config.TOTPConfig{EncryptionKey: validTestHexKey()}, nil, nil)
+
+	resp, err := svc.Enroll(context.Background(), user.ID.String())
+	if err != nil {
+		t.Fatalf("Enroll failed: %v", err)
+	}
+	code, err := ptotp.GenerateCode(resp.Secret, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("GenerateCode failed: %v", err)
+	}
+	backupCodes, err := svc.ConfirmEnrollment(context.Background(), user.ID.String(), code)
+	if err != nil || len(backupCodes) != 10 {
+		t.Fatalf("ConfirmEnrollment failed: %v", err)
+	}
+
+	targetCode := backupCodes[0]
+	const concurrency = 10
+	var (
+		wg           sync.WaitGroup
+		successCount atomic.Int32
+		failCount    atomic.Int32
+	)
+
+	wg.Add(concurrency)
+	for i := 0; i < concurrency; i++ {
+		go func() {
+			defer wg.Done()
+			err := svc.VerifyBackupCode(context.Background(), user.ID.String(), targetCode, "127.0.0.1")
+			if err == nil {
+				successCount.Add(1)
+			} else if errors.Is(err, apperrors.ErrBackupCodeInvalid) {
+				failCount.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if successCount.Load() != 1 {
+		t.Fatalf("expected exactly 1 successful redemption, got %d", successCount.Load())
+	}
+	if failCount.Load() != concurrency-1 {
+		t.Fatalf("expected %d failed redemptions, got %d", concurrency-1, failCount.Load())
+	}
+
+	// Subsequent redemption must fail
+	err = svc.VerifyBackupCode(context.Background(), user.ID.String(), targetCode, "127.0.0.1")
+	if !errors.Is(err, apperrors.ErrBackupCodeInvalid) {
+		t.Fatalf("expected ErrBackupCodeInvalid after consumption, got %v", err)
+	}
+}
+
+func TestRecordTokenAttempt_ConcurrentRace(t *testing.T) {
+	t.Parallel()
+
+	database := setupTestDB(t)
+	user := createTestUser(t, database, "token_race@example.com", true)
+	svc := NewService(database, config.TOTPConfig{
+		EncryptionKey:        validTestHexKey(),
+		ChallengeTokenTTL:    5 * time.Minute,
+		MaxAttemptsPerWindow: 5,
+	}, nil, nil)
+
+	rawToken, err := svc.CreateChallengeToken(context.Background(), user.ID.String())
+	if err != nil {
+		t.Fatalf("CreateChallengeToken failed: %v", err)
+	}
+
+	const concurrency = 20
+	var (
+		wg             sync.WaitGroup
+		exhaustedCount atomic.Int32
+		incrementCount atomic.Int32
+		invalidCount   atomic.Int32
+	)
+
+	wg.Add(concurrency)
+	for i := 0; i < concurrency; i++ {
+		go func() {
+			defer wg.Done()
+			_, err := svc.RecordTokenAttempt(context.Background(), rawToken)
+			if err == nil {
+				incrementCount.Add(1)
+			} else if errors.Is(err, apperrors.ErrTwoFactorMaxAttemptsExceeded) {
+				exhaustedCount.Add(1)
+			} else if errors.Is(err, apperrors.ErrTwoFactorTokenInvalid) {
+				invalidCount.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if exhaustedCount.Load() == 0 && invalidCount.Load() == 0 {
+		t.Fatalf("expected at least one exhaustion or invalid error, got none")
+	}
+
+	// Token must be hard deleted
+	_, err = svc.ValidateChallengeToken(context.Background(), rawToken)
+	if !errors.Is(err, apperrors.ErrTwoFactorTokenInvalid) {
+		t.Fatalf("expected ErrTwoFactorTokenInvalid after exhaustion, got %v", err)
+	}
+}
+
+func TestConsumeChallengeToken_DoubleSpend(t *testing.T) {
+	t.Parallel()
+
+	database := setupTestDB(t)
+	user := createTestUser(t, database, "consume_race@example.com", true)
+	svc := NewService(database, config.TOTPConfig{EncryptionKey: validTestHexKey()}, nil, nil)
+
+	rawToken, err := svc.CreateChallengeToken(context.Background(), user.ID.String())
+	if err != nil {
+		t.Fatalf("CreateChallengeToken failed: %v", err)
+	}
+
+	const concurrency = 5
+	var (
+		wg           sync.WaitGroup
+		successCount atomic.Int32
+		failCount    atomic.Int32
+	)
+
+	wg.Add(concurrency)
+	for i := 0; i < concurrency; i++ {
+		go func() {
+			defer wg.Done()
+			u, err := svc.ConsumeChallengeToken(context.Background(), rawToken)
+			if err == nil && u != nil && u.ID == user.ID {
+				successCount.Add(1)
+			} else if errors.Is(err, apperrors.ErrTwoFactorTokenInvalid) {
+				failCount.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if successCount.Load() != 1 {
+		t.Fatalf("expected exactly 1 consume success, got %d", successCount.Load())
+	}
+	if failCount.Load() != concurrency-1 {
+		t.Fatalf("expected %d failures, got %d", concurrency-1, failCount.Load())
+	}
+}
+
+func TestDisableTOTP_CodeReplay(t *testing.T) {
+	t.Parallel()
+
+	database := setupTestDB(t)
+	user := createTestUser(t, database, "disable_replay@example.com", true)
+	svc := NewService(database, config.TOTPConfig{EncryptionKey: validTestHexKey()}, nil, nil)
+
+	resp, err := svc.Enroll(context.Background(), user.ID.String())
+	if err != nil {
+		t.Fatalf("Enroll failed: %v", err)
+	}
+	code, _ := ptotp.GenerateCode(resp.Secret, time.Now().UTC())
+	_, err = svc.ConfirmEnrollment(context.Background(), user.ID.String(), code)
+	if err != nil {
+		t.Fatalf("ConfirmEnrollment failed: %v", err)
+	}
+
+	// Code was already used to confirm enrollment -> replaying it in DisableTOTP should fail with ErrTOTPCodeReplayed
+	err = svc.DisableTOTP(context.Background(), user.ID.String(), "", code)
+	if !errors.Is(err, apperrors.ErrTOTPCodeReplayed) {
+		t.Fatalf("expected ErrTOTPCodeReplayed when reusing confirm code in DisableTOTP, got %v", err)
+	}
+
+	// Generate a new code for the next time window (+1 step, within skew=1)
+	now := time.Now().UTC()
+	nextStepTime := time.Unix((now.Unix()/30+1)*30+5, 0).UTC()
+	newCode, _ := ptotp.GenerateCode(resp.Secret, nextStepTime)
+
+	// Disable with valid fresh code
+	err = svc.DisableTOTP(context.Background(), user.ID.String(), "", newCode)
+	if err != nil {
+		t.Fatalf("DisableTOTP failed: %v", err)
+	}
+
+	// Code used to disable TOTP must be recorded in db.TotpUsedCode to eliminate replay window
+	var count int64
+	newCodeHash := CodeHash(newCode, user.ID.String())
+	err = database.Model(&db.TotpUsedCode{}).Where("user_id = ? AND code_hash = ?", user.ID, newCodeHash).Count(&count).Error
+	if err != nil || count != 1 {
+		t.Fatalf("expected used code to be recorded in db.TotpUsedCode, count=%d, err=%v", count, err)
+	}
+}
+
+func TestConfirmEnrollment_RateLimiting(t *testing.T) {
+	t.Parallel()
+
+	database := setupTestDB(t)
+	user := createTestUser(t, database, "ratelimit_confirm@example.com", true)
+	limiter := ratelimit.NewLimiter(time.Minute, 2)
+	svc := NewService(database, config.TOTPConfig{EncryptionKey: validTestHexKey()}, limiter, nil)
+
+	_, err := svc.Enroll(context.Background(), user.ID.String())
+	if err != nil {
+		t.Fatalf("Enroll failed: %v", err)
+	}
+
+	// Attempt 1 with invalid code
+	_, err = svc.ConfirmEnrollment(context.Background(), user.ID.String(), "111111")
+	if !errors.Is(err, apperrors.ErrTOTPCodeInvalid) {
+		t.Fatalf("expected ErrTOTPCodeInvalid on attempt 1, got %v", err)
+	}
+
+	// Attempt 2 with invalid code
+	_, err = svc.ConfirmEnrollment(context.Background(), user.ID.String(), "222222")
+	if !errors.Is(err, apperrors.ErrTOTPCodeInvalid) {
+		t.Fatalf("expected ErrTOTPCodeInvalid on attempt 2, got %v", err)
+	}
+
+	// Attempt 3: Rate limit exceeded
+	_, err = svc.ConfirmEnrollment(context.Background(), user.ID.String(), "333333")
+	if !errors.Is(err, apperrors.ErrTOTPRateLimitExceeded) {
+		t.Fatalf("expected ErrTOTPRateLimitExceeded on attempt 3, got %v", err)
 	}
 }
