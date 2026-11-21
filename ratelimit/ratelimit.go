@@ -76,6 +76,16 @@ func AccountKey(account string) string {
 	return "account:" + account
 }
 
+// TOTPIPKey returns a rate limit key scoped to the client IP address for TOTP endpoints.
+func TOTPIPKey(ip string) string {
+	return "totp:ip:" + ip
+}
+
+// TOTPUserKey returns a rate limit key scoped to the user ID for TOTP verification.
+func TOTPUserKey(userID string) string {
+	return "totp:user:" + userID
+}
+
 // ClientIP extracts the client IP address from r.RemoteAddr, stripping the port
 // and normalizing IPv6 bracket enclosing formats.
 func ClientIP(r *http.Request) string {

@@ -2,9 +2,11 @@ package handler
 
 import (
 	"bytes"
+	"log/slog"
 	"mime"
 	"net/http"
 	"strings"
+	"time"
 
 	"gorm.io/gorm"
 
@@ -15,6 +17,7 @@ import (
 	"github.com/kaiizer777/go-auth/oauth"
 	"github.com/kaiizer777/go-auth/ratelimit"
 	"github.com/kaiizer777/go-auth/session"
+	"github.com/kaiizer777/go-auth/totp"
 )
 
 // Handler maintains the HTTP router, database connection, and configuration.
@@ -34,6 +37,8 @@ type Handler struct {
 	signupIPLimiter *ratelimit.Limiter
 	resetIPLimiter  *ratelimit.Limiter
 	oauthIPLimiter  *ratelimit.Limiter
+	totpSvc         totp.Service
+	totpLimiter     *ratelimit.Limiter
 }
 
 // Option configures optional dependencies for Handler.
@@ -88,6 +93,20 @@ func WithOAuthIPLimiters(oauthIP *ratelimit.Limiter) Option {
 	}
 }
 
+// WithTotpService attaches a TOTP two-factor authentication service to the Handler.
+func WithTotpService(svc totp.Service) Option {
+	return func(h *Handler) {
+		h.totpSvc = svc
+	}
+}
+
+// WithTotpLimiter attaches a custom in-memory rate limiter for TOTP verification.
+func WithTotpLimiter(limiter *ratelimit.Limiter) Option {
+	return func(h *Handler) {
+		h.totpLimiter = limiter
+	}
+}
+
 // New initializes the handler scaffold, registers routes, and applies CORS middleware.
 func New(db *gorm.DB, cfg config.Config, authSvc auth.Service, opts ...Option) http.Handler {
 	h := &Handler{
@@ -113,6 +132,18 @@ func New(db *gorm.DB, cfg config.Config, authSvc auth.Service, opts ...Option) h
 
 	if h.sessHandler == nil && h.sessionSvc != nil {
 		h.sessHandler = NewSessionHandler(h.sessionSvc, db, &cfg)
+	}
+
+	if h.totpLimiter == nil && h.cfg.TOTP.MaxAttemptsPerWindow > 0 {
+		window := h.cfg.TOTP.AttemptWindow
+		if window <= 0 {
+			window = 5 * time.Minute
+		}
+		h.totpLimiter = ratelimit.NewLimiter(window, h.cfg.TOTP.MaxAttemptsPerWindow)
+	}
+
+	if h.totpSvc == nil && db != nil && cfg.TOTP.EncryptionKey != "" {
+		h.totpSvc = totp.NewService(db, cfg.TOTP, h.totpLimiter, slog.Default())
 	}
 
 	h.registerRoutes()
@@ -187,6 +218,7 @@ func (h *Handler) registerRoutes() {
 	if h.authSvc != nil {
 		authH := NewAuthHandler(h.authSvc,
 			WithAuthSessionService(h.sessionSvc),
+			WithAuthTotpService(h.totpSvc),
 			WithAuthConfig(&h.cfg),
 			WithAuthLimiters(h.loginLimiter, h.signupLimiter, h.resetLimiter),
 			WithAuthIPLimiters(h.loginIPLimiter, h.signupIPLimiter, h.resetIPLimiter),
@@ -265,6 +297,42 @@ func (h *Handler) registerRoutes() {
 		h.mux.HandleFunc("GET /api/auth/oauth/{provider}", h.OAuthInitiate)
 		h.mux.HandleFunc("GET /api/auth/oauth/{provider}/callback", h.OAuthCallback)
 		h.mux.HandleFunc("POST /api/auth/oauth/{provider}/callback", h.OAuthCallback)
+	}
+
+	if h.totpSvc != nil {
+		authMw := RequireAuth(h.sessionSvc, &h.cfg)
+		csrfMw := csrf.Middleware(&h.cfg)
+		preAuthCsrfMw := csrf.PreAuthMiddleware(&h.cfg)
+
+		authedWrap := func(hf http.HandlerFunc) http.Handler {
+			return csrfMw(authMw(hf))
+		}
+		preAuthWrap := func(hf http.HandlerFunc) http.Handler {
+			return preAuthCsrfMw(hf)
+		}
+
+		// Authenticated endpoints
+		h.mux.Handle("POST /auth/totp/enroll", authedWrap(h.HandleTotpEnroll))
+		h.mux.Handle("POST /auth/totp/confirm", authedWrap(h.HandleTotpConfirm))
+		h.mux.Handle("POST /auth/totp/disable", authedWrap(h.HandleTotpDisable))
+		h.mux.Handle("DELETE /auth/totp", authedWrap(h.HandleTotpDisable))
+		h.mux.Handle("GET /auth/totp/status", authedWrap(h.HandleTotpStatus))
+
+		// Pre-auth challenge endpoints
+		h.mux.Handle("POST /auth/totp/verify", preAuthWrap(h.HandleTotpVerify))
+		h.mux.Handle("POST /auth/totp/backup", preAuthWrap(h.HandleTotpBackup))
+		h.mux.Handle("POST /auth/totp/backup-code", preAuthWrap(h.HandleTotpBackup))
+
+		// Aliases
+		h.mux.Handle("POST /api/auth/totp/enroll", authedWrap(h.HandleTotpEnroll))
+		h.mux.Handle("POST /api/auth/totp/confirm", authedWrap(h.HandleTotpConfirm))
+		h.mux.Handle("POST /api/auth/totp/disable", authedWrap(h.HandleTotpDisable))
+		h.mux.Handle("DELETE /api/auth/totp", authedWrap(h.HandleTotpDisable))
+		h.mux.Handle("GET /api/auth/totp/status", authedWrap(h.HandleTotpStatus))
+
+		h.mux.Handle("POST /api/auth/totp/verify", preAuthWrap(h.HandleTotpVerify))
+		h.mux.Handle("POST /api/auth/totp/backup", preAuthWrap(h.HandleTotpBackup))
+		h.mux.Handle("POST /api/auth/totp/backup-code", preAuthWrap(h.HandleTotpBackup))
 	}
 }
 

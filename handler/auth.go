@@ -5,6 +5,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"time"
 
 	"github.com/kaiizer777/go-auth/auth"
 	"github.com/kaiizer777/go-auth/config"
@@ -13,12 +14,14 @@ import (
 	"github.com/kaiizer777/go-auth/errors"
 	"github.com/kaiizer777/go-auth/ratelimit"
 	"github.com/kaiizer777/go-auth/session"
+	"github.com/kaiizer777/go-auth/totp"
 )
 
 // AuthHandler handles HTTP requests for user authentication and lifecycle operations.
 type AuthHandler struct {
 	svc             auth.Service
 	sessionSvc      session.Service
+	totpSvc         totp.Service
 	cfg             *config.Config
 	loginLimiter    *ratelimit.Limiter
 	loginIPLimiter  *ratelimit.Limiter
@@ -30,6 +33,13 @@ type AuthHandler struct {
 
 // AuthOption configures optional dependencies for AuthHandler.
 type AuthOption func(*AuthHandler)
+
+// WithAuthTotpService configures the TOTP service for AuthHandler.
+func WithAuthTotpService(svc totp.Service) AuthOption {
+	return func(h *AuthHandler) {
+		h.totpSvc = svc
+	}
+}
 
 // WithAuthSessionService configures the session service for AuthHandler.
 func WithAuthSessionService(sessionSvc session.Service) AuthOption {
@@ -213,6 +223,37 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 
 	if h.loginLimiter != nil {
 		h.loginLimiter.Reset(accountKey)
+	}
+
+	if h.totpSvc != nil {
+		enabled, err := h.totpSvc.Status(r.Context(), user.ID.String())
+		if err != nil {
+			errors.WriteJSON(w, err)
+			return
+		}
+		if enabled {
+			challengeToken, err := h.totpSvc.CreateChallengeToken(r.Context(), user.ID.String())
+			if err != nil {
+				errors.WriteJSON(w, err)
+				return
+			}
+			slog.InfoContext(r.Context(), "two_factor_challenge_issued",
+				"user_id", user.ID.String(),
+				"ip", ip,
+			)
+			ttlSeconds := 300
+			if h.cfg != nil && h.cfg.TOTP.ChallengeTokenTTL > 0 {
+				ttlSeconds = int(h.cfg.TOTP.ChallengeTokenTTL / time.Second)
+			}
+			w.Header().Set("Cache-Control", "no-store, private")
+			w.Header().Set("Pragma", "no-cache")
+			writeJSON(w, http.StatusOK, map[string]any{
+				"two_factor_required": true,
+				"challenge_token":     challengeToken,
+				"expires_in":          ttlSeconds,
+			})
+			return
+		}
 	}
 
 	if h.sessionSvc != nil {

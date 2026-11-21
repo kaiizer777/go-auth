@@ -101,7 +101,7 @@ func TestMigrations_Lifecycle(t *testing.T) {
 	}
 
 	// Clean tables before downing all migrations to ensure no non-zero credential_version rows block 000006 down
-	_, _ = sqlDB.Exec("TRUNCATE TABLE sessions, verification_tokens, password_reset_tokens, users CASCADE")
+	_, _ = sqlDB.Exec("TRUNCATE TABLE sessions, verification_tokens, password_reset_tokens, oauth_accounts, totp_secrets, totp_used_codes, two_factor_tokens, users CASCADE")
 
 	// 4. Down all migrations cleanly
 	if err := m.Down(); err != nil {
@@ -113,7 +113,7 @@ func TestMigrations_Lifecycle(t *testing.T) {
 	err = sqlDB.QueryRow(`
 		SELECT COUNT(*) FROM information_schema.tables 
 		WHERE table_schema = 'public' 
-		  AND table_name IN ('users', 'sessions', 'verification_tokens', 'password_reset_tokens')
+		  AND table_name IN ('users', 'sessions', 'verification_tokens', 'password_reset_tokens', 'oauth_accounts', 'totp_secrets', 'totp_used_codes', 'two_factor_tokens')
 	`).Scan(&tableCount)
 	if err != nil {
 		t.Fatalf("querying tables failed: %v", err)
@@ -130,13 +130,13 @@ func TestMigrations_Lifecycle(t *testing.T) {
 	err = sqlDB.QueryRow(`
 		SELECT COUNT(*) FROM information_schema.tables 
 		WHERE table_schema = 'public' 
-		  AND table_name IN ('users', 'sessions', 'verification_tokens', 'password_reset_tokens')
+		  AND table_name IN ('users', 'sessions', 'verification_tokens', 'password_reset_tokens', 'oauth_accounts', 'totp_secrets', 'totp_used_codes', 'two_factor_tokens')
 	`).Scan(&tableCount)
 	if err != nil {
 		t.Fatalf("querying tables failed: %v", err)
 	}
-	if tableCount != 4 {
-		t.Fatalf("expected 4 application tables after re-Up, found %d", tableCount)
+	if tableCount != 8 {
+		t.Fatalf("expected 8 application tables after re-Up, found %d", tableCount)
 	}
 }
 
@@ -167,8 +167,8 @@ func TestMigrations_DownRefusedOnSeededDB(t *testing.T) {
 		_ = sqlDB.Close()
 	}()
 
-	if err := m.Up(); err != nil && err != migrate.ErrNoChange {
-		t.Fatalf("m.Up() failed: %v", err)
+	if err := m.Migrate(7); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("m.Migrate(7) failed: %v", err)
 	}
 
 	if _, err := sqlDB.Exec(`INSERT INTO users (email, password_hash, credential_version) VALUES ('down-refusal@example.com', 'hash', 1)`); err != nil {
@@ -245,7 +245,175 @@ func TestMigrations_DownRefusedOnSeededDB(t *testing.T) {
 	if _, err := sqlDB2.Exec(`DELETE FROM users WHERE email = 'down-rollback@example.com'`); err != nil {
 		t.Fatalf("failed to remove seed row: %v", err)
 	}
-	if verr, ddirty, verr2 := m2.Version(); verr2 != nil || verr != 7 || ddirty {
-		t.Fatalf("expected version 7 clean after re-up, got version=%d dirty=%v err=%v", verr, ddirty, verr2)
+	if verr, ddirty, verr2 := m2.Version(); verr2 != nil || verr != 8 || ddirty {
+		t.Fatalf("expected version 8 clean after re-up, got version=%d dirty=%v err=%v", verr, ddirty, verr2)
+	}
+}
+
+func TestMigration000008_UpAndDown(t *testing.T) {
+	dbURL := resolveDatabaseURL()
+	testDB, err := sql.Open("pgx", dbURL)
+	if err != nil {
+		if os.Getenv("CI") != "" {
+			t.Fatalf("CI: failed to open postgres connection: %v", err)
+		}
+		t.Skipf("Postgres not available, skipping: %v", err)
+	}
+	pingCtx, pingCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer pingCancel()
+	if err := testDB.PingContext(pingCtx); err != nil {
+		_ = testDB.Close()
+		if os.Getenv("CI") != "" {
+			t.Fatalf("CI: PostgreSQL connection failed: %v", err)
+		}
+		t.Skipf("Postgres not available, skipping: %v", err)
+	}
+	_ = testDB.Close()
+
+	m, sqlDB := newMigrator(t, dbURL)
+	defer func() {
+		_, _ = m.Close()
+		_ = sqlDB.Close()
+	}()
+
+	// Ensure migrated to latest (000008)
+	if err := m.Up(); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("m.Up() failed: %v", err)
+	}
+
+	// 1. Verify tables exist
+	for _, table := range []string{"totp_secrets", "totp_used_codes", "two_factor_tokens"} {
+		var exists bool
+		err := sqlDB.QueryRow(`
+			SELECT EXISTS (
+				SELECT 1 FROM information_schema.tables 
+				WHERE table_schema = 'public' AND table_name = $1
+			)
+		`, table).Scan(&exists)
+		if err != nil || !exists {
+			t.Fatalf("table %s does not exist after 000008 up: %v", table, err)
+		}
+	}
+
+	// 2. Verify unique constraints
+	for _, constraint := range []string{"uq_totp_secrets_user_id", "uq_totp_used_codes_user_code", "uq_two_factor_tokens_token_hash"} {
+		var exists bool
+		err := sqlDB.QueryRow(`
+			SELECT EXISTS (
+				SELECT 1 FROM information_schema.table_constraints 
+				WHERE constraint_name = $1
+			)
+		`, constraint).Scan(&exists)
+		if err != nil || !exists {
+			t.Fatalf("unique constraint %s missing: %v", constraint, err)
+		}
+	}
+
+	// 3. Verify two_factor_tokens schema invariants (attempts exists, deleted_at absent)
+	var hasAttempts, hasDeletedAt bool
+	err = sqlDB.QueryRow(`
+		SELECT 
+			EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'two_factor_tokens' AND column_name = 'attempts'),
+			EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'two_factor_tokens' AND column_name = 'deleted_at')
+	`).Scan(&hasAttempts, &hasDeletedAt)
+	if err != nil {
+		t.Fatalf("failed to query two_factor_tokens columns: %v", err)
+	}
+	if !hasAttempts {
+		t.Fatal("two_factor_tokens missing attempts column")
+	}
+	if hasDeletedAt {
+		t.Fatal("two_factor_tokens must NOT have deleted_at column (hard-delete invariant)")
+	}
+
+	// 4. Test Step Down (-1)
+	if err := m.Steps(-1); err != nil {
+		t.Fatalf("000008 down migration failed: %v", err)
+	}
+
+	// Verify all 3 tables dropped
+	var tableCount int
+	err = sqlDB.QueryRow(`
+		SELECT COUNT(*) FROM information_schema.tables 
+		WHERE table_schema = 'public' 
+		  AND table_name IN ('totp_secrets', 'totp_used_codes', 'two_factor_tokens')
+	`).Scan(&tableCount)
+	if err != nil {
+		t.Fatalf("failed to query dropped totp tables: %v", err)
+	}
+	if tableCount != 0 {
+		t.Fatalf("expected 0 totp tables after 000008 down, found %d", tableCount)
+	}
+
+	// 5. Restore Up
+	if err := m.Up(); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("restoring 000008 up failed: %v", err)
+	}
+}
+
+func TestMigration000008_DownRefusedOnSeededDB(t *testing.T) {
+	dbURL := resolveDatabaseURL()
+
+	testDB, err := sql.Open("pgx", dbURL)
+	if err != nil {
+		if os.Getenv("CI") != "" {
+			t.Fatalf("CI: failed to open postgres connection: %v", err)
+		}
+		t.Skipf("Postgres not available, skipping: %v", err)
+	}
+	pingCtx, pingCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer pingCancel()
+	if err := testDB.PingContext(pingCtx); err != nil {
+		_ = testDB.Close()
+		if os.Getenv("CI") != "" {
+			t.Fatalf("CI: PostgreSQL connection failed: %v", err)
+		}
+		t.Skipf("Postgres not available, skipping: %v", err)
+	}
+	_ = testDB.Close()
+
+	m, sqlDB := newMigrator(t, dbURL)
+	defer func() {
+		_, _ = m.Close()
+		_ = sqlDB.Close()
+	}()
+
+	if err := m.Migrate(8); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("m.Migrate(8) failed: %v", err)
+	}
+
+	if _, err := sqlDB.Exec(`INSERT INTO users (email, password_hash, credential_version) VALUES ('totp-down-refusal@example.com', 'hash', 1)`); err != nil {
+		t.Fatalf("failed to seed user: %v", err)
+	}
+	if _, err := sqlDB.Exec(`INSERT INTO totp_secrets (user_id, encrypted_secret, backup_codes, enabled) SELECT id, '\x010203', '[]', true FROM users WHERE email = 'totp-down-refusal@example.com'`); err != nil {
+		t.Fatalf("failed to seed totp secret: %v", err)
+	}
+
+	err = m.Steps(-1)
+	if err == nil {
+		t.Fatal("expected 000008 down to refuse on seeded totp_secrets, got nil")
+	}
+	if !strings.Contains(err.Error(), "down refused") {
+		t.Fatalf("expected down-refused error, got: %v", err)
+	}
+
+	// Recovery
+	_, _ = m.Close()
+	_ = sqlDB.Close()
+
+	m2, sqlDB2 := newMigrator(t, dbURL)
+	defer func() {
+		_, _ = m2.Close()
+		_ = sqlDB2.Close()
+	}()
+
+	if ferr := m2.Force(8); ferr != nil {
+		t.Fatalf("m2.Force(8) failed: %v", ferr)
+	}
+	if _, err := sqlDB2.Exec(`DELETE FROM totp_secrets WHERE user_id IN (SELECT id FROM users WHERE email = 'totp-down-refusal@example.com')`); err != nil {
+		t.Fatalf("failed to remove seed totp row: %v", err)
+	}
+	if _, err := sqlDB2.Exec(`DELETE FROM users WHERE email = 'totp-down-refusal@example.com'`); err != nil {
+		t.Fatalf("failed to remove seed user row: %v", err)
 	}
 }

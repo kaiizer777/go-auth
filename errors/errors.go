@@ -67,6 +67,25 @@ const (
 	// Phase 4 Rate limiting
 	CodeRateLimitExceeded Code = "RATE_LIMIT_EXCEEDED" // 429
 
+	// Phase 7 Multi-Factor Authentication (TOTP 2FA)
+	CodeTOTPNotEnrolled              Code = "TOTP_NOT_ENROLLED"                // 400
+	CodeTOTPAlreadyEnabled           Code = "TOTP_ALREADY_ENABLED"             // 409
+	CodeTOTPCodeInvalid              Code = "TOTP_CODE_INVALID"                // 400
+	CodeTOTPCodeReplayed             Code = "TOTP_CODE_REPLAYED"               // 400
+	CodeTOTPBackupCodeInvalid        Code = "TOTP_BACKUP_CODE_INVALID"         // 400
+	CodeTwoFactorTokenInvalid        Code = "TWO_FACTOR_TOKEN_INVALID"         // 401
+	CodeTwoFactorTokenExpired        Code = "TWO_FACTOR_TOKEN_EXPIRED"         // 401
+	CodeTwoFactorMaxAttemptsExceeded Code = "TWO_FACTOR_MAX_ATTEMPTS_EXCEEDED" // 429
+	CodeTOTPRateLimitExceeded        Code = "TOTP_RATE_LIMIT_EXCEEDED"         // 429
+
+	// Casing aliases
+	CodeTotpNotEnrolled       = CodeTOTPNotEnrolled
+	CodeTotpAlreadyEnabled    = CodeTOTPAlreadyEnabled
+	CodeTotpCodeInvalid       = CodeTOTPCodeInvalid
+	CodeTotpCodeReplayed      = CodeTOTPCodeReplayed
+	CodeTotpBackupCodeInvalid = CodeTOTPBackupCodeInvalid
+	CodeTotpRateLimitExceeded = CodeTOTPRateLimitExceeded
+
 	// Deprecated: Use CodeInvalidConfig instead.
 	INVALID_CONFIG = CodeInvalidConfig
 	// Deprecated: Use CodeDatabaseError instead.
@@ -108,19 +127,21 @@ func (c Code) HTTPStatus() int {
 	switch c {
 	case CodePasswordTooShort, CodePasswordTooLong, CodePasswordTooCommon,
 		CodeInvalidEmail, CodeValidationError, CodeInvalidToken, CodeTokenExpired,
-		CodeOAuthCallbackFailed, CodeOAuthCodeInvalid, CodeOAuthEmailUnverified:
+		CodeOAuthCallbackFailed, CodeOAuthCodeInvalid, CodeOAuthEmailUnverified,
+		CodeTOTPNotEnrolled, CodeTOTPCodeInvalid, CodeTOTPCodeReplayed, CodeTOTPBackupCodeInvalid:
 		return http.StatusBadRequest
 	case CodeInvalidCredentials, CodeUnauthenticated,
 		CodeSessionNotFound, CodeSessionExpired, CodeSessionInvalid,
-		CodeMFARequired, CodeMFAInvalidCode:
+		CodeMFARequired, CodeMFAInvalidCode,
+		CodeTwoFactorTokenInvalid, CodeTwoFactorTokenExpired:
 		return http.StatusUnauthorized
 	case CodeEmailNotVerified, CodeCSRFTokenMissing, CodeCSRFTokenInvalid, CodeOAuthStateInvalid:
 		return http.StatusForbidden
-	case CodeRateLimitExceeded:
+	case CodeRateLimitExceeded, CodeTwoFactorMaxAttemptsExceeded, CodeTOTPRateLimitExceeded:
 		return http.StatusTooManyRequests
 	case CodeNotFound, CodeUserNotFound, CodeTokenNotFound, CodeOAuthAccountNotLinked, CodeOAuthProviderNotFound:
 		return http.StatusNotFound
-	case CodeUserAlreadyExists, CodeEmailAlreadyExists, CodeOAuthAccountAlreadyLinked, CodeOAuthAccountLinkConflict:
+	case CodeUserAlreadyExists, CodeEmailAlreadyExists, CodeOAuthAccountAlreadyLinked, CodeOAuthAccountLinkConflict, CodeTOTPAlreadyEnabled:
 		return http.StatusConflict
 	case CodeMethodNotAllowed:
 		return http.StatusMethodNotAllowed
@@ -329,6 +350,10 @@ var (
 	ErrOAuthStateSecretTooShort        = New(CodeInvalidConfig, "oauth state secret length too short", nil)
 	ErrOAuthStateSecretRequired        = New(CodeInvalidConfig, "oauth state secret is required when providers are configured", nil)
 	ErrOAuthStateCookieNameCollision   = New(CodeInvalidConfig, "oauth state cookie name must not match session or CSRF cookie name", nil)
+	ErrTOTPEncryptionKeyInvalid        = New(CodeInvalidConfig, "totp encryption key must be 64 hex chars (32 bytes)", nil)
+	ErrTOTPChallengeTokenTTLInvalid    = New(CodeInvalidConfig, "totp challenge token TTL must be between 1m and 30m", nil)
+	ErrTOTPMaxAttemptsInvalid          = New(CodeInvalidConfig, "totp max attempts must be at least 1", nil)
+	ErrTOTPAttemptWindowInvalid        = New(CodeInvalidConfig, "totp attempt window must be at least 1m", nil)
 
 	// Predefined sentinel errors for Phase 3 Core Auth.
 	ErrInvalidCredentials = New(CodeInvalidCredentials, "invalid email or password", nil)
@@ -369,11 +394,29 @@ var (
 	ErrCSRFTokenInvalid  = New(CodeCSRFTokenInvalid, "CSRF token is invalid", nil)
 	ErrRateLimitExceeded = New(CodeRateLimitExceeded, "Too many requests, try again later", nil)
 
+	// Predefined sentinel errors for Phase 7 Multi-Factor Authentication (TOTP 2FA).
+	ErrTOTPNotEnrolled              = New(CodeTOTPNotEnrolled, "user has no active totp enrollment", nil)
+	ErrTOTPAlreadyEnabled           = New(CodeTOTPAlreadyEnabled, "totp is already enabled for this user", nil)
+	ErrTOTPCodeInvalid              = New(CodeTOTPCodeInvalid, "totp code is invalid", nil)
+	ErrTOTPCodeReplayed             = New(CodeTOTPCodeReplayed, "totp code has already been used in this window", nil)
+	ErrBackupCodeInvalid            = New(CodeTOTPBackupCodeInvalid, "backup code is invalid", nil)
+	ErrTwoFactorTokenInvalid        = New(CodeTwoFactorTokenInvalid, "two factor challenge token is invalid", nil)
+	ErrTwoFactorTokenExpired        = New(CodeTwoFactorTokenExpired, "two factor challenge token has expired", nil)
+	ErrTwoFactorMaxAttemptsExceeded = New(CodeTwoFactorMaxAttemptsExceeded, "maximum verification attempts exceeded", nil)
+	ErrTOTPRateLimitExceeded        = New(CodeTOTPRateLimitExceeded, "totp verification rate limit exceeded", nil)
+
 	// Aliases
-	ErrInvalidCookieName   = ErrSessionCookieNameInvalid
-	ErrInvalidCookiePath   = ErrSessionCookiePathInvalid
-	ErrInvalidCookieDomain = ErrSessionCookieDomainInvalid
-	ErrInvalidSession      = ErrSessionInvalid
+	ErrInvalidCookieName     = ErrSessionCookieNameInvalid
+	ErrInvalidCookiePath     = ErrSessionCookiePathInvalid
+	ErrInvalidCookieDomain   = ErrSessionCookieDomainInvalid
+	ErrInvalidSession        = ErrSessionInvalid
+	ErrTotpNotEnrolled       = ErrTOTPNotEnrolled
+	ErrTotpAlreadyEnabled    = ErrTOTPAlreadyEnabled
+	ErrTotpCodeInvalid       = ErrTOTPCodeInvalid
+	ErrTotpCodeReplayed      = ErrTOTPCodeReplayed
+	ErrTOTPBackupCodeInvalid = ErrBackupCodeInvalid
+	ErrTotpBackupCodeInvalid = ErrBackupCodeInvalid
+	ErrTotpRateLimitExceeded = ErrTOTPRateLimitExceeded
 )
 
 // WriteJSON writes an error response envelope to the response writer with the appropriate HTTP status.
@@ -404,7 +447,7 @@ func WriteJSON(w http.ResponseWriter, err error) {
 				msg = "CSRF token is missing"
 			case CodeCSRFTokenInvalid:
 				msg = "CSRF token is invalid"
-			case CodeRateLimitExceeded:
+			case CodeRateLimitExceeded, CodeTwoFactorMaxAttemptsExceeded, CodeTOTPRateLimitExceeded:
 				msg = "Too many requests, try again later"
 			default:
 				if status == http.StatusInternalServerError {

@@ -23,6 +23,7 @@ import (
 	"github.com/kaiizer777/go-auth/oauth"
 	"github.com/kaiizer777/go-auth/ratelimit"
 	"github.com/kaiizer777/go-auth/session"
+	"github.com/kaiizer777/go-auth/totp"
 )
 
 // Auth is the main entry point for the authentication library.
@@ -43,6 +44,9 @@ type Auth struct {
 	// OAuth is the external identity provider and social login service.
 	OAuth oauth.Service
 
+	// TOTP is the RFC 6238 TOTP two-factor authentication service.
+	TOTP totp.Service
+
 	// SessionHandler is the HTTP handler for session management.
 	SessionHandler *handler.SessionHandler
 
@@ -52,6 +56,7 @@ type Auth struct {
 	resetIPLimiter  *ratelimit.Limiter
 	signupLimiter   *ratelimit.Limiter
 	signupIPLimiter *ratelimit.Limiter
+	totpLimiter     *ratelimit.Limiter
 	limiterDone     chan struct{}
 	closeErr        error
 	closeOnce       sync.Once
@@ -133,6 +138,22 @@ func NewWithDB(database *gorm.DB, cfg config.Config) (*Auth, error) {
 		oauthOpt = handler.WithOAuthService(oauthSvc, providers)
 	}
 
+	var totpSvc totp.Service
+	var totpLimiter *ratelimit.Limiter
+	if cfg.TOTP.EncryptionKey != "" {
+		window := cfg.TOTP.AttemptWindow
+		if window <= 0 {
+			window = 5 * time.Minute
+		}
+		maxAttempts := cfg.TOTP.MaxAttemptsPerWindow
+		if maxAttempts <= 0 {
+			maxAttempts = 5
+		}
+		totpLimiter = ratelimit.NewLimiter(window, maxAttempts)
+		totpLimiter.StartCleanup(cleanupTick, limiterDone)
+		totpSvc = totp.NewService(database, cfg.TOTP, totpLimiter, slog.Default())
+	}
+
 	handlerOpts := []handler.Option{
 		handler.WithSessionService(sessionSvc),
 		handler.WithSessionHandler(sessHandler),
@@ -142,6 +163,12 @@ func NewWithDB(database *gorm.DB, cfg config.Config) (*Auth, error) {
 	}
 	if oauthOpt != nil {
 		handlerOpts = append(handlerOpts, oauthOpt)
+	}
+	if totpSvc != nil {
+		handlerOpts = append(handlerOpts, handler.WithTotpService(totpSvc))
+	}
+	if totpLimiter != nil {
+		handlerOpts = append(handlerOpts, handler.WithTotpLimiter(totpLimiter))
 	}
 	h := handler.New(database, cfg, authSvc, handlerOpts...)
 
@@ -159,6 +186,7 @@ func NewWithDB(database *gorm.DB, cfg config.Config) (*Auth, error) {
 		Auth:            authSvc,
 		Session:         sessionSvc,
 		OAuth:           oauthSvc,
+		TOTP:            totpSvc,
 		SessionHandler:  sessHandler,
 		loginLimiter:    loginLimiter,
 		loginIPLimiter:  loginIPLimiter,
@@ -166,6 +194,7 @@ func NewWithDB(database *gorm.DB, cfg config.Config) (*Auth, error) {
 		resetIPLimiter:  resetIPLimiter,
 		signupLimiter:   signupLimiter,
 		signupIPLimiter: signupIPLimiter,
+		totpLimiter:     totpLimiter,
 		limiterDone:     limiterDone,
 	}
 	return a, nil
@@ -218,6 +247,9 @@ func (a *Auth) Close() error {
 		if a.signupIPLimiter != nil {
 			a.signupIPLimiter.Close()
 		}
+		if a.totpLimiter != nil {
+			a.totpLimiter.Close()
+		}
 		if a.emailDispatcher != nil {
 			timeout := a.cfg.EmailDispatchTimeout
 			if timeout <= 0 {
@@ -262,6 +294,22 @@ func (a *Auth) SessionService() session.Service {
 // OAuthService returns the configured OAuth service.
 func (a *Auth) OAuthService() oauth.Service {
 	return a.OAuth
+}
+
+// Totp returns the configured TOTP two-factor authentication service.
+func (a *Auth) Totp() totp.Service {
+	if a == nil {
+		return nil
+	}
+	return a.TOTP
+}
+
+// TotpService returns the configured TOTP two-factor authentication service.
+func (a *Auth) TotpService() totp.Service {
+	if a == nil {
+		return nil
+	}
+	return a.TOTP
 }
 
 // PurgeExpiredSessions deletes all sessions past their absolute expiration or idle timeout across all users.
