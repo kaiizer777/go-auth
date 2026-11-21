@@ -293,4 +293,3 @@ func isDefaultMigrationsPath(p string) bool {
 	clean := filepath.ToSlash(filepath.Clean(p))
 	return p == "" || clean == "db/migrations" || clean == "db/migrations/mysql" || clean == "migrations" || clean == "migrations/mysql"
 }
-

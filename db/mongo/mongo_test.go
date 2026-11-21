@@ -398,6 +398,11 @@ func TestNormalizeMongoError(t *testing.T) {
 		}
 	}
 
+	unmappedErr := &mongo.CommandError{
+		Code:    11000,
+		Message: "E11000 duplicate key error collection: test.misc index: some_other_index dup key: { foo: \"bar\" }",
+	}
+
 	tests := []struct {
 		name    string
 		err     error
@@ -427,6 +432,11 @@ func TestNormalizeMongoError(t *testing.T) {
 			name:    "oauth account duplicate provider uid",
 			err:     makeDupErr("E11000 duplicate key error collection: test.oauth_accounts index: uq_oauth_accounts_provider_uid dup key: { provider_id: \"google\", provider_user_id: \"123\" }"),
 			wantErr: errors.ErrOAuthAccountAlreadyLinked,
+		},
+		{
+			name:    "unmapped duplicate key error returns original error",
+			err:     unmappedErr,
+			wantErr: unmappedErr,
 		},
 	}
 
@@ -463,6 +473,45 @@ func TestStandaloneTransactionDetection(t *testing.T) {
 		if isStandaloneTransactionError(err) {
 			t.Errorf("expected isStandaloneTransactionError(%v) = false, got true", err)
 		}
+	}
+}
+
+func TestEnsureIndexes_ModelsAndNilDatabase(t *testing.T) {
+	if err := EnsureIndexes(context.Background(), nil); err != nil {
+		t.Fatalf("expected nil error on nil database, got: %v", err)
+	}
+
+	specs := IndexSpecifications()
+	expectedCollections := []string{
+		"users",
+		"sessions",
+		"verification_tokens",
+		"password_reset_tokens",
+		"oauth_accounts",
+		"totp_secrets",
+		"totp_used_codes",
+		"two_factor_tokens",
+	}
+
+	for _, col := range expectedCollections {
+		models, ok := specs[col]
+		if !ok || len(models) == 0 {
+			t.Errorf("expected non-empty index models for collection %s", col)
+		}
+	}
+}
+
+func TestMongoConnect_InvalidURI(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.DatabaseType = config.DatabaseTypeMongo
+	cfg.DatabaseURL = "invalid://mongodb:not_a_valid_uri"
+	cfg.MongoDB.Database = "testdb"
+	cfg.MongoDB.ConnectTimeout = 100 * time.Millisecond
+
+	store, err := Connect(cfg)
+	if err == nil {
+		_ = store.Close()
+		t.Fatal("expected error on invalid mongo uri, got nil")
 	}
 }
 
@@ -582,4 +631,143 @@ func TestUserStore_Delete_Cascade(t *testing.T) {
 	if !errors.Is(err, gorm.ErrRecordNotFound) && err == nil {
 		t.Fatal("expected verification token to be deleted by cascade, but found it")
 	}
+}
+
+func TestMongoStore_CanceledContext_AllMethods(t *testing.T) {
+	opts := options.Client().
+		ApplyURI("mongodb://127.0.0.1:27017").
+		SetServerSelectionTimeout(1 * time.Millisecond).
+		SetConnectTimeout(1 * time.Millisecond).
+		SetTimeout(1 * time.Millisecond)
+	client, err := mongo.Connect(opts)
+	if err != nil {
+		t.Fatalf("mongo.Connect failed: %v", err)
+	}
+	defer func() { _ = client.Disconnect(context.Background()) }()
+
+	dbInst := client.Database("test_db")
+	store := New(client, dbInst, true)
+
+	if store.Client() != client || store.Database() != dbInst {
+		t.Fatal("Client() or Database() mismatch")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	uid := uuid.New()
+	user := &db.User{
+		ID:        uid,
+		Email:     "test@example.com",
+		CreatedAt: time.Now().UTC(),
+		UpdatedAt: time.Now().UTC(),
+	}
+
+	_ = store.Users().Create(ctx, user)
+	_, _ = store.Users().GetByID(ctx, uid)
+	_, _ = store.Users().GetByIDForUpdate(ctx, uid)
+	_, _ = store.Users().GetByEmail(ctx, "test@example.com")
+	_ = store.Users().Update(ctx, user)
+	_ = store.Users().UpdatePassword(ctx, uid, "newpass")
+	_, _ = store.Users().IncrementCredentialVersion(ctx, uid)
+	_ = store.Users().SetEmailVerified(ctx, uid, true)
+	_ = store.Users().Delete(ctx, uid)
+
+	sess := &db.Session{
+		ID:                uuid.New(),
+		UserID:            uid,
+		IDHash:            "idhash",
+		SessionType:       db.SessionTypeCookie,
+		CreatedAt:         time.Now().UTC(),
+		LastActiveAt:      time.Now().UTC(),
+		AbsoluteExpiresAt: time.Now().Add(time.Hour),
+	}
+	_ = store.Sessions().Create(ctx, sess)
+	_, _ = store.Sessions().GetByID(ctx, sess.ID)
+	_, _ = store.Sessions().GetByIDHash(ctx, "idhash")
+	_, _ = store.Sessions().ListByUserID(ctx, uid)
+	_ = store.Sessions().UpdateLastActive(ctx, sess.ID, time.Now().UTC())
+	_ = store.Sessions().Delete(ctx, sess.ID)
+	_, _ = store.Sessions().DeleteByIDHash(ctx, "idhash")
+	_, _ = store.Sessions().DeleteIfStale(ctx, sess.ID, time.Now().UTC())
+	_, _ = store.Sessions().DeleteIfStaleByIDHash(ctx, "idhash", time.Now().UTC())
+	_ = store.Sessions().DeleteByUserID(ctx, uid)
+	_, _ = store.Sessions().DeleteExpired(ctx, time.Now().UTC(), time.Now().UTC())
+	_ = store.Sessions().DeleteExpiredByUserID(ctx, uid, time.Now().UTC(), time.Now().UTC())
+
+	vtok := &db.VerificationToken{
+		TokenHash: []byte("vtok"),
+		UserID:    uid,
+		ExpiresAt: time.Now().Add(time.Hour),
+	}
+	_ = store.VerificationTokens().Create(ctx, vtok)
+	_, _ = store.VerificationTokens().GetByTokenHash(ctx, []byte("vtok"))
+	_ = store.VerificationTokens().Delete(ctx, []byte("vtok"))
+	_ = store.VerificationTokens().DeleteByUserID(ctx, uid)
+
+	rtok := &db.PasswordResetToken{
+		TokenHash: []byte("rtok"),
+		UserID:    uid,
+		ExpiresAt: time.Now().Add(time.Hour),
+	}
+	_ = store.PasswordResetTokens().Create(ctx, rtok)
+	_, _ = store.PasswordResetTokens().GetByTokenHash(ctx, []byte("rtok"))
+	_ = store.PasswordResetTokens().Delete(ctx, []byte("rtok"))
+	_ = store.PasswordResetTokens().DeleteByUserID(ctx, uid)
+	_, _ = store.PasswordResetTokens().ConsumeToken(ctx, []byte("rtok"), time.Now().UTC())
+
+	acc := &db.OAuthAccount{
+		ID:             uuid.New(),
+		UserID:         uid,
+		ProviderID:     "gh",
+		ProviderUserID: "123",
+	}
+	_ = store.OAuthAccounts().Create(ctx, acc)
+	_, _ = store.OAuthAccounts().GetByProvider(ctx, "gh", "123")
+	_, _ = store.OAuthAccounts().GetByUserID(ctx, uid)
+	_ = store.OAuthAccounts().Delete(ctx, acc.ID)
+	_ = store.OAuthAccounts().DeleteByUserID(ctx, uid)
+
+	sec := &db.TotpSecret{
+		ID:              uuid.New(),
+		UserID:          uid,
+		EncryptedSecret: []byte("sec"),
+	}
+	_ = store.Totp().CreateSecret(ctx, sec)
+	_, _ = store.Totp().GetSecretByUserID(ctx, uid)
+	_, _ = store.Totp().GetSecretByUserIDForUpdate(ctx, uid)
+	_ = store.Totp().EnableSecret(ctx, sec.ID, []byte("[]"))
+	_ = store.Totp().UpdateBackupCodes(ctx, uid, []string{"1"})
+	_ = store.Totp().UpdateBackupCodesJSON(ctx, sec.ID, []byte("[]"))
+	_ = store.Totp().DeleteSecret(ctx, uid)
+	_ = store.Totp().DeleteUnconfirmedSecret(ctx, uid)
+	_, _ = store.Totp().IsTotpEnabled(ctx, uid)
+	_, _ = store.Totp().HasUsedCode(ctx, uid, []byte("code"), time.Now().UTC())
+
+	usedCode := &db.TotpUsedCode{
+		ID:       uuid.New(),
+		UserID:   uid,
+		CodeHash: []byte("code"),
+		UsedAt:   time.Now().UTC(),
+	}
+	_ = store.Totp().RecordUsedCode(ctx, usedCode)
+	_ = store.Totp().PruneUsedCodes(ctx, uid, time.Now().UTC())
+
+	tfTok := &db.TwoFactorToken{
+		ID:        uuid.New(),
+		UserID:    uid,
+		TokenHash: []byte("tf"),
+		ExpiresAt: time.Now().Add(time.Hour),
+	}
+	_ = store.Totp().CreateTwoFactorToken(ctx, tfTok)
+	_, _ = store.Totp().GetTwoFactorToken(ctx, []byte("tf"))
+	_, _ = store.Totp().IncrementTwoFactorAttempts(ctx, []byte("tf"), 5, time.Now().UTC())
+	_, _ = store.Totp().DeleteTwoFactorToken(ctx, tfTok.ID)
+	_ = store.Totp().DeleteTwoFactorTokensByUserID(ctx, uid)
+
+	_ = store.Ping(ctx)
+	_ = store.Transaction(ctx, func(txStore db.Store) error {
+		return nil
+	})
+	_ = store.Close()
 }

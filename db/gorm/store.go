@@ -435,12 +435,12 @@ func New(database *gorm.DB) db.Store {
 	}
 }
 
-func (s *gormStore) Users() db.UserStore { return s.users }
-func (s *gormStore) Sessions() db.SessionStore { return s.sessions }
-func (s *gormStore) VerificationTokens() db.VerificationTokenStore { return s.verificationTokens }
+func (s *gormStore) Users() db.UserStore                             { return s.users }
+func (s *gormStore) Sessions() db.SessionStore                       { return s.sessions }
+func (s *gormStore) VerificationTokens() db.VerificationTokenStore   { return s.verificationTokens }
 func (s *gormStore) PasswordResetTokens() db.PasswordResetTokenStore { return s.passwordReset }
-func (s *gormStore) OAuthAccounts() db.OAuthAccountStore { return s.oauthAccounts }
-func (s *gormStore) Totp() db.TotpStore { return s.totp }
+func (s *gormStore) OAuthAccounts() db.OAuthAccountStore             { return s.oauthAccounts }
+func (s *gormStore) Totp() db.TotpStore                              { return s.totp }
 
 func (s *gormStore) Transaction(ctx context.Context, fn func(txStore db.Store) error) error {
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {

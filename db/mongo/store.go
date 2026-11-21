@@ -23,10 +23,10 @@ import (
 
 // MongoStore represents a MongoDB-backed implementation of db.Store.
 type MongoStore struct {
-	client                 *mongo.Client
-	database               *mongo.Database
+	client                *mongo.Client
+	database              *mongo.Database
 	allowNonTransactional bool
-	session                *mongo.Session
+	session               *mongo.Session
 
 	users              *userStore
 	sessions           *sessionStore
@@ -39,8 +39,8 @@ type MongoStore struct {
 // New creates a new MongoStore instance wrapping a MongoDB client and database.
 func New(client *mongo.Client, database *mongo.Database, allowNonTransactional bool) *MongoStore {
 	store := &MongoStore{
-		client:                 client,
-		database:               database,
+		client:                client,
+		database:              database,
 		allowNonTransactional: allowNonTransactional,
 	}
 	store.users = &userStore{store: store}
@@ -54,10 +54,10 @@ func New(client *mongo.Client, database *mongo.Database, allowNonTransactional b
 
 func (s *MongoStore) withSession(sess *mongo.Session) *MongoStore {
 	store := &MongoStore{
-		client:                 s.client,
-		database:               s.database,
+		client:                s.client,
+		database:              s.database,
 		allowNonTransactional: s.allowNonTransactional,
-		session:                sess,
+		session:               sess,
 	}
 	store.users = &userStore{store: store}
 	store.sessions = &sessionStore{store: store}
@@ -80,7 +80,7 @@ func (s *MongoStore) Sessions() db.SessionStore                       { return s
 func (s *MongoStore) VerificationTokens() db.VerificationTokenStore   { return s.verificationTokens }
 func (s *MongoStore) PasswordResetTokens() db.PasswordResetTokenStore { return s.passwordReset }
 func (s *MongoStore) OAuthAccounts() db.OAuthAccountStore             { return s.oauthAccounts }
-func (s *MongoStore) Totp() db.TotpStore                             { return s.totp }
+func (s *MongoStore) Totp() db.TotpStore                              { return s.totp }
 
 func (s *MongoStore) Client() *mongo.Client     { return s.client }
 func (s *MongoStore) Database() *mongo.Database { return s.database }
@@ -246,6 +246,7 @@ func (s *userStore) GetByEmail(ctx context.Context, email string) (*db.User, err
 		Strength: 2,
 	})
 	var doc UserDoc
+	// codeql[go/sql-injection] Safe: trimmed is a strictly-typed Go string serialized as a BSON string literal.
 	err := s.collection().FindOne(s.store.resolveCtx(ctx), filter, findOpts).Decode(&doc)
 	if err != nil {
 		if errors.Is(err, mongo.ErrNoDocuments) {
@@ -376,6 +377,7 @@ func (s *sessionStore) GetByID(ctx context.Context, id uuid.UUID) (*db.Session, 
 
 func (s *sessionStore) GetByIDHash(ctx context.Context, idHash string) (*db.Session, error) {
 	var doc SessionDoc
+	// codeql[go/sql-injection] Safe: idHash is a strictly-typed Go string serialized as a BSON string literal.
 	err := s.collection().FindOne(s.store.resolveCtx(ctx), bson.M{"id_hash": idHash}).Decode(&doc)
 	if err != nil {
 		if errors.Is(err, mongo.ErrNoDocuments) {
@@ -423,6 +425,7 @@ func (s *sessionStore) Delete(ctx context.Context, id uuid.UUID) error {
 }
 
 func (s *sessionStore) DeleteByIDHash(ctx context.Context, idHash string) (int64, error) {
+	// codeql[go/sql-injection] Safe: idHash is a strictly-typed Go string serialized as a BSON string literal.
 	res, err := s.collection().DeleteMany(s.store.resolveCtx(ctx), bson.M{"id_hash": idHash})
 	if err != nil {
 		return 0, err
@@ -447,6 +450,7 @@ func (s *sessionStore) DeleteIfStaleByIDHash(ctx context.Context, idHash string,
 		"id_hash":        idHash,
 		"last_active_at": bson.M{"$lte": lastActive.UTC()},
 	}
+	// codeql[go/sql-injection] Safe: idHash is a strictly-typed Go string serialized as a BSON string literal.
 	res, err := s.collection().DeleteMany(s.store.resolveCtx(ctx), filter)
 	if err != nil {
 		return 0, err
@@ -508,6 +512,7 @@ func (s *verificationTokenStore) Create(ctx context.Context, token *db.Verificat
 
 func (s *verificationTokenStore) GetByTokenHash(ctx context.Context, tokenHash []byte) (*db.VerificationToken, error) {
 	var doc VerificationTokenDoc
+	// codeql[go/sql-injection] Safe: tokenHash is a strictly-typed byte slice serialized as a BSON binary literal.
 	err := s.collection().FindOne(s.store.resolveCtx(ctx), bson.M{"_id": tokenHash}).Decode(&doc)
 	if err != nil {
 		if errors.Is(err, mongo.ErrNoDocuments) {
@@ -551,6 +556,7 @@ func (s *passwordResetTokenStore) Create(ctx context.Context, token *db.Password
 
 func (s *passwordResetTokenStore) GetByTokenHash(ctx context.Context, tokenHash []byte) (*db.PasswordResetToken, error) {
 	var doc PasswordResetTokenDoc
+	// codeql[go/sql-injection] Safe: tokenHash is a strictly-typed byte slice serialized as a BSON binary literal.
 	err := s.collection().FindOne(s.store.resolveCtx(ctx), bson.M{"_id": tokenHash}).Decode(&doc)
 	if err != nil {
 		if errors.Is(err, mongo.ErrNoDocuments) {
@@ -576,6 +582,7 @@ func (s *passwordResetTokenStore) ConsumeToken(ctx context.Context, tokenHash []
 		"_id":        tokenHash,
 		"expires_at": bson.M{"$gt": now.UTC()},
 	}
+	// codeql[go/sql-injection] Safe: tokenHash is a strictly-typed byte slice serialized as a BSON binary literal.
 	res, err := s.collection().DeleteOne(s.store.resolveCtx(ctx), filter)
 	if err != nil {
 		return false, err
@@ -610,6 +617,7 @@ func (s *oauthAccountStore) GetByProvider(ctx context.Context, providerID, provi
 		"provider_user_id": providerUserID,
 	}
 	var doc OAuthAccountDoc
+	// codeql[go/sql-injection] Safe: providerID and providerUserID are strictly-typed Go strings serialized as BSON string literals.
 	err := s.collection().FindOne(s.store.resolveCtx(ctx), filter).Decode(&doc)
 	if err != nil {
 		if errors.Is(err, mongo.ErrNoDocuments) {
@@ -822,6 +830,7 @@ func (s *totpStore) CreateTwoFactorToken(ctx context.Context, token *db.TwoFacto
 
 func (s *totpStore) GetTwoFactorToken(ctx context.Context, tokenHash []byte) (*db.TwoFactorToken, error) {
 	var doc TwoFactorTokenDoc
+	// codeql[go/sql-injection] Safe: tokenHash is a strictly-typed byte slice serialized as a BSON binary literal.
 	err := s.twoFactorTokens().FindOne(s.store.resolveCtx(ctx), bson.M{"token_hash": tokenHash}).Decode(&doc)
 	if err != nil {
 		if errors.Is(err, mongo.ErrNoDocuments) {
@@ -841,6 +850,7 @@ func (s *totpStore) IncrementTwoFactorAttempts(ctx context.Context, tokenHash []
 	update := bson.M{"$inc": bson.M{"attempts": 1}}
 
 	var doc TwoFactorTokenDoc
+	// codeql[go/sql-injection] Safe: tokenHash is a strictly-typed byte slice serialized as a BSON binary literal.
 	err := s.twoFactorTokens().FindOneAndUpdate(s.store.resolveCtx(ctx), filter, update, opts).Decode(&doc)
 	if err != nil {
 		if errors.Is(err, mongo.ErrNoDocuments) {
