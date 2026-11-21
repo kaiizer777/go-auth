@@ -222,7 +222,7 @@ func New(cfg config.Config) (*Auth, error) {
 	}
 
 	switch cfg.DatabaseType {
-	case config.DatabaseTypePostgres, "":
+	case config.DatabaseTypePostgres, "", config.DatabaseTypeMySQL:
 		database, err := dbConnectFn(cfg)
 		if err != nil {
 			return nil, errors.Wrap(err, errors.CodeDatabaseError, "goauth: failed to connect to database")
@@ -236,8 +236,6 @@ func New(cfg config.Config) (*Auth, error) {
 			return nil, err
 		}
 		return a, nil
-	case config.DatabaseTypeMySQL:
-		return nil, errors.Wrap(errors.ErrDatabaseAdapterFailed, errors.CodeDatabaseAdapterFailed, "mysql adapter not yet implemented")
 	case config.DatabaseTypeMongo, "mongo":
 		return nil, errors.Wrap(errors.ErrDatabaseAdapterFailed, errors.CodeDatabaseAdapterFailed, "mongodb adapter not yet implemented")
 	default:

@@ -655,3 +655,128 @@ func TestAuth_PurgeExpiredSessions(t *testing.T) {
 		t.Fatalf("expected 1 purged session, got %d", purged)
 	}
 }
+
+func TestNew_MySQL(t *testing.T) {
+	oldDBConnect := dbConnectFn
+	t.Cleanup(func() {
+		dbConnectFn = oldDBConnect
+	})
+
+	cfg := config.Config{
+		DatabaseType: config.DatabaseTypeMySQL,
+		DatabaseURL:  "user:pass@tcp(127.0.0.1:3306)/dbname?parseTime=true",
+		BaseURL:      "http://localhost:8080",
+	}
+
+	// 1. Connection error propagates
+	dbConnectFn = func(c config.Config) (*gorm.DB, error) {
+		return nil, stderrors.New("mock mysql connection failure")
+	}
+
+	auth, err := New(cfg)
+	if err == nil {
+		t.Fatal("expected error from mock mysql connect failure, got nil")
+	}
+	if !strings.Contains(err.Error(), "goauth: failed to connect to database") {
+		t.Fatalf("expected error containing 'goauth: failed to connect to database', got: %v", err)
+	}
+	if auth != nil {
+		t.Fatal("expected nil auth on error")
+	}
+
+	// 2. Successful connection dispatches NewWithDB
+	sqliteDB, err := gorm.Open(sqlite.Open("file::memory:?cache=shared"), &gorm.Config{
+		DisableAutomaticPing: true,
+	})
+	if err != nil {
+		t.Fatalf("failed to open sqlite db: %v", err)
+	}
+	t.Cleanup(func() {
+		if sqlDB, errDB := sqliteDB.DB(); errDB == nil {
+			_ = sqlDB.Close()
+		}
+	})
+
+	ddl := `
+	CREATE TABLE IF NOT EXISTS users (
+		id TEXT PRIMARY KEY,
+		email TEXT UNIQUE NOT NULL,
+		password_hash TEXT NOT NULL,
+		credential_version INTEGER NOT NULL DEFAULT 0,
+		email_verified BOOLEAN NOT NULL DEFAULT 0,
+		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+	);
+	CREATE TABLE IF NOT EXISTS sessions (
+		id TEXT PRIMARY KEY,
+		user_id TEXT NOT NULL,
+		id_hash TEXT UNIQUE NOT NULL,
+		session_type TEXT NOT NULL DEFAULT 'cookie',
+		ip_address TEXT NOT NULL DEFAULT '',
+		user_agent TEXT NOT NULL DEFAULT '',
+		credential_version INTEGER NOT NULL DEFAULT 0,
+		last_active_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		absolute_expires_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+	);
+	CREATE TABLE IF NOT EXISTS verification_tokens (
+		token_hash BLOB PRIMARY KEY,
+		user_id TEXT NOT NULL,
+		expires_at DATETIME NOT NULL,
+		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+	);
+	CREATE TABLE IF NOT EXISTS password_reset_tokens (
+		token_hash BLOB PRIMARY KEY,
+		user_id TEXT NOT NULL,
+		expires_at DATETIME NOT NULL,
+		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+	);
+	CREATE TABLE IF NOT EXISTS oauth_accounts (
+		id TEXT PRIMARY KEY,
+		user_id TEXT NOT NULL,
+		provider_id TEXT NOT NULL,
+		provider_user_id TEXT NOT NULL,
+		email TEXT NOT NULL,
+		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+	);
+	CREATE TABLE IF NOT EXISTS totp_secrets (
+		id TEXT PRIMARY KEY,
+		user_id TEXT UNIQUE NOT NULL,
+		encrypted_secret BLOB NOT NULL,
+		backup_codes TEXT NOT NULL,
+		enabled BOOLEAN NOT NULL DEFAULT 0,
+		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+	);
+	CREATE TABLE IF NOT EXISTS totp_used_codes (
+		id TEXT PRIMARY KEY,
+		user_id TEXT NOT NULL,
+		code_hash BLOB NOT NULL,
+		used_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+	);
+	CREATE TABLE IF NOT EXISTS two_factor_tokens (
+		id TEXT PRIMARY KEY,
+		user_id TEXT NOT NULL,
+		token_hash BLOB UNIQUE NOT NULL,
+		expires_at DATETIME NOT NULL,
+		attempts INTEGER NOT NULL DEFAULT 0
+	);
+	`
+	if err := sqliteDB.Exec(ddl).Error; err != nil {
+		t.Fatalf("failed to execute sqlite ddl: %v", err)
+	}
+
+	dbConnectFn = func(c config.Config) (*gorm.DB, error) {
+		return sqliteDB, nil
+	}
+
+	auth, err = New(cfg)
+	if err != nil {
+		t.Fatalf("New with DatabaseTypeMySQL err = %v, want nil", err)
+	}
+	if auth == nil {
+		t.Fatal("expected non-nil auth on success")
+	}
+	_ = auth.Close()
+}

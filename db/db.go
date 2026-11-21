@@ -4,17 +4,22 @@ import (
 	"context"
 	"database/sql"
 	"embed"
+	stderrors "errors"
 	"io"
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
+	mysqlDriver "github.com/go-sql-driver/mysql"
 	"github.com/golang-migrate/migrate/v4"
+	mysqlmigrate "github.com/golang-migrate/migrate/v4/database/mysql"
 	pgmigrate "github.com/golang-migrate/migrate/v4/database/postgres"
 	"github.com/golang-migrate/migrate/v4/source"
 	"github.com/golang-migrate/migrate/v4/source/iofs"
 	_ "github.com/jackc/pgx/v5/stdlib"
+	gormmysql "gorm.io/driver/mysql"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
@@ -23,7 +28,7 @@ import (
 	"github.com/kaiizer777/go-auth/errors"
 )
 
-//go:embed migrations/*.sql
+//go:embed migrations/*.sql migrations/mysql/*.sql
 var defaultMigrationsFS embed.FS
 
 const (
@@ -32,17 +37,30 @@ const (
 )
 
 var (
-	runMigrationsFn = runMigrations
-	getSQLDBFn      = func(db *gorm.DB) (*sql.DB, error) { return db.DB() }
-	sqlDBPingFn     = func(ctx context.Context, db *sql.DB) error { return db.PingContext(ctx) }
+	runMigrationsFn      = runMigrations
+	runMySQLMigrationsFn = runMySQLMigrations
+	getSQLDBFn           = func(db *gorm.DB) (*sql.DB, error) { return db.DB() }
+	sqlDBPingFn          = func(ctx context.Context, db *sql.DB) error { return db.PingContext(ctx) }
 )
 
-// Connect runs pending migrations, initializes the GORM PostgreSQL connection,
+// Connect runs pending migrations, initializes the GORM database connection,
 // and applies connection pooling limits.
 func Connect(cfg config.Config) (*gorm.DB, error) {
-	// 1. Run migrations first
-	if err := runMigrationsFn(cfg.DatabaseURL, cfg.MigrationsPath); err != nil {
-		return nil, err
+	var dialector gorm.Dialector
+	switch cfg.DatabaseType {
+	case config.DatabaseTypeMySQL:
+		if err := runMySQLMigrationsFn(cfg.DatabaseURL, cfg.MigrationsPath); err != nil {
+			return nil, err
+		}
+		dialector = gormmysql.New(gormmysql.Config{
+			DSN:                       cfg.DatabaseURL,
+			SkipInitializeWithVersion: true,
+		})
+	default:
+		if err := runMigrationsFn(cfg.DatabaseURL, cfg.MigrationsPath); err != nil {
+			return nil, err
+		}
+		dialector = postgres.Open(cfg.DatabaseURL)
 	}
 
 	// 2. Open GORM
@@ -57,7 +75,7 @@ func Connect(cfg config.Config) (*gorm.DB, error) {
 		},
 	)
 
-	db, err := gorm.Open(postgres.Open(cfg.DatabaseURL), &gorm.Config{
+	db, err := gorm.Open(dialector, &gorm.Config{
 		Logger:                                   gormLogger,
 		DisableForeignKeyConstraintWhenMigrating: true,
 		DisableAutomaticPing:                     true,
@@ -100,7 +118,7 @@ func Connect(cfg config.Config) (*gorm.DB, error) {
 }
 
 // runMigrations executes database migrations using either embedded migration files
-// or a custom filesystem directory.
+// or a custom filesystem directory for PostgreSQL.
 func runMigrations(databaseURL, migrationsPath string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), defaultMigrationTimeout)
 	defer cancel()
@@ -171,6 +189,101 @@ func runMigrations(databaseURL, migrationsPath string) error {
 	return nil
 }
 
+// runMySQLMigrations executes database migrations using either embedded migration files
+// or a custom filesystem directory for MySQL.
+func runMySQLMigrations(databaseURL, migrationsPath string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), defaultMigrationTimeout)
+	defer cancel()
+
+	db, err := sql.Open("mysql", databaseURL)
+	if err != nil {
+		return errors.New(errors.CodeDatabaseError, "open database connection failed", err)
+	}
+
+	if err := db.PingContext(ctx); err != nil {
+		_ = db.Close()
+		return errors.New(errors.CodeDatabaseUnavailable, "ping database failed", err)
+	}
+
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		_ = db.Close()
+		return errors.New(errors.CodeDatabaseError, "checkout migration connection failed", err)
+	}
+
+	driver, err := mysqlmigrate.WithConnection(ctx, conn, &mysqlmigrate.Config{
+		MigrationsTable:  "schema_migrations",
+		StatementTimeout: defaultMigrationTimeout,
+	})
+	if err != nil {
+		_ = conn.Close()
+		_ = db.Close()
+		return errors.New(errors.CodeMigrationFailed, "initialize mysql migration driver failed", err)
+	}
+
+	var sourceDriver source.Driver
+	if isDefaultMigrationsPath(migrationsPath) {
+		sourceDriver, err = iofs.New(defaultMigrationsFS, "migrations/mysql")
+		if err != nil {
+			_ = driver.Close()
+			_ = db.Close()
+			return errors.New(errors.CodeMigrationFailed, "init embedded migrations source failed", err)
+		}
+	} else {
+		sourceDriver, err = iofs.New(os.DirFS(migrationsPath), ".")
+		if err != nil {
+			_ = driver.Close()
+			_ = db.Close()
+			return errors.New(errors.CodeMigrationFailed, "init custom migrations source failed", err)
+		}
+	}
+
+	m, err := migrate.NewWithInstance("iofs", sourceDriver, "mysql", driver)
+	if err != nil {
+		_ = sourceDriver.Close()
+		_ = driver.Close()
+		_ = db.Close()
+		return errors.New(errors.CodeMigrationFailed, "init migrate instance failed", err)
+	}
+
+	defer func() {
+		_, _ = m.Close()
+		_ = db.Close()
+	}()
+
+	if err := m.Up(); err != nil && err != migrate.ErrNoChange {
+		return errors.New(errors.CodeMigrationFailed, "execute migrations failed", err)
+	}
+	return nil
+}
+
+// NormalizeMySQLError maps MySQL error code 1062 (ER_DUP_ENTRY) to domain error sentinels
+// based on table or index names, or returns the original error if unmapped.
+func NormalizeMySQLError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var myErr *mysqlDriver.MySQLError
+	is1062 := errors.Is(err, gorm.ErrDuplicatedKey) || (stderrors.As(err, &myErr) && myErr.Number == 1062)
+	msg := strings.ToLower(err.Error())
+	if !is1062 && !strings.Contains(msg, "1062") && !strings.Contains(msg, "duplicate entry") {
+		return err
+	}
+
+	switch {
+	case strings.Contains(msg, "idx_users_email") || strings.Contains(msg, "users"):
+		return errors.ErrEmailAlreadyExists
+	case strings.Contains(msg, "totp_used_codes") || strings.Contains(msg, "uq_totp_used_codes"):
+		return errors.ErrTOTPCodeReplayed
+	case strings.Contains(msg, "totp_secrets") || strings.Contains(msg, "uq_totp_secrets"):
+		return errors.ErrTOTPAlreadyEnabled
+	case strings.Contains(msg, "oauth_accounts") || strings.Contains(msg, "uq_oauth_accounts"):
+		return errors.ErrOAuthAccountAlreadyLinked
+	default:
+		return err
+	}
+}
+
 // MigrationsFS returns the embedded migration filesystem.
 func MigrationsFS() embed.FS {
 	return defaultMigrationsFS
@@ -178,5 +291,6 @@ func MigrationsFS() embed.FS {
 
 func isDefaultMigrationsPath(p string) bool {
 	clean := filepath.ToSlash(filepath.Clean(p))
-	return p == "" || clean == "db/migrations"
+	return p == "" || clean == "db/migrations" || clean == "db/migrations/mysql" || clean == "migrations" || clean == "migrations/mysql"
 }
+

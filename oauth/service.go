@@ -2,11 +2,13 @@ package oauth
 
 import (
 	"context"
+	stderrors "errors"
 	"log/slog"
 	"net"
 	"net/http"
 	"strings"
 
+	"github.com/go-sql-driver/mysql"
 	"github.com/google/uuid"
 	"gorm.io/gorm"
 
@@ -249,20 +251,27 @@ func logLinkAudit(ctx context.Context, providerID string, user db.User, linked, 
 
 // isUniqueViolation reports driver-agnostic unique-constraint conflicts:
 // gorm.ErrDuplicatedKey where the dialector translates, sqlite's
-// "UNIQUE constraint failed", postgres "duplicate key"/SQLSTATE 23505.
-// Substring matching is deliberate: sqlite and pgx word these differently, and
-// a missed match would turn every convergence path into a 500.
+// "UNIQUE constraint failed", postgres "duplicate key"/SQLSTATE 23505,
+// and MySQL error 1062 / "duplicate entry".
+// Substring matching is deliberate: sqlite, pgx, and mysql word these differently,
+// and a missed match would turn every convergence path into a 500.
 func isUniqueViolation(err error) bool {
 	if err == nil {
 		return false
 	}
-	if errors.Is(err, gorm.ErrDuplicatedKey) {
+	if errors.Is(err, gorm.ErrDuplicatedKey) || errors.Is(err, errors.ErrOAuthAccountAlreadyLinked) {
+		return true
+	}
+	var myErr *mysql.MySQLError
+	if stderrors.As(err, &myErr) && myErr.Number == 1062 {
 		return true
 	}
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "unique constraint") ||
 		strings.Contains(msg, "duplicate key") ||
-		strings.Contains(msg, "23505")
+		strings.Contains(msg, "23505") ||
+		strings.Contains(msg, "1062") ||
+		strings.Contains(msg, "duplicate entry")
 }
 
 // errLinkConflict reports a unique-constraint loss on the oauth_accounts insert.

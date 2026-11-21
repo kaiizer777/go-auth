@@ -27,7 +27,11 @@ type userStore struct {
 }
 
 func (s *userStore) Create(ctx context.Context, user *db.User) error {
-	return s.db.WithContext(ctx).Create(user).Error
+	err := s.db.WithContext(ctx).Create(user).Error
+	if err != nil {
+		return db.NormalizeMySQLError(err)
+	}
+	return nil
 }
 
 func (s *userStore) GetByID(ctx context.Context, id uuid.UUID) (*db.User, error) {
@@ -211,7 +215,11 @@ type oauthAccountStore struct {
 }
 
 func (s *oauthAccountStore) Create(ctx context.Context, account *db.OAuthAccount) error {
-	return s.db.WithContext(ctx).Create(account).Error
+	err := s.db.WithContext(ctx).Create(account).Error
+	if err != nil {
+		return db.NormalizeMySQLError(err)
+	}
+	return nil
 }
 
 func (s *oauthAccountStore) GetByProvider(ctx context.Context, providerID, providerUserID string) (*db.OAuthAccount, error) {
@@ -243,7 +251,11 @@ type totpStore struct {
 }
 
 func (s *totpStore) CreateSecret(ctx context.Context, secret *db.TotpSecret) error {
-	return s.db.WithContext(ctx).Create(secret).Error
+	err := s.db.WithContext(ctx).Create(secret).Error
+	if err != nil {
+		return db.NormalizeMySQLError(err)
+	}
+	return nil
 }
 
 func (s *totpStore) GetSecretByUserID(ctx context.Context, userID uuid.UUID) (*db.TotpSecret, error) {
@@ -327,7 +339,11 @@ func (s *totpStore) HasUsedCode(ctx context.Context, userID uuid.UUID, codeHash 
 }
 
 func (s *totpStore) RecordUsedCode(ctx context.Context, usedCode *db.TotpUsedCode) error {
-	return s.db.WithContext(ctx).Create(usedCode).Error
+	err := s.db.WithContext(ctx).Create(usedCode).Error
+	if err != nil {
+		return db.NormalizeMySQLError(err)
+	}
+	return nil
 }
 
 func (s *totpStore) PruneUsedCodes(ctx context.Context, userID uuid.UUID, before time.Time) error {
