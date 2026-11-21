@@ -42,10 +42,58 @@ func GenerateBackupCodes() ([]string, error) {
 	return codes, nil
 }
 
+// FastTestHashParams returns reduced Argon2id parameters for quick test execution.
+func FastTestHashParams() crypto.HashParams {
+	return crypto.HashParams{
+		Memory:      19456,
+		Time:        2,
+		Parallelism: 1,
+		SaltLength:  16,
+		KeyLength:   32,
+	}
+}
+
+var (
+	backupHashParamsMu sync.RWMutex
+	backupHashParams   = crypto.DefaultHashParams()
+
+	dummyBackupHashMu sync.RWMutex
+	dummyBackupHash   string
+)
+
+// SetBackupHashParamsForTesting sets custom Argon2id parameters for testing and invalidates the cached dummy hash.
+// It returns a cleanup function that restores previous parameters.
+func SetBackupHashParamsForTesting(params crypto.HashParams) func() {
+	backupHashParamsMu.Lock()
+	old := backupHashParams
+	backupHashParams = params
+	backupHashParamsMu.Unlock()
+
+	dummyBackupHashMu.Lock()
+	dummyBackupHash = ""
+	dummyBackupHashMu.Unlock()
+
+	return func() {
+		backupHashParamsMu.Lock()
+		backupHashParams = old
+		backupHashParamsMu.Unlock()
+
+		dummyBackupHashMu.Lock()
+		dummyBackupHash = ""
+		dummyBackupHashMu.Unlock()
+	}
+}
+
+func getBackupHashParams() crypto.HashParams {
+	backupHashParamsMu.RLock()
+	defer backupHashParamsMu.RUnlock()
+	return backupHashParams
+}
+
 // HashBackupCodes hashes each plaintext backup code using Argon2id and marshals the resulting PHC string slice to JSON.
 func HashBackupCodes(codes []string) ([]byte, error) {
 	hashes := make([]string, len(codes))
-	params := crypto.DefaultHashParams()
+	params := getBackupHashParams()
 	for i, code := range codes {
 		normalized := strings.ToUpper(strings.TrimSpace(code))
 		h, err := crypto.HashPassword(normalized, params)
@@ -57,18 +105,25 @@ func HashBackupCodes(codes []string) ([]byte, error) {
 	return json.Marshal(hashes)
 }
 
-var (
-	dummyBackupHashOnce sync.Once
-	dummyBackupHash     string
-)
-
 func getDummyBackupHash() string {
-	dummyBackupHashOnce.Do(func() {
-		h, err := crypto.GenerateDummyHash(crypto.DefaultHashParams())
+	dummyBackupHashMu.RLock()
+	if dummyBackupHash != "" {
+		h := dummyBackupHash
+		dummyBackupHashMu.RUnlock()
+		return h
+	}
+	dummyBackupHashMu.RUnlock()
+
+	params := getBackupHashParams()
+
+	dummyBackupHashMu.Lock()
+	defer dummyBackupHashMu.Unlock()
+	if dummyBackupHash == "" {
+		h, err := crypto.GenerateDummyHash(params)
 		if err == nil {
 			dummyBackupHash = h
 		}
-	})
+	}
 	return dummyBackupHash
 }
 
@@ -78,7 +133,7 @@ func isValidBackupCodeFormat(code string) bool {
 	}
 	for i := 0; i < len(code); i++ {
 		c := code[i]
-		if !((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) {
+		if (c < 'A' || c > 'Z') && (c < '0' || c > '9') {
 			return false
 		}
 	}

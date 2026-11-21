@@ -30,6 +30,10 @@ import (
 
 const secEncryptionKey = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 
+func init() {
+	totp.SetBackupHashParamsForTesting(totp.FastTestHashParams())
+}
+
 func setupTotpSecurityApp(t *testing.T, modifyCfg ...func(*config.Config)) (*goauth.Auth, *gorm.DB, config.Config) {
 	t.Helper()
 

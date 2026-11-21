@@ -406,7 +406,7 @@ func (s *totpService) RecordTokenAttempt(ctx context.Context, rawToken string) (
 	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var token db.TwoFactorToken
 		query := tx
-		if tx.Dialector != nil && !strings.Contains(strings.ToLower(tx.Dialector.Name()), "sqlite") {
+		if tx.Dialector != nil && !strings.Contains(strings.ToLower(tx.Name()), "sqlite") {
 			query = query.Clauses(clause.Locking{Strength: "UPDATE"})
 		}
 		if err := query.Where("token_hash = ?", tokenHash[:]).First(&token).Error; err != nil {
@@ -609,7 +609,7 @@ func (s *totpService) VerifyBackupCode(ctx context.Context, userID, backupCode, 
 	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var secretRecord db.TotpSecret
 		query := tx
-		if tx.Dialector != nil && !strings.Contains(strings.ToLower(tx.Dialector.Name()), "sqlite") {
+		if tx.Dialector != nil && !strings.Contains(strings.ToLower(tx.Name()), "sqlite") {
 			query = query.Clauses(clause.Locking{Strength: "UPDATE"})
 		}
 		if err := query.Where("user_id = ? AND enabled = true", uid).First(&secretRecord).Error; err != nil {

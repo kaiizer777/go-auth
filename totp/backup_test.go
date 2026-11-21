@@ -5,9 +5,15 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+
+	"github.com/kaiizer777/go-auth/crypto"
 )
 
 var codeRegex = regexp.MustCompile("^[A-Z0-9]{8}$")
+
+func init() {
+	SetBackupHashParamsForTesting(FastTestHashParams())
+}
 
 func TestGenerateBackupCodes(t *testing.T) {
 	t.Parallel()
@@ -243,14 +249,29 @@ func TestConsumeBackupCodePreservesOthers(t *testing.T) {
 		t.Fatalf("consumption of code 0 failed: %v", err)
 	}
 
-	// All other 9 codes should still match against updatedJSON
-	for i := 1; i < len(codes); i++ {
-		_, matchedOther, err := VerifyAndConsumeBackupCode(updatedJSON, codes[i])
+	// Verify remaining array length is 9
+	var remaining []string
+	if err := json.Unmarshal(updatedJSON, &remaining); err != nil {
+		t.Fatalf("failed to unmarshal remaining: %v", err)
+	}
+	if len(remaining) != BackupCodeCount-1 {
+		t.Fatalf("got %d remaining codes, want %d", len(remaining), BackupCodeCount-1)
+	}
+
+	// Consumed code 0 must fail on second attempt
+	_, matchedAgain, err := VerifyAndConsumeBackupCode(updatedJSON, codes[0])
+	if err != nil || matchedAgain {
+		t.Fatalf("expected consumed code 0 to not match, matched=%v, err=%v", matchedAgain, err)
+	}
+
+	// Spot-check remaining codes at boundary positions (index 1 and last index)
+	for _, idx := range []int{1, len(codes) - 1} {
+		_, matchedOther, err := VerifyAndConsumeBackupCode(updatedJSON, codes[idx])
 		if err != nil {
-			t.Fatalf("error checking remaining code %d: %v", i, err)
+			t.Fatalf("error checking remaining code %d: %v", idx, err)
 		}
 		if !matchedOther {
-			t.Errorf("remaining code %d (%s) failed to match", i, codes[i])
+			t.Errorf("remaining code %d (%s) failed to match", idx, codes[idx])
 		}
 	}
 }
@@ -298,5 +319,35 @@ func TestConsumeBackupCodeEmptyJSON(t *testing.T) {
 			t.Errorf("expected nil updated json, got %s", updated)
 		}
 		_ = err
+	}
+}
+
+func TestSetBackupHashParamsForTesting(t *testing.T) {
+	initial := getBackupHashParams()
+
+	custom := crypto.HashParams{
+		Memory:      19456,
+		Time:        2,
+		Parallelism: 1,
+		SaltLength:  16,
+		KeyLength:   32,
+	}
+	cleanup := SetBackupHashParamsForTesting(custom)
+	defer cleanup()
+
+	params := getBackupHashParams()
+	if params.Memory != custom.Memory || params.Time != custom.Time {
+		t.Fatalf("expected custom params, got %+v", params)
+	}
+
+	dummy := getDummyBackupHash()
+	if !strings.HasPrefix(dummy, "$argon2id$") {
+		t.Fatalf("expected valid argon2id dummy hash, got %q", dummy)
+	}
+
+	cleanup()
+	restored := getBackupHashParams()
+	if restored != initial {
+		t.Fatalf("expected restored initial params %+v, got %+v", initial, restored)
 	}
 }

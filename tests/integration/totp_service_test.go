@@ -22,6 +22,10 @@ import (
 	"github.com/kaiizer777/go-auth/totp"
 )
 
+func init() {
+	totp.SetBackupHashParamsForTesting(totp.FastTestHashParams())
+}
+
 func setupTotpIntegrationDB(t *testing.T) *gorm.DB {
 	t.Helper()
 	name := fmt.Sprintf("file:totp_e2e_%d_%s?mode=memory&cache=shared", time.Now().UnixNano(), uuid.New().String())
