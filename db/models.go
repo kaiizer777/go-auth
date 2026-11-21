@@ -76,6 +76,22 @@ func (s *Session) BeforeCreate(tx *gorm.DB) error {
 // TableName returns the table name for Session.
 func (Session) TableName() string { return "sessions" }
 
+// LogValue implements slog.LogValuer to prevent session hash leakage in logs.
+func (s Session) LogValue() slog.Value {
+	return slog.GroupValue(
+		slog.String("id", s.ID.String()),
+		slog.String("user_id", s.UserID.String()),
+		slog.String("id_hash", "[REDACTED]"),
+		slog.String("session_type", string(s.SessionType)),
+		slog.String("ip_address", s.IPAddress),
+		slog.String("user_agent", s.UserAgent),
+		slog.Int("credential_version", s.CredentialVersion),
+		slog.Time("last_active_at", s.LastActiveAt),
+		slog.Time("absolute_expires_at", s.AbsoluteExpiresAt),
+		slog.Time("created_at", s.CreatedAt),
+	)
+}
+
 // VerificationToken represents an email verification token record.
 type VerificationToken struct {
 	TokenHash []byte    `gorm:"primaryKey;column:token_hash" json:"-"`

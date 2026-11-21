@@ -476,3 +476,30 @@ func TestBeforeCreateUUIDGeneration(t *testing.T) {
 		t.Fatalf("TwoFactorToken.BeforeCreate failed to generate UUID: %v, ID=%v", err, tft.ID)
 	}
 }
+
+func TestSession_LogValue_RedactsIDHash(t *testing.T) {
+	s := Session{
+		ID:                uuid.New(),
+		UserID:            uuid.New(),
+		IDHash:            "sensitive-session-hash-12345",
+		SessionType:       SessionTypeBearer,
+		IPAddress:         "127.0.0.1",
+		UserAgent:         "TestAgent",
+		CredentialVersion: 1,
+		LastActiveAt:      time.Now(),
+		AbsoluteExpiresAt: time.Now().Add(24 * time.Hour),
+		CreatedAt:         time.Now(),
+	}
+	found := false
+	for _, a := range s.LogValue().Group() {
+		if a.Key == "id_hash" {
+			found = true
+			if a.Value.String() != "[REDACTED]" {
+				t.Errorf("Session IDHash not redacted: %s", a.Value.String())
+			}
+		}
+	}
+	if !found {
+		t.Errorf("expected id_hash in Session.LogValue()")
+	}
+}

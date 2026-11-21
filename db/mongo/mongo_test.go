@@ -3,6 +3,8 @@ package mongostore
 import (
 	"context"
 	"fmt"
+	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -10,7 +12,9 @@ import (
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
+	"gorm.io/gorm"
 
+	"github.com/kaiizer777/go-auth/config"
 	"github.com/kaiizer777/go-auth/db"
 	"github.com/kaiizer777/go-auth/errors"
 )
@@ -499,5 +503,83 @@ func TestMongoStore_ResolveCtx_DynamicBinding(t *testing.T) {
 	txStore := store.withSession(nil)
 	if txStore.resolveCtx(ctx) != ctx {
 		t.Errorf("expected resolveCtx to return caller context when session is nil")
+	}
+}
+
+func TestUserStore_Delete_Cascade(t *testing.T) {
+	uri := os.Getenv("TEST_MONGO_URI")
+	if uri == "" {
+		t.Skip("TEST_MONGO_URI unset; skipping live MongoDB cascade test")
+	}
+	cfg := config.DefaultConfig()
+	cfg.DatabaseType = config.DatabaseTypeMongo
+	cfg.DatabaseURL = uri
+	cfg.MongoDB.Database = fmt.Sprintf("goauth_test_cascade_%s", strings.ReplaceAll(uuid.New().String(), "-", ""))
+	cfg.MongoDB.AllowNonTransactionalMongo = true
+
+	store, err := Connect(cfg)
+	if err != nil {
+		t.Fatalf("failed to connect to mongodb: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = store.Database().Drop(context.Background())
+		_ = store.Close()
+	})
+
+	ctx := context.Background()
+	uid := uuid.New()
+	user := &db.User{
+		ID:            uid,
+		Email:         "cascade@example.com",
+		PasswordHash:  "dummy_hash",
+		EmailVerified: true,
+		CreatedAt:     time.Now().UTC(),
+		UpdatedAt:     time.Now().UTC(),
+	}
+	if err := store.Users().Create(ctx, user); err != nil {
+		t.Fatalf("Create user failed: %v", err)
+	}
+
+	// Seed child documents across collections
+	sess := &db.Session{
+		ID:                uuid.New(),
+		UserID:            uid,
+		IDHash:            "id_hash_1",
+		SessionType:       db.SessionTypeBearer,
+		LastActiveAt:      time.Now().UTC(),
+		AbsoluteExpiresAt: time.Now().Add(time.Hour).UTC(),
+		CreatedAt:         time.Now().UTC(),
+	}
+	if err := store.Sessions().Create(ctx, sess); err != nil {
+		t.Fatalf("Create session failed: %v", err)
+	}
+
+	tok := &db.VerificationToken{
+		TokenHash: []byte("vtok_hash_1"),
+		UserID:    uid,
+		ExpiresAt: time.Now().Add(time.Hour).UTC(),
+		CreatedAt: time.Now().UTC(),
+	}
+	if err := store.VerificationTokens().Create(ctx, tok); err != nil {
+		t.Fatalf("Create verification token failed: %v", err)
+	}
+
+	// Delete user
+	if err := store.Users().Delete(ctx, uid); err != nil {
+		t.Fatalf("Delete user failed: %v", err)
+	}
+
+	// Verify child collections are purged
+	sessions, err := store.Sessions().ListByUserID(ctx, uid)
+	if err != nil {
+		t.Fatalf("ListByUserID failed: %v", err)
+	}
+	if len(sessions) != 0 {
+		t.Fatalf("expected 0 sessions after cascade delete, got %d", len(sessions))
+	}
+
+	_, err = store.VerificationTokens().GetByTokenHash(ctx, []byte("vtok_hash_1"))
+	if !errors.Is(err, gorm.ErrRecordNotFound) && err == nil {
+		t.Fatal("expected verification token to be deleted by cascade, but found it")
 	}
 }

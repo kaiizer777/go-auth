@@ -103,6 +103,9 @@ func (s *MongoStore) Transaction(ctx context.Context, fn func(txStore db.Store) 
 	if s.client == nil {
 		return errors.ErrTransactionUnsupported
 	}
+	if s.session != nil {
+		return fn(s)
+	}
 	sess, err := s.client.StartSession()
 	if err != nil {
 		if s.allowNonTransactional {
@@ -312,8 +315,30 @@ func (s *userStore) SetEmailVerified(ctx context.Context, id uuid.UUID, verified
 }
 
 func (s *userStore) Delete(ctx context.Context, id uuid.UUID) error {
-	_, err := s.collection().DeleteOne(s.store.resolveCtx(ctx), bson.M{"_id": id.String()})
-	return err
+	uidStr := id.String()
+	return s.store.Transaction(ctx, func(txStore db.Store) error {
+		mTx, ok := txStore.(*MongoStore)
+		if !ok {
+			mTx = s.store
+		}
+		cCtx := mTx.resolveCtx(ctx)
+		childCollections := []string{
+			"sessions",
+			"verification_tokens",
+			"password_reset_tokens",
+			"oauth_accounts",
+			"totp_secrets",
+			"totp_used_codes",
+			"two_factor_tokens",
+		}
+		for _, col := range childCollections {
+			if _, err := mTx.database.Collection(col).DeleteMany(cCtx, bson.M{"user_id": uidStr}); err != nil {
+				return err
+			}
+		}
+		_, err := mTx.database.Collection("users").DeleteOne(cCtx, bson.M{"_id": uidStr})
+		return err
+	})
 }
 
 // ==========================================
