@@ -70,6 +70,8 @@ func (h *Handler) HandleTotpEnroll(w http.ResponseWriter, r *http.Request) {
 		"user_agent", r.UserAgent(),
 	)
 
+	w.Header().Set("Cache-Control", "no-store, private")
+	w.Header().Set("Pragma", "no-cache")
 	writeJSON(w, http.StatusOK, res)
 }
 
@@ -121,6 +123,8 @@ func (h *Handler) HandleTotpConfirm(w http.ResponseWriter, r *http.Request) {
 		"ip", ip,
 	)
 
+	w.Header().Set("Cache-Control", "no-store, private")
+	w.Header().Set("Pragma", "no-cache")
 	writeJSON(w, http.StatusOK, map[string]any{
 		"confirmed":    true,
 		"backup_codes": backupCodes,
@@ -277,6 +281,23 @@ func (h *Handler) HandleTotpDisable(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	ip := realIP(r)
+	var ipKey, userKey string
+	if h.totpLimiter != nil {
+		ipKey = ratelimit.TOTPIPKey(ip)
+		if !h.totpLimiter.Allow(ipKey) {
+			slog.WarnContext(r.Context(), "rate_limit_exceeded", "ip", ip, "endpoint", r.URL.Path, "key_type", "ip")
+			ratelimit.WriteRateLimitError(w, h.totpLimiter.RetryAfter(ipKey))
+			return
+		}
+		userKey = ratelimit.TOTPUserKey(userID.String())
+		if !h.totpLimiter.Allow(userKey) {
+			slog.WarnContext(r.Context(), "rate_limit_exceeded", "user_id", userID.String(), "endpoint", r.URL.Path, "key_type", "user")
+			ratelimit.WriteRateLimitError(w, h.totpLimiter.RetryAfter(userKey))
+			return
+		}
+	}
+
 	req, ok := decodeJSON[totpDisableRequest](w, r)
 	if !ok {
 		return
@@ -286,7 +307,7 @@ func (h *Handler) HandleTotpDisable(w http.ResponseWriter, r *http.Request) {
 	if code == "" {
 		code = strings.TrimSpace(req.TotpCode)
 	}
-	password := strings.TrimSpace(req.Password)
+	password := req.Password
 
 	if password == "" && code == "" {
 		errors.WriteHTTP(w, errors.ErrInvalidCredentials)
@@ -298,9 +319,14 @@ func (h *Handler) HandleTotpDisable(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if h.totpLimiter != nil {
+		h.totpLimiter.Reset(ipKey)
+		h.totpLimiter.Reset(userKey)
+	}
+
 	slog.InfoContext(r.Context(), "totp_disabled",
 		"user_id", userID.String(),
-		"ip", realIP(r),
+		"ip", ip,
 	)
 
 	writeJSON(w, http.StatusOK, map[string]any{

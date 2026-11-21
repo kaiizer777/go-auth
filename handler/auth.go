@@ -245,6 +245,8 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 			if h.cfg != nil && h.cfg.TOTP.ChallengeTokenTTL > 0 {
 				ttlSeconds = int(h.cfg.TOTP.ChallengeTokenTTL / time.Second)
 			}
+			w.Header().Set("Cache-Control", "no-store, private")
+			w.Header().Set("Pragma", "no-cache")
 			writeJSON(w, http.StatusOK, map[string]any{
 				"two_factor_required": true,
 				"challenge_token":     challengeToken,

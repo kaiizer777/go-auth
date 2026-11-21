@@ -40,6 +40,11 @@ func setupTotpSecurityApp(t *testing.T, modifyCfg ...func(*config.Config)) (*goa
 	if err != nil {
 		t.Fatalf("failed to open sqlite database: %v", err)
 	}
+	sqlDB, err := database.DB()
+	if err != nil {
+		t.Fatalf("failed to get sql.DB: %v", err)
+	}
+	sqlDB.SetMaxOpenConns(1)
 
 	ddl := `
 	CREATE TABLE IF NOT EXISTS users (
@@ -246,11 +251,17 @@ func interceptLogin(t *testing.T, app *goauth.Auth, email, password string) stri
 	if !res.TwoFactorRequired || res.ChallengeToken == "" {
 		t.Fatalf("expected two_factor_required=true and challenge token, got %+v", res)
 	}
+	if cc := rec.Header().Get("Cache-Control"); cc != "no-store, private" {
+		t.Errorf("expected Cache-Control 'no-store, private', got %q", cc)
+	}
+	if pragma := rec.Header().Get("Pragma"); pragma != "no-cache" {
+		t.Errorf("expected Pragma 'no-cache', got %q", pragma)
+	}
 	return res.ChallengeToken
 }
 
-// 1. TestConcurrentCodeReplayRace: 16 concurrent goroutines submit the EXACT same valid code simultaneously.
-// Exactly 1 must succeed (200 OK); all other 15 must fail with replay or token error.
+// 1. TestConcurrentCodeReplayRace: 16 concurrent goroutines submit the EXACT same valid code simultaneously with distinct challenge tokens.
+// Exactly 1 must succeed (200 OK); all other 15 must fail with code replay error.
 func TestConcurrentCodeReplayRace(t *testing.T) {
 	t.Parallel()
 	app, dbConn, _ := setupTotpSecurityApp(t, func(c *config.Config) {
@@ -262,13 +273,17 @@ func TestConcurrentCodeReplayRace(t *testing.T) {
 	user := createTotpSecUser(t, dbConn, email, rawPass, true)
 	secret, _ := enrollAndConfirmUser(t, app, user.ID.String())
 
-	challengeToken := interceptLogin(t, app, email, rawPass)
 	validCode, err := ptotp.GenerateCode(secret, time.Now().UTC())
 	if err != nil {
 		t.Fatalf("generate valid code: %v", err)
 	}
 
 	const concurrency = 16
+	challengeTokens := make([]string, concurrency)
+	for i := 0; i < concurrency; i++ {
+		challengeTokens[i] = interceptLogin(t, app, email, rawPass)
+	}
+
 	type result struct {
 		code int
 		body string
@@ -285,7 +300,7 @@ func TestConcurrentCodeReplayRace(t *testing.T) {
 			<-startGate
 
 			rec := doSecRequest(app.Handler, http.MethodPost, "/auth/totp/verify", map[string]string{
-				"challenge_token": challengeToken,
+				"challenge_token": challengeTokens[idx],
 				"code":            validCode,
 			}, []*http.Cookie{csrfCookie}, map[string]string{
 				"X-CSRF-Token": csrfToken,
@@ -299,15 +314,14 @@ func TestConcurrentCodeReplayRace(t *testing.T) {
 	wg.Wait()
 
 	successCount := 0
-	replayOrInvalidCount := 0
+	replayCount := 0
 	otherCount := 0
 
 	for _, res := range results {
 		if res.code == http.StatusOK {
 			successCount++
-		} else if (res.code == http.StatusBadRequest && strings.Contains(res.body, "TOTP_CODE_REPLAYED")) ||
-			(res.code == http.StatusUnauthorized && strings.Contains(res.body, "TWO_FACTOR_TOKEN_INVALID")) {
-			replayOrInvalidCount++
+		} else if res.code == http.StatusBadRequest && (strings.Contains(res.body, "TOTP_CODE_REPLAYED") || strings.Contains(res.body, "TOTP_CODE_ALREADY_USED")) {
+			replayCount++
 		} else {
 			otherCount++
 		}
@@ -317,11 +331,14 @@ func TestConcurrentCodeReplayRace(t *testing.T) {
 		for idx, res := range results {
 			t.Logf("[%d] code=%d body=%s", idx, res.code, res.body)
 		}
-		t.Fatalf("concurrency race failure: expected EXACTLY 1 success (200 OK), got %d (replays/invalids=%d, other=%d)",
-			successCount, replayOrInvalidCount, otherCount)
+		t.Fatalf("concurrency race failure: expected EXACTLY 1 success (200 OK), got %d (replays=%d, other=%d)",
+			successCount, replayCount, otherCount)
 	}
-	if replayOrInvalidCount != concurrency-1 {
-		t.Fatalf("expected %d rejected replay/token-invalid attempts, got %d", concurrency-1, replayOrInvalidCount)
+	if replayCount != concurrency-1 {
+		for idx, res := range results {
+			t.Logf("[%d] code=%d body=%s", idx, res.code, res.body)
+		}
+		t.Fatalf("expected %d rejected replay attempts, got %d (other=%d)", concurrency-1, replayCount, otherCount)
 	}
 }
 

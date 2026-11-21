@@ -682,15 +682,14 @@ func (s *totpService) DisableTOTP(ctx context.Context, userID, password, code st
 		return err
 	}
 
-	trimmedPassword := strings.TrimSpace(password)
 	trimmedCode := strings.TrimSpace(code)
-	if trimmedPassword == "" && trimmedCode == "" {
+	if password == "" && trimmedCode == "" {
 		return apperrors.ErrInvalidCredentials
 	}
 
 	var authed bool
-	if trimmedPassword != "" {
-		match, err := crypto.VerifyPassword(trimmedPassword, user.PasswordHash)
+	if password != "" {
+		match, err := crypto.VerifyPassword(password, user.PasswordHash)
 		if err == nil && match {
 			authed = true
 		}

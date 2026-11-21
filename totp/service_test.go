@@ -794,6 +794,54 @@ func TestDisableTOTP_BothCredentialsValid(t *testing.T) {
 	}
 }
 
+func TestDisableTOTP_PreservesPasswordWhitespace(t *testing.T) {
+	t.Parallel()
+
+	database := setupTestDB(t)
+	plainPassword := "  PasswordWithSpaces#2026!  "
+	hash, err := crypto.HashPassword(plainPassword, crypto.DefaultHashParams())
+	if err != nil {
+		t.Fatalf("HashPassword failed: %v", err)
+	}
+
+	user := db.User{
+		ID:            uuid.New(),
+		Email:         "whitespace_pass@example.com",
+		PasswordHash:  hash,
+		EmailVerified: true,
+		CreatedAt:     time.Now(),
+		UpdatedAt:     time.Now(),
+	}
+	if err := database.Create(&user).Error; err != nil {
+		t.Fatalf("failed to create user: %v", err)
+	}
+
+	svc := NewService(database, config.TOTPConfig{EncryptionKey: validTestHexKey()}, nil, nil)
+	resp, err := svc.Enroll(context.Background(), user.ID.String())
+	if err != nil {
+		t.Fatalf("Enroll failed: %v", err)
+	}
+	code, err := ptotp.GenerateCode(resp.Secret, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("GenerateCode failed: %v", err)
+	}
+	_, err = svc.ConfirmEnrollment(context.Background(), user.ID.String(), code)
+	if err != nil {
+		t.Fatalf("ConfirmEnrollment failed: %v", err)
+	}
+
+	// Disable with exact password containing leading and trailing spaces
+	err = svc.DisableTOTP(context.Background(), user.ID.String(), plainPassword, "")
+	if err != nil {
+		t.Fatalf("DisableTOTP failed with whitespace password: %v", err)
+	}
+
+	enabled, err := svc.Status(context.Background(), user.ID.String())
+	if err != nil || enabled {
+		t.Fatalf("expected enabled=false, got %v, err=%v", enabled, err)
+	}
+}
+
 func TestVerifyBackupCode_DualRateLimit(t *testing.T) {
 	t.Parallel()
 
