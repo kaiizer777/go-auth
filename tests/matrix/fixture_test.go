@@ -319,7 +319,7 @@ func getAvailableAdapters(t *testing.T) []TestAdapter {
 	if pgURL != "" {
 		adapter, err := setupPostgresAdapter(t, pgURL)
 		if err != nil {
-			t.Logf("PostgreSQL adapter init skipped: %v", err)
+			t.Fatalf("configured %s test backend failed to initialize: %v", "postgres", err)
 		} else {
 			adapters = append(adapters, adapter)
 		}
@@ -332,7 +332,7 @@ func getAvailableAdapters(t *testing.T) []TestAdapter {
 	if mysqlDSN != "" {
 		adapter, err := setupMySQLAdapter(t, mysqlDSN)
 		if err != nil {
-			t.Logf("MySQL adapter init skipped: %v", err)
+			t.Fatalf("configured %s test backend failed to initialize: %v", "mysql", err)
 		} else {
 			adapters = append(adapters, adapter)
 		}
@@ -345,7 +345,7 @@ func getAvailableAdapters(t *testing.T) []TestAdapter {
 	if mongoURI != "" {
 		adapter, err := setupMongoAdapter(t, mongoURI)
 		if err != nil {
-			t.Logf("MongoDB adapter init skipped: %v", err)
+			t.Fatalf("configured %s test backend failed to initialize: %v", "mongodb", err)
 		} else {
 			adapters = append(adapters, adapter)
 		}

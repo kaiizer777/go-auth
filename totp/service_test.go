@@ -2,6 +2,7 @@ package totp
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -19,6 +20,7 @@ import (
 	"github.com/kaiizer777/go-auth/config"
 	"github.com/kaiizer777/go-auth/crypto"
 	"github.com/kaiizer777/go-auth/db"
+	gormstore "github.com/kaiizer777/go-auth/db/gorm"
 	apperrors "github.com/kaiizer777/go-auth/errors"
 	"github.com/kaiizer777/go-auth/ratelimit"
 )
@@ -1166,5 +1168,158 @@ func TestConfirmEnrollment_RateLimiting(t *testing.T) {
 	_, err = svc.ConfirmEnrollment(context.Background(), user.ID.String(), "333333")
 	if !errors.Is(err, apperrors.ErrTOTPRateLimitExceeded) {
 		t.Fatalf("expected ErrTOTPRateLimitExceeded on attempt 3, got %v", err)
+	}
+}
+
+type mockTotpStoreWrapper struct {
+	db.TotpStore
+	recordUsedCodeErr error
+}
+
+func (m *mockTotpStoreWrapper) RecordUsedCode(ctx context.Context, usedCode *db.TotpUsedCode) error {
+	if m.recordUsedCodeErr != nil {
+		return m.recordUsedCodeErr
+	}
+	return m.TotpStore.RecordUsedCode(ctx, usedCode)
+}
+
+type mockStoreWrapper struct {
+	db.Store
+	totpWrapper *mockTotpStoreWrapper
+}
+
+func (m *mockStoreWrapper) Totp() db.TotpStore {
+	return m.totpWrapper
+}
+
+func (m *mockStoreWrapper) Transaction(ctx context.Context, fn func(txStore db.Store) error) error {
+	return fn(m)
+}
+
+func TestVerifyCode_StorageErrorNotMaskedAsReplay(t *testing.T) {
+	t.Parallel()
+
+	database := setupTestDB(t)
+	user := createTestUser(t, database, "storage_err_verify@example.com", true)
+	baseStore := gormstore.New(database)
+	totpMock := &mockTotpStoreWrapper{TotpStore: baseStore.Totp()}
+	wrappedStore := &mockStoreWrapper{Store: baseStore, totpWrapper: totpMock}
+	svc := NewServiceWithStore(wrappedStore, config.TOTPConfig{EncryptionKey: validTestHexKey()}, nil, nil)
+
+	resp, err := svc.Enroll(context.Background(), user.ID.String())
+	if err != nil {
+		t.Fatalf("Enroll failed: %v", err)
+	}
+	code, err := ptotp.GenerateCode(resp.Secret, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("GenerateCode failed: %v", err)
+	}
+	_, err = svc.ConfirmEnrollment(context.Background(), user.ID.String(), code)
+	if err != nil {
+		t.Fatalf("ConfirmEnrollment failed: %v", err)
+	}
+
+	// Next code window
+	nextCode, err := ptotp.GenerateCode(resp.Secret, time.Now().Add(30*time.Second).UTC())
+	if err != nil {
+		t.Fatalf("GenerateCode for next window failed: %v", err)
+	}
+
+	// 1. Simulate non-duplicate storage error (e.g. context deadline exceeded)
+	transientErr := errors.New("transient network failure connecting to db")
+	totpMock.recordUsedCodeErr = transientErr
+
+	err = svc.VerifyCode(context.Background(), user.ID.String(), nextCode, "127.0.0.1")
+	if errors.Is(err, apperrors.ErrTOTPCodeReplayed) {
+		t.Fatalf("critical error: non-duplicate storage error was masked as ErrTOTPCodeReplayed")
+	}
+	if !errors.Is(err, transientErr) {
+		t.Fatalf("expected transientErr, got %v", err)
+	}
+
+	// 2. Clear mock error -> now verify succeeds
+	totpMock.recordUsedCodeErr = nil
+	err = svc.VerifyCode(context.Background(), user.ID.String(), nextCode, "127.0.0.1")
+	if err != nil {
+		t.Fatalf("VerifyCode failed after clearing mock storage error: %v", err)
+	}
+
+	// 3. Immediate replay must correctly yield ErrTOTPCodeReplayed
+	err = svc.VerifyCode(context.Background(), user.ID.String(), nextCode, "127.0.0.1")
+	if !errors.Is(err, apperrors.ErrTOTPCodeReplayed) {
+		t.Fatalf("expected ErrTOTPCodeReplayed on replay, got %v", err)
+	}
+}
+
+func TestConfirmEnrollment_StorageErrorNotMaskedAsReplay(t *testing.T) {
+	t.Parallel()
+
+	database := setupTestDB(t)
+	user := createTestUser(t, database, "storage_err_confirm@example.com", true)
+	baseStore := gormstore.New(database)
+	totpMock := &mockTotpStoreWrapper{TotpStore: baseStore.Totp()}
+	wrappedStore := &mockStoreWrapper{Store: baseStore, totpWrapper: totpMock}
+	svc := NewServiceWithStore(wrappedStore, config.TOTPConfig{EncryptionKey: validTestHexKey()}, nil, nil)
+
+	resp, err := svc.Enroll(context.Background(), user.ID.String())
+	if err != nil {
+		t.Fatalf("Enroll failed: %v", err)
+	}
+	code, err := ptotp.GenerateCode(resp.Secret, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("GenerateCode failed: %v", err)
+	}
+
+	transientErr := errors.New("database context deadline exceeded")
+	totpMock.recordUsedCodeErr = transientErr
+
+	_, err = svc.ConfirmEnrollment(context.Background(), user.ID.String(), code)
+	if errors.Is(err, apperrors.ErrTOTPCodeReplayed) {
+		t.Fatalf("critical error: non-duplicate storage error was masked as ErrTOTPCodeReplayed")
+	}
+	if !errors.Is(err, transientErr) {
+		t.Fatalf("expected transientErr, got %v", err)
+	}
+}
+
+func TestConsumeChallengeToken_ExhaustedAndExpired(t *testing.T) {
+	t.Parallel()
+
+	database := setupTestDB(t)
+	user := createTestUser(t, database, "consume_exhausted@example.com", true)
+	svc := NewService(database, config.TOTPConfig{EncryptionKey: validTestHexKey(), MaxAttemptsPerWindow: 3}, nil, nil)
+
+	// Test 1: Exhausted token cannot be consumed
+	rawToken, err := svc.CreateChallengeToken(context.Background(), user.ID.String())
+	if err != nil {
+		t.Fatalf("CreateChallengeToken failed: %v", err)
+	}
+
+	for i := 0; i < 3; i++ {
+		_, _ = svc.RecordTokenAttempt(context.Background(), rawToken)
+	}
+
+	consumedUser, err := svc.ConsumeChallengeToken(context.Background(), rawToken)
+	if consumedUser != nil || err == nil {
+		t.Fatalf("expected error consuming exhausted token, got user=%v, err=nil", consumedUser)
+	}
+
+	// Test 2: Expired token cannot be consumed
+	tokenHash := sha256.Sum256([]byte("expired_token_literal"))
+	expiredTok := &db.TwoFactorToken{
+		ID:        uuid.New(),
+		UserID:    user.ID,
+		TokenHash: tokenHash[:],
+		ExpiresAt: time.Now().UTC().Add(-5 * time.Minute),
+		Attempts:  0,
+	}
+	store := gormstore.New(database)
+	if err := store.Totp().CreateTwoFactorToken(context.Background(), expiredTok); err != nil {
+		t.Fatalf("CreateTwoFactorToken failed: %v", err)
+	}
+
+	consumedUser, err = svc.ConsumeChallengeToken(context.Background(), "expired_token_literal")
+	if consumedUser != nil || !errors.Is(err, apperrors.ErrTwoFactorTokenExpired) {
+		t.Fatalf("expected ErrTwoFactorTokenExpired, got user=%v, err=%v", consumedUser, err)
 	}
 }

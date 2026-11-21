@@ -653,6 +653,16 @@ func TestTotpStore_AllMethods(t *testing.T) {
 		t.Fatalf("expected ErrTOTPNotEnrolled, got %v", err)
 	}
 
+	// 8b. UpdateBackupCodesCAS
+	casSuccess, err := totp.UpdateBackupCodesCAS(ctx, userID, []string{"raw1"}, []string{"raw2"})
+	if err != nil || !casSuccess {
+		t.Fatalf("UpdateBackupCodesCAS expected success, got %v, err=%v", casSuccess, err)
+	}
+	casFail, err := totp.UpdateBackupCodesCAS(ctx, userID, []string{"wrong_stale"}, []string{"raw3"})
+	if err != nil || casFail {
+		t.Fatalf("UpdateBackupCodesCAS expected false on mismatch, got %v, err=%v", casFail, err)
+	}
+
 	// 9. DeleteUnconfirmedSecret (should not delete enabled secret)
 	if err := totp.DeleteUnconfirmedSecret(ctx, userID); err != nil {
 		t.Fatalf("DeleteUnconfirmedSecret failed: %v", err)
@@ -773,6 +783,24 @@ func TestTotpStore_AllMethods(t *testing.T) {
 	attCapped, err := totp.IncrementTwoFactorAttempts(ctx, []byte("capped_2fa_hash"), 3, time.Now().UTC())
 	if !errors.Is(err, apperrors.ErrTwoFactorMaxAttemptsExceeded) || attCapped != 3 {
 		t.Fatalf("expected ErrTwoFactorMaxAttemptsExceeded with 3 attempts, got %d, %v", attCapped, err)
+	}
+
+	// ConsumeTwoFactorToken - valid
+	consumeValidTok := &db.TwoFactorToken{
+		UserID:    userID,
+		TokenHash: []byte("consume_tok_hash"),
+		ExpiresAt: time.Now().UTC().Add(time.Hour),
+		Attempts:  0,
+	}
+	_ = totp.CreateTwoFactorToken(ctx, consumeValidTok)
+	consumed, err := totp.ConsumeTwoFactorToken(ctx, []byte("consume_tok_hash"), 5, time.Now().UTC())
+	if err != nil || !consumed {
+		t.Fatalf("ConsumeTwoFactorToken expected true, got %v, err=%v", consumed, err)
+	}
+	// Already consumed -> false
+	consumedAgain, err := totp.ConsumeTwoFactorToken(ctx, []byte("consume_tok_hash"), 5, time.Now().UTC())
+	if err != nil || consumedAgain {
+		t.Fatalf("ConsumeTwoFactorToken expected false on second attempt, got %v, err=%v", consumedAgain, err)
 	}
 
 	// DeleteTwoFactorToken

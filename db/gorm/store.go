@@ -316,6 +316,42 @@ func (s *totpStore) UpdateBackupCodesJSON(ctx context.Context, secretID uuid.UUI
 	return nil
 }
 
+func (s *totpStore) UpdateBackupCodesCAS(ctx context.Context, userID uuid.UUID, expectedCodes []string, newCodes []string) (bool, error) {
+	expectedJSON, err := json.Marshal(expectedCodes)
+	if err != nil {
+		return false, err
+	}
+	newJSON, err := json.Marshal(newCodes)
+	if err != nil {
+		return false, err
+	}
+	now := time.Now().UTC()
+
+	var res *gorm.DB
+	switch s.db.Name() {
+	case "postgres":
+		res = s.db.WithContext(ctx).Exec(
+			"UPDATE totp_secrets SET backup_codes = CAST(? AS jsonb), updated_at = ? WHERE user_id = ? AND enabled = true AND (backup_codes = CAST(? AS jsonb) OR CAST(backup_codes AS TEXT) = ?)",
+			string(newJSON), now, userID.String(), string(expectedJSON), string(expectedJSON),
+		)
+	case "mysql":
+		res = s.db.WithContext(ctx).Exec(
+			"UPDATE totp_secrets SET backup_codes = CAST(? AS JSON), updated_at = ? WHERE user_id = ? AND enabled = true AND (backup_codes = CAST(? AS JSON) OR backup_codes = ?)",
+			string(newJSON), now, userID.String(), string(expectedJSON), string(expectedJSON),
+		)
+	default:
+		res = s.db.WithContext(ctx).Exec(
+			"UPDATE totp_secrets SET backup_codes = ?, updated_at = ? WHERE user_id = ? AND enabled = true AND (backup_codes = ? OR backup_codes = ?)",
+			string(newJSON), now, userID.String(), string(expectedJSON), expectedJSON,
+		)
+	}
+
+	if res.Error != nil {
+		return false, res.Error
+	}
+	return res.RowsAffected > 0, nil
+}
+
 func (s *totpStore) DeleteSecret(ctx context.Context, userID uuid.UUID) error {
 	return s.db.WithContext(ctx).Where("user_id = ?", userID).Delete(&db.TotpSecret{}).Error
 }
@@ -400,6 +436,19 @@ func (s *totpStore) IncrementTwoFactorAttempts(ctx context.Context, tokenHash []
 		return newAttempts, resErr
 	}
 	return newAttempts, nil
+}
+
+func (s *totpStore) ConsumeTwoFactorToken(ctx context.Context, tokenHash []byte, maxAttempts int, now time.Time) (bool, error) {
+	if maxAttempts <= 0 {
+		maxAttempts = 5
+	}
+	res := s.db.WithContext(ctx).
+		Where("token_hash = ? AND expires_at > ? AND attempts < ?", tokenHash, now.UTC(), maxAttempts).
+		Delete(&db.TwoFactorToken{})
+	if res.Error != nil {
+		return false, res.Error
+	}
+	return res.RowsAffected > 0, nil
 }
 
 func (s *totpStore) DeleteTwoFactorToken(ctx context.Context, id uuid.UUID) (int64, error) {

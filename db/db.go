@@ -288,7 +288,10 @@ func NormalizeMySQLError(err error) error {
 	if strings.Contains(msg, "1452") || strings.Contains(msg, "foreign key constraint fails") {
 		return errors.ErrUserNotFound
 	}
-	if !is1062 && !strings.Contains(msg, "1062") && !strings.Contains(msg, "duplicate entry") {
+	isDup := is1062 || strings.Contains(msg, "1062") || strings.Contains(msg, "duplicate entry") ||
+		strings.Contains(msg, "duplicate key") || strings.Contains(msg, "23505") ||
+		strings.Contains(msg, "unique constraint")
+	if !isDup {
 		return err
 	}
 

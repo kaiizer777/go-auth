@@ -823,6 +823,39 @@ func (s *totpStore) UpdateBackupCodesJSON(ctx context.Context, secretID uuid.UUI
 	return nil
 }
 
+func (s *totpStore) UpdateBackupCodesCAS(ctx context.Context, userID uuid.UUID, expectedCodes []string, newCodes []string) (bool, error) {
+	expectedJSON, err := json.Marshal(expectedCodes)
+	if err != nil {
+		return false, err
+	}
+	newJSON, err := json.Marshal(newCodes)
+	if err != nil {
+		return false, err
+	}
+	now := time.Now().UTC()
+
+	filter := bson.M{
+		"user_id": userID.String(),
+		"enabled": true,
+		"$or": []bson.M{
+			{"backup_codes": expectedCodes},
+			{"backup_codes": expectedJSON},
+			{"backup_codes": string(expectedJSON)},
+		},
+	}
+	update := bson.M{
+		"$set": bson.M{
+			"backup_codes": newJSON,
+			"updated_at":   now,
+		},
+	}
+	res, err := s.secrets().UpdateOne(s.store.resolveCtx(ctx), filter, update)
+	if err != nil {
+		return false, err
+	}
+	return res.ModifiedCount > 0, nil
+}
+
 func (s *totpStore) DeleteSecret(ctx context.Context, userID uuid.UUID) error {
 	_, err := s.secrets().DeleteMany(s.store.resolveCtx(ctx), bson.M{"user_id": userID.String()})
 	return err
@@ -919,6 +952,22 @@ func (s *totpStore) IncrementTwoFactorAttempts(ctx context.Context, tokenHash []
 		return doc.Attempts, errors.ErrTwoFactorMaxAttemptsExceeded
 	}
 	return doc.Attempts, nil
+}
+
+func (s *totpStore) ConsumeTwoFactorToken(ctx context.Context, tokenHash []byte, maxAttempts int, now time.Time) (bool, error) {
+	if maxAttempts <= 0 {
+		maxAttempts = 5
+	}
+	filter := bson.M{
+		"token_hash": tokenHash,
+		"expires_at": bson.M{"$gt": now.UTC()},
+		"attempts":   bson.M{"$lt": maxAttempts},
+	}
+	res, err := s.twoFactorTokens().DeleteOne(s.store.resolveCtx(ctx), filter)
+	if err != nil {
+		return false, err
+	}
+	return res.DeletedCount > 0, nil
 }
 
 func (s *totpStore) DeleteTwoFactorToken(ctx context.Context, id uuid.UUID) (int64, error) {

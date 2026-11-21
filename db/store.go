@@ -72,6 +72,7 @@ type TotpStore interface {
 	EnableSecret(ctx context.Context, secretID uuid.UUID, backupCodesJSON []byte) error
 	UpdateBackupCodes(ctx context.Context, userID uuid.UUID, backupCodes []string) error
 	UpdateBackupCodesJSON(ctx context.Context, secretID uuid.UUID, backupCodesJSON []byte) error
+	UpdateBackupCodesCAS(ctx context.Context, userID uuid.UUID, expectedCodes []string, newCodes []string) (bool, error)
 	DeleteSecret(ctx context.Context, userID uuid.UUID) error
 	DeleteUnconfirmedSecret(ctx context.Context, userID uuid.UUID) error
 	IsTotpEnabled(ctx context.Context, userID uuid.UUID) (bool, error)
@@ -83,6 +84,7 @@ type TotpStore interface {
 	CreateTwoFactorToken(ctx context.Context, token *TwoFactorToken) error
 	GetTwoFactorToken(ctx context.Context, tokenHash []byte) (*TwoFactorToken, error)
 	IncrementTwoFactorAttempts(ctx context.Context, tokenHash []byte, maxAttempts int, now time.Time) (int, error)
+	ConsumeTwoFactorToken(ctx context.Context, tokenHash []byte, maxAttempts int, now time.Time) (bool, error)
 	DeleteTwoFactorToken(ctx context.Context, id uuid.UUID) (int64, error)
 	DeleteTwoFactorTokensByUserID(ctx context.Context, userID uuid.UUID) error
 }

@@ -5,12 +5,14 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
 	"time"
 
+	mysqlDriver "github.com/go-sql-driver/mysql"
 	"github.com/google/uuid"
 	"gorm.io/gorm"
 
@@ -292,7 +294,10 @@ func (s *totpService) ConfirmEnrollment(ctx context.Context, userID, code string
 			UsedAt:   time.Now(),
 		}
 		if err := txStore.Totp().RecordUsedCode(ctx, &usedRecord); err != nil {
-			return apperrors.ErrTOTPCodeReplayed
+			if isTOTPReplayError(err) {
+				return apperrors.ErrTOTPCodeReplayed
+			}
+			return err
 		}
 
 		return txStore.Totp().EnableSecret(ctx, pending.ID, hashedCodesJSON)
@@ -472,7 +477,10 @@ func (s *totpService) VerifyCode(ctx context.Context, userID, code, clientIP str
 			UsedAt:   time.Now(),
 		}
 		if err := txStore.Totp().RecordUsedCode(ctx, &usedRecord); err != nil {
-			return apperrors.ErrTOTPCodeReplayed
+			if isTOTPReplayError(err) {
+				return apperrors.ErrTOTPCodeReplayed
+			}
+			return err
 		}
 		return nil
 	})
@@ -511,16 +519,26 @@ func (s *totpService) ConsumeChallengeToken(ctx context.Context, rawToken string
 		return nil, err
 	}
 
-	if time.Now().After(token.ExpiresAt) {
+	maxAttempts := s.cfg.MaxAttemptsPerWindow
+	if maxAttempts <= 0 {
+		maxAttempts = 5
+	}
+
+	now := time.Now().UTC()
+	if now.After(token.ExpiresAt) {
 		_, _ = s.store.Totp().DeleteTwoFactorToken(ctx, token.ID)
 		return nil, apperrors.ErrTwoFactorTokenExpired
 	}
+	if token.Attempts >= maxAttempts {
+		_, _ = s.store.Totp().DeleteTwoFactorToken(ctx, token.ID)
+		return nil, apperrors.ErrTwoFactorMaxAttemptsExceeded
+	}
 
-	rows, err := s.store.Totp().DeleteTwoFactorToken(ctx, token.ID)
+	consumed, err := s.store.Totp().ConsumeTwoFactorToken(ctx, tokenHash[:], maxAttempts, now)
 	if err != nil {
 		return nil, err
 	}
-	if rows == 0 {
+	if !consumed {
 		return nil, apperrors.ErrTwoFactorTokenInvalid
 	}
 
@@ -567,6 +585,11 @@ func (s *totpService) VerifyBackupCode(ctx context.Context, userID, backupCode, 
 			return err
 		}
 
+		var currentCodes []string
+		if err := json.Unmarshal(secretRecord.BackupCodes, &currentCodes); err != nil {
+			return err
+		}
+
 		updatedJSON, matched, err := VerifyAndConsumeBackupCode(secretRecord.BackupCodes, trimmedCode)
 		if err != nil {
 			return err
@@ -575,7 +598,20 @@ func (s *totpService) VerifyBackupCode(ctx context.Context, userID, backupCode, 
 			return apperrors.ErrBackupCodeInvalid
 		}
 
-		return txStore.Totp().UpdateBackupCodesJSON(ctx, secretRecord.ID, updatedJSON)
+		var updatedCodes []string
+		if err := json.Unmarshal(updatedJSON, &updatedCodes); err != nil {
+			return err
+		}
+
+		ok, err := txStore.Totp().UpdateBackupCodesCAS(ctx, uid, currentCodes, updatedCodes)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return apperrors.ErrBackupCodeInvalid
+		}
+
+		return nil
 	})
 	if err != nil {
 		return err
@@ -679,7 +715,10 @@ func (s *totpService) DisableTOTP(ctx context.Context, userID, password, code st
 				UsedAt:   time.Now(),
 			}
 			if err := txStore.Totp().RecordUsedCode(ctx, &usedRecord); err != nil {
-				return apperrors.ErrTOTPCodeReplayed
+				if isTOTPReplayError(err) {
+					return apperrors.ErrTOTPCodeReplayed
+				}
+				return err
 			}
 		}
 		return txStore.Totp().DeleteTwoFactorTokensByUserID(ctx, uid)
@@ -741,4 +780,24 @@ func (s *totpService) ConsumeTwoFactorToken(ctx context.Context, rawToken string
 // DisableTotp is a UUID-friendly helper for DisableTOTP.
 func (s *totpService) DisableTotp(ctx context.Context, userID uuid.UUID, password, code string) error {
 	return s.DisableTOTP(ctx, userID.String(), password, code)
+}
+
+func isTOTPReplayError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, apperrors.ErrTOTPCodeReplayed) || errors.Is(err, gorm.ErrDuplicatedKey) {
+		return true
+	}
+	var myErr *mysqlDriver.MySQLError
+	if errors.As(err, &myErr) && myErr.Number == 1062 {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "1062") ||
+		strings.Contains(msg, "11000") ||
+		strings.Contains(msg, "23505") ||
+		strings.Contains(msg, "duplicate key") ||
+		strings.Contains(msg, "unique constraint") ||
+		strings.Contains(msg, "duplicate entry")
 }

@@ -744,6 +744,7 @@ func TestMongoStore_CanceledContext_AllMethods(t *testing.T) {
 	_ = store.Totp().EnableSecret(ctx, sec.ID, []byte("[]"))
 	_ = store.Totp().UpdateBackupCodes(ctx, uid, []string{"1"})
 	_ = store.Totp().UpdateBackupCodesJSON(ctx, sec.ID, []byte("[]"))
+	_, _ = store.Totp().UpdateBackupCodesCAS(ctx, uid, []string{"1"}, []string{"2"})
 	_ = store.Totp().DeleteSecret(ctx, uid)
 	_ = store.Totp().DeleteUnconfirmedSecret(ctx, uid)
 	_, _ = store.Totp().IsTotpEnabled(ctx, uid)
@@ -767,6 +768,7 @@ func TestMongoStore_CanceledContext_AllMethods(t *testing.T) {
 	_ = store.Totp().CreateTwoFactorToken(ctx, tfTok)
 	_, _ = store.Totp().GetTwoFactorToken(ctx, []byte("tf"))
 	_, _ = store.Totp().IncrementTwoFactorAttempts(ctx, []byte("tf"), 5, time.Now().UTC())
+	_, _ = store.Totp().ConsumeTwoFactorToken(ctx, []byte("tf"), 5, time.Now().UTC())
 	_, _ = store.Totp().DeleteTwoFactorToken(ctx, tfTok.ID)
 	_ = store.Totp().DeleteTwoFactorTokensByUserID(ctx, uid)
 
