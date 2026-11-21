@@ -189,13 +189,29 @@ func runMigrations(databaseURL, migrationsPath string) error {
 	return nil
 }
 
+// PrepareMySQLMigrationDSN parses the MySQL DSN and ensures multiStatements=true
+// is enabled for migration scripts, while runtime connections keep multiStatements=false.
+func PrepareMySQLMigrationDSN(databaseURL string) (string, error) {
+	cfg, err := mysqlDriver.ParseDSN(databaseURL)
+	if err != nil {
+		return "", errors.New(errors.CodeDatabaseError, "parse mysql migration dsn failed", err)
+	}
+	cfg.MultiStatements = true
+	return cfg.FormatDSN(), nil
+}
+
 // runMySQLMigrations executes database migrations using either embedded migration files
 // or a custom filesystem directory for MySQL.
 func runMySQLMigrations(databaseURL, migrationsPath string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), defaultMigrationTimeout)
 	defer cancel()
 
-	db, err := sql.Open("mysql", databaseURL)
+	migrationDSN, err := PrepareMySQLMigrationDSN(databaseURL)
+	if err != nil {
+		return err
+	}
+
+	db, err := sql.Open("mysql", migrationDSN)
 	if err != nil {
 		return errors.New(errors.CodeDatabaseError, "open database connection failed", err)
 	}

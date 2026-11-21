@@ -1778,6 +1778,16 @@ func TestRedactURL_Dialects(t *testing.T) {
 			expected: "root:REDACTED@tcp(127.0.0.1:3306)/auth?parseTime=true",
 		},
 		{
+			name:     "mysql dsn password with @ symbol",
+			raw:      "user:p@ss@word@tcp(127.0.0.1:3306)/db",
+			expected: "user:REDACTED@tcp(127.0.0.1:3306)/db",
+		},
+		{
+			name:     "mysql dsn unix socket password with @ symbol",
+			raw:      "user:p@ss@word@unix(/var/run/mysqld/mysqld.sock)/db",
+			expected: "user:REDACTED@unix(/var/run/mysqld/mysqld.sock)/db",
+		},
+		{
 			name:     "mongo standard uri",
 			raw:      "mongodb://admin:secret123@localhost:27017/auth",
 			expected: "mongodb://admin:REDACTED@localhost:27017/auth",
@@ -1801,5 +1811,32 @@ func TestRedactURL_Dialects(t *testing.T) {
 				t.Errorf("RedactURL(%q) = %q, want %q", tc.raw, got, tc.expected)
 			}
 		})
+	}
+}
+
+func TestRedactURL_MySQLPasswordsWithAtSymbol(t *testing.T) {
+	rawDSN := "user:p@ss@word@tcp(127.0.0.1:3306)/auth_db?charset=utf8mb4&parseTime=True"
+	redacted := RedactURL(rawDSN)
+
+	if strings.Contains(redacted, "p@ss@word") {
+		t.Fatalf("RedactURL leaked password containing @: %s", redacted)
+	}
+	if !strings.Contains(redacted, "user:REDACTED@tcp(127.0.0.1:3306)/auth_db") {
+		t.Fatalf("unexpected redacted DSN format: %s", redacted)
+	}
+
+	cfg := DefaultConfig()
+	cfg.DatabaseType = DatabaseTypeMySQL
+	cfg.DatabaseURL = rawDSN
+
+	logVal := cfg.LogValue()
+	logStr := fmt.Sprintf("%v", logVal)
+	if strings.Contains(logStr, "p@ss@word") {
+		t.Fatalf("Config.LogValue leaked password containing @: %s", logStr)
+	}
+
+	cfgStr := cfg.String()
+	if strings.Contains(cfgStr, "p@ss@word") {
+		t.Fatalf("Config.String leaked password containing @: %s", cfgStr)
 	}
 }

@@ -455,6 +455,9 @@ func TestStandaloneTransactionDetection(t *testing.T) {
 		fmt.Errorf("Command startTransaction failed: Transaction numbers are only allowed on a replica set member or mongos"),
 		fmt.Errorf("error code 20: transaction numbers are only allowed on a replica set member"),
 		fmt.Errorf("standalone instance does not support transactions"),
+		mongo.CommandError{Code: 115, Name: "CommandNotSupportedOnStandalone", Message: "command not supported on standalone"},
+		&mongo.CommandError{Code: 115, Name: "CommandNotSupportedOnStandalone"},
+		mongo.CommandError{Code: 20, Message: "illegal operation"},
 	}
 
 	for _, err := range standaloneErrors {
@@ -466,6 +469,8 @@ func TestStandaloneTransactionDetection(t *testing.T) {
 	nonStandaloneErrors := []error{
 		fmt.Errorf("context deadline exceeded"),
 		fmt.Errorf("connection reset by peer"),
+		fmt.Errorf("write error on database standalone_test.users: duplicate key"),
+		fmt.Errorf("database name contains standalone but this is a normal query error"),
 		nil,
 	}
 

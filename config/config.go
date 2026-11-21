@@ -861,7 +861,7 @@ var (
 	urlSchemePrefixRegex = regexp.MustCompile(`^(?:[a-zA-Z][a-zA-Z0-9+.-]*:)?//`)
 	dsnSecretRegex       = regexp.MustCompile(`(?i)\b(password|pass|token|secret|api_key|apikey|sslpassword)\b(\s*=\s*)(?:'(?:\\.|[^'\\])*'|"(?:\\.|[^"\\])*"|\S+)`)
 	userinfoRegex        = regexp.MustCompile(`://([^:]+):([^@]+)@`)
-	mysqlUserinfoRegex   = regexp.MustCompile(`(^|[^\w/])([a-zA-Z0-9_\-\.]+):([^@]+)@`)
+	mysqlUserinfoRegex   = regexp.MustCompile(`(^|[^\w/])([a-zA-Z0-9_\-\.]+):(.+)@((?:tcp|unix)\([^\)]+\)|[a-zA-Z0-9_\-\.]*\/|$)`)
 )
 
 func isSecretParam(k string) bool {
@@ -904,10 +904,15 @@ func RedactURL(rawURL string) string {
 		return rawURL
 	}
 
+	// Check MySQL DSN format (handles passwords containing '@')
+	if redacted, ok := RedactMySQLDSN(rawURL); ok {
+		return redacted
+	}
+
 	// Fallback for non-standard connection strings or DSNs containing passwords/secrets
 	cleaned := dsnSecretRegex.ReplaceAllString(rawURL, "${1}${2}REDACTED")
 	cleaned = userinfoRegex.ReplaceAllString(cleaned, "://${1}:REDACTED@")
-	cleaned = mysqlUserinfoRegex.ReplaceAllString(cleaned, "${1}${2}:REDACTED@")
+	cleaned = mysqlUserinfoRegex.ReplaceAllString(cleaned, "${1}${2}:REDACTED@${4}")
 	return cleaned
 }
 

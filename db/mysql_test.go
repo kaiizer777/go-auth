@@ -318,3 +318,40 @@ func TestIsDefaultMigrationsPath_MySQL(t *testing.T) {
 		}
 	}
 }
+
+func TestPrepareMySQLMigrationDSN_MultiStatements(t *testing.T) {
+	rawDSN := "testuser:secretpassword@tcp(127.0.0.1:3306)/authdb?parseTime=true"
+
+	// 1. Initial raw DSN must have MultiStatements == false
+	initialCfg, err := mysqlDriver.ParseDSN(rawDSN)
+	if err != nil {
+		t.Fatalf("failed to parse initial DSN: %v", err)
+	}
+	if initialCfg.MultiStatements {
+		t.Fatalf("expected initial DSN MultiStatements to be false, got true")
+	}
+
+	// 2. Migration DSN prepared via PrepareMySQLMigrationDSN must have MultiStatements == true
+	migrationDSN, err := PrepareMySQLMigrationDSN(rawDSN)
+	if err != nil {
+		t.Fatalf("PrepareMySQLMigrationDSN failed: %v", err)
+	}
+
+	parsedMigrationCfg, err := mysqlDriver.ParseDSN(migrationDSN)
+	if err != nil {
+		t.Fatalf("failed to parse prepared migration DSN: %v", err)
+	}
+	if !parsedMigrationCfg.MultiStatements {
+		t.Fatalf("expected migration DSN MultiStatements to be true, got false")
+	}
+
+	// 3. Invalid DSN must return a wrapped error
+	_, err = PrepareMySQLMigrationDSN("invalid://dsn/format")
+	if err == nil {
+		t.Fatal("expected error when preparing invalid DSN, got nil")
+	}
+	var appErr *errors.Error
+	if !errors.As(err, &appErr) || appErr.Code() != errors.CodeDatabaseError {
+		t.Fatalf("expected CodeDatabaseError, got: %v", err)
+	}
+}

@@ -128,7 +128,7 @@ func (s *MongoStore) Transaction(ctx context.Context, fn func(txStore db.Store) 
 			}
 			return errors.Wrap(errors.ErrTransactionUnsupported, errors.CodeTransactionUnsupported, err.Error())
 		}
-		return err
+		return NormalizeMongoError(err)
 	}
 	return nil
 }
@@ -137,11 +137,30 @@ func isStandaloneTransactionError(err error) bool {
 	if err == nil {
 		return false
 	}
+	var srvErr mongo.ServerError
+	if errors.As(err, &srvErr) {
+		if srvErr.HasErrorCode(115) || srvErr.HasErrorCode(20) {
+			return true
+		}
+	}
+	var cmdErr mongo.CommandError
+	if errors.As(err, &cmdErr) {
+		if cmdErr.Code == 115 || cmdErr.Code == 20 || cmdErr.Name == "CommandNotSupportedOnStandalone" {
+			return true
+		}
+	}
+	var cmdErrPtr *mongo.CommandError
+	if errors.As(err, &cmdErrPtr) && cmdErrPtr != nil {
+		if cmdErrPtr.Code == 115 || cmdErrPtr.Code == 20 || cmdErrPtr.Name == "CommandNotSupportedOnStandalone" {
+			return true
+		}
+	}
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "transaction numbers are only allowed on a replica set") ||
-		strings.Contains(msg, "standalone") ||
+		strings.Contains(msg, "commandnotsupportedonstandalone") ||
+		strings.Contains(msg, "error code 115") ||
 		strings.Contains(msg, "error code 20") ||
-		strings.Contains(msg, "transactions are not supported")
+		strings.Contains(msg, "standalone instance does not support transactions")
 }
 
 // Connect establishes a connection to MongoDB, validates connectivity via ping,
@@ -235,6 +254,19 @@ func (s *userStore) GetByID(ctx context.Context, id uuid.UUID) (*db.User, error)
 }
 
 func (s *userStore) GetByIDForUpdate(ctx context.Context, id uuid.UUID) (*db.User, error) {
+	if s.store.session != nil {
+		filter := bson.M{"_id": id.String()}
+		update := bson.M{"$set": bson.M{"updated_at": time.Now().UTC()}}
+		var doc UserDoc
+		err := s.collection().FindOneAndUpdate(s.store.resolveCtx(ctx), filter, update).Decode(&doc)
+		if err != nil {
+			if errors.Is(err, mongo.ErrNoDocuments) {
+				return nil, gorm.ErrRecordNotFound
+			}
+			return nil, NormalizeMongoError(err)
+		}
+		return doc.toDomain(), nil
+	}
 	return s.GetByID(ctx, id)
 }
 

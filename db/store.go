@@ -45,6 +45,8 @@ type VerificationTokenStore interface {
 }
 
 // PasswordResetTokenStore defines storage operations for password reset tokens.
+// Token creation and invalidation are serialized per-user inside transactional boundaries
+// to guarantee atomic replacement of active reset tokens.
 type PasswordResetTokenStore interface {
 	Create(ctx context.Context, token *PasswordResetToken) error
 	GetByTokenHash(ctx context.Context, tokenHash []byte) (*PasswordResetToken, error)

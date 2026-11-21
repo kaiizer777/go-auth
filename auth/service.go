@@ -350,19 +350,7 @@ func (s *authService) RequestPasswordReset(ctx context.Context, req db.PasswordR
 		return "", errors.Wrap(err, errors.CodeDatabaseError, "failed to query user")
 	}
 
-	rawToken, tokenHash, err := crypto.GenerateToken()
-	if err != nil {
-		return "", errors.Wrap(err, errors.CodeInternalError, "failed to generate password reset token")
-	}
-
-	now := time.Now().UTC()
-	resetToken := db.PasswordResetToken{
-		TokenHash: tokenHash[:],
-		UserID:    user.ID,
-		ExpiresAt: now.Add(s.cfg.PasswordResetTokenExpiry),
-		CreatedAt: now,
-	}
-
+	var rawToken string
 	// Invalidate prior unconsumed reset tokens. Serialize per-user via a row lock
 	// on the user record so concurrent requests under READ COMMITTED cannot race.
 	if terr := s.store.Transaction(ctx, func(txStore db.Store) error {
@@ -372,6 +360,21 @@ func (s *authService) RequestPasswordReset(ctx context.Context, req db.PasswordR
 		if err := txStore.PasswordResetTokens().DeleteByUserID(ctx, user.ID); err != nil {
 			return err
 		}
+
+		tok, tokenHash, gerr := crypto.GenerateToken()
+		if gerr != nil {
+			return errors.Wrap(gerr, errors.CodeInternalError, "failed to generate password reset token")
+		}
+		rawToken = tok
+
+		now := time.Now().UTC()
+		resetToken := db.PasswordResetToken{
+			TokenHash: tokenHash[:],
+			UserID:    user.ID,
+			ExpiresAt: now.Add(s.cfg.PasswordResetTokenExpiry),
+			CreatedAt: now,
+		}
+
 		return txStore.PasswordResetTokens().Create(ctx, &resetToken)
 	}); terr != nil {
 		return "", errors.Wrap(terr, errors.CodeDatabaseError, "failed to create password reset token")
