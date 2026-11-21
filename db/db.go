@@ -280,8 +280,14 @@ func NormalizeMySQLError(err error) error {
 		return nil
 	}
 	var myErr *mysqlDriver.MySQLError
+	if stderrors.As(err, &myErr) && myErr.Number == 1452 {
+		return errors.ErrUserNotFound
+	}
 	is1062 := errors.Is(err, gorm.ErrDuplicatedKey) || (stderrors.As(err, &myErr) && myErr.Number == 1062)
 	msg := strings.ToLower(err.Error())
+	if strings.Contains(msg, "1452") || strings.Contains(msg, "foreign key constraint fails") {
+		return errors.ErrUserNotFound
+	}
 	if !is1062 && !strings.Contains(msg, "1062") && !strings.Contains(msg, "duplicate entry") {
 		return err
 	}

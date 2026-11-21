@@ -116,7 +116,7 @@ func (s *service) CreateSession(
 	err = s.store.Transaction(ctx, func(txStore db.Store) error {
 		user, uerr := txStore.Users().GetByIDForUpdate(ctx, userID)
 		if uerr != nil {
-			if errors.Is(uerr, gorm.ErrRecordNotFound) {
+			if errors.Is(uerr, gorm.ErrRecordNotFound) || errors.Is(uerr, apperrors.ErrUserNotFound) {
 				slog.InfoContext(ctx, "session_invalidated",
 					"user_id", userID.String(),
 					"reason", "missing_user_at_mint",

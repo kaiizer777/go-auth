@@ -2,7 +2,7 @@ CREATE TABLE IF NOT EXISTS oauth_accounts (
     id               VARCHAR(36) PRIMARY KEY,
     user_id          VARCHAR(36) NOT NULL,
     provider_id      VARCHAR(32) NOT NULL,
-    provider_user_id VARCHAR(255) NOT NULL,
+    provider_user_id VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
     email            VARCHAR(255) NOT NULL,
     created_at       DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
     updated_at       DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),

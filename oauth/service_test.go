@@ -885,3 +885,116 @@ func TestHandleCallbackAuditFlags(t *testing.T) {
 		}
 	})
 }
+
+func TestService_CreateUserEmailRaceRecovery(t *testing.T) {
+	t.Run("race loser links onto verified winner", func(t *testing.T) {
+		database, _, _, svc := setupServiceTest(t, nil)
+		ctx := context.Background()
+
+		// Seed the winning user that won the race
+		winner := db.User{
+			ID:            uuid.New(),
+			Email:         "raced@example.com",
+			PasswordHash:  "hash",
+			EmailVerified: true,
+		}
+		if err := database.Create(&winner).Error; err != nil {
+			t.Fatalf("seed winner: %v", err)
+		}
+
+		// Raced user tries to create user and link
+		info := &UserInfo{
+			ProviderUserID: "raced-subject-123",
+			Email:          "raced@example.com",
+			EmailVerified:  true,
+		}
+		user, linked, created, err := svc.(*service).createUserAndLink(ctx, "google", info)
+		if err != nil {
+			t.Fatalf("expected successful race recovery, got err: %v", err)
+		}
+		if user.ID != winner.ID {
+			t.Fatalf("expected linked user ID %v, got %v", winner.ID, user.ID)
+		}
+		if !linked {
+			t.Fatal("expected linked to be true")
+		}
+		if created {
+			t.Fatal("expected created to be false (reused winning user)")
+		}
+
+		// Verify oauth_accounts has the link
+		var link db.OAuthAccount
+		if err := database.Where("provider_id = ? AND provider_user_id = ?", "google", "raced-subject-123").First(&link).Error; err != nil {
+			t.Fatalf("failed to query recovered link: %v", err)
+		}
+		if link.UserID != winner.ID {
+			t.Fatalf("expected link user_id %v, got %v", winner.ID, link.UserID)
+		}
+	})
+
+	t.Run("race loser rejected if winner email unverified", func(t *testing.T) {
+		database, _, _, svc := setupServiceTest(t, nil)
+		ctx := context.Background()
+
+		unverifiedWinner := db.User{
+			ID:            uuid.New(),
+			Email:         "unverified@example.com",
+			PasswordHash:  "hash",
+			EmailVerified: false,
+		}
+		if err := database.Create(&unverifiedWinner).Error; err != nil {
+			t.Fatalf("seed unverified: %v", err)
+		}
+
+		info := &UserInfo{
+			ProviderUserID: "raced-subject-unverified",
+			Email:          "unverified@example.com",
+			EmailVerified:  true,
+		}
+		_, _, _, err := svc.(*service).createUserAndLink(ctx, "google", info)
+		if !errors.Is(err, errors.ErrOAuthAccountLinkConflict) {
+			t.Fatalf("expected ErrOAuthAccountLinkConflict, got %v", err)
+		}
+	})
+}
+
+func TestService_SubjectCaseSensitivity(t *testing.T) {
+	_, _, _, svc := setupServiceTest(t, nil)
+	ctx := context.Background()
+
+	upperInfo := &UserInfo{
+		ProviderUserID: "Subject_CASE_123",
+		Email:          "upper@example.com",
+		EmailVerified:  true,
+	}
+	lowerInfo := &UserInfo{
+		ProviderUserID: "subject_case_123",
+		Email:          "lower@example.com",
+		EmailVerified:  true,
+	}
+
+	u1, linked1, created1, err1 := svc.(*service).createUserAndLink(ctx, "google", upperInfo)
+	if err1 != nil || !linked1 || !created1 {
+		t.Fatalf("create upper failed: %v", err1)
+	}
+
+	u2, linked2, created2, err2 := svc.(*service).createUserAndLink(ctx, "google", lowerInfo)
+	if err2 != nil || !linked2 || !created2 {
+		t.Fatalf("create lower failed: %v", err2)
+	}
+
+	if u1.ID == u2.ID {
+		t.Fatalf("expected distinct users for case-variant provider subjects, got identical ID: %v", u1.ID)
+	}
+
+	// Verify lookups resolve distinct accounts
+	l1, found1, err := svc.(*service).findLink(ctx, "google", "Subject_CASE_123")
+	if err != nil || !found1 || l1.UserID != u1.ID {
+		t.Fatalf("upper lookup mismatch: found=%v, err=%v, link=%+v", found1, err, l1)
+	}
+
+	l2, found2, err := svc.(*service).findLink(ctx, "google", "subject_case_123")
+	if err != nil || !found2 || l2.UserID != u2.ID {
+		t.Fatalf("lower lookup mismatch: found=%v, err=%v, link=%+v", found2, err, l2)
+	}
+}

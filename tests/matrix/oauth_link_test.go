@@ -66,6 +66,62 @@ func TestMatrix_OAuthLink(t *testing.T) {
 			t.Fatal("expected error on duplicate OAuth link insertion, but succeeded")
 		}
 
+		// 3b. Case-Variant Provider Subject Isolation (Regression Test for Issue 6)
+		userCaseUpper := createTestUser(t, store, fmt.Sprintf("case_upper_%s@example.com", uuid.New().String()[:8]), "Password#2026!", true)
+		userCaseLower := createTestUser(t, store, fmt.Sprintf("case_lower_%s@example.com", uuid.New().String()[:8]), "Password#2026!", true)
+		upperSubject := fmt.Sprintf("Subject_CASE_%s", uuid.New().String()[:6])
+		lowerSubject := fmt.Sprintf("subject_case_%s", uuid.New().String()[:6])
+
+		errUpper := store.OAuthAccounts().Create(ctx, &db.OAuthAccount{
+			ID:             uuid.New(),
+			UserID:         userCaseUpper.ID,
+			ProviderID:     "google",
+			ProviderUserID: upperSubject,
+			Email:          userCaseUpper.Email,
+			CreatedAt:      time.Now().UTC(),
+			UpdatedAt:      time.Now().UTC(),
+		})
+		if errUpper != nil {
+			t.Fatalf("failed to insert upper-case provider subject: %v", errUpper)
+		}
+
+		errLower := store.OAuthAccounts().Create(ctx, &db.OAuthAccount{
+			ID:             uuid.New(),
+			UserID:         userCaseLower.ID,
+			ProviderID:     "google",
+			ProviderUserID: lowerSubject,
+			Email:          userCaseLower.Email,
+			CreatedAt:      time.Now().UTC(),
+			UpdatedAt:      time.Now().UTC(),
+		})
+		if errLower != nil {
+			t.Fatalf("failed to insert lower-case provider subject: %v", errLower)
+		}
+
+		fetchedUpper, err := store.OAuthAccounts().GetByProvider(ctx, "google", upperSubject)
+		if err != nil || fetchedUpper.UserID != userCaseUpper.ID {
+			t.Fatalf("upper subject mismatch: err=%v, user=%v, want=%v", err, fetchedUpper.UserID, userCaseUpper.ID)
+		}
+
+		fetchedLower, err := store.OAuthAccounts().GetByProvider(ctx, "google", lowerSubject)
+		if err != nil || fetchedLower.UserID != userCaseLower.ID {
+			t.Fatalf("lower subject mismatch: err=%v, user=%v, want=%v", err, fetchedLower.UserID, userCaseLower.ID)
+		}
+
+		// 3c. Link to Non-Existent User Prevention (Issue 5)
+		nonExistentUserLink := &db.OAuthAccount{
+			ID:             uuid.New(),
+			UserID:         uuid.New(),
+			ProviderID:     "google",
+			ProviderUserID: fmt.Sprintf("orphaned_%s", uuid.New().String()[:8]),
+			Email:          "orphaned@example.com",
+			CreatedAt:      time.Now().UTC(),
+			UpdatedAt:      time.Now().UTC(),
+		}
+		if orphanErr := store.OAuthAccounts().Create(ctx, nonExistentUserLink); orphanErr == nil {
+			t.Fatal("expected error creating link for non-existent user, got nil")
+		}
+
 		// 4. Cascade on User Deletion
 		err = store.Users().Delete(ctx, user.ID)
 		if err != nil {

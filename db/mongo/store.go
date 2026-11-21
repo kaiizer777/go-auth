@@ -644,8 +644,19 @@ func (s *oauthAccountStore) collection() *mongo.Collection {
 }
 
 func (s *oauthAccountStore) Create(ctx context.Context, account *db.OAuthAccount) error {
+	cCtx := s.store.resolveCtx(ctx)
+	// Verify target user exists before inserting link to prevent orphaned links
+	var userDoc UserDoc
+	err := s.store.database.Collection("users").FindOne(cCtx, bson.M{"_id": account.UserID.String()}).Decode(&userDoc)
+	if err != nil {
+		if errors.Is(err, mongo.ErrNoDocuments) {
+			return errors.ErrUserNotFound
+		}
+		return NormalizeMongoError(err)
+	}
+
 	doc := oauthAccountDocFromDomain(account)
-	_, err := s.collection().InsertOne(s.store.resolveCtx(ctx), doc)
+	_, err = s.collection().InsertOne(cCtx, doc)
 	if err != nil {
 		return NormalizeMongoError(err)
 	}

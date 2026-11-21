@@ -259,7 +259,10 @@ func isUniqueViolation(err error) bool {
 	if err == nil {
 		return false
 	}
-	if errors.Is(err, gorm.ErrDuplicatedKey) || errors.Is(err, errors.ErrOAuthAccountAlreadyLinked) {
+	if errors.Is(err, gorm.ErrDuplicatedKey) ||
+		errors.Is(err, errors.ErrOAuthAccountAlreadyLinked) ||
+		errors.Is(err, errors.ErrEmailAlreadyExists) ||
+		errors.Is(err, errors.ErrUserAlreadyExists) {
 		return true
 	}
 	var myErr *mysql.MySQLError
@@ -271,7 +274,8 @@ func isUniqueViolation(err error) bool {
 		strings.Contains(msg, "duplicate key") ||
 		strings.Contains(msg, "23505") ||
 		strings.Contains(msg, "1062") ||
-		strings.Contains(msg, "duplicate entry")
+		strings.Contains(msg, "duplicate entry") ||
+		strings.Contains(msg, "already exists")
 }
 
 // errLinkConflict reports a unique-constraint loss on the oauth_accounts insert.
@@ -325,7 +329,7 @@ func (s *service) findLink(ctx context.Context, providerID, providerUserID strin
 func (s *service) loadLinkedUser(ctx context.Context, link db.OAuthAccount) (db.User, error) {
 	user, err := s.store.Users().GetByID(ctx, link.UserID)
 	if err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
+		if errors.Is(err, gorm.ErrRecordNotFound) || errors.Is(err, errors.ErrUserNotFound) {
 			return db.User{}, errors.ErrOAuthAccountNotLinked
 		}
 		return db.User{}, errors.New(errors.CodeInternalError, "failed to load linked user", err)
@@ -369,6 +373,9 @@ func (s *service) linkExisting(ctx context.Context, owner db.User, providerID st
 		if errors.Is(err, errLinkConflict) {
 			user, _, _, rerr := s.relinkExisting(ctx, providerID, info.ProviderUserID)
 			return user, false, rerr
+		}
+		if errors.Is(err, errors.ErrUserNotFound) || errors.Is(err, gorm.ErrRecordNotFound) {
+			return db.User{}, false, errors.ErrUserNotFound
 		}
 		return db.User{}, false, errors.New(errors.CodeInternalError, "failed to link oauth account", err)
 	}
@@ -439,7 +446,9 @@ func (s *service) createUserAndLink(ctx context.Context, providerID string, info
 	op := "failed to create oauth user"
 	txErr := s.store.Transaction(ctx, func(txStore db.Store) error {
 		if err := txStore.Users().Create(ctx, &user); err != nil {
-			userConflict = isUniqueViolation(err)
+			userConflict = errors.Is(err, errors.ErrEmailAlreadyExists) ||
+				errors.Is(err, errors.ErrUserAlreadyExists) ||
+				isUniqueViolation(err)
 			return err
 		}
 		op = "failed to link oauth account"
@@ -485,7 +494,7 @@ func (s *service) linkOrCreate(ctx context.Context, providerID string, info *Use
 		user, linked, lerr := s.linkExisting(ctx, existing, providerID, info)
 		return user, linked, false, lerr
 	}
-	if !errors.Is(err, gorm.ErrRecordNotFound) {
+	if !errors.Is(err, gorm.ErrRecordNotFound) && !errors.Is(err, errors.ErrUserNotFound) {
 		return db.User{}, false, false, errors.New(errors.CodeInternalError, "failed to query user", err)
 	}
 	return s.createUserAndLink(ctx, providerID, info)

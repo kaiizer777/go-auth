@@ -121,5 +121,37 @@ func TestMatrix_SessionManagement(t *testing.T) {
 				t.Fatalf("expected ErrRecordNotFound for session %s, got: %v", s.ID, err)
 			}
 		}
+
+		// 5. Credential Version Verification and Serialization
+		user2 := createTestUser(t, store, fmt.Sprintf("matrix_cred_%s@example.com", uuid.New().String()[:8]), "Password#2026!", true)
+
+		// Create valid session with current version 0
+		sValid, _, err := app.Session.CreateSession(ctx, user2.ID, 0, db.SessionTypeBearer, "127.0.0.1", "Agent-Cred")
+		if err != nil || sValid == nil {
+			t.Fatalf("CreateSession with current credential version failed: %v", err)
+		}
+
+		// Create session with stale credential version (e.g. 99)
+		_, _, staleErr := app.Session.CreateSession(ctx, user2.ID, 99, db.SessionTypeBearer, "127.0.0.1", "Agent-Cred")
+		if !errors.Is(staleErr, errors.ErrSessionInvalid) {
+			t.Fatalf("expected ErrSessionInvalid on stale credential version mint, got: %v", staleErr)
+		}
+
+		// Invalidate all user sessions (bumps credential version to 1)
+		if err := app.Session.InvalidateAllUserSessions(ctx, user2.ID); err != nil {
+			t.Fatalf("InvalidateAllUserSessions failed: %v", err)
+		}
+
+		// Minting with previous version 0 now fails because version was bumped
+		_, _, bumpedErr := app.Session.CreateSession(ctx, user2.ID, 0, db.SessionTypeBearer, "127.0.0.1", "Agent-Cred")
+		if !errors.Is(bumpedErr, errors.ErrSessionInvalid) {
+			t.Fatalf("expected ErrSessionInvalid after credential version bump, got: %v", bumpedErr)
+		}
+
+		// Minting with new version 1 succeeds
+		sNew, _, err := app.Session.CreateSession(ctx, user2.ID, 1, db.SessionTypeBearer, "127.0.0.1", "Agent-Cred")
+		if err != nil || sNew == nil {
+			t.Fatalf("CreateSession with bumped credential version 1 failed: %v", err)
+		}
 	})
 }
