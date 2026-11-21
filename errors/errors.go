@@ -414,6 +414,7 @@ var (
 	ErrTotpAlreadyEnabled    = ErrTOTPAlreadyEnabled
 	ErrTotpCodeInvalid       = ErrTOTPCodeInvalid
 	ErrTotpCodeReplayed      = ErrTOTPCodeReplayed
+	ErrTOTPBackupCodeInvalid = ErrBackupCodeInvalid
 	ErrTotpBackupCodeInvalid = ErrBackupCodeInvalid
 	ErrTotpRateLimitExceeded = ErrTOTPRateLimitExceeded
 )

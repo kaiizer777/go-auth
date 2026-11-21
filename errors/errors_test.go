@@ -822,6 +822,8 @@ func TestSentinels_Phase7TOTP(t *testing.T) {
 		{ErrTOTPCodeInvalid, CodeTOTPCodeInvalid, "totp code is invalid", http.StatusBadRequest},
 		{ErrTOTPCodeReplayed, CodeTOTPCodeReplayed, "totp code has already been used in this window", http.StatusBadRequest},
 		{ErrBackupCodeInvalid, CodeTOTPBackupCodeInvalid, "backup code is invalid", http.StatusBadRequest},
+		{ErrTOTPBackupCodeInvalid, CodeTOTPBackupCodeInvalid, "backup code is invalid", http.StatusBadRequest},
+		{ErrTotpBackupCodeInvalid, CodeTOTPBackupCodeInvalid, "backup code is invalid", http.StatusBadRequest},
 		{ErrTwoFactorTokenInvalid, CodeTwoFactorTokenInvalid, "two factor challenge token is invalid", http.StatusUnauthorized},
 		{ErrTwoFactorTokenExpired, CodeTwoFactorTokenExpired, "two factor challenge token has expired", http.StatusUnauthorized},
 		{ErrTwoFactorMaxAttemptsExceeded, CodeTwoFactorMaxAttemptsExceeded, "maximum verification attempts exceeded", http.StatusTooManyRequests},

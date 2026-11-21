@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math/big"
 	"strings"
+	"sync"
 
 	"github.com/kaiizer777/go-auth/crypto"
 )
@@ -56,6 +57,34 @@ func HashBackupCodes(codes []string) ([]byte, error) {
 	return json.Marshal(hashes)
 }
 
+var (
+	dummyBackupHashOnce sync.Once
+	dummyBackupHash     string
+)
+
+func getDummyBackupHash() string {
+	dummyBackupHashOnce.Do(func() {
+		h, err := crypto.GenerateDummyHash(crypto.DefaultHashParams())
+		if err == nil {
+			dummyBackupHash = h
+		}
+	})
+	return dummyBackupHash
+}
+
+func isValidBackupCodeFormat(code string) bool {
+	if len(code) != BackupCodeLength {
+		return false
+	}
+	for i := 0; i < len(code); i++ {
+		c := code[i]
+		if !((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) {
+			return false
+		}
+	}
+	return true
+}
+
 // VerifyAndConsumeBackupCode checks if candidate code matches any hashed backup code in storedJSON.
 // If a match is found, the matched code hash is atomically removed and the updated JSON array is returned with matched=true.
 // If no code matches, it returns (nil, false, nil).
@@ -74,14 +103,25 @@ func VerifyAndConsumeBackupCode(storedJSON []byte, code string) ([]byte, bool, e
 	}
 
 	normalized := strings.ToUpper(strings.TrimSpace(code))
-	matchIndex := -1
+	if !isValidBackupCodeFormat(normalized) {
+		return nil, false, nil
+	}
 
+	matchIndex := -1
 	for i, h := range hashes {
 		matched, err := crypto.VerifyPassword(normalized, h)
-		// INVARIANT: Check err == nil && matched. A mismatched password returns false, nil.
-		if err == nil && matched {
+		if err != nil {
+			return nil, false, fmt.Errorf("totp: failed to verify backup code hash: %w", err)
+		}
+		if matched && matchIndex == -1 {
 			matchIndex = i
-			break
+		}
+	}
+
+	dummyHash := getDummyBackupHash()
+	if dummyHash != "" {
+		for i := len(hashes); i < BackupCodeCount; i++ {
+			_, _ = crypto.VerifyPassword(normalized, dummyHash)
 		}
 	}
 

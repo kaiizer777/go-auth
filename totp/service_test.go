@@ -585,6 +585,34 @@ func TestVerifyBackupCode_Lifecycle(t *testing.T) {
 	}
 }
 
+func TestServiceVerifyBackupCode_CorruptedHash(t *testing.T) {
+	t.Parallel()
+
+	database := setupTestDB(t)
+	user := createTestUser(t, database, "corrupt_backup@example.com", true)
+	svc := NewService(database, config.TOTPConfig{EncryptionKey: validTestHexKey()}, nil, nil)
+
+	// Direct insert of secret with corrupted backup codes
+	corruptedSecret := db.TotpSecret{
+		UserID:          user.ID,
+		EncryptedSecret: []byte("encrypted-secret"),
+		Enabled:         true,
+		BackupCodes:     []byte(`["$argon2id$v=19$m=65536,t=3,p=4$corrupted$hash"]`),
+	}
+	if err := database.Create(&corruptedSecret).Error; err != nil {
+		t.Fatalf("failed to create secret: %v", err)
+	}
+
+	// Verify backup code should return an internal error, NOT ErrBackupCodeInvalid
+	err := svc.VerifyBackupCode(context.Background(), user.ID.String(), "ABCD1234", "127.0.0.1")
+	if err == nil {
+		t.Fatal("expected error for corrupted backup code hash, got nil")
+	}
+	if errors.Is(err, apperrors.ErrBackupCodeInvalid) {
+		t.Fatalf("corrupted hash error was masked as ErrBackupCodeInvalid: %v", err)
+	}
+}
+
 func TestDisableTOTP_WithPassword(t *testing.T) {
 	t.Parallel()
 

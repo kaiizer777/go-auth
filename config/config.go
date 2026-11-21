@@ -126,6 +126,16 @@ func (t TOTPConfig) LogValue() slog.Value {
 	)
 }
 
+// String implements fmt.Stringer to ensure EncryptionKey is masked when formatted.
+func (t TOTPConfig) String() string {
+	keyMasked := "[REDACTED]"
+	if t.EncryptionKey == "" {
+		keyMasked = ""
+	}
+	return fmt.Sprintf("TOTPConfig{EncryptionKey: %s, Issuer: %s, ChallengeTokenTTL: %v, AttemptWindow: %v, MaxAttemptsPerWindow: %d}",
+		keyMasked, t.Issuer, t.ChallengeTokenTTL, t.AttemptWindow, t.MaxAttemptsPerWindow)
+}
+
 // DefaultTOTPConfig returns safe production defaults for TOTP configuration.
 func DefaultTOTPConfig() TOTPConfig {
 	return TOTPConfig{

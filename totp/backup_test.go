@@ -95,6 +95,101 @@ func TestVerifyBackupCodeWrong(t *testing.T) {
 	}
 }
 
+func TestVerifyBackupCode_InvalidFormat(t *testing.T) {
+	t.Parallel()
+
+	codes, err := GenerateBackupCodes()
+	if err != nil {
+		t.Fatalf("failed to generate codes: %v", err)
+	}
+
+	storedJSON, err := HashBackupCodes(codes)
+	if err != nil {
+		t.Fatalf("HashBackupCodes failed: %v", err)
+	}
+
+	invalidCodes := []string{
+		"",
+		"   ",
+		"ABC",
+		"1234567",
+		"123456789",
+		"ABCDEFGH123",
+		"ABCD!234",
+		"ABCD-123",
+		"ABCD 123",
+		"@@@@@@@@",
+	}
+
+	for _, invalid := range invalidCodes {
+		updated, matched, err := VerifyAndConsumeBackupCode(storedJSON, invalid)
+		if err != nil {
+			t.Errorf("expected nil error for invalid format %q, got: %v", invalid, err)
+		}
+		if matched {
+			t.Errorf("invalid format %q unexpectedly matched", invalid)
+		}
+		if updated != nil {
+			t.Errorf("expected nil updatedJSON for invalid format %q, got: %s", invalid, updated)
+		}
+	}
+}
+
+func TestVerifyBackupCode_CorruptedHash(t *testing.T) {
+	t.Parallel()
+
+	corruptedJSON := []byte(`["$argon2id$v=19$m=65536,t=3,p=4$corrupted$hash"]`)
+	updated, matched, err := VerifyAndConsumeBackupCode(corruptedJSON, "ABCD1234")
+	if err == nil {
+		t.Fatal("expected error for corrupted PHC hash, got nil")
+	}
+	if matched {
+		t.Fatal("matched unexpectedly on corrupted hash")
+	}
+	if updated != nil {
+		t.Errorf("expected nil updatedJSON on error, got: %s", updated)
+	}
+}
+
+func TestVerifyBackupCode_PaddedAndPositions(t *testing.T) {
+	t.Parallel()
+
+	codes, err := GenerateBackupCodes()
+	if err != nil {
+		t.Fatalf("failed to generate codes: %v", err)
+	}
+
+	storedJSON, err := HashBackupCodes(codes)
+	if err != nil {
+		t.Fatalf("HashBackupCodes failed: %v", err)
+	}
+
+	// Match last code (index 9)
+	lastCode := codes[len(codes)-1]
+	updatedJSON, matched, err := VerifyAndConsumeBackupCode(storedJSON, lastCode)
+	if err != nil || !matched {
+		t.Fatalf("failed to match last code: err=%v, matched=%v", err, matched)
+	}
+
+	// Verify remaining has 9 items
+	var remaining []string
+	if err := json.Unmarshal(updatedJSON, &remaining); err != nil {
+		t.Fatalf("failed to unmarshal remaining: %v", err)
+	}
+	if len(remaining) != BackupCodeCount-1 {
+		t.Fatalf("got %d remaining, want %d", len(remaining), BackupCodeCount-1)
+	}
+
+	// Verify dummy hash padding works when remaining < BackupCodeCount
+	updatedJSON2, matched2, err := VerifyAndConsumeBackupCode(updatedJSON, codes[0])
+	if err != nil || !matched2 {
+		t.Fatalf("failed to match first code with padded dummy hashes: err=%v, matched=%v", err, matched2)
+	}
+	if len(updatedJSON2) == 0 {
+		t.Fatal("expected non-empty updatedJSON2")
+	}
+}
+
 func TestConsumeBackupCodeSingleUse(t *testing.T) {
 	t.Parallel()
 

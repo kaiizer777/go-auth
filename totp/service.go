@@ -620,7 +620,10 @@ func (s *totpService) VerifyBackupCode(ctx context.Context, userID, backupCode, 
 		}
 
 		updatedJSON, matched, err := VerifyAndConsumeBackupCode(secretRecord.BackupCodes, trimmedCode)
-		if err != nil || !matched {
+		if err != nil {
+			return err
+		}
+		if !matched {
 			return apperrors.ErrBackupCodeInvalid
 		}
 

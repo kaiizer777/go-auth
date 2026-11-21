@@ -2,6 +2,7 @@ package config
 
 import (
 	"bytes"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -1425,6 +1426,51 @@ func TestConfig_SecretRedaction_LogValue_String(t *testing.T) {
 		str := oauthCfg.String()
 		if strings.Contains(str, "top-secret-token") {
 			t.Fatalf("ProviderConfig.String() leaked client secret: %q", str)
+		}
+	})
+
+	t.Run("TOTPConfig redacts EncryptionKey", func(t *testing.T) {
+		totpCfg := TOTPConfig{
+			EncryptionKey:        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+			Issuer:               "test-app",
+			ChallengeTokenTTL:    10 * time.Minute,
+			AttemptWindow:        5 * time.Minute,
+			MaxAttemptsPerWindow: 5,
+		}
+
+		val := totpCfg.LogValue()
+		var secretVal string
+		for _, attr := range val.Group() {
+			if attr.Key == "encryption_key" {
+				secretVal = attr.Value.String()
+			}
+		}
+		if strings.Contains(secretVal, "0123456789abcdef") {
+			t.Fatalf("TOTPConfig.LogValue leaked encryption key: %q", secretVal)
+		}
+		if secretVal != "[REDACTED]" {
+			t.Fatalf("TOTPConfig.LogValue expected [REDACTED], got: %q", secretVal)
+		}
+
+		str := totpCfg.String()
+		if strings.Contains(str, "0123456789abcdef") {
+			t.Fatalf("TOTPConfig.String() leaked encryption key: %q", str)
+		}
+		if !strings.Contains(str, "EncryptionKey: [REDACTED]") {
+			t.Fatalf("TOTPConfig.String() expected EncryptionKey: [REDACTED], got: %q", str)
+		}
+
+		formatted := fmt.Sprintf("%+v", totpCfg)
+		if strings.Contains(formatted, "0123456789abcdef") {
+			t.Fatalf("fmt.Sprintf(%%+v) leaked encryption key: %q", formatted)
+		}
+		if !strings.Contains(formatted, "EncryptionKey: [REDACTED]") {
+			t.Fatalf("fmt.Sprintf(%%+v) expected EncryptionKey: [REDACTED], got: %q", formatted)
+		}
+
+		emptyCfg := TOTPConfig{Issuer: "test-app"}
+		if strings.Contains(emptyCfg.String(), "[REDACTED]") {
+			t.Fatalf("empty EncryptionKey should not contain [REDACTED], got: %q", emptyCfg.String())
 		}
 	})
 }
