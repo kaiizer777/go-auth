@@ -240,7 +240,10 @@ func (s *userStore) GetByIDForUpdate(ctx context.Context, id uuid.UUID) (*db.Use
 
 func (s *userStore) GetByEmail(ctx context.Context, email string) (*db.User, error) {
 	trimmed := strings.TrimSpace(email)
-	filter := bson.M{"email": trimmed}
+	if trimmed == "" {
+		return nil, gorm.ErrRecordNotFound
+	}
+	filter := bson.D{{Key: "email", Value: trimmed}}
 	findOpts := options.FindOne().SetCollation(&options.Collation{
 		Locale:   "en",
 		Strength: 2,
@@ -523,9 +526,12 @@ func (s *verificationTokenStore) GetByTokenHash(ctx context.Context, tokenHash [
 	return doc.toDomain(), nil
 }
 
-func (s *verificationTokenStore) Delete(ctx context.Context, tokenHash []byte) error {
-	_, err := s.collection().DeleteOne(s.store.resolveCtx(ctx), bson.M{"_id": tokenHash})
-	return err
+func (s *verificationTokenStore) Delete(ctx context.Context, tokenHash []byte) (int64, error) {
+	res, err := s.collection().DeleteOne(s.store.resolveCtx(ctx), bson.M{"_id": tokenHash})
+	if err != nil {
+		return 0, err
+	}
+	return res.DeletedCount, nil
 }
 
 func (s *verificationTokenStore) DeleteByUserID(ctx context.Context, userID uuid.UUID) error {
@@ -567,9 +573,12 @@ func (s *passwordResetTokenStore) GetByTokenHash(ctx context.Context, tokenHash 
 	return doc.toDomain(), nil
 }
 
-func (s *passwordResetTokenStore) Delete(ctx context.Context, tokenHash []byte) error {
-	_, err := s.collection().DeleteOne(s.store.resolveCtx(ctx), bson.M{"_id": tokenHash})
-	return err
+func (s *passwordResetTokenStore) Delete(ctx context.Context, tokenHash []byte) (int64, error) {
+	res, err := s.collection().DeleteOne(s.store.resolveCtx(ctx), bson.M{"_id": tokenHash})
+	if err != nil {
+		return 0, err
+	}
+	return res.DeletedCount, nil
 }
 
 func (s *passwordResetTokenStore) DeleteByUserID(ctx context.Context, userID uuid.UUID) error {

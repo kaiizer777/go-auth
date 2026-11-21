@@ -40,7 +40,7 @@ type SessionStore interface {
 type VerificationTokenStore interface {
 	Create(ctx context.Context, token *VerificationToken) error
 	GetByTokenHash(ctx context.Context, tokenHash []byte) (*VerificationToken, error)
-	Delete(ctx context.Context, tokenHash []byte) error
+	Delete(ctx context.Context, tokenHash []byte) (int64, error)
 	DeleteByUserID(ctx context.Context, userID uuid.UUID) error
 }
 
@@ -48,7 +48,7 @@ type VerificationTokenStore interface {
 type PasswordResetTokenStore interface {
 	Create(ctx context.Context, token *PasswordResetToken) error
 	GetByTokenHash(ctx context.Context, tokenHash []byte) (*PasswordResetToken, error)
-	Delete(ctx context.Context, tokenHash []byte) error
+	Delete(ctx context.Context, tokenHash []byte) (int64, error)
 	DeleteByUserID(ctx context.Context, userID uuid.UUID) error
 	ConsumeToken(ctx context.Context, tokenHash []byte, now time.Time) (bool, error)
 }

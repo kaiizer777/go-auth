@@ -702,7 +702,7 @@ func TestMongoStore_CanceledContext_AllMethods(t *testing.T) {
 	}
 	_ = store.VerificationTokens().Create(ctx, vtok)
 	_, _ = store.VerificationTokens().GetByTokenHash(ctx, []byte("vtok"))
-	_ = store.VerificationTokens().Delete(ctx, []byte("vtok"))
+	_, _ = store.VerificationTokens().Delete(ctx, []byte("vtok"))
 	_ = store.VerificationTokens().DeleteByUserID(ctx, uid)
 
 	rtok := &db.PasswordResetToken{
@@ -712,7 +712,7 @@ func TestMongoStore_CanceledContext_AllMethods(t *testing.T) {
 	}
 	_ = store.PasswordResetTokens().Create(ctx, rtok)
 	_, _ = store.PasswordResetTokens().GetByTokenHash(ctx, []byte("rtok"))
-	_ = store.PasswordResetTokens().Delete(ctx, []byte("rtok"))
+	_, _ = store.PasswordResetTokens().Delete(ctx, []byte("rtok"))
 	_ = store.PasswordResetTokens().DeleteByUserID(ctx, uid)
 	_, _ = store.PasswordResetTokens().ConsumeToken(ctx, []byte("rtok"), time.Now().UTC())
 

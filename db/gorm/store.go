@@ -173,8 +173,9 @@ func (s *verificationTokenStore) GetByTokenHash(ctx context.Context, tokenHash [
 	return &tok, nil
 }
 
-func (s *verificationTokenStore) Delete(ctx context.Context, tokenHash []byte) error {
-	return s.db.WithContext(ctx).Where("token_hash = ?", tokenHash).Delete(&db.VerificationToken{}).Error
+func (s *verificationTokenStore) Delete(ctx context.Context, tokenHash []byte) (int64, error) {
+	res := s.db.WithContext(ctx).Where("token_hash = ?", tokenHash).Delete(&db.VerificationToken{})
+	return res.RowsAffected, res.Error
 }
 
 func (s *verificationTokenStore) DeleteByUserID(ctx context.Context, userID uuid.UUID) error {
@@ -197,8 +198,9 @@ func (s *passwordResetTokenStore) GetByTokenHash(ctx context.Context, tokenHash 
 	return &tok, nil
 }
 
-func (s *passwordResetTokenStore) Delete(ctx context.Context, tokenHash []byte) error {
-	return s.db.WithContext(ctx).Where("token_hash = ?", tokenHash).Delete(&db.PasswordResetToken{}).Error
+func (s *passwordResetTokenStore) Delete(ctx context.Context, tokenHash []byte) (int64, error) {
+	res := s.db.WithContext(ctx).Where("token_hash = ?", tokenHash).Delete(&db.PasswordResetToken{})
+	return res.RowsAffected, res.Error
 }
 
 func (s *passwordResetTokenStore) DeleteByUserID(ctx context.Context, userID uuid.UUID) error {

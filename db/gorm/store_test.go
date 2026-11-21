@@ -417,8 +417,13 @@ func TestVerificationTokenStore_AllMethods(t *testing.T) {
 	}
 
 	// 3. Delete
-	if err := tokens.Delete(ctx, tokenHash); err != nil {
-		t.Fatalf("Delete token failed: %v", err)
+	count, err := tokens.Delete(ctx, tokenHash)
+	if err != nil || count != 1 {
+		t.Fatalf("Delete token failed: count=%d, err=%v", count, err)
+	}
+	count2, err := tokens.Delete(ctx, tokenHash)
+	if err != nil || count2 != 0 {
+		t.Fatalf("Delete token second time failed: count=%d, err=%v", count2, err)
 	}
 	if _, err := tokens.GetByTokenHash(ctx, tokenHash); !errors.Is(err, gormdriver.ErrRecordNotFound) {
 		t.Fatalf("expected deleted token, got %v", err)
@@ -500,8 +505,9 @@ func TestPasswordResetTokenStore_AllMethods(t *testing.T) {
 		ExpiresAt: now.Add(time.Hour),
 	}
 	_ = resets.Create(ctx, tokDelete)
-	if err := resets.Delete(ctx, []byte("tok_to_delete")); err != nil {
-		t.Fatalf("Delete failed: %v", err)
+	delCount, err := resets.Delete(ctx, []byte("tok_to_delete"))
+	if err != nil || delCount != 1 {
+		t.Fatalf("Delete failed: count=%d, err=%v", delCount, err)
 	}
 
 	// 5. DeleteByUserID

@@ -295,11 +295,16 @@ func (s *authService) VerifyEmail(ctx context.Context, req db.VerifyEmailRequest
 
 		if time.Now().UTC().After(tok.ExpiresAt) {
 			isExpired = true
-			return txStore.VerificationTokens().Delete(ctx, tokenHash[:])
+			_, err := txStore.VerificationTokens().Delete(ctx, tokenHash[:])
+			return err
 		}
 
-		if err := txStore.VerificationTokens().Delete(ctx, tokenHash[:]); err != nil {
+		rows, err := txStore.VerificationTokens().Delete(ctx, tokenHash[:])
+		if err != nil {
 			return err
+		}
+		if rows == 0 {
+			return errors.ErrInvalidToken
 		}
 
 		if err := txStore.Users().SetEmailVerified(ctx, tok.UserID, true); err != nil {
@@ -400,7 +405,7 @@ func (s *authService) ResetPassword(ctx context.Context, req db.PasswordResetCon
 	}
 
 	if time.Now().UTC().After(tok.ExpiresAt) {
-		_ = s.store.PasswordResetTokens().Delete(ctx, tokenHash[:])
+		_, _ = s.store.PasswordResetTokens().Delete(ctx, tokenHash[:])
 		return nil, errors.ErrTokenExpired
 	}
 
@@ -421,7 +426,7 @@ func (s *authService) ResetPassword(ctx context.Context, req db.PasswordResetCon
 		}
 		if !consumed {
 			if countTok, _ := txStore.PasswordResetTokens().GetByTokenHash(ctx, tokenHash[:]); countTok != nil {
-				_ = txStore.PasswordResetTokens().Delete(ctx, tokenHash[:])
+				_, _ = txStore.PasswordResetTokens().Delete(ctx, tokenHash[:])
 				return errors.ErrTokenExpired
 			}
 			return errors.ErrInvalidToken
