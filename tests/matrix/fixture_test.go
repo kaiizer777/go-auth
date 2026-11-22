@@ -281,11 +281,12 @@ func setupMongoAdapter(t *testing.T, uri string) (TestAdapter, error) {
 		return TestAdapter{}, err
 	}
 
-	// Dynamically test transaction capability
+	// Dynamically test transaction capability using a strict (non-fallback) store
 	var supportsTx bool
+	probeStore := mongostore.New(store.Client(), store.Database(), false)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	if txErr := store.Transaction(ctx, func(txStore db.Store) error {
+	if txErr := probeStore.Transaction(ctx, func(txStore db.Store) error {
 		return nil
 	}); txErr == nil {
 		supportsTx = true
