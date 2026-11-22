@@ -14,3 +14,5 @@ CREATE TABLE IF NOT EXISTS sessions (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE INDEX idx_sessions_user_id ON sessions(user_id);
+CREATE INDEX idx_sessions_last_active_at ON sessions(last_active_at);
+CREATE INDEX idx_sessions_absolute_expires_at ON sessions(absolute_expires_at);

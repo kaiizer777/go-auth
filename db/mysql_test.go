@@ -189,6 +189,26 @@ func TestMySQLMigration000008_DownRefusesOnTotpSecrets(t *testing.T) {
 	}
 }
 
+func TestMySQLMigration000002_SessionTimestampIndexes(t *testing.T) {
+	data, err := defaultMigrationsFS.ReadFile("migrations/mysql/000002_create_sessions.up.sql")
+	if err != nil {
+		t.Fatalf("failed to read mysql migration 2 up: %v", err)
+	}
+	content := string(data)
+
+	requiredIndexes := []string{
+		"CREATE INDEX idx_sessions_user_id ON sessions(user_id);",
+		"CREATE INDEX idx_sessions_last_active_at ON sessions(last_active_at);",
+		"CREATE INDEX idx_sessions_absolute_expires_at ON sessions(absolute_expires_at);",
+	}
+
+	for _, idx := range requiredIndexes {
+		if !strings.Contains(content, idx) {
+			t.Errorf("mysql migration 2 up missing expected index statement: %s", idx)
+		}
+	}
+}
+
 func TestNormalizeMySQLError(t *testing.T) {
 	if got := NormalizeMySQLError(nil); got != nil {
 		t.Errorf("NormalizeMySQLError(nil) = %v; want nil", got)
