@@ -535,6 +535,40 @@ func TestMongoConnect_InvalidURI(t *testing.T) {
 	}
 }
 
+func TestMongoConnect_ZeroConnectTimeout(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		timeout time.Duration
+	}{
+		{name: "zero timeout", timeout: 0},
+		{name: "negative timeout", timeout: -5 * time.Second},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := config.DefaultConfig()
+			cfg.DatabaseType = config.DatabaseTypeMongo
+			cfg.DatabaseURL = "mongodb://127.0.0.1:27017"
+			cfg.MongoDB.Database = "testdb"
+			cfg.MongoDB.ConnectTimeout = tc.timeout
+			cfg.MongoDB.ServerSelectionTimeout = 50 * time.Millisecond
+
+			start := time.Now()
+			_, err := Connect(cfg)
+			elapsed := time.Since(start)
+
+			if err == nil {
+				return
+			}
+			// When ConnectTimeout <= 0, the fallback must ensure pingCtx does not immediately
+			// expire with a 0-duration deadline before server selection runs.
+			// An immediate 0-duration context failure returns "failed to ping mongodb: context deadline exceeded"
+			// without attempting server selection.
+			if !strings.Contains(err.Error(), "server selection error") && strings.HasSuffix(err.Error(), "failed to ping mongodb: context deadline exceeded") {
+				t.Fatalf("expected ping context not to expire immediately from zero-duration deadline, took %v, err: %v", elapsed, err)
+			}
+		})
+	}
+}
+
 func TestMongoStore_NilClientOperations(t *testing.T) {
 	store := New(nil, nil, false)
 

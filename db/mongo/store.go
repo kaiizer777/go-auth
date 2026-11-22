@@ -180,6 +180,11 @@ func Connect(cfg config.Config) (*MongoStore, error) {
 	if cfg.MongoDB.MaxConnIdleTime > 0 {
 		opts.SetMaxConnIdleTime(cfg.MongoDB.MaxConnIdleTime)
 	}
+	connectTimeout := cfg.MongoDB.ConnectTimeout
+	if connectTimeout <= 0 {
+		connectTimeout = 10 * time.Second
+	}
+
 	if cfg.MongoDB.ConnectTimeout > 0 {
 		opts.SetConnectTimeout(cfg.MongoDB.ConnectTimeout)
 	}
@@ -189,18 +194,14 @@ func Connect(cfg config.Config) (*MongoStore, error) {
 
 	opts.SetReadPreference(readpref.Primary())
 	opts.SetWriteConcern(writeconcern.Majority())
-	if cfg.MongoDB.ConnectTimeout > 0 {
-		opts.SetTimeout(cfg.MongoDB.ConnectTimeout)
-	} else {
-		opts.SetTimeout(5 * time.Second)
-	}
+	opts.SetTimeout(connectTimeout)
 
 	client, err := mongo.Connect(opts)
 	if err != nil {
 		return nil, errors.Wrap(err, errors.CodeDatabaseError, "failed to connect to mongodb")
 	}
 
-	pingCtx, cancel := context.WithTimeout(context.Background(), cfg.MongoDB.ConnectTimeout)
+	pingCtx, cancel := context.WithTimeout(context.Background(), connectTimeout)
 	defer cancel()
 	if err := client.Ping(pingCtx, readpref.Primary()); err != nil {
 		_ = client.Disconnect(context.Background())
@@ -210,7 +211,7 @@ func Connect(cfg config.Config) (*MongoStore, error) {
 	dbName := cfg.MongoDB.Database
 	database := client.Database(dbName)
 
-	idxCtx, idxCancel := context.WithTimeout(context.Background(), cfg.MongoDB.ConnectTimeout)
+	idxCtx, idxCancel := context.WithTimeout(context.Background(), connectTimeout)
 	defer idxCancel()
 	if err := EnsureIndexes(idxCtx, database); err != nil {
 		_ = client.Disconnect(context.Background())
