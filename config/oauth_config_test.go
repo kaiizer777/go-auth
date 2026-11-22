@@ -107,7 +107,7 @@ func TestConfigValidate_OAuth(t *testing.T) {
 		{
 			name: "unknown provider rejected",
 			mutate: func(c *Config) {
-				c.OAuth.Providers = enabled("discord", ProviderConfig{
+				c.OAuth.Providers = enabled("unsupported-idp", ProviderConfig{
 					ClientID:     "did",
 					ClientSecret: "dsecret",
 					RedirectURL:  "https://example.com/callback",
@@ -331,9 +331,157 @@ func TestConfigValidate_OAuth(t *testing.T) {
 		{
 			name: "disabled unknown provider rejected",
 			mutate: func(c *Config) {
-				c.OAuth.Providers = map[string]ProviderConfig{"discord": {}}
+				c.OAuth.Providers = map[string]ProviderConfig{"unsupported-idp": {}}
 			},
 			wantErr: errors.ErrOAuthProviderUnknown,
+		},
+		{
+			name: "discord enabled valid defaults scopes",
+			mutate: func(c *Config) {
+				c.OAuth.Discord = &DiscordConfig{
+					ClientID:     "discord-id",
+					ClientSecret: "discord-secret",
+					RedirectURI:  "https://example.com/callback",
+				}
+			},
+			wantErr: nil,
+		},
+		{
+			name: "discord missing client id rejected",
+			mutate: func(c *Config) {
+				c.OAuth.Discord = &DiscordConfig{
+					ClientID:     "",
+					ClientSecret: "discord-secret",
+					RedirectURI:  "https://example.com/callback",
+				}
+			},
+			wantErr: errors.ErrOAuthClientIDRequired,
+		},
+		{
+			name: "discord missing client secret rejected",
+			mutate: func(c *Config) {
+				c.OAuth.Discord = &DiscordConfig{
+					ClientID:     "discord-id",
+					ClientSecret: "",
+					RedirectURI:  "https://example.com/callback",
+				}
+			},
+			wantErr: errors.ErrOAuthClientSecretRequired,
+		},
+		{
+			name: "discord missing redirect uri rejected",
+			mutate: func(c *Config) {
+				c.OAuth.Discord = &DiscordConfig{
+					ClientID:     "discord-id",
+					ClientSecret: "discord-secret",
+					RedirectURI:  "",
+				}
+			},
+			wantErr: errors.ErrOAuthRedirectURLRequired,
+		},
+		{
+			name: "discord missing state secret rejected",
+			mutate: func(c *Config) {
+				c.OAuth.StateSecret = ""
+				c.OAuth.Discord = &DiscordConfig{
+					ClientID:     "discord-id",
+					ClientSecret: "discord-secret",
+					RedirectURI:  "https://example.com/callback",
+				}
+			},
+			wantErr: errors.ErrOAuthStateSecretRequired,
+		},
+		{
+			name: "facebook enabled valid defaults version and scopes",
+			mutate: func(c *Config) {
+				c.OAuth.Facebook = &FacebookConfig{
+					AppID:       "fb-app-id",
+					AppSecret:   "fb-app-secret",
+					RedirectURI: "https://example.com/callback",
+				}
+			},
+			wantErr: nil,
+		},
+		{
+			name: "facebook missing app id rejected",
+			mutate: func(c *Config) {
+				c.OAuth.Facebook = &FacebookConfig{
+					AppID:       "",
+					AppSecret:   "fb-app-secret",
+					RedirectURI: "https://example.com/callback",
+				}
+			},
+			wantErr: errors.ErrOAuthClientIDRequired,
+		},
+		{
+			name: "facebook missing app secret rejected",
+			mutate: func(c *Config) {
+				c.OAuth.Facebook = &FacebookConfig{
+					AppID:       "fb-app-id",
+					AppSecret:   "",
+					RedirectURI: "https://example.com/callback",
+				}
+			},
+			wantErr: errors.ErrOAuthClientSecretRequired,
+		},
+		{
+			name: "facebook missing redirect uri rejected",
+			mutate: func(c *Config) {
+				c.OAuth.Facebook = &FacebookConfig{
+					AppID:       "fb-app-id",
+					AppSecret:   "fb-app-secret",
+					RedirectURI: "",
+				}
+			},
+			wantErr: errors.ErrOAuthRedirectURLRequired,
+		},
+		{
+			name: "facebook invalid graph version missing v prefix rejected",
+			mutate: func(c *Config) {
+				c.OAuth.Facebook = &FacebookConfig{
+					AppID:        "fb-app-id",
+					AppSecret:    "fb-app-secret",
+					RedirectURI:  "https://example.com/callback",
+					GraphVersion: "19.0",
+				}
+			},
+			wantErr: errors.ErrOAuthGraphVersionInvalid,
+		},
+		{
+			name: "facebook invalid graph version below 19 rejected",
+			mutate: func(c *Config) {
+				c.OAuth.Facebook = &FacebookConfig{
+					AppID:        "fb-app-id",
+					AppSecret:    "fb-app-secret",
+					RedirectURI:  "https://example.com/callback",
+					GraphVersion: "v18.0",
+				}
+			},
+			wantErr: errors.ErrOAuthGraphVersionInvalid,
+		},
+		{
+			name: "facebook valid graph version 20 allowed",
+			mutate: func(c *Config) {
+				c.OAuth.Facebook = &FacebookConfig{
+					AppID:        "fb-app-id",
+					AppSecret:    "fb-app-secret",
+					RedirectURI:  "https://example.com/callback",
+					GraphVersion: "v20.0",
+				}
+			},
+			wantErr: nil,
+		},
+		{
+			name: "facebook missing state secret rejected",
+			mutate: func(c *Config) {
+				c.OAuth.StateSecret = ""
+				c.OAuth.Facebook = &FacebookConfig{
+					AppID:       "fb-app-id",
+					AppSecret:   "fb-app-secret",
+					RedirectURI: "https://example.com/callback",
+				}
+			},
+			wantErr: errors.ErrOAuthStateSecretRequired,
 		},
 	}
 
@@ -484,6 +632,89 @@ func TestProviderConfigLogValue(t *testing.T) {
 		}
 		if strings.Contains(str, "ms-secret") {
 			t.Fatalf("String() leaked nested microsoft secret: %q", str)
+		}
+	})
+
+	t.Run("DiscordConfig masks client secret in LogValue and String", func(t *testing.T) {
+		d := DiscordConfig{
+			ClientID:     "discord-client-id",
+			ClientSecret: "discord-secret-token",
+			RedirectURI:  "https://example.com/callback",
+			Scopes:       []string{"identify", "email"},
+		}
+		val := d.LogValue()
+		attrs := make(map[string]string)
+		for _, attr := range val.Group() {
+			attrs[attr.Key] = attr.Value.String()
+		}
+		if attrs["client_secret"] != "[REDACTED]" {
+			t.Errorf("client_secret = %q; want [REDACTED]", attrs["client_secret"])
+		}
+		if strings.Contains(attrs["client_secret"], "discord-secret-token") {
+			t.Fatalf("LogValue leaked discord client secret")
+		}
+		str := d.String()
+		if strings.Contains(str, "discord-secret-token") {
+			t.Fatalf("String() leaked discord client secret: %q", str)
+		}
+		if !strings.Contains(str, "[REDACTED]") {
+			t.Fatalf("String() expected [REDACTED], got: %q", str)
+		}
+	})
+
+	t.Run("FacebookConfig masks app secret in LogValue and String", func(t *testing.T) {
+		f := FacebookConfig{
+			AppID:        "fb-app-id",
+			AppSecret:    "fb-app-secret-token",
+			RedirectURI:  "https://example.com/callback",
+			Scopes:       []string{"email", "public_profile"},
+			GraphVersion: "v19.0",
+		}
+		val := f.LogValue()
+		attrs := make(map[string]string)
+		for _, attr := range val.Group() {
+			attrs[attr.Key] = attr.Value.String()
+		}
+		if attrs["app_secret"] != "[REDACTED]" {
+			t.Errorf("app_secret = %q; want [REDACTED]", attrs["app_secret"])
+		}
+		if strings.Contains(attrs["app_secret"], "fb-app-secret-token") {
+			t.Fatalf("LogValue leaked facebook app secret")
+		}
+		str := f.String()
+		if strings.Contains(str, "fb-app-secret-token") {
+			t.Fatalf("String() leaked facebook app secret: %q", str)
+		}
+		if !strings.Contains(str, "[REDACTED]") {
+			t.Fatalf("String() expected [REDACTED], got: %q", str)
+		}
+	})
+
+	t.Run("OAuthConfig masks nested discord and facebook secrets in LogValue and String", func(t *testing.T) {
+		o := OAuthConfig{
+			StateSecret: "state-secret-super-confidential",
+			Discord: &DiscordConfig{
+				ClientID:     "discord-id",
+				ClientSecret: "discord-secret-leak-test",
+			},
+			Facebook: &FacebookConfig{
+				AppID:     "fb-id",
+				AppSecret: "fb-secret-leak-test",
+			},
+		}
+		val := o.LogValue()
+		for _, attr := range val.Group() {
+			if strings.Contains(attr.Value.String(), "discord-secret-leak-test") ||
+				strings.Contains(attr.Value.String(), "fb-secret-leak-test") {
+				t.Fatalf("OAuthConfig.LogValue leaked secrets in %s", attr.Key)
+			}
+		}
+		str := o.String()
+		if strings.Contains(str, "discord-secret-leak-test") {
+			t.Fatalf("String() leaked discord secret")
+		}
+		if strings.Contains(str, "fb-secret-leak-test") {
+			t.Fatalf("String() leaked fb secret")
 		}
 	})
 }
