@@ -43,6 +43,10 @@ func (f *stubProvider) AuthURL(state, codeChallenge string) string {
 	return "https://provider.example/auth?state=" + state + "&code_challenge=" + codeChallenge
 }
 
+func (f *stubProvider) AuthCodeURL(state, codeChallenge string, _ ...AuthCodeOption) string {
+	return f.AuthURL(state, codeChallenge)
+}
+
 func (f *stubProvider) ExchangeCode(_ context.Context, code, codeVerifier string) (*TokenResponse, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

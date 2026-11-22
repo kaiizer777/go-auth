@@ -35,6 +35,10 @@ func (f *stubOAuthProvider) AuthURL(state, codeChallenge string) string {
 	return "https://provider.example/auth?state=" + state + "&code_challenge=" + codeChallenge
 }
 
+func (f *stubOAuthProvider) AuthCodeURL(state, codeChallenge string, _ ...oauth.AuthCodeOption) string {
+	return f.AuthURL(state, codeChallenge)
+}
+
 func (f *stubOAuthProvider) ExchangeCode(_ context.Context, code, _ string) (*oauth.TokenResponse, error) {
 	if f.exchErr != nil {
 		return nil, f.exchErr

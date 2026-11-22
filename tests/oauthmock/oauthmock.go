@@ -141,6 +141,11 @@ func (m *Mock) AuthURL(state, codeChallenge string) string {
 	return "https://provider." + m.id + ".example/auth?state=" + state + "&code_challenge=" + codeChallenge
 }
 
+// AuthCodeURL returns a fake provider authorization URL, recording the challenge.
+func (m *Mock) AuthCodeURL(state, codeChallenge string, _ ...oauth.AuthCodeOption) string {
+	return m.AuthURL(state, codeChallenge)
+}
+
 // ExchangeCode posts the code/verifier to the mock token server.
 func (m *Mock) ExchangeCode(ctx context.Context, code, verifier string) (*oauth.TokenResponse, error) {
 	sent := verifier
