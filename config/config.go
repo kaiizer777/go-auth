@@ -77,18 +77,39 @@ func (p ProviderConfig) String() string {
 
 // OAuthConfig groups configurations for all external identity providers.
 type OAuthConfig struct {
-	// Providers maps provider ID ("google", "github", "apple") to provider configuration.
+	// Providers maps provider ID ("google", "github", "apple", "microsoft") to provider configuration.
 	Providers       map[string]ProviderConfig
-	StateCookieName string        // Default: "oauth_state"
-	StateCookiePath string        // Default: "/" (ensures cookies are sent on /auth/oauth/* and /api/auth/oauth/*)
-	StateTTL        time.Duration // Default: 10 * time.Minute
-	StateSecret     string        // Required when any OAuth provider is enabled; empty fails closed at startup. Min 32 bytes.
-	CallbackBaseURL string        // e.g. "https://api.example.com"
+	Microsoft       *MicrosoftConfig `json:"microsoft,omitempty"`
+	StateCookieName string           // Default: "oauth_state"
+	StateCookiePath string           // Default: "/" (ensures cookies are sent on /auth/oauth/* and /api/auth/oauth/*)
+	StateTTL        time.Duration    // Default: 10 * time.Minute
+	StateSecret     string           // Required when any OAuth provider is enabled; empty fails closed at startup. Min 32 bytes.
+	CallbackBaseURL string           // e.g. "https://api.example.com"
 	// StateCookieSameSite is the base SameSite policy for the OAuth state
 	// cookie on GET-redirect flows. Default: Lax. form_post providers (Apple)
 	// always escalate to None+Secure regardless, since browsers withhold Lax
 	// on cross-site POST navigations.
 	StateCookieSameSite http.SameSite
+}
+
+// LogValue implements slog.LogValuer to ensure StateSecret and nested provider secrets are redacted.
+func (o OAuthConfig) LogValue() slog.Value {
+	secretMasked := "[REDACTED]"
+	if o.StateSecret == "" {
+		secretMasked = ""
+	}
+	attrs := []slog.Attr{
+		slog.String("state_secret", secretMasked),
+		slog.String("state_cookie_name", o.StateCookieName),
+		slog.String("state_cookie_path", o.StateCookiePath),
+		slog.Duration("state_ttl", o.StateTTL),
+		slog.String("callback_base_url", o.CallbackBaseURL),
+		slog.Any("providers", o.Providers),
+	}
+	if o.Microsoft != nil {
+		attrs = append(attrs, slog.Any("microsoft", o.Microsoft.LogValue()))
+	}
+	return slog.GroupValue(attrs...)
 }
 
 // SecurityHeadersConfig groups HTTP security header policies.
@@ -681,6 +702,9 @@ func (c *Config) Validate() error {
 				return errors.ErrOAuthStateSecretRequired
 			}
 		}
+		if c.OAuth.Microsoft != nil {
+			return errors.ErrOAuthStateSecretRequired
+		}
 	} else if len(c.OAuth.StateSecret) < 32 {
 		return errors.ErrOAuthStateSecretTooShort
 	}
@@ -699,7 +723,7 @@ func (c *Config) Validate() error {
 	}
 	for id, provider := range c.OAuth.Providers {
 		switch id {
-		case "google", "github", "apple":
+		case "google", "github", "apple", "microsoft":
 		default:
 			return errors.ErrOAuthProviderUnknown
 		}
@@ -713,7 +737,7 @@ func (c *Config) Validate() error {
 			return errors.ErrOAuthRedirectURLRequired
 		}
 		switch id {
-		case "google", "github":
+		case "google", "github", "microsoft":
 			if provider.ClientSecret == "" {
 				return errors.ErrOAuthClientSecretRequired
 			}
@@ -722,6 +746,24 @@ func (c *Config) Validate() error {
 				(provider.TeamID == "" || provider.KeyID == "" || provider.PrivateKey == "") {
 				return errors.ErrOAuthClientSecretRequired
 			}
+		}
+	}
+
+	if c.OAuth.Microsoft != nil {
+		if c.OAuth.Microsoft.ClientID == "" {
+			return errors.ErrOAuthClientIDRequired
+		}
+		if c.OAuth.Microsoft.ClientSecret == "" {
+			return errors.ErrOAuthClientSecretRequired
+		}
+		if c.OAuth.Microsoft.Tenant == "" {
+			c.OAuth.Microsoft.Tenant = "common"
+		}
+		if len(c.OAuth.Microsoft.Scopes) == 0 {
+			c.OAuth.Microsoft.Scopes = []string{"openid", "profile", "email", "offline_access"}
+		}
+		if c.OAuth.Microsoft.JWKSCacheTTL == 0 {
+			c.OAuth.Microsoft.JWKSCacheTTL = 24 * time.Hour
 		}
 	}
 

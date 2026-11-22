@@ -267,6 +267,57 @@ func TestConfigValidate_OAuth(t *testing.T) {
 			wantErr: errors.ErrOAuthStateCookiePathInvalid,
 		},
 		{
+			name: "microsoft config valid defaults",
+			mutate: func(c *Config) {
+				c.OAuth.Microsoft = &MicrosoftConfig{
+					ClientID:     "ms-client-id",
+					ClientSecret: "ms-client-secret",
+					RedirectURI:  "https://example.com/callback",
+				}
+			},
+			wantErr: nil,
+		},
+		{
+			name: "microsoft config missing client id rejected",
+			mutate: func(c *Config) {
+				c.OAuth.Microsoft = &MicrosoftConfig{
+					ClientSecret: "ms-client-secret",
+				}
+			},
+			wantErr: errors.ErrOAuthClientIDRequired,
+		},
+		{
+			name: "microsoft config missing client secret rejected",
+			mutate: func(c *Config) {
+				c.OAuth.Microsoft = &MicrosoftConfig{
+					ClientID: "ms-client-id",
+				}
+			},
+			wantErr: errors.ErrOAuthClientSecretRequired,
+		},
+		{
+			name: "microsoft config missing state secret rejected",
+			mutate: func(c *Config) {
+				c.OAuth.StateSecret = ""
+				c.OAuth.Microsoft = &MicrosoftConfig{
+					ClientID:     "ms-client-id",
+					ClientSecret: "ms-client-secret",
+				}
+			},
+			wantErr: errors.ErrOAuthStateSecretRequired,
+		},
+		{
+			name: "microsoft provider map allowed",
+			mutate: func(c *Config) {
+				c.OAuth.Providers = enabled("microsoft", ProviderConfig{
+					ClientID:     "ms-client-id",
+					ClientSecret: "ms-client-secret",
+					RedirectURL:  "https://example.com/callback",
+				})
+			},
+			wantErr: nil,
+		},
+		{
 			name: "disabled unknown provider rejected",
 			mutate: func(c *Config) {
 				c.OAuth.Providers = map[string]ProviderConfig{"discord": {}}
@@ -351,6 +402,44 @@ func TestProviderConfigLogValue(t *testing.T) {
 		p := ProviderConfig{ClientID: "id", ClientSecret: "top-secret-token"}
 		if str := p.String(); strings.Contains(str, "top-secret-token") {
 			t.Fatalf("String() leaked client secret: %q", str)
+		}
+	})
+
+	t.Run("MicrosoftConfig masks client secret in LogValue", func(t *testing.T) {
+		m := MicrosoftConfig{
+			ClientID:     "ms-id",
+			ClientSecret: "ms-top-secret",
+			Tenant:       "common",
+			RedirectURI:  "https://example.com/callback",
+		}
+		val := m.LogValue()
+		attrs := make(map[string]string)
+		for _, attr := range val.Group() {
+			attrs[attr.Key] = attr.Value.String()
+		}
+		if attrs["client_secret"] != "[REDACTED]" {
+			t.Errorf("client_secret = %q; want [REDACTED]", attrs["client_secret"])
+		}
+		if strings.Contains(attrs["client_secret"], "ms-top-secret") {
+			t.Fatalf("LogValue leaked microsoft secret")
+		}
+	})
+
+	t.Run("OAuthConfig masks state secret and nested microsoft secret", func(t *testing.T) {
+		o := OAuthConfig{
+			StateSecret: "state-secret-super-confidential",
+			Microsoft: &MicrosoftConfig{
+				ClientID:     "ms-id",
+				ClientSecret: "ms-secret",
+			},
+		}
+		val := o.LogValue()
+		attrs := make(map[string]string)
+		for _, attr := range val.Group() {
+			attrs[attr.Key] = attr.Value.String()
+		}
+		if attrs["state_secret"] != "[REDACTED]" {
+			t.Errorf("state_secret = %q; want [REDACTED]", attrs["state_secret"])
 		}
 	})
 }
