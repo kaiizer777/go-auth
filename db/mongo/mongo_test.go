@@ -403,6 +403,11 @@ func TestNormalizeMongoError(t *testing.T) {
 		Message: "E11000 duplicate key error collection: test.misc index: some_other_index dup key: { foo: \"bar\" }",
 	}
 
+	unmappedEmailErr := &mongo.CommandError{
+		Code:    11000,
+		Message: "E11000 duplicate key error collection: test.newsletter index: newsletter_subscribers dup key: { email: \"user@example.com\" }",
+	}
+
 	tests := []struct {
 		name    string
 		err     error
@@ -432,6 +437,16 @@ func TestNormalizeMongoError(t *testing.T) {
 			name:    "oauth account duplicate provider uid",
 			err:     makeDupErr("E11000 duplicate key error collection: test.oauth_accounts index: uq_oauth_accounts_provider_uid dup key: { provider_id: \"google\", provider_user_id: \"123\" }"),
 			wantErr: errors.ErrOAuthAccountAlreadyLinked,
+		},
+		{
+			name:    "oauth account duplicate with email in dup key maps to oauth account error",
+			err:     makeDupErr("E11000 duplicate key error collection: test.oauth_accounts index: uq_oauth_accounts_provider_uid dup key: { provider_id: \"google\", email: \"user@example.com\" }"),
+			wantErr: errors.ErrOAuthAccountAlreadyLinked,
+		},
+		{
+			name:    "unmapped duplicate key error with email substring returns original error",
+			err:     unmappedEmailErr,
+			wantErr: unmappedEmailErr,
 		},
 		{
 			name:    "unmapped duplicate key error returns original error",

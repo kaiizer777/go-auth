@@ -19,7 +19,7 @@ func NormalizeMongoError(err error) error {
 	}
 	msg := strings.ToLower(err.Error())
 	switch {
-	case strings.Contains(msg, "uq_users_email") || strings.Contains(msg, "email_1") || strings.Contains(msg, "email"):
+	case strings.Contains(msg, "uq_users_email") || strings.Contains(msg, "email_1"):
 		return errors.ErrEmailAlreadyExists
 	case strings.Contains(msg, "uq_totp_used_codes_user_code") || strings.Contains(msg, "code_hash_1") || strings.Contains(msg, "code_hash"):
 		return errors.ErrTOTPCodeReplayed
