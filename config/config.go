@@ -112,6 +112,16 @@ func (o OAuthConfig) LogValue() slog.Value {
 	return slog.GroupValue(attrs...)
 }
 
+// String implements fmt.Stringer to ensure StateSecret is masked when printed.
+func (o OAuthConfig) String() string {
+	secret := "[REDACTED]"
+	if o.StateSecret == "" {
+		secret = ""
+	}
+	return fmt.Sprintf("OAuthConfig{Providers: %v, Microsoft: %v, StateSecret: %s, CallbackBaseURL: %s}",
+		o.Providers, o.Microsoft, secret, o.CallbackBaseURL)
+}
+
 // SecurityHeadersConfig groups HTTP security header policies.
 // Struct fields are ordered largest-to-smallest to eliminate memory alignment padding.
 type SecurityHeadersConfig struct {
@@ -755,6 +765,9 @@ func (c *Config) Validate() error {
 		}
 		if c.OAuth.Microsoft.ClientSecret == "" {
 			return errors.ErrOAuthClientSecretRequired
+		}
+		if c.OAuth.Microsoft.RedirectURI == "" {
+			return errors.ErrOAuthRedirectURLRequired
 		}
 		if c.OAuth.Microsoft.Tenant == "" {
 			c.OAuth.Microsoft.Tenant = "common"

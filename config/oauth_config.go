@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"log/slog"
 	"time"
 )
@@ -40,4 +41,14 @@ func (m MicrosoftConfig) LogValue() slog.Value {
 		slog.Any("scopes", m.Scopes),
 		slog.Duration("jwks_cache_ttl", m.JWKSCacheTTL),
 	)
+}
+
+// String implements fmt.Stringer to ensure ClientSecret is masked when printed.
+func (m MicrosoftConfig) String() string {
+	secret := "[REDACTED]"
+	if m.ClientSecret == "" {
+		secret = ""
+	}
+	return fmt.Sprintf("MicrosoftConfig{ClientID: %s, ClientSecret: %s, Tenant: %s, RedirectURI: %s, Scopes: %v, JWKSCacheTTL: %v}",
+		m.ClientID, secret, m.Tenant, m.RedirectURI, m.Scopes, m.JWKSCacheTTL)
 }

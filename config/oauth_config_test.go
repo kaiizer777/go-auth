@@ -296,6 +296,17 @@ func TestConfigValidate_OAuth(t *testing.T) {
 			wantErr: errors.ErrOAuthClientSecretRequired,
 		},
 		{
+			name: "microsoft config missing redirect uri rejected",
+			mutate: func(c *Config) {
+				c.OAuth.Microsoft = &MicrosoftConfig{
+					ClientID:     "ms-client-id",
+					ClientSecret: "ms-client-secret",
+					RedirectURI:  "",
+				}
+			},
+			wantErr: errors.ErrOAuthRedirectURLRequired,
+		},
+		{
 			name: "microsoft config missing state secret rejected",
 			mutate: func(c *Config) {
 				c.OAuth.StateSecret = ""
@@ -440,6 +451,39 @@ func TestProviderConfigLogValue(t *testing.T) {
 		}
 		if attrs["state_secret"] != "[REDACTED]" {
 			t.Errorf("state_secret = %q; want [REDACTED]", attrs["state_secret"])
+		}
+	})
+
+	t.Run("MicrosoftConfig String masks client secret", func(t *testing.T) {
+		m := MicrosoftConfig{
+			ClientID:     "ms-id",
+			ClientSecret: "ms-top-secret",
+			Tenant:       "common",
+			RedirectURI:  "https://example.com/callback",
+		}
+		str := m.String()
+		if strings.Contains(str, "ms-top-secret") {
+			t.Fatalf("String() leaked client secret: %q", str)
+		}
+		if !strings.Contains(str, "[REDACTED]") {
+			t.Fatalf("String() expected [REDACTED], got: %q", str)
+		}
+	})
+
+	t.Run("OAuthConfig String masks state secret", func(t *testing.T) {
+		o := OAuthConfig{
+			StateSecret: "state-secret-super-confidential",
+			Microsoft: &MicrosoftConfig{
+				ClientID:     "ms-id",
+				ClientSecret: "ms-secret",
+			},
+		}
+		str := o.String()
+		if strings.Contains(str, "state-secret-super-confidential") {
+			t.Fatalf("String() leaked state secret: %q", str)
+		}
+		if strings.Contains(str, "ms-secret") {
+			t.Fatalf("String() leaked nested microsoft secret: %q", str)
 		}
 	})
 }
