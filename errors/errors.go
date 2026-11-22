@@ -54,6 +54,11 @@ const (
 	CodeOAuthEmailUnverified      Code = "OAUTH_EMAIL_UNVERIFIED"
 	CodeOAuthAccountLinkConflict  Code = "OAUTH_ACCOUNT_LINK_CONFLICT"
 	CodeOAuthProviderNotFound     Code = "OAUTH_PROVIDER_NOT_FOUND"
+	CodeOAuthEmailRequired        Code = "OAUTH_EMAIL_REQUIRED"
+	CodeOAuthRateLimitExceeded    Code = "OAUTH_RATE_LIMIT_EXCEEDED"
+	CodeOAuthTokenExchangeFailed  Code = "OAUTH_TOKEN_EXCHANGE_FAILED"
+	CodeOAuthIDTokenInvalid       Code = "OAUTH_ID_TOKEN_INVALID"
+	CodeOAuthTenantInvalid        Code = "OAUTH_TENANT_INVALID"
 
 	// Phase 4 Session errors
 	CodeSessionNotFound Code = "SESSION_NOT_FOUND" // 401
@@ -133,6 +138,7 @@ func (c Code) HTTPStatus() int {
 	case CodePasswordTooShort, CodePasswordTooLong, CodePasswordTooCommon,
 		CodeInvalidEmail, CodeValidationError, CodeInvalidToken, CodeTokenExpired,
 		CodeOAuthCallbackFailed, CodeOAuthCodeInvalid, CodeOAuthEmailUnverified,
+		CodeOAuthEmailRequired, CodeOAuthTenantInvalid,
 		CodeTOTPNotEnrolled, CodeTOTPCodeInvalid, CodeTOTPCodeReplayed, CodeTOTPBackupCodeInvalid,
 		CodeDatabaseUnsupported:
 		return http.StatusBadRequest
@@ -143,11 +149,12 @@ func (c Code) HTTPStatus() int {
 	case CodeInvalidCredentials, CodeUnauthenticated,
 		CodeSessionNotFound, CodeSessionExpired, CodeSessionInvalid,
 		CodeMFARequired, CodeMFAInvalidCode,
-		CodeTwoFactorTokenInvalid, CodeTwoFactorTokenExpired:
+		CodeTwoFactorTokenInvalid, CodeTwoFactorTokenExpired,
+		CodeOAuthIDTokenInvalid:
 		return http.StatusUnauthorized
 	case CodeEmailNotVerified, CodeCSRFTokenMissing, CodeCSRFTokenInvalid, CodeOAuthStateInvalid:
 		return http.StatusForbidden
-	case CodeRateLimitExceeded, CodeTwoFactorMaxAttemptsExceeded, CodeTOTPRateLimitExceeded:
+	case CodeRateLimitExceeded, CodeTwoFactorMaxAttemptsExceeded, CodeTOTPRateLimitExceeded, CodeOAuthRateLimitExceeded:
 		return http.StatusTooManyRequests
 	case CodeNotFound, CodeUserNotFound, CodeTokenNotFound, CodeOAuthAccountNotLinked, CodeOAuthProviderNotFound:
 		return http.StatusNotFound
@@ -155,7 +162,7 @@ func (c Code) HTTPStatus() int {
 		return http.StatusConflict
 	case CodeMethodNotAllowed:
 		return http.StatusMethodNotAllowed
-	case CodeOAuthProviderError:
+	case CodeOAuthProviderError, CodeOAuthTokenExchangeFailed:
 		return http.StatusBadGateway
 	case CodeDatabaseUnavailable:
 		return http.StatusServiceUnavailable
@@ -399,6 +406,11 @@ var (
 	ErrOAuthEmailUnverified      = New(CodeOAuthEmailUnverified, "oauth provider email is not verified", nil)
 	ErrOAuthAccountLinkConflict  = New(CodeOAuthAccountLinkConflict, "cannot link oauth identity to unverified local account", nil)
 	ErrOAuthProviderNotFound     = New(CodeOAuthProviderNotFound, "oauth provider not found", nil)
+	ErrOAuthEmailRequired        = New(CodeOAuthEmailRequired, "oauth email required for unauthenticated registration", nil)
+	ErrOAuthRateLimitExceeded    = New(CodeOAuthRateLimitExceeded, "oauth provider rate limit exceeded", nil)
+	ErrOAuthTokenExchangeFailed  = New(CodeOAuthTokenExchangeFailed, "oauth token exchange failed", nil)
+	ErrOAuthIDTokenInvalid       = New(CodeOAuthIDTokenInvalid, "oauth id token verification failed", nil)
+	ErrOAuthTenantInvalid        = New(CodeOAuthTenantInvalid, "oauth tenant is invalid or untrusted", nil)
 
 	// Predefined sentinel errors for Phase 4 Session, CSRF, and Rate Limiting.
 	ErrSessionNotFound   = New(CodeSessionNotFound, "Session is invalid or has expired", nil)

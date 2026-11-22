@@ -13,39 +13,96 @@ import (
 	"github.com/kaiizer777/go-auth/errors"
 )
 
-// UserInfo represents normalized profile data retrieved from an OAuth provider.
-type UserInfo struct {
-	ProviderID     string
-	ProviderUserID string
-	Email          string
-	EmailVerified  bool
-	Name           string
-	AvatarURL      string
+// AuthCodeOption specifies query parameters for authorization requests.
+type AuthCodeOption struct {
+	Key   string
+	Value string
 }
 
-// TokenResponse represents token credentials received from the provider's token endpoint.
-type TokenResponse struct {
-	AccessToken  string
-	TokenType    string
-	RefreshToken string
-	ExpiresIn    int
-	IDToken      string
-	Raw          map[string]any
+// AccessTypeOffline specifies offline access for refresh token issuance.
+func AccessTypeOffline() AuthCodeOption {
+	return AuthCodeOption{Key: "access_type", Value: "offline"}
 }
+
+// PromptOption specifies prompt behavior (e.g. consent, select_account).
+func PromptOption(prompt string) AuthCodeOption {
+	return AuthCodeOption{Key: "prompt", Value: prompt}
+}
+
+// NonceOption specifies cryptographic nonce for OpenID Connect authorization requests.
+func NonceOption(nonce string) AuthCodeOption {
+	return AuthCodeOption{Key: "nonce", Value: nonce}
+}
+
+// OAuthToken encapsulates the token response returned by an OAuth 2.0 provider.
+type OAuthToken struct {
+	AccessToken  string         `json:"access_token"`
+	TokenType    string         `json:"token_type"`
+	RefreshToken string         `json:"refresh_token,omitempty"`
+	ExpiresAt    time.Time      `json:"expires_at,omitempty"`
+	ExpiresIn    int            `json:"expires_in,omitempty"`
+	IDToken      string         `json:"id_token,omitempty"`
+	Raw          map[string]any `json:"-"`
+}
+
+// TokenResponse is a backward-compatible alias for OAuthToken.
+type TokenResponse = OAuthToken
+
+// OAuthUser represents normalized profile data retrieved from an OAuth provider.
+type OAuthUser struct {
+	ProviderID     string         `json:"provider_id"`
+	ProviderUserID string         `json:"provider_user_id"`
+	Email          string         `json:"email"`
+	EmailVerified  bool           `json:"email_verified"`
+	Name           string         `json:"name"`
+	AvatarURL      string         `json:"avatar_url"`
+	RawClaims      map[string]any `json:"raw_claims,omitempty"`
+}
+
+// UserInfo is a backward-compatible alias for OAuthUser.
+type UserInfo = OAuthUser
 
 // Provider defines the standard contract required for any OAuth2 / OIDC identity provider.
 type Provider interface {
-	// ID returns the canonical provider slug (e.g. "google", "github", "apple").
+	// ID returns the canonical provider slug (e.g. "google", "github", "apple", "microsoft").
 	ID() string
 
 	// AuthURL constructs the provider authorization URL with PKCE challenge, state, and scopes.
 	AuthURL(state, codeChallenge string) string
 
+	// AuthCodeURL constructs the authorization redirect URL with state, PKCE challenge, and options.
+	AuthCodeURL(state, codeChallenge string, opts ...AuthCodeOption) string
+
 	// ExchangeCode exchanges an authorization code and PKCE code verifier for tokens.
-	ExchangeCode(ctx context.Context, code, codeVerifier string) (*TokenResponse, error)
+	ExchangeCode(ctx context.Context, code, codeVerifier string) (*OAuthToken, error)
 
 	// FetchUserInfo retrieves and normalizes user profile information using the granted tokens.
-	FetchUserInfo(ctx context.Context, tokens *TokenResponse) (*UserInfo, error)
+	FetchUserInfo(ctx context.Context, tokens *OAuthToken) (*OAuthUser, error)
+}
+
+// OIDCProvider extends Provider for OpenID Connect compliant providers supporting ID token discovery & verification.
+type OIDCProvider interface {
+	Provider
+
+	// VerifyIDToken cryptographically validates an ID Token JWT against provider JWKS.
+	VerifyIDToken(ctx context.Context, rawIDToken, nonce string) (*IDTokenClaims, error)
+}
+
+// IDTokenClaims defines the standard OpenID Connect claims extracted from an ID Token.
+type IDTokenClaims struct {
+	Issuer            string   `json:"iss"`
+	Subject           string   `json:"sub"`
+	Audience          string   `json:"aud"`
+	Expiration        int64    `json:"exp"`
+	IssuedAt          int64    `json:"iat"`
+	Nonce             string   `json:"nonce,omitempty"`
+	Email             string   `json:"email,omitempty"`
+	EmailVerified     bool     `json:"email_verified,omitempty"`
+	Name              string   `json:"name,omitempty"`
+	PreferredUsername string   `json:"preferred_username,omitempty"`
+	TenantID          string   `json:"tid,omitempty"`
+	OID               string   `json:"oid,omitempty"`
+	Roles             []string `json:"roles,omitempty"`
 }
 
 // SupportedProviders defines the canonical set of locked Big 3 providers supported in v1.

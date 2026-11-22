@@ -68,6 +68,11 @@ func (p *AppleProvider) ID() string { return "apple" }
 
 // AuthURL builds the Apple authorization URL with form_post response mode and PKCE S256.
 func (p *AppleProvider) AuthURL(state, codeChallenge string) string {
+	return p.AuthCodeURL(state, codeChallenge)
+}
+
+// AuthCodeURL builds the Apple authorization URL with options.
+func (p *AppleProvider) AuthCodeURL(state, codeChallenge string, opts ...AuthCodeOption) string {
 	q := url.Values{}
 	q.Set("response_type", "code")
 	q.Set("response_mode", "form_post")
@@ -77,6 +82,11 @@ func (p *AppleProvider) AuthURL(state, codeChallenge string) string {
 	q.Set("state", state)
 	q.Set("code_challenge", codeChallenge)
 	q.Set("code_challenge_method", "S256")
+	for _, opt := range opts {
+		if opt.Key != "" {
+			q.Set(opt.Key, opt.Value)
+		}
+	}
 	return p.authURL + "?" + q.Encode()
 }
 
