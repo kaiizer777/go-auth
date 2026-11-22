@@ -1,0 +1,526 @@
+package oauth
+
+import (
+	"context"
+	"crypto"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"math/big"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/kaiizer777/go-auth/config"
+	"github.com/kaiizer777/go-auth/errors"
+)
+
+// helper to mint a valid test RSA key and generate RS256 JWTs
+func generateTestRSAKey(t *testing.T) (*rsa.PrivateKey, string, string) {
+	t.Helper()
+	privKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("failed to generate rsa key: %v", err)
+	}
+	nRaw := base64.RawURLEncoding.EncodeToString(privKey.N.Bytes())
+	eBytes := big.NewInt(int64(privKey.E)).Bytes()
+	eRaw := base64.RawURLEncoding.EncodeToString(eBytes)
+	return privKey, nRaw, eRaw
+}
+
+func signRS256JWT(t *testing.T, privKey *rsa.PrivateKey, kid string, claims map[string]any) string {
+	t.Helper()
+	headerBytes, err := json.Marshal(map[string]string{
+		"alg": "RS256",
+		"kid": kid,
+	})
+	if err != nil {
+		t.Fatalf("failed to marshal header: %v", err)
+	}
+
+	payloadBytes, err := json.Marshal(claims)
+	if err != nil {
+		t.Fatalf("failed to marshal claims: %v", err)
+	}
+
+	hB64 := base64.RawURLEncoding.EncodeToString(headerBytes)
+	pB64 := base64.RawURLEncoding.EncodeToString(payloadBytes)
+	signingInput := hB64 + "." + pB64
+
+	digest := sha256.Sum256([]byte(signingInput))
+	sig, err := rsa.SignPKCS1v15(rand.Reader, privKey, crypto.SHA256, digest[:])
+	if err != nil {
+		t.Fatalf("failed to sign jwt: %v", err)
+	}
+
+	sB64 := base64.RawURLEncoding.EncodeToString(sig)
+	return signingInput + "." + sB64
+}
+
+func TestOIDC_DiscoveryAndJWKS(t *testing.T) {
+	privKey, nRaw, eRaw := generateTestRSAKey(t)
+	var jwksRequests atomic.Int32
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/.well-known/openid-configuration":
+			disc := OIDCDiscovery{
+				AuthorizationEndpoint: "https://login.example.com/auth",
+				TokenEndpoint:         "https://login.example.com/token",
+				JWKSURI:               "http://" + r.Host + "/keys",
+				UserinfoEndpoint:      "https://login.example.com/userinfo",
+			}
+			_ = json.NewEncoder(w).Encode(disc)
+		case "/keys":
+			jwksRequests.Add(1)
+			doc := JWKDoc{
+				Keys: []JWKKey{
+					{
+						Kty: "RSA",
+						Use: "sig",
+						Kid: "key-1",
+						Alg: "RS256",
+						N:   nRaw,
+						E:   eRaw,
+					},
+				},
+			}
+			_ = json.NewEncoder(w).Encode(doc)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	ctx := context.Background()
+	client := server.Client()
+
+	t.Run("fetch oidc discovery", func(t *testing.T) {
+		disc, err := FetchOIDCDiscovery(ctx, client, server.URL+"/.well-known/openid-configuration")
+		if err != nil {
+			t.Fatalf("unexpected discovery error: %v", err)
+		}
+		if disc.TokenEndpoint != "https://login.example.com/token" {
+			t.Errorf("token endpoint = %q", disc.TokenEndpoint)
+		}
+		if disc.JWKSURI != server.URL+"/keys" {
+			t.Errorf("jwks_uri = %q", disc.JWKSURI)
+		}
+	})
+
+	t.Run("jwks manager cache and singleflight", func(t *testing.T) {
+		mgr := NewJWKSManager(server.URL+"/keys", client, 1*time.Hour)
+
+		key, err := mgr.GetKey(ctx, "key-1")
+		if err != nil {
+			t.Fatalf("failed to get key: %v", err)
+		}
+		if key.N.Cmp(privKey.N) != 0 {
+			t.Fatalf("modulus mismatch")
+		}
+
+		// Second fetch should be cached (jwksRequests == 1)
+		_, err = mgr.GetKey(ctx, "key-1")
+		if err != nil {
+			t.Fatalf("cached fetch failed: %v", err)
+		}
+		if jwksRequests.Load() != 1 {
+			t.Fatalf("expected 1 jwks request, got %d", jwksRequests.Load())
+		}
+	})
+
+	t.Run("verify valid rs256 jwt", func(t *testing.T) {
+		mgr := NewJWKSManager(server.URL+"/keys", client, 1*time.Hour)
+		claims := map[string]any{
+			"iss":   "https://example.com",
+			"sub":   "user-123",
+			"aud":   "client-xyz",
+			"email": "test@example.com",
+		}
+		rawJWT := signRS256JWT(t, privKey, "key-1", claims)
+
+		parsed, err := VerifyRS256JWT(ctx, rawJWT, mgr)
+		if err != nil {
+			t.Fatalf("verification failed: %v", err)
+		}
+		if parsed["email"] != "test@example.com" {
+			t.Errorf("email = %v", parsed["email"])
+		}
+	})
+
+	t.Run("reject tampered jwt signature", func(t *testing.T) {
+		mgr := NewJWKSManager(server.URL+"/keys", client, 1*time.Hour)
+		claims := map[string]any{"sub": "user-123"}
+		rawJWT := signRS256JWT(t, privKey, "key-1", claims)
+
+		// Tamper with payload
+		parts := strings.Split(rawJWT, ".")
+		tampered := parts[0] + "." + base64.RawURLEncoding.EncodeToString([]byte(`{"sub":"attacker"}`)) + "." + parts[2]
+
+		_, err := VerifyRS256JWT(ctx, tampered, mgr)
+		if err == nil {
+			t.Fatal("expected signature error for tampered token, got nil")
+		}
+		var appErr *errors.Error
+		if !errors.As(err, &appErr) || appErr.Code() != errors.CodeOAuthIDTokenInvalid {
+			t.Fatalf("expected CodeOAuthIDTokenInvalid, got %v", err)
+		}
+	})
+}
+
+func TestMicrosoftProvider(t *testing.T) {
+	privKey, nRaw, eRaw := generateTestRSAKey(t)
+	var jwksRequests atomic.Int32
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/keys":
+			jwksRequests.Add(1)
+			doc := JWKDoc{
+				Keys: []JWKKey{
+					{
+						Kty: "RSA",
+						Use: "sig",
+						Kid: "ms-key-1",
+						Alg: "RS256",
+						N:   nRaw,
+						E:   eRaw,
+					},
+				},
+			}
+			_ = json.NewEncoder(w).Encode(doc)
+		case "/token":
+			if r.Method != http.MethodPost {
+				http.Error(w, "bad method", http.StatusMethodNotAllowed)
+				return
+			}
+			_ = r.ParseForm()
+			if r.FormValue("code") == "bad-code" {
+				w.WriteHeader(http.StatusBadRequest)
+				_ = json.NewEncoder(w).Encode(map[string]any{"error": "invalid_grant"})
+				return
+			}
+
+			// Valid token response
+			idTokenClaims := map[string]any{
+				"iss":   "https://login.microsoftonline.com/9188040d-6c67-4c5b-b112-36a304b66dad/v2.0",
+				"sub":   "consumer-sub-1",
+				"aud":   "client-test-id",
+				"exp":   time.Now().Add(10 * time.Minute).Unix(),
+				"iat":   time.Now().Unix(),
+				"email": "consumer@outlook.com",
+				"tid":   MicrosoftConsumerTenantGUID,
+				"name":  "Consumer User",
+			}
+			idTok := signRS256JWT(t, privKey, "ms-key-1", idTokenClaims)
+
+			resp := map[string]any{
+				"token_type":    "Bearer",
+				"access_token":  "mock-access-token",
+				"refresh_token": "mock-refresh-token",
+				"expires_in":    3600,
+				"id_token":      idTok,
+			}
+			_ = json.NewEncoder(w).Encode(resp)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	newTestProvider := func(tenant string, trusted []string) *MicrosoftProvider {
+		cfg := config.MicrosoftConfig{
+			ClientID:       "client-test-id",
+			ClientSecret:   "client-test-secret",
+			Tenant:         tenant,
+			TrustedTenants: trusted,
+			RedirectURI:    "https://example.com/callback",
+		}
+		p := NewMicrosoftProvider(cfg)
+		p.client = server.Client()
+		p.tokenURL = server.URL + "/token"
+		p.jwksURL = server.URL + "/keys"
+		p.jwksMgr = NewJWKSManager(server.URL+"/keys", p.client, 24*time.Hour)
+		p.jwksRetriever = p.jwksMgr
+		return p
+	}
+
+	ctx := context.Background()
+
+	t.Run("AuthCodeURL generation", func(t *testing.T) {
+		p := newTestProvider("common", nil)
+		authURL := p.AuthCodeURL("state-123", "challenge-xyz", NonceOption("nonce-abc"), PromptOption("consent"))
+
+		u, err := url.Parse(authURL)
+		if err != nil {
+			t.Fatalf("failed to parse url: %v", err)
+		}
+		q := u.Query()
+		if q.Get("client_id") != "client-test-id" {
+			t.Errorf("client_id = %q", q.Get("client_id"))
+		}
+		if q.Get("state") != "state-123" {
+			t.Errorf("state = %q", q.Get("state"))
+		}
+		if q.Get("code_challenge") != "challenge-xyz" {
+			t.Errorf("code_challenge = %q", q.Get("code_challenge"))
+		}
+		if q.Get("code_challenge_method") != "S256" {
+			t.Errorf("code_challenge_method = %q", q.Get("code_challenge_method"))
+		}
+		if q.Get("nonce") != "nonce-abc" {
+			t.Errorf("nonce = %q", q.Get("nonce"))
+		}
+		if q.Get("prompt") != "consent" {
+			t.Errorf("prompt = %q", q.Get("prompt"))
+		}
+	})
+
+	t.Run("ExchangeCode success and failure", func(t *testing.T) {
+		p := newTestProvider("common", nil)
+		tok, err := p.ExchangeCode(ctx, "good-code", "verifier-123")
+		if err != nil {
+			t.Fatalf("exchange code failed: %v", err)
+		}
+		if tok.AccessToken != "mock-access-token" {
+			t.Errorf("access_token = %q", tok.AccessToken)
+		}
+		if tok.IDToken == "" {
+			t.Errorf("expected id_token")
+		}
+
+		// Bad code
+		_, err = p.ExchangeCode(ctx, "bad-code", "verifier-123")
+		if err == nil {
+			t.Fatal("expected error for bad code, got nil")
+		}
+	})
+
+	t.Run("VerifyIDToken dynamic issuer and authority modes", func(t *testing.T) {
+		// 1. Consumers authority mode accepts consumer GUID
+		pConsumer := newTestProvider("consumers", nil)
+		claimsConsumer := map[string]any{
+			"iss":   "https://login.microsoftonline.com/9188040d-6c67-4c5b-b112-36a304b66dad/v2.0",
+			"sub":   "sub-consumer",
+			"aud":   "client-test-id",
+			"exp":   time.Now().Add(10 * time.Minute).Unix(),
+			"email": "user@outlook.com",
+			"tid":   MicrosoftConsumerTenantGUID,
+		}
+		tokConsumer := signRS256JWT(t, privKey, "ms-key-1", claimsConsumer)
+		c, err := pConsumer.VerifyIDToken(ctx, tokConsumer, "")
+		if err != nil {
+			t.Fatalf("consumers mode verification failed: %v", err)
+		}
+		if !c.EmailVerified {
+			t.Errorf("expected consumer email to be verified")
+		}
+
+		// Consumers mode rejects non-consumer issuer
+		claimsOrgInConsumer := map[string]any{
+			"iss": "https://login.microsoftonline.com/custom-tenant-guid/v2.0",
+			"sub": "sub-org",
+			"aud": "client-test-id",
+			"exp": time.Now().Add(10 * time.Minute).Unix(),
+			"tid": "custom-tenant-guid",
+		}
+		tokOrgInConsumer := signRS256JWT(t, privKey, "ms-key-1", claimsOrgInConsumer)
+		_, err = pConsumer.VerifyIDToken(ctx, tokOrgInConsumer, "")
+		if err == nil {
+			t.Fatal("expected error for non-consumer issuer in consumers mode")
+		}
+
+		// 2. Organizations mode accepts custom tenant GUID but rejects consumer account
+		pOrg := newTestProvider("organizations", nil)
+		claimsOrg := map[string]any{
+			"iss":   "https://login.microsoftonline.com/corp-tenant-guid/v2.0",
+			"sub":   "sub-corp",
+			"aud":   "client-test-id",
+			"exp":   time.Now().Add(10 * time.Minute).Unix(),
+			"email": "corp@company.com",
+			"tid":   "corp-tenant-guid",
+		}
+		tokOrg := signRS256JWT(t, privKey, "ms-key-1", claimsOrg)
+		_, err = pOrg.VerifyIDToken(ctx, tokOrg, "")
+		if err != nil {
+			t.Fatalf("organizations mode verification failed: %v", err)
+		}
+
+		// Organizations mode rejects consumer account
+		_, err = pOrg.VerifyIDToken(ctx, tokConsumer, "")
+		if err == nil {
+			t.Fatal("expected error when consumer account logs in under organizations mode")
+		}
+
+		// 3. Specific tenant GUID
+		pSingle := newTestProvider("target-tenant-uuid", nil)
+		claimsSingle := map[string]any{
+			"iss":   "https://login.microsoftonline.com/target-tenant-uuid/v2.0",
+			"sub":   "sub-single",
+			"aud":   "client-test-id",
+			"exp":   time.Now().Add(10 * time.Minute).Unix(),
+			"email": "single@target.com",
+			"tid":   "target-tenant-uuid",
+		}
+		tokSingle := signRS256JWT(t, privKey, "ms-key-1", claimsSingle)
+		cSingle, err := pSingle.VerifyIDToken(ctx, tokSingle, "")
+		if err != nil {
+			t.Fatalf("single tenant verification failed: %v", err)
+		}
+		if !cSingle.EmailVerified {
+			t.Errorf("expected single tenant email to be verified")
+		}
+
+		// Specific tenant rejects foreign tenant
+		_, err = pSingle.VerifyIDToken(ctx, tokOrg, "")
+		if err == nil {
+			t.Fatal("expected error when foreign tenant connects to single-tenant adapter")
+		}
+	})
+
+	t.Run("nOauth defense - untrusted tenant vs domain ownership attestation", func(t *testing.T) {
+		pCommon := newTestProvider("common", []string{"trusted-partner-guid"})
+
+		// 1. Untrusted tenant without xms_edov -> EmailVerified must be FALSE
+		claimsUntrusted := map[string]any{
+			"iss":   "https://login.microsoftonline.com/untrusted-guid/v2.0",
+			"sub":   "attacker-sub",
+			"aud":   "client-test-id",
+			"exp":   time.Now().Add(10 * time.Minute).Unix(),
+			"email": "victim@victim-corp.com",
+			"tid":   "untrusted-guid",
+		}
+		tokUntrusted := signRS256JWT(t, privKey, "ms-key-1", claimsUntrusted)
+		cUntrusted, err := pCommon.VerifyIDToken(ctx, tokUntrusted, "")
+		if err != nil {
+			t.Fatalf("unexpected verification error: %v", err)
+		}
+		if cUntrusted.EmailVerified {
+			t.Errorf("nOauth vulnerability: untrusted tenant should have EmailVerified == false")
+		}
+
+		// 2. Untrusted tenant with xms_edov == '1' -> EmailVerified must be TRUE
+		claimsAttested := map[string]any{
+			"iss":      "https://login.microsoftonline.com/untrusted-guid/v2.0",
+			"sub":      "verified-sub",
+			"aud":      "client-test-id",
+			"exp":      time.Now().Add(10 * time.Minute).Unix(),
+			"email":    "user@attested-corp.com",
+			"tid":      "untrusted-guid",
+			"xms_edov": "1",
+		}
+		tokAttested := signRS256JWT(t, privKey, "ms-key-1", claimsAttested)
+		cAttested, err := pCommon.VerifyIDToken(ctx, tokAttested, "")
+		if err != nil {
+			t.Fatalf("unexpected verification error: %v", err)
+		}
+		if !cAttested.EmailVerified {
+			t.Errorf("expected EmailVerified == true when xms_edov == '1'")
+		}
+
+		// 3. Trusted tenant whitelist match -> EmailVerified must be TRUE
+		claimsTrusted := map[string]any{
+			"iss":   "https://login.microsoftonline.com/trusted-partner-guid/v2.0",
+			"sub":   "partner-sub",
+			"aud":   "client-test-id",
+			"exp":   time.Now().Add(10 * time.Minute).Unix(),
+			"email": "partner@partner.com",
+			"tid":   "trusted-partner-guid",
+		}
+		tokTrusted := signRS256JWT(t, privKey, "ms-key-1", claimsTrusted)
+		cTrusted, err := pCommon.VerifyIDToken(ctx, tokTrusted, "")
+		if err != nil {
+			t.Fatalf("unexpected verification error: %v", err)
+		}
+		if !cTrusted.EmailVerified {
+			t.Errorf("expected EmailVerified == true for whitelisted trusted tenant")
+		}
+	})
+
+	t.Run("token expiration, audience and nonce security checks", func(t *testing.T) {
+		p := newTestProvider("common", nil)
+
+		// 1. Expired token (outside 1m skew)
+		claimsExpired := map[string]any{
+			"iss": "https://login.microsoftonline.com/tid-1/v2.0",
+			"sub": "sub-1",
+			"aud": "client-test-id",
+			"exp": time.Now().Add(-5 * time.Minute).Unix(),
+			"tid": "tid-1",
+		}
+		tokExpired := signRS256JWT(t, privKey, "ms-key-1", claimsExpired)
+		_, err := p.VerifyIDToken(ctx, tokExpired, "")
+		if err == nil {
+			t.Fatal("expected error for expired token, got nil")
+		}
+
+		// 2. Audience mismatch
+		claimsBadAud := map[string]any{
+			"iss": "https://login.microsoftonline.com/tid-1/v2.0",
+			"sub": "sub-1",
+			"aud": "wrong-client-id",
+			"exp": time.Now().Add(5 * time.Minute).Unix(),
+			"tid": "tid-1",
+		}
+		tokBadAud := signRS256JWT(t, privKey, "ms-key-1", claimsBadAud)
+		_, err = p.VerifyIDToken(ctx, tokBadAud, "")
+		if err == nil {
+			t.Fatal("expected error for audience mismatch, got nil")
+		}
+
+		// 3. Nonce mismatch
+		claimsNonce := map[string]any{
+			"iss":   "https://login.microsoftonline.com/tid-1/v2.0",
+			"sub":   "sub-1",
+			"aud":   "client-test-id",
+			"exp":   time.Now().Add(5 * time.Minute).Unix(),
+			"tid":   "tid-1",
+			"nonce": "valid-nonce",
+		}
+		tokNonce := signRS256JWT(t, privKey, "ms-key-1", claimsNonce)
+		_, err = p.VerifyIDToken(ctx, tokNonce, "tampered-nonce")
+		if err == nil {
+			t.Fatal("expected error for nonce mismatch, got nil")
+		}
+		cNonce, err := p.VerifyIDToken(ctx, tokNonce, "valid-nonce")
+		if err != nil || cNonce.Nonce != "valid-nonce" {
+			t.Fatalf("failed to verify valid nonce: %v", err)
+		}
+	})
+
+	t.Run("FetchUserInfo maps OID and PreferredUsername", func(t *testing.T) {
+		p := newTestProvider("common", nil)
+		claims := map[string]any{
+			"iss":                "https://login.microsoftonline.com/tid-1/v2.0",
+			"sub":                "sub-fallback",
+			"oid":                "immutable-oid-guid",
+			"aud":                "client-test-id",
+			"exp":                time.Now().Add(10 * time.Minute).Unix(),
+			"preferred_username": "fallback.user@example.com",
+			"tid":                "tid-1",
+			"name":               "Fallback User",
+		}
+		idTok := signRS256JWT(t, privKey, "ms-key-1", claims)
+
+		user, err := p.FetchUserInfo(ctx, &OAuthToken{IDToken: idTok})
+		if err != nil {
+			t.Fatalf("FetchUserInfo failed: %v", err)
+		}
+		if user.ProviderUserID != "immutable-oid-guid" {
+			t.Errorf("ProviderUserID = %q, want immutable-oid-guid", user.ProviderUserID)
+		}
+		if user.Email != "fallback.user@example.com" {
+			t.Errorf("Email = %q, want fallback.user@example.com", user.Email)
+		}
+		if user.Name != "Fallback User" {
+			t.Errorf("Name = %q, want Fallback User", user.Name)
+		}
+	})
+}
