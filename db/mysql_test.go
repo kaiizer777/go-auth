@@ -116,15 +116,75 @@ func TestMySQLMigrations_TableOptionsAndReverseDownOrder(t *testing.T) {
 	}
 	downText := string(downContent)
 
-	idxTwoFactor := strings.Index(downText, "two_factor_tokens")
-	idxTotpUsed := strings.Index(downText, "totp_used_codes")
-	idxTotpSecrets := strings.Index(downText, "totp_secrets")
+	idxTwoFactor := strings.Index(downText, "DROP TABLE IF EXISTS two_factor_tokens")
+	idxTotpUsed := strings.Index(downText, "DROP TABLE IF EXISTS totp_used_codes")
+	idxTotpSecrets := strings.Index(downText, "DROP TABLE IF EXISTS totp_secrets")
 
 	if idxTwoFactor == -1 || idxTotpUsed == -1 || idxTotpSecrets == -1 {
 		t.Fatalf("000008 down migration missing one or more required drop tables: %s", downText)
 	}
 	if idxTwoFactor > idxTotpUsed || idxTotpUsed > idxTotpSecrets {
 		t.Errorf("000008 down drop order must be two_factor_tokens -> totp_used_codes -> totp_secrets, got indices %d, %d, %d",
+			idxTwoFactor, idxTotpUsed, idxTotpSecrets)
+	}
+}
+
+func TestMySQLMigration000007_DownRefusesOnLinkedAccounts(t *testing.T) {
+	data, err := defaultMigrationsFS.ReadFile("migrations/mysql/000007_create_oauth_accounts.down.sql")
+	if err != nil {
+		t.Fatalf("failed to read mysql migration 7 down: %v", err)
+	}
+	content := string(data)
+
+	if !strings.Contains(content, "down refused") {
+		t.Error("mysql migration 7 down must carry the refusal text")
+	}
+	guardIdx := strings.Index(content, "SELECT 1 FROM oauth_accounts")
+	signalIdx := strings.Index(content, "SIGNAL SQLSTATE '45000'")
+	if guardIdx == -1 {
+		t.Fatal("mysql migration 7 down must gate refusal on oauth_accounts contents")
+	}
+	if signalIdx == -1 {
+		t.Fatal("mysql migration 7 down missing SIGNAL SQLSTATE refusal")
+	}
+	if guardIdx > signalIdx {
+		t.Errorf("mysql migration 7 data guard (idx %d) must precede refusal (idx %d)", guardIdx, signalIdx)
+	}
+	if strings.Contains(content, "SELECT 1 FROM users") {
+		t.Error("mysql migration 7 down must not gate refusal on users-row existence")
+	}
+}
+
+func TestMySQLMigration000008_DownRefusesOnTotpSecrets(t *testing.T) {
+	data, err := defaultMigrationsFS.ReadFile("migrations/mysql/000008_create_totp.down.sql")
+	if err != nil {
+		t.Fatalf("failed to read mysql migration 8 down: %v", err)
+	}
+	content := string(data)
+
+	if !strings.Contains(content, "down refused") {
+		t.Error("mysql migration 8 down must carry the refusal text")
+	}
+	guardIdx := strings.Index(content, "SELECT 1 FROM totp_secrets")
+	signalIdx := strings.Index(content, "SIGNAL SQLSTATE '45000'")
+	if guardIdx == -1 {
+		t.Fatal("mysql migration 8 down must gate refusal on totp_secrets contents")
+	}
+	if signalIdx == -1 {
+		t.Fatal("mysql migration 8 down missing SIGNAL SQLSTATE refusal")
+	}
+	if guardIdx > signalIdx {
+		t.Errorf("mysql migration 8 data guard (idx %d) must precede refusal (idx %d)", guardIdx, signalIdx)
+	}
+
+	idxTwoFactor := strings.Index(content, "DROP TABLE IF EXISTS two_factor_tokens")
+	idxTotpUsed := strings.Index(content, "DROP TABLE IF EXISTS totp_used_codes")
+	idxTotpSecrets := strings.Index(content, "DROP TABLE IF EXISTS totp_secrets")
+	if idxTwoFactor == -1 || idxTotpUsed == -1 || idxTotpSecrets == -1 {
+		t.Fatal("mysql migration 8 down missing drop table statements")
+	}
+	if idxTwoFactor > idxTotpUsed || idxTotpUsed > idxTotpSecrets {
+		t.Errorf("mysql migration 8 down drop order must be two_factor_tokens -> totp_used_codes -> totp_secrets, got indices %d, %d, %d",
 			idxTwoFactor, idxTotpUsed, idxTotpSecrets)
 	}
 }
