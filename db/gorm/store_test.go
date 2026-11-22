@@ -856,6 +856,15 @@ func TestNormalizeMySQLError_StoreIntegration(t *testing.T) {
 	if got := db.NormalizeMySQLError(dupUnknown); got != dupUnknown {
 		t.Fatalf("expected unknown 1062 error to pass through, got %v", got)
 	}
+
+	fkErr := errors.New("ERROR: insert or update on table \"oauth_accounts\" violates foreign key constraint \"fk_oauth_accounts_user_id\" (SQLSTATE 23503)")
+	if got := db.NormalizeMySQLError(fkErr); !errors.Is(got, apperrors.ErrUserNotFound) {
+		t.Fatalf("expected ErrUserNotFound for postgres fk error, got %v", got)
+	}
+
+	if got := db.NormalizeMySQLError(gormdriver.ErrForeignKeyViolated); !errors.Is(got, apperrors.ErrUserNotFound) {
+		t.Fatalf("expected ErrUserNotFound for gorm ErrForeignKeyViolated, got %v", got)
+	}
 }
 
 type dummyDialector struct {

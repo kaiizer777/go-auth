@@ -10,6 +10,8 @@ import (
 
 	mysqlDriver "github.com/go-sql-driver/mysql"
 	"github.com/golang-migrate/migrate/v4/source/iofs"
+	"github.com/jackc/pgx/v5/pgconn"
+	"gorm.io/gorm"
 
 	"github.com/kaiizer777/go-auth/config"
 	"github.com/kaiizer777/go-auth/errors"
@@ -219,6 +221,31 @@ func TestNormalizeMySQLError(t *testing.T) {
 		err     error
 		wantErr error
 	}{
+		{
+			name:    "foreign key violation via mysql 1452 error",
+			err:     &mysqlDriver.MySQLError{Number: 1452, Message: "Cannot add or update a child row: a foreign key constraint fails"},
+			wantErr: errors.ErrUserNotFound,
+		},
+		{
+			name:    "foreign key violation via mysql string",
+			err:     stderrors.New("Error 1452 (23000): Cannot add or update a child row: a foreign key constraint fails"),
+			wantErr: errors.ErrUserNotFound,
+		},
+		{
+			name:    "foreign key violation via postgres pgconn error",
+			err:     &pgconn.PgError{Code: "23503", Message: "insert or update on table \"oauth_accounts\" violates foreign key constraint \"fk_oauth_accounts_user_id\""},
+			wantErr: errors.ErrUserNotFound,
+		},
+		{
+			name:    "foreign key violation via postgres string",
+			err:     stderrors.New("ERROR: insert or update on table \"oauth_accounts\" violates foreign key constraint \"fk_oauth_accounts_user_id\" (SQLSTATE 23503)"),
+			wantErr: errors.ErrUserNotFound,
+		},
+		{
+			name:    "foreign key violation via gorm sentinel",
+			err:     gorm.ErrForeignKeyViolated,
+			wantErr: errors.ErrUserNotFound,
+		},
 		{
 			name:    "email duplicate via MySQLError",
 			err:     &mysqlDriver.MySQLError{Number: 1062, Message: "Duplicate entry 'test@example.com' for key 'users.idx_users_email_lower'"},

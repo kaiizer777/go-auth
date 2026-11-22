@@ -18,6 +18,7 @@ import (
 	pgmigrate "github.com/golang-migrate/migrate/v4/database/postgres"
 	"github.com/golang-migrate/migrate/v4/source"
 	"github.com/golang-migrate/migrate/v4/source/iofs"
+	"github.com/jackc/pgx/v5/pgconn"
 	_ "github.com/jackc/pgx/v5/stdlib"
 	gormmysql "gorm.io/driver/mysql"
 	"gorm.io/driver/postgres"
@@ -273,22 +274,35 @@ func runMySQLMigrations(databaseURL, migrationsPath string) error {
 	return nil
 }
 
-// NormalizeMySQLError maps MySQL error code 1062 (ER_DUP_ENTRY) to domain error sentinels
-// based on table or index names, or returns the original error if unmapped.
+// NormalizeMySQLError maps database driver constraint violations (MySQL and PostgreSQL)
+// to domain error sentinels, or returns the original error if unmapped.
 func NormalizeMySQLError(err error) error {
 	if err == nil {
 		return nil
+	}
+	if stderrors.Is(err, gorm.ErrForeignKeyViolated) {
+		return errors.ErrUserNotFound
 	}
 	var myErr *mysqlDriver.MySQLError
 	if stderrors.As(err, &myErr) && myErr.Number == 1452 {
 		return errors.ErrUserNotFound
 	}
-	is1062 := errors.Is(err, gorm.ErrDuplicatedKey) || (stderrors.As(err, &myErr) && myErr.Number == 1062)
-	msg := strings.ToLower(err.Error())
-	if strings.Contains(msg, "1452") || strings.Contains(msg, "foreign key constraint fails") {
+	var pgErr *pgconn.PgError
+	if stderrors.As(err, &pgErr) && pgErr.Code == "23503" {
 		return errors.ErrUserNotFound
 	}
-	isDup := is1062 || strings.Contains(msg, "1062") || strings.Contains(msg, "duplicate entry") ||
+
+	msg := strings.ToLower(err.Error())
+	if strings.Contains(msg, "1452") || strings.Contains(msg, "23503") ||
+		strings.Contains(msg, "foreign key constraint fails") ||
+		strings.Contains(msg, "violates foreign key constraint") ||
+		strings.Contains(msg, "foreign key constraint") {
+		return errors.ErrUserNotFound
+	}
+
+	is1062 := errors.Is(err, gorm.ErrDuplicatedKey) || (stderrors.As(err, &myErr) && myErr.Number == 1062)
+	isDup := is1062 || (stderrors.As(err, &pgErr) && pgErr.Code == "23505") ||
+		strings.Contains(msg, "1062") || strings.Contains(msg, "duplicate entry") ||
 		strings.Contains(msg, "duplicate key") || strings.Contains(msg, "23505") ||
 		strings.Contains(msg, "unique constraint")
 	if !isDup {
