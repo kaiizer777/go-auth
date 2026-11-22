@@ -135,6 +135,7 @@ func NewWithStore(store db.Store, cfg config.Config) (*Auth, error) {
 		}
 		p, err := oauth.NewProvider(id, pcfg)
 		if err != nil {
+			close(limiterDone)
 			return nil, err
 		}
 		providers[id] = p
@@ -247,7 +248,12 @@ func New(cfg config.Config) (*Auth, error) {
 		if err != nil {
 			return nil, errors.Wrap(err, errors.CodeDatabaseError, "goauth: failed to connect to mongodb")
 		}
-		return NewWithStore(store, cfg)
+		a, err := NewWithStore(store, cfg)
+		if err != nil {
+			_ = store.Close()
+			return nil, err
+		}
+		return a, nil
 	default:
 		return nil, errors.Wrap(errors.ErrDatabaseUnsupported, errors.CodeDatabaseUnsupported, "unsupported database type: "+string(cfg.DatabaseType))
 	}

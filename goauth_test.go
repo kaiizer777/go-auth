@@ -908,3 +908,54 @@ func TestNew_MongoDB_Success(t *testing.T) {
 	}
 	_ = auth.Close()
 }
+
+type closeTrackingStore struct {
+	db.Store
+	closed bool
+}
+
+func (s *closeTrackingStore) Close() error {
+	s.closed = true
+	return s.Store.Close()
+}
+
+func TestNew_MongoDB_NewWithStoreError_ClosesStore(t *testing.T) {
+	sqliteDB, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{
+		DisableAutomaticPing: true,
+	})
+	if err != nil {
+		t.Fatalf("failed to open in-memory sqlite: %v", err)
+	}
+	adapter := gormstore.New(sqliteDB)
+	tracker := &closeTrackingStore{Store: adapter}
+
+	orig := mongoConnectFn
+	defer func() { mongoConnectFn = orig }()
+
+	providersMap := make(map[string]config.ProviderConfig)
+	mongoConnectFn = func(cfg config.Config) (db.Store, error) {
+		providersMap["invalid_provider"] = config.ProviderConfig{Enabled: true}
+		return tracker, nil
+	}
+
+	cfg := config.Config{
+		DatabaseType: config.DatabaseTypeMongo,
+		DatabaseURL:  "mongodb://localhost:27017/test_db",
+		BaseURL:      "http://localhost:8080",
+		OAuth: config.OAuthConfig{
+			Providers: providersMap,
+		},
+	}
+
+	auth, err := New(cfg)
+	if err == nil {
+		t.Fatal("expected error from New, got nil")
+	}
+	if auth != nil {
+		t.Fatal("expected nil auth on initialization failure")
+	}
+	if !tracker.closed {
+		t.Fatal("expected store.Close() to be called on initialization failure")
+	}
+}
+
