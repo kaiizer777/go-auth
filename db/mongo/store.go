@@ -425,7 +425,7 @@ func (s *sessionStore) GetByIDHash(ctx context.Context, idHash string) (*db.Sess
 }
 
 func (s *sessionStore) ListByUserID(ctx context.Context, userID uuid.UUID) ([]*db.Session, error) {
-	opts := options.Find().SetSort(bson.D{{Key: "created_at", Value: -1}}).SetLimit(50)
+	opts := options.Find().SetSort(bson.D{{Key: "last_active_at", Value: -1}}).SetLimit(50)
 	cursor, err := s.collection().Find(s.store.resolveCtx(ctx), bson.M{"user_id": userID.String()}, opts)
 	if err != nil {
 		return []*db.Session{}, err

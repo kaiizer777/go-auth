@@ -649,12 +649,37 @@ func TestUserStore_Delete_Cascade(t *testing.T) {
 		UserID:            uid,
 		IDHash:            "id_hash_1",
 		SessionType:       db.SessionTypeBearer,
-		LastActiveAt:      time.Now().UTC(),
+		LastActiveAt:      time.Now().Add(-10 * time.Minute).UTC(),
 		AbsoluteExpiresAt: time.Now().Add(time.Hour).UTC(),
 		CreatedAt:         time.Now().UTC(),
 	}
 	if err := store.Sessions().Create(ctx, sess); err != nil {
 		t.Fatalf("Create session failed: %v", err)
+	}
+
+	sess2 := &db.Session{
+		ID:                uuid.New(),
+		UserID:            uid,
+		IDHash:            "id_hash_2",
+		SessionType:       db.SessionTypeCookie,
+		LastActiveAt:      time.Now().UTC(),
+		AbsoluteExpiresAt: time.Now().Add(time.Hour).UTC(),
+		CreatedAt:         time.Now().Add(-1 * time.Hour).UTC(),
+	}
+	if err := store.Sessions().Create(ctx, sess2); err != nil {
+		t.Fatalf("Create session2 failed: %v", err)
+	}
+
+	// Verify ListByUserID orders by last_active_at DESC
+	activeList, err := store.Sessions().ListByUserID(ctx, uid)
+	if err != nil {
+		t.Fatalf("ListByUserID failed: %v", err)
+	}
+	if len(activeList) < 2 {
+		t.Fatalf("expected at least 2 sessions, got %d", len(activeList))
+	}
+	if activeList[0].ID != sess2.ID {
+		t.Fatalf("expected sess2 first by last_active_at DESC, got %v", activeList[0].ID)
 	}
 
 	tok := &db.VerificationToken{

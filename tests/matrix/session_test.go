@@ -98,6 +98,21 @@ func TestMatrix_SessionManagement(t *testing.T) {
 			t.Fatalf("UpdateLastActive timestamp mismatch: got %v, want ~%v", updatedSess.LastActiveAt, newActiveTime)
 		}
 
+		// Verify ListByUserID returns sessions sorted by last_active_at DESC
+		reorderedSessions, err := store.Sessions().ListByUserID(ctx, user.ID)
+		if err != nil {
+			t.Fatalf("ListByUserID after UpdateLastActive failed: %v", err)
+		}
+		if len(reorderedSessions) == 0 || reorderedSessions[0].ID != targetSess.ID {
+			t.Fatalf("expected target session %v to be first after UpdateLastActive, got %v", targetSess.ID, reorderedSessions[0].ID)
+		}
+		for i := 0; i < len(reorderedSessions)-1; i++ {
+			if reorderedSessions[i].LastActiveAt.Before(reorderedSessions[i+1].LastActiveAt) {
+				t.Fatalf("sessions not sorted by last_active_at DESC at index %d: %v before %v",
+					i, reorderedSessions[i].LastActiveAt, reorderedSessions[i+1].LastActiveAt)
+			}
+		}
+
 		// 4. User Deletion Cascade Verification
 		err = store.Users().Delete(ctx, user.ID)
 		if err != nil {
