@@ -21,7 +21,6 @@ type MicrosoftProvider struct {
 	client         *http.Client
 	authURL        string
 	tokenURL       string
-	userinfoURL    string
 	jwksURL        string
 	jwksMgr        *JWKSManager
 	jwksRetriever  JWKSKeyRetriever
