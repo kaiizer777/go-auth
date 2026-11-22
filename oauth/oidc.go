@@ -118,8 +118,17 @@ func (m *JWKSManager) GetKey(ctx context.Context, kid string) (*rsa.PublicKey, e
 	}
 	m.mu.RUnlock()
 
-	// If missing after joiner flight, refresh once directly to handle key rollover published during flight
-	if err := m.refresh(ctx); err != nil {
+	// If missing after joiner flight, refresh under singleflight deduplication to avoid stampedes
+	_, err, _ = m.sf.Do("jwks_rollover_refresh", func() (any, error) {
+		m.mu.RLock()
+		if _, ok := m.keys[kid]; ok {
+			m.mu.RUnlock()
+			return nil, nil
+		}
+		m.mu.RUnlock()
+		return nil, m.refresh(ctx)
+	})
+	if err != nil {
 		return nil, err
 	}
 
@@ -164,6 +173,9 @@ func (m *JWKSManager) refresh(ctx context.Context) error {
 	parsedKeys := make(map[string]*rsa.PublicKey, len(doc.Keys))
 	for _, k := range doc.Keys {
 		if k.Kid == "" {
+			continue
+		}
+		if k.Use != "" && k.Use != "sig" {
 			continue
 		}
 		pubKey, ok := parseRSAPublicKey(k.N, k.E)

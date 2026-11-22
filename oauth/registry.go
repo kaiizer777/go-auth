@@ -1,6 +1,7 @@
 package oauth
 
 import (
+	"slices"
 	"sync"
 
 	"github.com/kaiizer777/go-auth/errors"
@@ -57,5 +58,6 @@ func (r *providerRegistry) List() []string {
 	for k := range r.providers {
 		keys = append(keys, k)
 	}
+	slices.Sort(keys)
 	return keys
 }

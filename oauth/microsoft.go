@@ -150,6 +150,10 @@ func (p *MicrosoftProvider) VerifyIDToken(ctx context.Context, rawIDToken, nonce
 		claims.IssuedAt = int64(iatVal)
 	case int64:
 		claims.IssuedAt = iatVal
+	case jsonNumber:
+		if n, err := iatVal.Int64(); err == nil {
+			claims.IssuedAt = n
+		}
 	}
 
 	if rolesVal, ok := rawClaims["roles"].([]any); ok {
@@ -169,6 +173,11 @@ func (p *MicrosoftProvider) VerifyIDToken(ctx context.Context, rawIDToken, nonce
 	now := time.Now().Unix()
 	if claims.Expiration <= (now - 60) {
 		return nil, errors.New(errors.CodeOAuthIDTokenInvalid, "id_token has expired", nil)
+	}
+
+	// Clock skew upper bound on IssuedAt (cannot be issued > 60s in future)
+	if claims.IssuedAt > (now + 60) {
+		return nil, errors.New(errors.CodeOAuthIDTokenInvalid, "id_token issued in the future", nil)
 	}
 
 	// Nonce verification if expected nonce is supplied

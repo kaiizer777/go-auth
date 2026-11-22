@@ -81,6 +81,9 @@ func TestProviderRegistry(t *testing.T) {
 		if len(list) != 2 {
 			t.Fatalf("expected 2 items in list, got %d", len(list))
 		}
+		if list[0] != "google" || list[1] != "microsoft" {
+			t.Fatalf("expected sorted list [google, microsoft], got %v", list)
+		}
 	})
 
 	t.Run("thread-safe concurrent access", func(t *testing.T) {

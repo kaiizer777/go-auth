@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -171,6 +172,46 @@ func TestOIDC_DiscoveryAndJWKS(t *testing.T) {
 		if !errors.As(err, &appErr) || appErr.Code() != errors.CodeOAuthIDTokenInvalid {
 			t.Fatalf("expected CodeOAuthIDTokenInvalid, got %v", err)
 		}
+	})
+
+	t.Run("ignore non-signing keys in jwks", func(t *testing.T) {
+		privKeyEnc, nEnc, eEnc := generateTestRSAKey(t)
+		s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			doc := JWKDoc{
+				Keys: []JWKKey{
+					{
+						Kty: "RSA",
+						Use: "enc", // Encryption key, must be ignored
+						Kid: "key-enc",
+						N:   nEnc,
+						E:   eEnc,
+					},
+					{
+						Kty: "RSA",
+						Use: "sig",
+						Kid: "key-sig",
+						N:   nRaw,
+						E:   eRaw,
+					},
+				},
+			}
+			_ = json.NewEncoder(w).Encode(doc)
+		}))
+		defer s.Close()
+
+		mgr := NewJWKSManager(s.URL, s.Client(), 1*time.Hour)
+		_, err := mgr.GetKey(ctx, "key-enc")
+		if err == nil {
+			t.Fatal("expected error getting encryption key, got nil")
+		}
+		sigKey, err := mgr.GetKey(ctx, "key-sig")
+		if err != nil {
+			t.Fatalf("failed to get sig key: %v", err)
+		}
+		if sigKey.N.Cmp(privKey.N) != 0 {
+			t.Fatalf("modulus mismatch")
+		}
+		_ = privKeyEnc
 	})
 }
 
@@ -491,6 +532,40 @@ func TestMicrosoftProvider(t *testing.T) {
 		cNonce, err := p.VerifyIDToken(ctx, tokNonce, "valid-nonce")
 		if err != nil || cNonce.Nonce != "valid-nonce" {
 			t.Fatalf("failed to verify valid nonce: %v", err)
+		}
+
+		// 4. Future IssuedAt (> now + 60)
+		claimsFuture := map[string]any{
+			"iss": "https://login.microsoftonline.com/tid-1/v2.0",
+			"sub": "sub-1",
+			"aud": "client-test-id",
+			"exp": time.Now().Add(10 * time.Minute).Unix(),
+			"iat": time.Now().Add(5 * time.Minute).Unix(),
+			"tid": "tid-1",
+		}
+		tokFuture := signRS256JWT(t, privKey, "ms-key-1", claimsFuture)
+		_, err = p.VerifyIDToken(ctx, tokFuture, "")
+		if err == nil {
+			t.Fatal("expected error for future iat, got nil")
+		}
+
+		// 5. json.Number iat is parsed correctly
+		nowUnix := time.Now().Unix()
+		claimsJSONNumber := map[string]any{
+			"iss": "https://login.microsoftonline.com/tid-1/v2.0",
+			"sub": "sub-1",
+			"aud": "client-test-id",
+			"exp": json.Number(strconv.FormatInt(nowUnix+600, 10)),
+			"iat": json.Number(strconv.FormatInt(nowUnix, 10)),
+			"tid": "tid-1",
+		}
+		tokJSONNumber := signRS256JWT(t, privKey, "ms-key-1", claimsJSONNumber)
+		cNum, err := p.VerifyIDToken(ctx, tokJSONNumber, "")
+		if err != nil {
+			t.Fatalf("failed to verify token with json.Number: %v", err)
+		}
+		if cNum.IssuedAt != nowUnix {
+			t.Fatalf("expected IssuedAt %d from json.Number, got %d", nowUnix, cNum.IssuedAt)
 		}
 	})
 
