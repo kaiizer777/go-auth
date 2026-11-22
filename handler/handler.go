@@ -135,12 +135,20 @@ func New(db *gorm.DB, cfg config.Config, authSvc auth.Service, opts ...Option) h
 		h.oauthIPLimiter = ratelimit.NewLimiter(h.cfg.RateLimitOAuthWindow, h.cfg.RateLimitOAuthIPMax)
 	}
 
-	if h.sessionSvc == nil && db != nil {
-		h.sessionSvc = session.NewService(db, &cfg)
+	if h.sessionSvc == nil {
+		if h.store != nil {
+			h.sessionSvc = session.NewServiceWithStore(h.store, &cfg)
+		} else if db != nil {
+			h.sessionSvc = session.NewService(db, &cfg)
+		}
 	}
 
 	if h.sessHandler == nil && h.sessionSvc != nil {
-		h.sessHandler = NewSessionHandler(h.sessionSvc, db, &cfg)
+		if h.store != nil {
+			h.sessHandler = NewSessionHandlerWithStore(h.sessionSvc, h.store, &cfg)
+		} else if db != nil {
+			h.sessHandler = NewSessionHandler(h.sessionSvc, db, &cfg)
+		}
 	}
 
 	if h.totpLimiter == nil && h.cfg.TOTP.MaxAttemptsPerWindow > 0 {
@@ -151,8 +159,12 @@ func New(db *gorm.DB, cfg config.Config, authSvc auth.Service, opts ...Option) h
 		h.totpLimiter = ratelimit.NewLimiter(window, h.cfg.TOTP.MaxAttemptsPerWindow)
 	}
 
-	if h.totpSvc == nil && db != nil && cfg.TOTP.EncryptionKey != "" {
-		h.totpSvc = totp.NewService(db, cfg.TOTP, h.totpLimiter, slog.Default())
+	if h.totpSvc == nil && cfg.TOTP.EncryptionKey != "" {
+		if h.store != nil {
+			h.totpSvc = totp.NewServiceWithStore(h.store, cfg.TOTP, h.totpLimiter, slog.Default())
+		} else if db != nil {
+			h.totpSvc = totp.NewService(db, cfg.TOTP, h.totpLimiter, slog.Default())
+		}
 	}
 
 	h.registerRoutes()

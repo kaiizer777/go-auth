@@ -15,7 +15,9 @@ import (
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 
+	"github.com/glebarez/sqlite"
 	"github.com/kaiizer777/go-auth/config"
+	gormstore "github.com/kaiizer777/go-auth/db/gorm"
 )
 
 var registerMockOnce sync.Once
@@ -574,3 +576,36 @@ func TestResponseInterceptor_UnwrapAndFlush(t *testing.T) {
 		t.Fatalf("expected underlying code 404, got %d", recJSON.Code)
 	}
 }
+
+func TestHandler_WithStore_MountsSessionAndTOTPRoutes(t *testing.T) {
+	sqliteDB, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{
+		DisableAutomaticPing: true,
+	})
+	if err != nil {
+		t.Fatalf("failed to open sqlite: %v", err)
+	}
+	store := gormstore.New(sqliteDB)
+
+	cfg := config.DefaultConfig()
+	cfg.TOTP.EncryptionKey = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+	h := New(nil, cfg, nil, WithStore(store))
+
+	// Verify session route is mounted (should return 401 Unauthorized, not 404)
+	reqSession := httptest.NewRequest(http.MethodGet, "/auth/sessions", nil)
+	recSession := httptest.NewRecorder()
+	h.ServeHTTP(recSession, reqSession)
+	if recSession.Code == http.StatusNotFound {
+		t.Errorf("expected session route to be mounted, got 404")
+	}
+
+	// Verify TOTP route is mounted (should return status other than 404)
+	reqTOTP := httptest.NewRequest(http.MethodPost, "/auth/totp/verify", strings.NewReader("{}"))
+	reqTOTP.Header.Set("Content-Type", "application/json")
+	recTOTP := httptest.NewRecorder()
+	h.ServeHTTP(recTOTP, reqTOTP)
+	if recTOTP.Code == http.StatusNotFound {
+		t.Errorf("expected TOTP route to be mounted, got 404")
+	}
+}
+
