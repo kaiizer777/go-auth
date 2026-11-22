@@ -305,12 +305,22 @@ func setupMongoAdapter(t *testing.T, uri string) (TestAdapter, error) {
 	}, nil
 }
 
-func getAvailableAdapters(t *testing.T) []TestAdapter {
+type adapterFactory struct {
+	Name  string
+	Setup func(t *testing.T) (TestAdapter, error)
+}
+
+func getAvailableAdapterFactories(t *testing.T) []adapterFactory {
 	t.Helper()
-	var adapters []TestAdapter
+	var factories []adapterFactory
 
 	// 1. SQLite (Always present, in-memory)
-	adapters = append(adapters, setupSQLiteAdapter(t))
+	factories = append(factories, adapterFactory{
+		Name: "SQLite",
+		Setup: func(t *testing.T) (TestAdapter, error) {
+			return setupSQLiteAdapter(t), nil
+		},
+	})
 
 	// 2. PostgreSQL
 	pgURL := os.Getenv("TEST_POSTGRES_URL")
@@ -318,12 +328,12 @@ func getAvailableAdapters(t *testing.T) []TestAdapter {
 		pgURL = os.Getenv("TEST_DATABASE_URL")
 	}
 	if pgURL != "" {
-		adapter, err := setupPostgresAdapter(t, pgURL)
-		if err != nil {
-			t.Fatalf("configured %s test backend failed to initialize: %v", "postgres", err)
-		} else {
-			adapters = append(adapters, adapter)
-		}
+		factories = append(factories, adapterFactory{
+			Name: "PostgreSQL",
+			Setup: func(t *testing.T) (TestAdapter, error) {
+				return setupPostgresAdapter(t, pgURL)
+			},
+		})
 	} else {
 		t.Log("Skipping PostgreSQL matrix: TEST_POSTGRES_URL unset")
 	}
@@ -331,12 +341,12 @@ func getAvailableAdapters(t *testing.T) []TestAdapter {
 	// 3. MySQL
 	mysqlDSN := os.Getenv("TEST_MYSQL_DSN")
 	if mysqlDSN != "" {
-		adapter, err := setupMySQLAdapter(t, mysqlDSN)
-		if err != nil {
-			t.Fatalf("configured %s test backend failed to initialize: %v", "mysql", err)
-		} else {
-			adapters = append(adapters, adapter)
-		}
+		factories = append(factories, adapterFactory{
+			Name: "MySQL",
+			Setup: func(t *testing.T) (TestAdapter, error) {
+				return setupMySQLAdapter(t, mysqlDSN)
+			},
+		})
 	} else {
 		t.Log("Skipping MySQL matrix: TEST_MYSQL_DSN unset")
 	}
@@ -344,27 +354,47 @@ func getAvailableAdapters(t *testing.T) []TestAdapter {
 	// 4. MongoDB
 	mongoURI := os.Getenv("TEST_MONGO_URI")
 	if mongoURI != "" {
-		adapter, err := setupMongoAdapter(t, mongoURI)
-		if err != nil {
-			t.Fatalf("configured %s test backend failed to initialize: %v", "mongodb", err)
-		} else {
-			adapters = append(adapters, adapter)
-		}
+		factories = append(factories, adapterFactory{
+			Name: "MongoDB",
+			Setup: func(t *testing.T) (TestAdapter, error) {
+				return setupMongoAdapter(t, mongoURI)
+			},
+		})
 	} else {
 		t.Log("Skipping MongoDB matrix: TEST_MONGO_URI unset")
 	}
 
+	return factories
+}
+
+func getAvailableAdapters(t *testing.T) []TestAdapter {
+	t.Helper()
+	factories := getAvailableAdapterFactories(t)
+	adapters := make([]TestAdapter, 0, len(factories))
+	for _, f := range factories {
+		adapter, err := f.Setup(t)
+		if err != nil {
+			t.Fatalf("configured %s test backend failed to initialize: %v", f.Name, err)
+		}
+		adapters = append(adapters, adapter)
+	}
 	return adapters
 }
 
 func testMatrix(t *testing.T, fn func(t *testing.T, auth *goauth.Auth, store db.Store)) {
 	t.Helper()
-	adapters := getAvailableAdapters(t)
-	for _, a := range adapters {
-		a := a
-		t.Run(a.Name, func(t *testing.T) {
-			defer a.Cleanup()
-			fn(t, a.App, a.Store)
+	factories := getAvailableAdapterFactories(t)
+	for _, f := range factories {
+		f := f
+		t.Run(f.Name, func(t *testing.T) {
+			adapter, err := f.Setup(t)
+			if err != nil {
+				t.Fatalf("configured %s test backend failed to initialize: %v", f.Name, err)
+			}
+			if adapter.Cleanup != nil {
+				t.Cleanup(adapter.Cleanup)
+			}
+			fn(t, adapter.App, adapter.Store)
 		})
 	}
 }
@@ -379,12 +409,18 @@ func TestMatrixHarness(t *testing.T) {
 
 func runMatrix(t *testing.T, fn func(t *testing.T, adapter TestAdapter)) {
 	t.Helper()
-	adapters := getAvailableAdapters(t)
-	for _, a := range adapters {
-		a := a
-		t.Run(a.Name, func(t *testing.T) {
-			defer a.Cleanup()
-			fn(t, a)
+	factories := getAvailableAdapterFactories(t)
+	for _, f := range factories {
+		f := f
+		t.Run(f.Name, func(t *testing.T) {
+			adapter, err := f.Setup(t)
+			if err != nil {
+				t.Fatalf("configured %s test backend failed to initialize: %v", f.Name, err)
+			}
+			if adapter.Cleanup != nil {
+				t.Cleanup(adapter.Cleanup)
+			}
+			fn(t, adapter)
 		})
 	}
 }
