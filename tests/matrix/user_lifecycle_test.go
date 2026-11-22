@@ -1,0 +1,145 @@
+package matrix_test
+
+import (
+	"context"
+	"fmt"
+	"testing"
+
+	"github.com/google/uuid"
+	"go.mongodb.org/mongo-driver/v2/mongo"
+	"gorm.io/gorm"
+
+	"github.com/kaiizer777/go-auth/crypto"
+	"github.com/kaiizer777/go-auth/db"
+	"github.com/kaiizer777/go-auth/errors"
+)
+
+func TestMatrix_UserLifecycle(t *testing.T) {
+	runMatrix(t, func(t *testing.T, adapter TestAdapter) {
+		ctx := context.Background()
+		app := adapter.App
+		store := adapter.Store
+
+		email := fmt.Sprintf("matrix_lifecycle_%s@example.com", uuid.New().String()[:8])
+		password := "SuperSecure#2026!"
+
+		// 1. Registration
+		user, rawToken, err := app.Auth.Signup(ctx, db.SignupRequest{
+			Email:    email,
+			Password: password,
+		})
+		if err != nil {
+			t.Fatalf("Signup failed: %v", err)
+		}
+		if user == nil {
+			t.Fatal("expected non-nil user from Signup")
+		}
+		if rawToken == "" {
+			t.Fatal("expected non-empty verification token from Signup")
+		}
+		if user.EmailVerified {
+			t.Fatal("expected email_verified = false on initial signup")
+		}
+		if user.CredentialVersion != 0 {
+			t.Fatalf("expected credential_version = 0, got %d", user.CredentialVersion)
+		}
+
+		// Verify hashed token persisted
+		tokenHash, err := crypto.HashToken(rawToken)
+		if err != nil {
+			t.Fatalf("crypto.HashToken failed: %v", err)
+		}
+		vTok, err := store.VerificationTokens().GetByTokenHash(ctx, tokenHash[:])
+		if err != nil {
+			t.Fatalf("failed to retrieve verification token: %v", err)
+		}
+		if vTok.UserID != user.ID {
+			t.Fatalf("verification token user mismatch: got %v, want %v", vTok.UserID, user.ID)
+		}
+
+		// 2. Email Verification
+		_, err = app.Auth.VerifyEmail(ctx, db.VerifyEmailRequest{
+			Token: rawToken,
+		})
+		if err != nil {
+			t.Fatalf("VerifyEmail failed: %v", err)
+		}
+
+		// Assert user email_verified transitioned to true
+		verifiedUser, err := store.Users().GetByID(ctx, user.ID)
+		if err != nil {
+			t.Fatalf("failed to get user after verification: %v", err)
+		}
+		if !verifiedUser.EmailVerified {
+			t.Fatal("expected email_verified = true after verification")
+		}
+
+		// Assert verification token permanently expunged
+		_, err = store.VerificationTokens().GetByTokenHash(ctx, tokenHash[:])
+		if err == nil {
+			t.Fatal("expected verification token to be expunged after consumption, but found it")
+		}
+
+		// 3. Login
+		loggedInUser, err := app.Auth.Login(ctx, db.LoginRequest{
+			Email:    email,
+			Password: password,
+		})
+		if err != nil {
+			t.Fatalf("Login failed: %v", err)
+		}
+		if loggedInUser.ID != user.ID {
+			t.Fatalf("login user mismatch: got %v, want %v", loggedInUser.ID, user.ID)
+		}
+
+		// Invalid password returns ErrInvalidCredentials
+		_, err = app.Auth.Login(ctx, db.LoginRequest{
+			Email:    email,
+			Password: "WrongPassword123!",
+		})
+		if !errors.Is(err, errors.ErrInvalidCredentials) {
+			t.Fatalf("expected ErrInvalidCredentials for wrong password, got %v", err)
+		}
+
+		// 4. Session Creation & Validation
+		sess, rawSessionToken, err := app.Session.CreateSession(ctx, user.ID, 0, db.SessionTypeBearer, "127.0.0.1", "MatrixUserAgent/1.0")
+		if err != nil {
+			t.Fatalf("CreateSession failed: %v", err)
+		}
+		if rawSessionToken == "" || sess == nil {
+			t.Fatal("CreateSession returned empty session token or nil session")
+		}
+
+		// Validate session
+		retrievedSess, err := app.Session.GetSession(ctx, rawSessionToken)
+		if err != nil {
+			t.Fatalf("GetSession failed: %v", err)
+		}
+		if retrievedSess.UserID != user.ID {
+			t.Fatalf("session user mismatch: got %v, want %v", retrievedSess.UserID, user.ID)
+		}
+		if retrievedSess.IPAddress != "127.0.0.1" {
+			t.Fatalf("session IP mismatch: got %s, want 127.0.0.1", retrievedSess.IPAddress)
+		}
+
+		// 5. Logout (Hard-Delete Session)
+		err = app.Session.InvalidateSession(ctx, rawSessionToken)
+		if err != nil {
+			t.Fatalf("InvalidateSession failed: %v", err)
+		}
+
+		// Validation after invalidation fails
+		_, err = app.Session.GetSession(ctx, rawSessionToken)
+		if err == nil {
+			t.Fatal("expected GetSession to fail after InvalidateSession, but succeeded")
+		}
+
+		// Database inspection: hard deletion asserted (zero rows remaining)
+		_, err = store.Sessions().GetByID(ctx, sess.ID)
+		if err == nil {
+			t.Fatal("expected session row/document to be hard-deleted from database, but found it")
+		} else if !errors.Is(err, gorm.ErrRecordNotFound) && !errors.Is(err, mongo.ErrNoDocuments) {
+			t.Fatalf("expected ErrRecordNotFound for session, got: %v", err)
+		}
+	})
+}

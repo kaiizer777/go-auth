@@ -317,6 +317,7 @@ func TestSentinels(t *testing.T) {
 		ErrPasswordMaxLengthInvalid,
 		ErrVerificationTokenExpiryInvalid,
 		ErrPasswordResetTokenExpiryInvalid,
+		ErrInvalidConfig,
 	}
 
 	for _, s := range sentinels {

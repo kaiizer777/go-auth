@@ -277,15 +277,39 @@ func TestConcurrentCodeReplayRace(t *testing.T) {
 	user := createTotpSecUser(t, dbConn, email, rawPass, true)
 	secret, _ := enrollAndConfirmUser(t, app, user.ID.String())
 
-	validCode, err := ptotp.GenerateCode(secret, time.Now().UTC())
-	if err != nil {
-		t.Fatalf("generate valid code: %v", err)
-	}
-
 	const concurrency = 16
 	challengeTokens := make([]string, concurrency)
 	for i := 0; i < concurrency; i++ {
 		challengeTokens[i] = interceptLogin(t, app, email, rawPass)
+	}
+
+	type reqPayload struct {
+		challengeToken string
+		csrfCookie     *http.Cookie
+		csrfToken      string
+	}
+	payloads := make([]reqPayload, concurrency)
+	for i := 0; i < concurrency; i++ {
+		cookie, csrfToken := fetchTotpCSRFPair(t, app.Handler)
+		payloads[i] = reqPayload{
+			challengeToken: challengeTokens[i],
+			csrfCookie:     cookie,
+			csrfToken:      csrfToken,
+		}
+	}
+
+	// Ensure at least 10s remain in the current 30s TOTP window to eliminate timestep rollover flakes on slow CI runners.
+	for {
+		remaining := 30 - (time.Now().Unix() % 30)
+		if remaining >= 10 {
+			break
+		}
+		time.Sleep(time.Duration(remaining)*time.Second + 100*time.Millisecond)
+	}
+
+	validCode, err := ptotp.GenerateCode(secret, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("generate valid code: %v", err)
 	}
 
 	type result struct {
@@ -293,27 +317,30 @@ func TestConcurrentCodeReplayRace(t *testing.T) {
 		body string
 	}
 	results := make([]result, concurrency)
+	var readyWg sync.WaitGroup
 	var wg sync.WaitGroup
 	startGate := make(chan struct{})
 
 	for i := 0; i < concurrency; i++ {
 		wg.Add(1)
+		readyWg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
-			csrfCookie, csrfToken := fetchTotpCSRFPair(t, app.Handler)
+			readyWg.Done()
 			<-startGate
 
 			rec := doSecRequest(app.Handler, http.MethodPost, "/auth/totp/verify", map[string]string{
-				"challenge_token": challengeTokens[idx],
+				"challenge_token": payloads[idx].challengeToken,
 				"code":            validCode,
-			}, []*http.Cookie{csrfCookie}, map[string]string{
-				"X-CSRF-Token": csrfToken,
+			}, []*http.Cookie{payloads[idx].csrfCookie}, map[string]string{
+				"X-CSRF-Token": payloads[idx].csrfToken,
 				"Remote-Addr":  fmt.Sprintf("198.51.100.%d:12345", idx+1),
 			})
 			results[idx] = result{code: rec.Code, body: rec.Body.String()}
 		}(i)
 	}
 
+	readyWg.Wait()
 	close(startGate)
 	wg.Wait()
 

@@ -17,6 +17,8 @@ import (
 	"github.com/kaiizer777/go-auth/config"
 	"github.com/kaiizer777/go-auth/csrf"
 	"github.com/kaiizer777/go-auth/db"
+	gormstore "github.com/kaiizer777/go-auth/db/gorm"
+	mongostore "github.com/kaiizer777/go-auth/db/mongo"
 	"github.com/kaiizer777/go-auth/email"
 	"github.com/kaiizer777/go-auth/errors"
 	"github.com/kaiizer777/go-auth/handler"
@@ -29,6 +31,7 @@ import (
 // Auth is the main entry point for the authentication library.
 type Auth struct {
 	db              *gorm.DB
+	store           db.Store
 	cfg             config.Config
 	emailDispatcher *email.AsyncDispatcher
 
@@ -62,10 +65,15 @@ type Auth struct {
 	closeOnce       sync.Once
 }
 
-var dbConnectFn = db.Connect
+var (
+	dbConnectFn    = db.Connect
+	mongoConnectFn = func(cfg config.Config) (db.Store, error) {
+		return mongostore.Connect(cfg)
+	}
+)
 
-// NewWithDB initializes Auth using an existing GORM database connection.
-func NewWithDB(database *gorm.DB, cfg config.Config) (*Auth, error) {
+// NewWithStore initializes Auth using an existing db.Store.
+func NewWithStore(store db.Store, cfg config.Config) (*Auth, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, errors.Wrap(err, errors.CodeInvalidConfig, "goauth: invalid configuration")
 	}
@@ -90,12 +98,12 @@ func NewWithDB(database *gorm.DB, cfg config.Config) (*Auth, error) {
 		}
 	}
 
-	authSvc, err := auth.New(cfg, database, emailHooks)
+	authSvc, err := auth.NewWithStore(cfg, store, emailHooks)
 	if err != nil {
 		return nil, err
 	}
 
-	sessionSvc := session.NewService(database, &cfg)
+	sessionSvc := session.NewServiceWithStore(store, &cfg)
 
 	loginLimiter := ratelimit.NewLimiter(cfg.RateLimitLoginWindow, cfg.RateLimitLoginMax)
 	loginIPLimiter := ratelimit.NewLimiter(cfg.RateLimitLoginWindow, cfg.RateLimitLoginIPMax)
@@ -118,7 +126,7 @@ func NewWithDB(database *gorm.DB, cfg config.Config) (*Auth, error) {
 	signupIPLimiter.StartCleanup(cleanupTick, limiterDone)
 	oauthIPLimiter.StartCleanup(cleanupTick, limiterDone)
 
-	sessHandler := handler.NewSessionHandler(sessionSvc, database, &cfg)
+	sessHandler := handler.NewSessionHandlerWithStore(sessionSvc, store, &cfg)
 
 	providers := make(map[string]oauth.Provider)
 	for id, pcfg := range cfg.OAuth.Providers {
@@ -127,6 +135,7 @@ func NewWithDB(database *gorm.DB, cfg config.Config) (*Auth, error) {
 		}
 		p, err := oauth.NewProvider(id, pcfg)
 		if err != nil {
+			close(limiterDone)
 			return nil, err
 		}
 		providers[id] = p
@@ -134,7 +143,7 @@ func NewWithDB(database *gorm.DB, cfg config.Config) (*Auth, error) {
 	var oauthSvc oauth.Service
 	var oauthOpt handler.Option
 	if len(providers) > 0 {
-		oauthSvc = oauth.NewService(database, sessionSvc, providers, &cfg)
+		oauthSvc = oauth.NewServiceWithStore(store, sessionSvc, providers, &cfg)
 		oauthOpt = handler.WithOAuthService(oauthSvc, providers)
 	}
 
@@ -151,10 +160,11 @@ func NewWithDB(database *gorm.DB, cfg config.Config) (*Auth, error) {
 		}
 		totpLimiter = ratelimit.NewLimiter(window, maxAttempts)
 		totpLimiter.StartCleanup(cleanupTick, limiterDone)
-		totpSvc = totp.NewService(database, cfg.TOTP, totpLimiter, slog.Default())
+		totpSvc = totp.NewServiceWithStore(store, cfg.TOTP, totpLimiter, slog.Default())
 	}
 
 	handlerOpts := []handler.Option{
+		handler.WithStore(store),
 		handler.WithSessionService(sessionSvc),
 		handler.WithSessionHandler(sessHandler),
 		handler.WithRateLimiters(loginLimiter, resetLimiter, signupLimiter),
@@ -170,11 +180,11 @@ func NewWithDB(database *gorm.DB, cfg config.Config) (*Auth, error) {
 	if totpLimiter != nil {
 		handlerOpts = append(handlerOpts, handler.WithTotpLimiter(totpLimiter))
 	}
-	h := handler.New(database, cfg, authSvc, handlerOpts...)
+	h := handler.New(nil, cfg, authSvc, handlerOpts...)
 
 	a := &Auth{
-		db:  database,
-		cfg: cfg,
+		store: store,
+		cfg:   cfg,
 		emailDispatcher: email.NewAsyncDispatcher(email.DispatcherConfig{
 			BaseURL:                   cfg.BaseURL,
 			DisableAsyncEmailDispatch: cfg.DisableAsyncEmailDispatch,
@@ -200,6 +210,17 @@ func NewWithDB(database *gorm.DB, cfg config.Config) (*Auth, error) {
 	return a, nil
 }
 
+// NewWithDB initializes Auth using an existing GORM database connection.
+func NewWithDB(database *gorm.DB, cfg config.Config) (*Auth, error) {
+	adapter := gormstore.New(database)
+	a, err := NewWithStore(adapter, cfg)
+	if err != nil {
+		return nil, err
+	}
+	a.db = database
+	return a, nil
+}
+
 // New validates runtime configuration, establishes database connectivity,
 // runs pending migrations, and initializes the HTTP handler chain.
 func New(cfg config.Config) (*Auth, error) {
@@ -207,19 +228,35 @@ func New(cfg config.Config) (*Auth, error) {
 		return nil, errors.Wrap(err, errors.CodeInvalidConfig, "goauth: invalid configuration")
 	}
 
-	database, err := dbConnectFn(cfg)
-	if err != nil {
-		return nil, errors.Wrap(err, errors.CodeDatabaseError, "goauth: failed to connect to database")
-	}
-
-	a, err := NewWithDB(database, cfg)
-	if err != nil {
-		if sqlDB, dbErr := database.DB(); dbErr == nil {
-			_ = sqlDB.Close()
+	switch cfg.DatabaseType {
+	case config.DatabaseTypePostgres, "", config.DatabaseTypeMySQL:
+		database, err := dbConnectFn(cfg)
+		if err != nil {
+			return nil, errors.Wrap(err, errors.CodeDatabaseError, "goauth: failed to connect to database")
 		}
-		return nil, err
+
+		a, err := NewWithDB(database, cfg)
+		if err != nil {
+			if sqlDB, dbErr := database.DB(); dbErr == nil {
+				_ = sqlDB.Close()
+			}
+			return nil, err
+		}
+		return a, nil
+	case config.DatabaseTypeMongo, "mongo":
+		store, err := mongoConnectFn(cfg)
+		if err != nil {
+			return nil, errors.Wrap(err, errors.CodeDatabaseError, "goauth: failed to connect to mongodb")
+		}
+		a, err := NewWithStore(store, cfg)
+		if err != nil {
+			_ = store.Close()
+			return nil, err
+		}
+		return a, nil
+	default:
+		return nil, errors.Wrap(errors.ErrDatabaseUnsupported, errors.CodeDatabaseUnsupported, "unsupported database type: "+string(cfg.DatabaseType))
 	}
-	return a, nil
 }
 
 // Close terminates the underlying database connection pool and background cleanups.
@@ -261,7 +298,11 @@ func (a *Auth) Close() error {
 				a.closeErr = err
 			}
 		}
-		if a.db != nil {
+		if a.store != nil {
+			if err := a.store.Close(); err != nil && a.closeErr == nil {
+				a.closeErr = err
+			}
+		} else if a.db != nil {
 			if sqlDB, err := a.db.DB(); err != nil {
 				if a.closeErr == nil {
 					a.closeErr = errors.New(errors.CodeDatabaseError, "failed to get sql.DB", err)
@@ -274,6 +315,14 @@ func (a *Auth) Close() error {
 		}
 	})
 	return a.closeErr
+}
+
+// Store returns the underlying storage abstraction implementation.
+func (a *Auth) Store() db.Store {
+	if a == nil {
+		return nil
+	}
+	return a.store
 }
 
 // RequireAuth returns middleware that validates session credentials from cookies or Bearer headers.

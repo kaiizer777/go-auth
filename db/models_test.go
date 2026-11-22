@@ -16,8 +16,12 @@ func TestModelPrimaryKeyTags(t *testing.T) {
 		model       any
 		expectedTag string
 	}{
-		{name: "User", model: User{}, expectedTag: "primaryKey;type:uuid;default:uuid_generate_v4()"},
-		{name: "Session", model: Session{}, expectedTag: "primaryKey;type:uuid;default:uuid_generate_v4()"},
+		{name: "User", model: User{}, expectedTag: "primaryKey;type:varchar(36)"},
+		{name: "Session", model: Session{}, expectedTag: "primaryKey;type:varchar(36)"},
+		{name: "OAuthAccount", model: OAuthAccount{}, expectedTag: "primaryKey;type:varchar(36)"},
+		{name: "TotpSecret", model: TotpSecret{}, expectedTag: "primaryKey;type:varchar(36)"},
+		{name: "TotpUsedCode", model: TotpUsedCode{}, expectedTag: "primaryKey;type:varchar(36)"},
+		{name: "TwoFactorToken", model: TwoFactorToken{}, expectedTag: "primaryKey;type:varchar(36)"},
 	}
 
 	for _, tc := range uuidPKModels {
@@ -38,8 +42,8 @@ func TestModelPrimaryKeyTags(t *testing.T) {
 		model       any
 		expectedTag string
 	}{
-		{name: "VerificationToken", model: VerificationToken{}, expectedTag: "primaryKey;column:token_hash;type:bytea"},
-		{name: "PasswordResetToken", model: PasswordResetToken{}, expectedTag: "primaryKey;column:token_hash;type:bytea"},
+		{name: "VerificationToken", model: VerificationToken{}, expectedTag: "primaryKey;column:token_hash"},
+		{name: "PasswordResetToken", model: PasswordResetToken{}, expectedTag: "primaryKey;column:token_hash"},
 	}
 
 	for _, tc := range byteaPKModels {
@@ -108,9 +112,9 @@ func TestModelUserIDIndexTags(t *testing.T) {
 		model       any
 		expectedTag string
 	}{
-		{name: "Session", model: Session{}, expectedTag: "type:uuid;not null;index:idx_sessions_user_id"},
-		{name: "VerificationToken", model: VerificationToken{}, expectedTag: "type:uuid;not null;index:idx_verification_tokens_user_id"},
-		{name: "PasswordResetToken", model: PasswordResetToken{}, expectedTag: "type:uuid;not null;index:idx_password_reset_tokens_user_id"},
+		{name: "Session", model: Session{}, expectedTag: "type:varchar(36);not null;index:idx_sessions_user_id"},
+		{name: "VerificationToken", model: VerificationToken{}, expectedTag: "type:varchar(36);not null;index:idx_verification_tokens_user_id"},
+		{name: "PasswordResetToken", model: PasswordResetToken{}, expectedTag: "type:varchar(36);not null;index:idx_password_reset_tokens_user_id"},
 	}
 
 	for _, tc := range models {
@@ -425,5 +429,77 @@ func TestTOTPModels_TableNameAndMasking(t *testing.T) {
 		if a.Key == "token_hash" && a.Value.String() != "[REDACTED]" {
 			t.Errorf("TwoFactorToken TokenHash not redacted: %s", a.Value.String())
 		}
+	}
+}
+
+func TestBeforeCreateUUIDGeneration(t *testing.T) {
+	t.Parallel()
+
+	// 1. User
+	u := &User{}
+	if err := u.BeforeCreate(nil); err != nil || u.ID == uuid.Nil {
+		t.Fatalf("User.BeforeCreate failed to generate UUID: %v, ID=%v", err, u.ID)
+	}
+	fixedID := uuid.New()
+	u2 := &User{ID: fixedID}
+	if err := u2.BeforeCreate(nil); err != nil || u2.ID != fixedID {
+		t.Fatalf("User.BeforeCreate overwrote preset ID: %v", u2.ID)
+	}
+
+	// 2. Session
+	s := &Session{}
+	if err := s.BeforeCreate(nil); err != nil || s.ID == uuid.Nil {
+		t.Fatalf("Session.BeforeCreate failed to generate UUID: %v, ID=%v", err, s.ID)
+	}
+
+	// 3. OAuthAccount
+	o := &OAuthAccount{}
+	if err := o.BeforeCreate(nil); err != nil || o.ID == uuid.Nil {
+		t.Fatalf("OAuthAccount.BeforeCreate failed to generate UUID: %v, ID=%v", err, o.ID)
+	}
+
+	// 4. TotpSecret
+	ts := &TotpSecret{}
+	if err := ts.BeforeCreate(nil); err != nil || ts.ID == uuid.Nil {
+		t.Fatalf("TotpSecret.BeforeCreate failed to generate UUID: %v, ID=%v", err, ts.ID)
+	}
+
+	// 5. TotpUsedCode
+	tuc := &TotpUsedCode{}
+	if err := tuc.BeforeCreate(nil); err != nil || tuc.ID == uuid.Nil {
+		t.Fatalf("TotpUsedCode.BeforeCreate failed to generate UUID: %v, ID=%v", err, tuc.ID)
+	}
+
+	// 6. TwoFactorToken
+	tft := &TwoFactorToken{}
+	if err := tft.BeforeCreate(nil); err != nil || tft.ID == uuid.Nil {
+		t.Fatalf("TwoFactorToken.BeforeCreate failed to generate UUID: %v, ID=%v", err, tft.ID)
+	}
+}
+
+func TestSession_LogValue_RedactsIDHash(t *testing.T) {
+	s := Session{
+		ID:                uuid.New(),
+		UserID:            uuid.New(),
+		IDHash:            "sensitive-session-hash-12345",
+		SessionType:       SessionTypeBearer,
+		IPAddress:         "127.0.0.1",
+		UserAgent:         "TestAgent",
+		CredentialVersion: 1,
+		LastActiveAt:      time.Now(),
+		AbsoluteExpiresAt: time.Now().Add(24 * time.Hour),
+		CreatedAt:         time.Now(),
+	}
+	found := false
+	for _, a := range s.LogValue().Group() {
+		if a.Key == "id_hash" {
+			found = true
+			if a.Value.String() != "[REDACTED]" {
+				t.Errorf("Session IDHash not redacted: %s", a.Value.String())
+			}
+		}
+	}
+	if !found {
+		t.Errorf("expected id_hash in Session.LogValue()")
 	}
 }

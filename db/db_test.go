@@ -40,7 +40,8 @@ func TestCustomMigrationsFS(t *testing.T) {
 }
 
 func TestDefaultMigrationsEmbedded(t *testing.T) {
-	driver, err := iofs.New(defaultMigrationsFS, "migrations")
+	fs := MigrationsFS()
+	driver, err := iofs.New(fs, "migrations")
 	if err != nil {
 		t.Fatalf("failed to init iofs driver: %v", err)
 	}

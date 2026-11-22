@@ -885,3 +885,313 @@ func TestHandleCallbackAuditFlags(t *testing.T) {
 		}
 	})
 }
+
+func TestService_CreateUserEmailRaceRecovery(t *testing.T) {
+	t.Run("race loser links onto verified winner", func(t *testing.T) {
+		database, _, _, svc := setupServiceTest(t, nil)
+		ctx := context.Background()
+
+		// Seed the winning user that won the race
+		winner := db.User{
+			ID:            uuid.New(),
+			Email:         "raced@example.com",
+			PasswordHash:  "hash",
+			EmailVerified: true,
+		}
+		if err := database.Create(&winner).Error; err != nil {
+			t.Fatalf("seed winner: %v", err)
+		}
+
+		// Raced user tries to create user and link
+		info := &UserInfo{
+			ProviderUserID: "raced-subject-123",
+			Email:          "raced@example.com",
+			EmailVerified:  true,
+		}
+		user, linked, created, err := svc.(*service).createUserAndLink(ctx, "google", info)
+		if err != nil {
+			t.Fatalf("expected successful race recovery, got err: %v", err)
+		}
+		if user.ID != winner.ID {
+			t.Fatalf("expected linked user ID %v, got %v", winner.ID, user.ID)
+		}
+		if !linked {
+			t.Fatal("expected linked to be true")
+		}
+		if created {
+			t.Fatal("expected created to be false (reused winning user)")
+		}
+
+		// Verify oauth_accounts has the link
+		var link db.OAuthAccount
+		if err := database.Where("provider_id = ? AND provider_user_id = ?", "google", "raced-subject-123").First(&link).Error; err != nil {
+			t.Fatalf("failed to query recovered link: %v", err)
+		}
+		if link.UserID != winner.ID {
+			t.Fatalf("expected link user_id %v, got %v", winner.ID, link.UserID)
+		}
+	})
+
+	t.Run("race loser rejected if winner email unverified", func(t *testing.T) {
+		database, _, _, svc := setupServiceTest(t, nil)
+		ctx := context.Background()
+
+		unverifiedWinner := db.User{
+			ID:            uuid.New(),
+			Email:         "unverified@example.com",
+			PasswordHash:  "hash",
+			EmailVerified: false,
+		}
+		if err := database.Create(&unverifiedWinner).Error; err != nil {
+			t.Fatalf("seed unverified: %v", err)
+		}
+
+		info := &UserInfo{
+			ProviderUserID: "raced-subject-unverified",
+			Email:          "unverified@example.com",
+			EmailVerified:  true,
+		}
+		_, _, _, err := svc.(*service).createUserAndLink(ctx, "google", info)
+		if !errors.Is(err, errors.ErrOAuthAccountLinkConflict) {
+			t.Fatalf("expected ErrOAuthAccountLinkConflict, got %v", err)
+		}
+	})
+}
+
+func TestService_SubjectCaseSensitivity(t *testing.T) {
+	_, _, _, svc := setupServiceTest(t, nil)
+	ctx := context.Background()
+
+	upperInfo := &UserInfo{
+		ProviderUserID: "Subject_CASE_123",
+		Email:          "upper@example.com",
+		EmailVerified:  true,
+	}
+	lowerInfo := &UserInfo{
+		ProviderUserID: "subject_case_123",
+		Email:          "lower@example.com",
+		EmailVerified:  true,
+	}
+
+	u1, linked1, created1, err1 := svc.(*service).createUserAndLink(ctx, "google", upperInfo)
+	if err1 != nil || !linked1 || !created1 {
+		t.Fatalf("create upper failed: %v", err1)
+	}
+
+	u2, linked2, created2, err2 := svc.(*service).createUserAndLink(ctx, "google", lowerInfo)
+	if err2 != nil || !linked2 || !created2 {
+		t.Fatalf("create lower failed: %v", err2)
+	}
+
+	if u1.ID == u2.ID {
+		t.Fatalf("expected distinct users for case-variant provider subjects, got identical ID: %v", u1.ID)
+	}
+
+	// Verify lookups resolve distinct accounts
+	l1, found1, err := svc.(*service).findLink(ctx, "google", "Subject_CASE_123")
+	if err != nil || !found1 || l1.UserID != u1.ID {
+		t.Fatalf("upper lookup mismatch: found=%v, err=%v, link=%+v", found1, err, l1)
+	}
+
+	l2, found2, err := svc.(*service).findLink(ctx, "google", "subject_case_123")
+	if err != nil || !found2 || l2.UserID != u2.ID {
+		t.Fatalf("lower lookup mismatch: found=%v, err=%v, link=%+v", found2, err, l2)
+	}
+}
+
+type retryProxyStore struct {
+	db.Store
+	attempt   int
+	onAttempt func(attempt int, base db.Store) db.Store
+}
+
+func (r *retryProxyStore) Transaction(ctx context.Context, fn func(txStore db.Store) error) error {
+	var err error
+	for i := 1; i <= 2; i++ {
+		r.attempt = i
+		txStore := r.onAttempt(i, r.Store)
+		err = fn(txStore)
+		if err == nil {
+			return nil
+		}
+	}
+	return err
+}
+
+type wrappedTxStore struct {
+	db.Store
+	users db.UserStore
+	oauth db.OAuthAccountStore
+}
+
+func (w *wrappedTxStore) Users() db.UserStore {
+	if w.users != nil {
+		return w.users
+	}
+	return w.Store.Users()
+}
+
+func (w *wrappedTxStore) OAuthAccounts() db.OAuthAccountStore {
+	if w.oauth != nil {
+		return w.oauth
+	}
+	return w.Store.OAuthAccounts()
+}
+
+type interceptUserStore struct {
+	db.UserStore
+	createFunc func(ctx context.Context, u *db.User) error
+}
+
+func (i *interceptUserStore) Create(ctx context.Context, u *db.User) error {
+	if i.createFunc != nil {
+		return i.createFunc(ctx, u)
+	}
+	return i.UserStore.Create(ctx, u)
+}
+
+type interceptOAuthStore struct {
+	db.OAuthAccountStore
+	createFunc func(ctx context.Context, a *db.OAuthAccount) error
+}
+
+func (i *interceptOAuthStore) Create(ctx context.Context, a *db.OAuthAccount) error {
+	if i.createFunc != nil {
+		return i.createFunc(ctx, a)
+	}
+	return i.OAuthAccountStore.Create(ctx, a)
+}
+
+func TestService_CreateUserAndLink_RetryIsolation(t *testing.T) {
+	t.Run("linkConflict on attempt 1 does not leak into attempt 2 failure", func(t *testing.T) {
+		_, _, _, rawSvc := setupServiceTest(t, nil)
+		svc := rawSvc.(*service)
+		ctx := context.Background()
+
+		networkErr := fmt.Errorf("fatal network timeout on attempt 2")
+		proxyStore := &retryProxyStore{
+			Store: svc.store,
+			onAttempt: func(attempt int, base db.Store) db.Store {
+				if attempt == 1 {
+					// Attempt 1: Users().Create succeeds, OAuthAccounts().Create returns unique conflict
+					return &wrappedTxStore{
+						Store: base,
+						oauth: &interceptOAuthStore{
+							OAuthAccountStore: base.OAuthAccounts(),
+							createFunc: func(ctx context.Context, a *db.OAuthAccount) error {
+								return errors.ErrOAuthAccountAlreadyLinked
+							},
+						},
+					}
+				}
+				// Attempt 2: Users().Create fails with unexpected non-conflict network error
+				return &wrappedTxStore{
+					Store: base,
+					users: &interceptUserStore{
+						UserStore: base.Users(),
+						createFunc: func(ctx context.Context, u *db.User) error {
+							return networkErr
+						},
+					},
+				}
+			},
+		}
+
+		testSvc := &service{
+			store:      proxyStore,
+			sessionSvc: svc.sessionSvc,
+			providers:  svc.providers,
+			cfg:        svc.cfg,
+		}
+
+		info := &UserInfo{
+			ProviderUserID: "retry-sub-link-conflict",
+			Email:          "retry-link@example.com",
+			EmailVerified:  true,
+		}
+
+		_, _, _, err := testSvc.createUserAndLink(ctx, "google", info)
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+		var appErr *errors.Error
+		if !errors.As(err, &appErr) {
+			t.Fatalf("expected *errors.Error, got %T: %v", err, err)
+		}
+		if appErr.Code() != errors.CodeInternalError {
+			t.Fatalf("expected CodeInternalError, got: %v", appErr.Code())
+		}
+		if !strings.Contains(appErr.Message(), "failed to create oauth user") {
+			t.Fatalf("expected op 'failed to create oauth user', got: %v", appErr.Message())
+		}
+		if !strings.Contains(err.Error(), "fatal network timeout") {
+			t.Fatalf("expected underlying error 'fatal network timeout', got: %v", err)
+		}
+	})
+
+	t.Run("userConflict on attempt 1 does not leak into attempt 2 failure", func(t *testing.T) {
+		_, _, _, rawSvc := setupServiceTest(t, nil)
+		svc := rawSvc.(*service)
+		ctx := context.Background()
+
+		diskErr := fmt.Errorf("disk full during oauth link on attempt 2")
+		proxyStore := &retryProxyStore{
+			Store: svc.store,
+			onAttempt: func(attempt int, base db.Store) db.Store {
+				if attempt == 1 {
+					// Attempt 1: Users().Create returns user conflict
+					return &wrappedTxStore{
+						Store: base,
+						users: &interceptUserStore{
+							UserStore: base.Users(),
+							createFunc: func(ctx context.Context, u *db.User) error {
+								return errors.ErrEmailAlreadyExists
+							},
+						},
+					}
+				}
+				// Attempt 2: Users().Create succeeds, OAuthAccounts().Create fails with non-conflict error
+				return &wrappedTxStore{
+					Store: base,
+					oauth: &interceptOAuthStore{
+						OAuthAccountStore: base.OAuthAccounts(),
+						createFunc: func(ctx context.Context, a *db.OAuthAccount) error {
+							return diskErr
+						},
+					},
+				}
+			},
+		}
+
+		testSvc := &service{
+			store:      proxyStore,
+			sessionSvc: svc.sessionSvc,
+			providers:  svc.providers,
+			cfg:        svc.cfg,
+		}
+
+		info := &UserInfo{
+			ProviderUserID: "retry-sub-user-conflict",
+			Email:          "retry-user@example.com",
+			EmailVerified:  true,
+		}
+
+		_, _, _, err := testSvc.createUserAndLink(ctx, "google", info)
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+		var appErr *errors.Error
+		if !errors.As(err, &appErr) {
+			t.Fatalf("expected *errors.Error, got %T: %v", err, err)
+		}
+		if appErr.Code() != errors.CodeInternalError {
+			t.Fatalf("expected CodeInternalError, got: %v", appErr.Code())
+		}
+		if !strings.Contains(appErr.Message(), "failed to link oauth account") {
+			t.Fatalf("expected op 'failed to link oauth account', got: %v", appErr.Message())
+		}
+		if !strings.Contains(err.Error(), "disk full during oauth link") {
+			t.Fatalf("expected underlying error 'disk full during oauth link', got: %v", err)
+		}
+	})
+}

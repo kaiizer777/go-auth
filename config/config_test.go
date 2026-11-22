@@ -1530,3 +1530,370 @@ func TestConfigValidate_SecurityHeaders(t *testing.T) {
 		t.Errorf(`sub-second CSRFCookieMaxAge err = %v`, err)
 	}
 }
+
+func TestDatabaseType_Validation(t *testing.T) {
+	t.Run("default empty is treated as postgres", func(t *testing.T) {
+		cfg := Config{
+			DatabaseURL: "postgres://user:pass@localhost:5432/testdb",
+			BaseURL:     "https://example.com",
+		}
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("unexpected validation error: %v", err)
+		}
+		if cfg.DatabaseType != DatabaseTypePostgres {
+			t.Errorf("got %q, want %q", cfg.DatabaseType, DatabaseTypePostgres)
+		}
+	})
+
+	t.Run("explicit postgres", func(t *testing.T) {
+		cfg := Config{
+			DatabaseType: DatabaseTypePostgres,
+			DatabaseURL:  "postgres://user:pass@localhost:5432/testdb",
+			BaseURL:      "https://example.com",
+		}
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("unexpected validation error: %v", err)
+		}
+	})
+
+	t.Run("unsupported database type", func(t *testing.T) {
+		cfg := Config{
+			DatabaseType: DatabaseType("sqlite"),
+			DatabaseURL:  "sqlite://auth.db",
+			BaseURL:      "https://example.com",
+		}
+		err := cfg.Validate()
+		if err == nil {
+			t.Fatal("expected error for unsupported database type, got nil")
+		}
+		if !errors.Is(err, errors.ErrDatabaseUnsupported) {
+			t.Errorf("got %v, want ErrDatabaseUnsupported", err)
+		}
+	})
+
+	t.Run("mysql valid config", func(t *testing.T) {
+		cfg := Config{
+			DatabaseType: DatabaseTypeMySQL,
+			DatabaseURL:  "user:pass@tcp(127.0.0.1:3306)/auth?parseTime=true",
+			BaseURL:      "https://example.com",
+		}
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("unexpected validation error: %v", err)
+		}
+		if cfg.MaxOpenConns != 25 {
+			t.Errorf("expected MaxOpenConns 25, got %d", cfg.MaxOpenConns)
+		}
+	})
+
+	t.Run("mysql missing DSN", func(t *testing.T) {
+		cfg := Config{
+			DatabaseType: DatabaseTypeMySQL,
+			BaseURL:      "https://example.com",
+		}
+		err := cfg.Validate()
+		if err == nil {
+			t.Fatal("expected error for empty MySQL DSN, got nil")
+		}
+	})
+
+	t.Run("mysql missing parseTime", func(t *testing.T) {
+		cfg := Config{
+			DatabaseType: DatabaseTypeMySQL,
+			DatabaseURL:  "user:pass@tcp(127.0.0.1:3306)/auth",
+			BaseURL:      "https://example.com",
+		}
+		err := cfg.Validate()
+		if err == nil {
+			t.Fatal("expected error for missing parseTime=true, got nil")
+		}
+	})
+
+	t.Run("mongodb valid uri", func(t *testing.T) {
+		cfg := Config{
+			DatabaseType: DatabaseTypeMongo,
+			DatabaseURL:  "mongodb://user:pass@localhost:27017/auth",
+			BaseURL:      "https://example.com",
+		}
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("unexpected validation error: %v", err)
+		}
+	})
+
+	t.Run("mongodb valid srv uri", func(t *testing.T) {
+		cfg := Config{
+			DatabaseType: DatabaseTypeMongo,
+			DatabaseURL:  "mongodb+srv://user:pass@cluster0.example.com/mydb",
+			BaseURL:      "https://example.com",
+		}
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("unexpected validation error: %v", err)
+		}
+	})
+
+	t.Run("mongodb missing uri", func(t *testing.T) {
+		cfg := Config{
+			DatabaseType: DatabaseTypeMongo,
+			BaseURL:      "https://example.com",
+		}
+		err := cfg.Validate()
+		if err == nil {
+			t.Fatal("expected error for empty Mongo URI, got nil")
+		}
+	})
+
+	t.Run("mongodb invalid prefix", func(t *testing.T) {
+		cfg := Config{
+			DatabaseType: DatabaseTypeMongo,
+			DatabaseURL:  "http://localhost:27017/auth",
+			BaseURL:      "https://example.com",
+		}
+		err := cfg.Validate()
+		if err == nil {
+			t.Fatal("expected error for invalid Mongo URI prefix, got nil")
+		}
+	})
+
+	t.Run("mongodb empty database returns ErrInvalidConfig", func(t *testing.T) {
+		cfg := Config{
+			DatabaseType: DatabaseTypeMongoDB,
+			DatabaseURL:  "mongodb://user:pass@localhost:27017",
+			BaseURL:      "https://example.com",
+		}
+		err := cfg.Validate()
+		if err == nil {
+			t.Fatal("expected error for empty MongoDB database, got nil")
+		}
+		if !errors.Is(err, errors.ErrInvalidConfig) {
+			t.Errorf("got %v, want ErrInvalidConfig", err)
+		}
+	})
+
+	t.Run("mongodb negative connect timeout returns ErrInvalidConfig", func(t *testing.T) {
+		cfg := Config{
+			DatabaseType: DatabaseTypeMongoDB,
+			DatabaseURL:  "mongodb://user:pass@localhost:27017/auth",
+			BaseURL:      "https://example.com",
+			MongoDB: MongoDBConfig{
+				Database:       "auth",
+				ConnectTimeout: -1 * time.Second,
+			},
+		}
+		err := cfg.Validate()
+		if err == nil {
+			t.Fatal("expected error for negative ConnectTimeout, got nil")
+		}
+		if !errors.Is(err, errors.ErrInvalidConfig) {
+			t.Errorf("got %v, want ErrInvalidConfig", err)
+		}
+	})
+
+	t.Run("mongodb negative server selection timeout returns ErrInvalidConfig", func(t *testing.T) {
+		cfg := Config{
+			DatabaseType: DatabaseTypeMongoDB,
+			DatabaseURL:  "mongodb://user:pass@localhost:27017/auth",
+			BaseURL:      "https://example.com",
+			MongoDB: MongoDBConfig{
+				Database:               "auth",
+				ServerSelectionTimeout: -1 * time.Second,
+			},
+		}
+		err := cfg.Validate()
+		if err == nil {
+			t.Fatal("expected error for negative ServerSelectionTimeout, got nil")
+		}
+		if !errors.Is(err, errors.ErrInvalidConfig) {
+			t.Errorf("got %v, want ErrInvalidConfig", err)
+		}
+	})
+
+	t.Run("mongodb negative max conn idle time returns ErrInvalidConfig", func(t *testing.T) {
+		cfg := Config{
+			DatabaseType: DatabaseTypeMongoDB,
+			DatabaseURL:  "mongodb://user:pass@localhost:27017/auth",
+			BaseURL:      "https://example.com",
+			MongoDB: MongoDBConfig{
+				Database:        "auth",
+				MaxConnIdleTime: -1 * time.Second,
+			},
+		}
+		err := cfg.Validate()
+		if err == nil {
+			t.Fatal("expected error for negative MaxConnIdleTime, got nil")
+		}
+		if !errors.Is(err, errors.ErrInvalidConfig) {
+			t.Errorf("got %v, want ErrInvalidConfig", err)
+		}
+	})
+
+	t.Run("mongodb invalid query timeout returns ErrInvalidConfig", func(t *testing.T) {
+		cfg := Config{
+			DatabaseType: DatabaseTypeMongoDB,
+			DatabaseURL:  "mongodb://user:pass@localhost:27017/auth?connectTimeoutMS=-5",
+			BaseURL:      "https://example.com",
+		}
+		err := cfg.Validate()
+		if err == nil {
+			t.Fatal("expected error for negative connectTimeoutMS query, got nil")
+		}
+		if !errors.Is(err, errors.ErrInvalidConfig) {
+			t.Errorf("got %v, want ErrInvalidConfig", err)
+		}
+	})
+
+	t.Run("mongodb explicit valid config", func(t *testing.T) {
+		cfg := Config{
+			DatabaseType: DatabaseTypeMongoDB,
+			DatabaseURL:  "mongodb://user:pass@localhost:27017",
+			BaseURL:      "https://example.com",
+			MongoDB: MongoDBConfig{
+				Database:               "custom_auth",
+				ConnectTimeout:         5 * time.Second,
+				ServerSelectionTimeout: 5 * time.Second,
+				MaxConnIdleTime:        10 * time.Minute,
+			},
+		}
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("unexpected validation error: %v", err)
+		}
+		if cfg.MongoDB.Database != "custom_auth" {
+			t.Errorf("got %q, want %q", cfg.MongoDB.Database, "custom_auth")
+		}
+	})
+}
+
+func TestRedactURL_Dialects(t *testing.T) {
+	tests := []struct {
+		name     string
+		raw      string
+		expected string
+	}{
+		{
+			name:     "postgres standard",
+			raw:      "postgres://admin:secret123@localhost:5432/mydb?sslmode=disable",
+			expected: "postgres://admin:REDACTED@localhost:5432/mydb?sslmode=disable",
+		},
+		{
+			name:     "mysql dsn",
+			raw:      "root:secret123@tcp(127.0.0.1:3306)/auth?parseTime=true",
+			expected: "root:REDACTED@tcp(127.0.0.1:3306)/auth?parseTime=true",
+		},
+		{
+			name:     "mysql dsn password with @ symbol",
+			raw:      "user:p@ss@word@tcp(127.0.0.1:3306)/db",
+			expected: "user:REDACTED@tcp(127.0.0.1:3306)/db",
+		},
+		{
+			name:     "mysql dsn unix socket password with @ symbol",
+			raw:      "user:p@ss@word@unix(/var/run/mysqld/mysqld.sock)/db",
+			expected: "user:REDACTED@unix(/var/run/mysqld/mysqld.sock)/db",
+		},
+		{
+			name:     "mongo standard uri",
+			raw:      "mongodb://admin:secret123@localhost:27017/auth",
+			expected: "mongodb://admin:REDACTED@localhost:27017/auth",
+		},
+		{
+			name:     "mongo srv uri",
+			raw:      "mongodb+srv://admin:secret123@cluster0.example.com/auth",
+			expected: "mongodb+srv://admin:REDACTED@cluster0.example.com/auth",
+		},
+		{
+			name:     "no password",
+			raw:      "localhost:5432/mydb",
+			expected: "localhost:5432/mydb",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := RedactURL(tc.raw)
+			if got != tc.expected {
+				t.Errorf("RedactURL(%q) = %q, want %q", tc.raw, got, tc.expected)
+			}
+		})
+	}
+}
+
+func TestRedactURL_MySQLPasswordsWithAtSymbol(t *testing.T) {
+	rawDSN := "user:p@ss@word@tcp(127.0.0.1:3306)/auth_db?charset=utf8mb4&parseTime=True"
+	redacted := RedactURL(rawDSN)
+
+	if strings.Contains(redacted, "p@ss@word") {
+		t.Fatalf("RedactURL leaked password containing @: %s", redacted)
+	}
+	if !strings.Contains(redacted, "user:REDACTED@tcp(127.0.0.1:3306)/auth_db") {
+		t.Fatalf("unexpected redacted DSN format: %s", redacted)
+	}
+
+	cfg := DefaultConfig()
+	cfg.DatabaseType = DatabaseTypeMySQL
+	cfg.DatabaseURL = rawDSN
+
+	logVal := cfg.LogValue()
+	logStr := fmt.Sprintf("%v", logVal)
+	if strings.Contains(logStr, "p@ss@word") {
+		t.Fatalf("Config.LogValue leaked password containing @: %s", logStr)
+	}
+
+	cfgStr := cfg.String()
+	if strings.Contains(cfgStr, "p@ss@word") {
+		t.Fatalf("Config.String leaked password containing @: %s", cfgStr)
+	}
+}
+
+func TestConfigValidate_DeprecatedMongoOverridesRespected(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.DatabaseType = DatabaseTypeMongoDB
+	cfg.DatabaseURL = "mongodb://localhost:27017/auth"
+	cfg.BaseURL = "http://localhost:8080"
+	cfg.Mongo.ConnectTimeout = 5 * time.Second
+	cfg.Mongo.ServerSelectionTimeout = 3 * time.Second
+	cfg.Mongo.MaxConnIdleTime = 15 * time.Minute
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("unexpected validation error: %v", err)
+	}
+
+	if cfg.MongoDB.ConnectTimeout != 5*time.Second {
+		t.Errorf("got MongoDB.ConnectTimeout %v, want 5s", cfg.MongoDB.ConnectTimeout)
+	}
+	if cfg.MongoDB.ServerSelectionTimeout != 3*time.Second {
+		t.Errorf("got MongoDB.ServerSelectionTimeout %v, want 3s", cfg.MongoDB.ServerSelectionTimeout)
+	}
+	if cfg.MongoDB.MaxConnIdleTime != 15*time.Minute {
+		t.Errorf("got MongoDB.MaxConnIdleTime %v, want 15m", cfg.MongoDB.MaxConnIdleTime)
+	}
+	if cfg.Mongo.ConnectTimeout != 5*time.Second {
+		t.Errorf("got Mongo.ConnectTimeout %v, want 5s", cfg.Mongo.ConnectTimeout)
+	}
+	if cfg.Mongo.ServerSelectionTimeout != 3*time.Second {
+		t.Errorf("got Mongo.ServerSelectionTimeout %v, want 3s", cfg.Mongo.ServerSelectionTimeout)
+	}
+	if cfg.Mongo.MaxConnIdleTime != 15*time.Minute {
+		t.Errorf("got Mongo.MaxConnIdleTime %v, want 15m", cfg.Mongo.MaxConnIdleTime)
+	}
+}
+
+func TestConfigValidate_MongoDBDefaultsAppliedWhenUnset(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.DatabaseType = DatabaseTypeMongoDB
+	cfg.DatabaseURL = "mongodb://localhost:27017/auth"
+	cfg.BaseURL = "http://localhost:8080"
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("unexpected validation error: %v", err)
+	}
+
+	if cfg.MongoDB.ConnectTimeout != 10*time.Second {
+		t.Errorf("got MongoDB.ConnectTimeout %v, want 10s", cfg.MongoDB.ConnectTimeout)
+	}
+	if cfg.MongoDB.ServerSelectionTimeout != 10*time.Second {
+		t.Errorf("got MongoDB.ServerSelectionTimeout %v, want 10s", cfg.MongoDB.ServerSelectionTimeout)
+	}
+	if cfg.MongoDB.MaxConnIdleTime != 30*time.Minute {
+		t.Errorf("got MongoDB.MaxConnIdleTime %v, want 30m", cfg.MongoDB.MaxConnIdleTime)
+	}
+	if cfg.Mongo.ConnectTimeout != 10*time.Second {
+		t.Errorf("got Mongo.ConnectTimeout %v, want 10s", cfg.Mongo.ConnectTimeout)
+	}
+}
