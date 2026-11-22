@@ -13,6 +13,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/kaiizer777/go-auth/config"
 	"github.com/kaiizer777/go-auth/db"
+	gormstore "github.com/kaiizer777/go-auth/db/gorm"
 	apperrors "github.com/kaiizer777/go-auth/errors"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
@@ -1325,6 +1326,89 @@ func TestService_ListSessions_PurgesExpired(t *testing.T) {
 		t.Fatalf("expected 1 row remaining in DB after purge, found %d", remainingCount)
 	}
 }
+
+type noopDeleteSessionStore struct {
+	db.SessionStore
+}
+
+func (s *noopDeleteSessionStore) DeleteExpiredByUserID(ctx context.Context, userID uuid.UUID, now time.Time, idleCutoff time.Time) error {
+	return nil
+}
+
+type noopDeleteStore struct {
+	db.Store
+	sessStore db.SessionStore
+}
+
+func (s *noopDeleteStore) Sessions() db.SessionStore {
+	return s.sessStore
+}
+
+func TestService_ListSessions_DefensivelyFiltersExpiredAndIdle(t *testing.T) {
+	database := setupTestDB(t)
+	cfg := testConfig()
+	baseStore := gormstore.New(database)
+	wrappedStore := &noopDeleteStore{
+		Store:     baseStore,
+		sessStore: &noopDeleteSessionStore{SessionStore: baseStore.Sessions()},
+	}
+	svc := NewServiceWithStore(wrappedStore, cfg)
+	userID := uuid.New()
+	seedTestUser(t, database, userID)
+	ctx := context.Background()
+
+	sessActive, _, err := svc.CreateSession(ctx, userID, 0, db.SessionTypeCookie, "127.0.0.1", "active")
+	if err != nil {
+		t.Fatalf("failed to create session: %v", err)
+	}
+
+	rawIDExp1, _ := generateRawID()
+	expiredRow1 := &db.Session{
+		ID:                uuid.New(),
+		UserID:            userID,
+		IDHash:            hashID(rawIDExp1),
+		SessionType:       db.SessionTypeCookie,
+		LastActiveAt:      time.Now().UTC().Add(-2 * time.Hour),
+		AbsoluteExpiresAt: time.Now().UTC().Add(-1 * time.Hour),
+		CreatedAt:         time.Now().UTC().Add(-25 * time.Hour),
+	}
+	if err := database.Create(expiredRow1).Error; err != nil {
+		t.Fatalf("failed to seed expired row: %v", err)
+	}
+
+	rawIDExp2, _ := generateRawID()
+	expiredRow2 := &db.Session{
+		ID:                uuid.New(),
+		UserID:            userID,
+		IDHash:            hashID(rawIDExp2),
+		SessionType:       db.SessionTypeBearer,
+		LastActiveAt:      time.Now().UTC().Add(-2 * cfg.SessionIdleTimeout),
+		AbsoluteExpiresAt: time.Now().UTC().Add(24 * time.Hour),
+		CreatedAt:         time.Now().UTC().Add(-1 * time.Hour),
+	}
+	if err := database.Create(expiredRow2).Error; err != nil {
+		t.Fatalf("failed to seed idle expired row: %v", err)
+	}
+
+	sessions, err := svc.ListSessions(ctx, userID)
+	if err != nil {
+		t.Fatalf("ListSessions failed: %v", err)
+	}
+
+	if len(sessions) != 1 {
+		t.Fatalf("expected 1 active session after defensive filtering, got %d", len(sessions))
+	}
+	if sessions[0].ID != sessActive.ID {
+		t.Errorf("expected session %v, got %v", sessActive.ID, sessions[0].ID)
+	}
+
+	var dbCount int64
+	database.Model(&db.Session{}).Where("user_id = ?", userID).Count(&dbCount)
+	if dbCount != 3 {
+		t.Fatalf("expected 3 rows remaining in DB, found %d", dbCount)
+	}
+}
+
 
 func TestInvalidateAllUserSessions_BumpsCredentialVersion(t *testing.T) {
 	database := setupTestDB(t)

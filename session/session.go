@@ -459,9 +459,18 @@ func (s *service) ListSessions(ctx context.Context, userID uuid.UUID) ([]*Sessio
 		return nil, apperrors.New(apperrors.CodeInternalError, "failed to list sessions", err)
 	}
 
-	sessions := make([]*Session, len(records))
-	for i := range records {
-		sessions[i] = fromDB(records[i])
+	sessions := make([]*Session, 0, len(records))
+	for _, rec := range records {
+		if rec == nil {
+			continue
+		}
+		if now.After(rec.AbsoluteExpiresAt) {
+			continue
+		}
+		if s.cfg.SessionIdleTimeout > 0 && rec.LastActiveAt.Before(idleCutoff) {
+			continue
+		}
+		sessions = append(sessions, fromDB(rec))
 	}
 	return sessions, nil
 }
