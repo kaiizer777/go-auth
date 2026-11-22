@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -25,6 +26,12 @@ func setupTestDB(t *testing.T) (*gormdriver.DB, db.Store) {
 	if err != nil {
 		t.Fatalf("failed to open sqlite database: %v", err)
 	}
+
+	sqlDB, err := database.DB()
+	if err != nil {
+		t.Fatalf("failed to get sql.DB: %v", err)
+	}
+	sqlDB.SetMaxOpenConns(1)
 
 	err = database.AutoMigrate(
 		&db.User{},
@@ -188,6 +195,24 @@ func TestUserStore_AllMethods(t *testing.T) {
 	if err != nil || gotUpdated.Email != "user1_updated@example.com" {
 		t.Fatalf("Update not reflected: %v", gotUpdated)
 	}
+	// Update non-existent user must return ErrUserNotFound
+	missingUser := &db.User{ID: uuid.New(), Email: "nonexistent@example.com"}
+	if err := users.Update(ctx, missingUser); !errors.Is(err, apperrors.ErrUserNotFound) {
+		t.Fatalf("expected ErrUserNotFound updating non-existent user, got: %v", err)
+	}
+	// Verify no phantom row was created
+	if _, err := users.GetByID(ctx, missingUser.ID); !errors.Is(err, gormdriver.ErrRecordNotFound) {
+		t.Fatalf("expected non-existent user to not exist after update, got: %v", err)
+	}
+	// Update duplicate email must return ErrEmailAlreadyExists
+	uDuplicate := &db.User{Email: "user_dup@example.com"}
+	if err := users.Create(ctx, uDuplicate); err != nil {
+		t.Fatalf("failed to create duplicate test user: %v", err)
+	}
+	uDuplicate.Email = "user1_updated@example.com"
+	if err := users.Update(ctx, uDuplicate); !errors.Is(err, apperrors.ErrEmailAlreadyExists) {
+		t.Fatalf("expected ErrEmailAlreadyExists on email collision, got: %v", err)
+	}
 
 	// 7. UpdatePassword
 	if err := users.UpdatePassword(ctx, u1.ID, "new_secret_hash"); err != nil {
@@ -232,6 +257,118 @@ func TestUserStore_AllMethods(t *testing.T) {
 	}
 	if _, err := users.GetByID(ctx, u1.ID); !errors.Is(err, gormdriver.ErrRecordNotFound) {
 		t.Fatalf("expected user to be deleted, got %v", err)
+	}
+}
+
+func TestUserStore_Update_ZeroValuesAndErrors(t *testing.T) {
+	_, store := setupTestDB(t)
+	ctx := context.Background()
+	users := store.Users()
+
+	// 1. Create a user with EmailVerified true
+	u := &db.User{
+		Email:         "verified_user@example.com",
+		PasswordHash:  "initial_hash",
+		EmailVerified: true,
+	}
+	if err := users.Create(ctx, u); err != nil {
+		t.Fatalf("Create failed: %v", err)
+	}
+
+	// 2. Update EmailVerified to false (zero value)
+	u.EmailVerified = false
+	if err := users.Update(ctx, u); err != nil {
+		t.Fatalf("Update with zero-value EmailVerified failed: %v", err)
+	}
+	fetched, err := users.GetByID(ctx, u.ID)
+	if err != nil {
+		t.Fatalf("GetByID failed: %v", err)
+	}
+	if fetched.EmailVerified != false {
+		t.Fatal("expected EmailVerified false to persist across Update")
+	}
+
+	// 3. Update non-existent user returns ErrUserNotFound and ErrRecordNotFound
+	missing := &db.User{ID: uuid.New(), Email: "ghost@example.com"}
+	err = users.Update(ctx, missing)
+	if !errors.Is(err, apperrors.ErrUserNotFound) {
+		t.Fatalf("expected ErrUserNotFound for missing user update, got: %v", err)
+	}
+	if !errors.Is(err, gormdriver.ErrRecordNotFound) {
+		t.Fatalf("expected ErrRecordNotFound for missing user update, got: %v", err)
+	}
+
+	// 4. Duplicate email returns ErrEmailAlreadyExists
+	other := &db.User{Email: "other@example.com"}
+	if err := users.Create(ctx, other); err != nil {
+		t.Fatalf("Create other user failed: %v", err)
+	}
+	other.Email = "verified_user@example.com"
+	if err := users.Update(ctx, other); !errors.Is(err, apperrors.ErrEmailAlreadyExists) {
+		t.Fatalf("expected ErrEmailAlreadyExists on duplicate email, got: %v", err)
+	}
+}
+
+func TestUserStore_IncrementCredentialVersion_Concurrent(t *testing.T) {
+	_, store := setupTestDB(t)
+	ctx := context.Background()
+	users := store.Users()
+
+	u := &db.User{Email: "concurrent_cred@example.com", CredentialVersion: 1}
+	if err := users.Create(ctx, u); err != nil {
+		t.Fatalf("Create user failed: %v", err)
+	}
+
+	const goroutines = 10
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+	versions := make(chan uint32, goroutines)
+	errCh := make(chan error, goroutines)
+
+	for i := 0; i < goroutines; i++ {
+		go func() {
+			defer wg.Done()
+			ver, err := users.IncrementCredentialVersion(ctx, u.ID)
+			if err != nil {
+				errCh <- err
+				return
+			}
+			versions <- ver
+		}()
+	}
+
+	wg.Wait()
+	close(versions)
+	close(errCh)
+
+	for err := range errCh {
+		t.Fatalf("concurrent IncrementCredentialVersion failed: %v", err)
+	}
+
+	seen := make(map[uint32]bool)
+	for ver := range versions {
+		if seen[ver] {
+			t.Fatalf("duplicate credential version observed: %d", ver)
+		}
+		seen[ver] = true
+	}
+
+	if len(seen) != goroutines {
+		t.Fatalf("expected %d distinct versions, got %d", goroutines, len(seen))
+	}
+
+	for v := uint32(2); v <= uint32(1+goroutines); v++ {
+		if !seen[v] {
+			t.Errorf("missing expected version %d in sequential progression", v)
+		}
+	}
+
+	finalUser, err := users.GetByID(ctx, u.ID)
+	if err != nil {
+		t.Fatalf("GetByID failed: %v", err)
+	}
+	if uint32(finalUser.CredentialVersion) != uint32(1+goroutines) {
+		t.Fatalf("final CredentialVersion = %d, want %d", finalUser.CredentialVersion, 1+goroutines)
 	}
 }
 

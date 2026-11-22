@@ -59,7 +59,14 @@ func (s *userStore) GetByEmail(ctx context.Context, email string) (*db.User, err
 }
 
 func (s *userStore) Update(ctx context.Context, user *db.User) error {
-	return s.db.WithContext(ctx).Save(user).Error
+	res := s.db.WithContext(ctx).Model(&db.User{}).Where("id = ?", user.ID).Select("*").Omit("id", "created_at").Updates(user)
+	if res.Error != nil {
+		return db.NormalizeMySQLError(res.Error)
+	}
+	if res.RowsAffected == 0 {
+		return apperrors.New(apperrors.CodeUserNotFound, "user not found", gorm.ErrRecordNotFound)
+	}
+	return nil
 }
 
 func (s *userStore) UpdatePassword(ctx context.Context, id uuid.UUID, passwordHash string) error {
@@ -67,18 +74,22 @@ func (s *userStore) UpdatePassword(ctx context.Context, id uuid.UUID, passwordHa
 }
 
 func (s *userStore) IncrementCredentialVersion(ctx context.Context, userID uuid.UUID) (uint32, error) {
-	res := s.db.WithContext(ctx).Model(&db.User{}).Where("id = ?", userID).Update("credential_version", gorm.Expr("credential_version + 1"))
-	if res.Error != nil {
-		return 0, res.Error
-	}
-	if res.RowsAffected == 0 {
-		return 0, nil
-	}
-	var u db.User
-	if err := s.db.WithContext(ctx).Select("credential_version").Where("id = ?", userID).First(&u).Error; err != nil {
+	var newVersion uint32
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var u db.User
+		if err := lockForUpdate(tx).Select("credential_version").Where("id = ?", userID).First(&u).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return nil
+			}
+			return err
+		}
+		newVersion = uint32(u.CredentialVersion + 1)
+		return tx.Model(&db.User{}).Where("id = ?", userID).Update("credential_version", newVersion).Error
+	})
+	if err != nil {
 		return 0, err
 	}
-	return uint32(u.CredentialVersion), nil
+	return newVersion, nil
 }
 
 func (s *userStore) SetEmailVerified(ctx context.Context, id uuid.UUID, verified bool) error {
