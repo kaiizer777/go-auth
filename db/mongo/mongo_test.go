@@ -660,6 +660,16 @@ func TestMongoStore_CanceledContext_AllMethods(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
+	assertCanceled := func(name string, err error) {
+		t.Helper()
+		if err == nil {
+			t.Fatalf("%s expected error on canceled context, got nil", name)
+		}
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("%s expected context.Canceled, got: %v", name, err)
+		}
+	}
+
 	uid := uuid.New()
 	user := &db.User{
 		ID:        uid,
@@ -668,15 +678,19 @@ func TestMongoStore_CanceledContext_AllMethods(t *testing.T) {
 		UpdatedAt: time.Now().UTC(),
 	}
 
-	_ = store.Users().Create(ctx, user)
-	_, _ = store.Users().GetByID(ctx, uid)
-	_, _ = store.Users().GetByIDForUpdate(ctx, uid)
-	_, _ = store.Users().GetByEmail(ctx, "test@example.com")
-	_ = store.Users().Update(ctx, user)
-	_ = store.Users().UpdatePassword(ctx, uid, "newpass")
-	_, _ = store.Users().IncrementCredentialVersion(ctx, uid)
-	_ = store.Users().SetEmailVerified(ctx, uid, true)
-	_ = store.Users().Delete(ctx, uid)
+	assertCanceled("Users.Create", store.Users().Create(ctx, user))
+	_, err = store.Users().GetByID(ctx, uid)
+	assertCanceled("Users.GetByID", err)
+	_, err = store.Users().GetByIDForUpdate(ctx, uid)
+	assertCanceled("Users.GetByIDForUpdate", err)
+	_, err = store.Users().GetByEmail(ctx, "test@example.com")
+	assertCanceled("Users.GetByEmail", err)
+	assertCanceled("Users.Update", store.Users().Update(ctx, user))
+	assertCanceled("Users.UpdatePassword", store.Users().UpdatePassword(ctx, uid, "newpass"))
+	_, err = store.Users().IncrementCredentialVersion(ctx, uid)
+	assertCanceled("Users.IncrementCredentialVersion", err)
+	assertCanceled("Users.SetEmailVerified", store.Users().SetEmailVerified(ctx, uid, true))
+	assertCanceled("Users.Delete", store.Users().Delete(ctx, uid))
 
 	sess := &db.Session{
 		ID:                uuid.New(),
@@ -687,39 +701,51 @@ func TestMongoStore_CanceledContext_AllMethods(t *testing.T) {
 		LastActiveAt:      time.Now().UTC(),
 		AbsoluteExpiresAt: time.Now().Add(time.Hour),
 	}
-	_ = store.Sessions().Create(ctx, sess)
-	_, _ = store.Sessions().GetByID(ctx, sess.ID)
-	_, _ = store.Sessions().GetByIDHash(ctx, "idhash")
-	_, _ = store.Sessions().ListByUserID(ctx, uid)
-	_ = store.Sessions().UpdateLastActive(ctx, sess.ID, time.Now().UTC())
-	_ = store.Sessions().Delete(ctx, sess.ID)
-	_, _ = store.Sessions().DeleteByIDHash(ctx, "idhash")
-	_, _ = store.Sessions().DeleteIfStale(ctx, sess.ID, time.Now().UTC())
-	_, _ = store.Sessions().DeleteIfStaleByIDHash(ctx, "idhash", time.Now().UTC())
-	_ = store.Sessions().DeleteByUserID(ctx, uid)
-	_, _ = store.Sessions().DeleteExpired(ctx, time.Now().UTC(), time.Now().UTC())
-	_ = store.Sessions().DeleteExpiredByUserID(ctx, uid, time.Now().UTC(), time.Now().UTC())
+	assertCanceled("Sessions.Create", store.Sessions().Create(ctx, sess))
+	_, err = store.Sessions().GetByID(ctx, sess.ID)
+	assertCanceled("Sessions.GetByID", err)
+	_, err = store.Sessions().GetByIDHash(ctx, "idhash")
+	assertCanceled("Sessions.GetByIDHash", err)
+	_, err = store.Sessions().ListByUserID(ctx, uid)
+	assertCanceled("Sessions.ListByUserID", err)
+	assertCanceled("Sessions.UpdateLastActive", store.Sessions().UpdateLastActive(ctx, sess.ID, time.Now().UTC()))
+	assertCanceled("Sessions.Delete", store.Sessions().Delete(ctx, sess.ID))
+	_, err = store.Sessions().DeleteByIDHash(ctx, "idhash")
+	assertCanceled("Sessions.DeleteByIDHash", err)
+	_, err = store.Sessions().DeleteIfStale(ctx, sess.ID, time.Now().UTC())
+	assertCanceled("Sessions.DeleteIfStale", err)
+	_, err = store.Sessions().DeleteIfStaleByIDHash(ctx, "idhash", time.Now().UTC())
+	assertCanceled("Sessions.DeleteIfStaleByIDHash", err)
+	assertCanceled("Sessions.DeleteByUserID", store.Sessions().DeleteByUserID(ctx, uid))
+	_, err = store.Sessions().DeleteExpired(ctx, time.Now().UTC(), time.Now().UTC())
+	assertCanceled("Sessions.DeleteExpired", err)
+	assertCanceled("Sessions.DeleteExpiredByUserID", store.Sessions().DeleteExpiredByUserID(ctx, uid, time.Now().UTC(), time.Now().UTC()))
 
 	vtok := &db.VerificationToken{
 		TokenHash: []byte("vtok"),
 		UserID:    uid,
 		ExpiresAt: time.Now().Add(time.Hour),
 	}
-	_ = store.VerificationTokens().Create(ctx, vtok)
-	_, _ = store.VerificationTokens().GetByTokenHash(ctx, []byte("vtok"))
-	_, _ = store.VerificationTokens().Delete(ctx, []byte("vtok"))
-	_ = store.VerificationTokens().DeleteByUserID(ctx, uid)
+	assertCanceled("VerificationTokens.Create", store.VerificationTokens().Create(ctx, vtok))
+	_, err = store.VerificationTokens().GetByTokenHash(ctx, []byte("vtok"))
+	assertCanceled("VerificationTokens.GetByTokenHash", err)
+	_, err = store.VerificationTokens().Delete(ctx, []byte("vtok"))
+	assertCanceled("VerificationTokens.Delete", err)
+	assertCanceled("VerificationTokens.DeleteByUserID", store.VerificationTokens().DeleteByUserID(ctx, uid))
 
 	rtok := &db.PasswordResetToken{
 		TokenHash: []byte("rtok"),
 		UserID:    uid,
 		ExpiresAt: time.Now().Add(time.Hour),
 	}
-	_ = store.PasswordResetTokens().Create(ctx, rtok)
-	_, _ = store.PasswordResetTokens().GetByTokenHash(ctx, []byte("rtok"))
-	_, _ = store.PasswordResetTokens().Delete(ctx, []byte("rtok"))
-	_ = store.PasswordResetTokens().DeleteByUserID(ctx, uid)
-	_, _ = store.PasswordResetTokens().ConsumeToken(ctx, []byte("rtok"), time.Now().UTC())
+	assertCanceled("PasswordResetTokens.Create", store.PasswordResetTokens().Create(ctx, rtok))
+	_, err = store.PasswordResetTokens().GetByTokenHash(ctx, []byte("rtok"))
+	assertCanceled("PasswordResetTokens.GetByTokenHash", err)
+	_, err = store.PasswordResetTokens().Delete(ctx, []byte("rtok"))
+	assertCanceled("PasswordResetTokens.Delete", err)
+	assertCanceled("PasswordResetTokens.DeleteByUserID", store.PasswordResetTokens().DeleteByUserID(ctx, uid))
+	_, err = store.PasswordResetTokens().ConsumeToken(ctx, []byte("rtok"), time.Now().UTC())
+	assertCanceled("PasswordResetTokens.ConsumeToken", err)
 
 	acc := &db.OAuthAccount{
 		ID:             uuid.New(),
@@ -727,28 +753,35 @@ func TestMongoStore_CanceledContext_AllMethods(t *testing.T) {
 		ProviderID:     "gh",
 		ProviderUserID: "123",
 	}
-	_ = store.OAuthAccounts().Create(ctx, acc)
-	_, _ = store.OAuthAccounts().GetByProvider(ctx, "gh", "123")
-	_, _ = store.OAuthAccounts().GetByUserID(ctx, uid)
-	_ = store.OAuthAccounts().Delete(ctx, acc.ID)
-	_ = store.OAuthAccounts().DeleteByUserID(ctx, uid)
+	assertCanceled("OAuthAccounts.Create", store.OAuthAccounts().Create(ctx, acc))
+	_, err = store.OAuthAccounts().GetByProvider(ctx, "gh", "123")
+	assertCanceled("OAuthAccounts.GetByProvider", err)
+	_, err = store.OAuthAccounts().GetByUserID(ctx, uid)
+	assertCanceled("OAuthAccounts.GetByUserID", err)
+	assertCanceled("OAuthAccounts.Delete", store.OAuthAccounts().Delete(ctx, acc.ID))
+	assertCanceled("OAuthAccounts.DeleteByUserID", store.OAuthAccounts().DeleteByUserID(ctx, uid))
 
 	sec := &db.TotpSecret{
 		ID:              uuid.New(),
 		UserID:          uid,
 		EncryptedSecret: []byte("sec"),
 	}
-	_ = store.Totp().CreateSecret(ctx, sec)
-	_, _ = store.Totp().GetSecretByUserID(ctx, uid)
-	_, _ = store.Totp().GetSecretByUserIDForUpdate(ctx, uid)
-	_ = store.Totp().EnableSecret(ctx, sec.ID, []byte("[]"))
-	_ = store.Totp().UpdateBackupCodes(ctx, uid, []string{"1"})
-	_ = store.Totp().UpdateBackupCodesJSON(ctx, sec.ID, []byte("[]"))
-	_, _ = store.Totp().UpdateBackupCodesCAS(ctx, uid, []string{"1"}, []string{"2"})
-	_ = store.Totp().DeleteSecret(ctx, uid)
-	_ = store.Totp().DeleteUnconfirmedSecret(ctx, uid)
-	_, _ = store.Totp().IsTotpEnabled(ctx, uid)
-	_, _ = store.Totp().HasUsedCode(ctx, uid, []byte("code"), time.Now().UTC())
+	assertCanceled("Totp.CreateSecret", store.Totp().CreateSecret(ctx, sec))
+	_, err = store.Totp().GetSecretByUserID(ctx, uid)
+	assertCanceled("Totp.GetSecretByUserID", err)
+	_, err = store.Totp().GetSecretByUserIDForUpdate(ctx, uid)
+	assertCanceled("Totp.GetSecretByUserIDForUpdate", err)
+	assertCanceled("Totp.EnableSecret", store.Totp().EnableSecret(ctx, sec.ID, []byte("[]")))
+	assertCanceled("Totp.UpdateBackupCodes", store.Totp().UpdateBackupCodes(ctx, uid, []string{"1"}))
+	assertCanceled("Totp.UpdateBackupCodesJSON", store.Totp().UpdateBackupCodesJSON(ctx, sec.ID, []byte("[]")))
+	_, err = store.Totp().UpdateBackupCodesCAS(ctx, uid, []string{"1"}, []string{"2"})
+	assertCanceled("Totp.UpdateBackupCodesCAS", err)
+	assertCanceled("Totp.DeleteSecret", store.Totp().DeleteSecret(ctx, uid))
+	assertCanceled("Totp.DeleteUnconfirmedSecret", store.Totp().DeleteUnconfirmedSecret(ctx, uid))
+	_, err = store.Totp().IsTotpEnabled(ctx, uid)
+	assertCanceled("Totp.IsTotpEnabled", err)
+	_, err = store.Totp().HasUsedCode(ctx, uid, []byte("code"), time.Now().UTC())
+	assertCanceled("Totp.HasUsedCode", err)
 
 	usedCode := &db.TotpUsedCode{
 		ID:       uuid.New(),
@@ -756,8 +789,8 @@ func TestMongoStore_CanceledContext_AllMethods(t *testing.T) {
 		CodeHash: []byte("code"),
 		UsedAt:   time.Now().UTC(),
 	}
-	_ = store.Totp().RecordUsedCode(ctx, usedCode)
-	_ = store.Totp().PruneUsedCodes(ctx, uid, time.Now().UTC())
+	assertCanceled("Totp.RecordUsedCode", store.Totp().RecordUsedCode(ctx, usedCode))
+	assertCanceled("Totp.PruneUsedCodes", store.Totp().PruneUsedCodes(ctx, uid, time.Now().UTC()))
 
 	tfTok := &db.TwoFactorToken{
 		ID:        uuid.New(),
@@ -765,16 +798,20 @@ func TestMongoStore_CanceledContext_AllMethods(t *testing.T) {
 		TokenHash: []byte("tf"),
 		ExpiresAt: time.Now().Add(time.Hour),
 	}
-	_ = store.Totp().CreateTwoFactorToken(ctx, tfTok)
-	_, _ = store.Totp().GetTwoFactorToken(ctx, []byte("tf"))
-	_, _ = store.Totp().IncrementTwoFactorAttempts(ctx, []byte("tf"), 5, time.Now().UTC())
-	_, _ = store.Totp().ConsumeTwoFactorToken(ctx, []byte("tf"), 5, time.Now().UTC())
-	_, _ = store.Totp().DeleteTwoFactorToken(ctx, tfTok.ID)
-	_ = store.Totp().DeleteTwoFactorTokensByUserID(ctx, uid)
+	assertCanceled("Totp.CreateTwoFactorToken", store.Totp().CreateTwoFactorToken(ctx, tfTok))
+	_, err = store.Totp().GetTwoFactorToken(ctx, []byte("tf"))
+	assertCanceled("Totp.GetTwoFactorToken", err)
+	_, err = store.Totp().IncrementTwoFactorAttempts(ctx, []byte("tf"), 5, time.Now().UTC())
+	assertCanceled("Totp.IncrementTwoFactorAttempts", err)
+	_, err = store.Totp().ConsumeTwoFactorToken(ctx, []byte("tf"), 5, time.Now().UTC())
+	assertCanceled("Totp.ConsumeTwoFactorToken", err)
+	_, err = store.Totp().DeleteTwoFactorToken(ctx, tfTok.ID)
+	assertCanceled("Totp.DeleteTwoFactorToken", err)
+	assertCanceled("Totp.DeleteTwoFactorTokensByUserID", store.Totp().DeleteTwoFactorTokensByUserID(ctx, uid))
 
-	_ = store.Ping(ctx)
-	_ = store.Transaction(ctx, func(txStore db.Store) error {
+	assertCanceled("Ping", store.Ping(ctx))
+	assertCanceled("Transaction", store.Transaction(ctx, func(txStore db.Store) error {
 		return nil
-	})
+	}))
 	_ = store.Close()
 }
