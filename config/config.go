@@ -330,11 +330,7 @@ func DefaultConfig() Config {
 			HSTSPreload:           false,
 		},
 
-		MongoDB: MongoDBConfig{
-			ConnectTimeout:         10 * time.Second,
-			ServerSelectionTimeout: 10 * time.Second,
-			MaxConnIdleTime:        30 * time.Minute,
-		},
+		MongoDB: MongoDBConfig{},
 
 		OAuth: OAuthConfig{
 			StateCookieName:     "oauth_state",

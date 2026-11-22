@@ -1840,3 +1840,60 @@ func TestRedactURL_MySQLPasswordsWithAtSymbol(t *testing.T) {
 		t.Fatalf("Config.String leaked password containing @: %s", cfgStr)
 	}
 }
+
+func TestConfigValidate_DeprecatedMongoOverridesRespected(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.DatabaseType = DatabaseTypeMongoDB
+	cfg.DatabaseURL = "mongodb://localhost:27017/auth"
+	cfg.BaseURL = "http://localhost:8080"
+	cfg.Mongo.ConnectTimeout = 5 * time.Second
+	cfg.Mongo.ServerSelectionTimeout = 3 * time.Second
+	cfg.Mongo.MaxConnIdleTime = 15 * time.Minute
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("unexpected validation error: %v", err)
+	}
+
+	if cfg.MongoDB.ConnectTimeout != 5*time.Second {
+		t.Errorf("got MongoDB.ConnectTimeout %v, want 5s", cfg.MongoDB.ConnectTimeout)
+	}
+	if cfg.MongoDB.ServerSelectionTimeout != 3*time.Second {
+		t.Errorf("got MongoDB.ServerSelectionTimeout %v, want 3s", cfg.MongoDB.ServerSelectionTimeout)
+	}
+	if cfg.MongoDB.MaxConnIdleTime != 15*time.Minute {
+		t.Errorf("got MongoDB.MaxConnIdleTime %v, want 15m", cfg.MongoDB.MaxConnIdleTime)
+	}
+	if cfg.Mongo.ConnectTimeout != 5*time.Second {
+		t.Errorf("got Mongo.ConnectTimeout %v, want 5s", cfg.Mongo.ConnectTimeout)
+	}
+	if cfg.Mongo.ServerSelectionTimeout != 3*time.Second {
+		t.Errorf("got Mongo.ServerSelectionTimeout %v, want 3s", cfg.Mongo.ServerSelectionTimeout)
+	}
+	if cfg.Mongo.MaxConnIdleTime != 15*time.Minute {
+		t.Errorf("got Mongo.MaxConnIdleTime %v, want 15m", cfg.Mongo.MaxConnIdleTime)
+	}
+}
+
+func TestConfigValidate_MongoDBDefaultsAppliedWhenUnset(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.DatabaseType = DatabaseTypeMongoDB
+	cfg.DatabaseURL = "mongodb://localhost:27017/auth"
+	cfg.BaseURL = "http://localhost:8080"
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("unexpected validation error: %v", err)
+	}
+
+	if cfg.MongoDB.ConnectTimeout != 10*time.Second {
+		t.Errorf("got MongoDB.ConnectTimeout %v, want 10s", cfg.MongoDB.ConnectTimeout)
+	}
+	if cfg.MongoDB.ServerSelectionTimeout != 10*time.Second {
+		t.Errorf("got MongoDB.ServerSelectionTimeout %v, want 10s", cfg.MongoDB.ServerSelectionTimeout)
+	}
+	if cfg.MongoDB.MaxConnIdleTime != 30*time.Minute {
+		t.Errorf("got MongoDB.MaxConnIdleTime %v, want 30m", cfg.MongoDB.MaxConnIdleTime)
+	}
+	if cfg.Mongo.ConnectTimeout != 10*time.Second {
+		t.Errorf("got Mongo.ConnectTimeout %v, want 10s", cfg.Mongo.ConnectTimeout)
+	}
+}
