@@ -445,6 +445,9 @@ func (s *service) createUserAndLink(ctx context.Context, providerID string, info
 	userConflict, linkConflict := false, false
 	op := "failed to create oauth user"
 	txErr := s.store.Transaction(ctx, func(txStore db.Store) error {
+		userConflict = false
+		linkConflict = false
+		op = "failed to create oauth user"
 		if err := txStore.Users().Create(ctx, &user); err != nil {
 			userConflict = errors.Is(err, errors.ErrEmailAlreadyExists) ||
 				errors.Is(err, errors.ErrUserAlreadyExists) ||
