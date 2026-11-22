@@ -1409,7 +1409,6 @@ func TestService_ListSessions_DefensivelyFiltersExpiredAndIdle(t *testing.T) {
 	}
 }
 
-
 func TestInvalidateAllUserSessions_BumpsCredentialVersion(t *testing.T) {
 	database := setupTestDB(t)
 	cfg := testConfig()

@@ -367,20 +367,6 @@ func getAvailableAdapterFactories(t *testing.T) []adapterFactory {
 	return factories
 }
 
-func getAvailableAdapters(t *testing.T) []TestAdapter {
-	t.Helper()
-	factories := getAvailableAdapterFactories(t)
-	adapters := make([]TestAdapter, 0, len(factories))
-	for _, f := range factories {
-		adapter, err := f.Setup(t)
-		if err != nil {
-			t.Fatalf("configured %s test backend failed to initialize: %v", f.Name, err)
-		}
-		adapters = append(adapters, adapter)
-	}
-	return adapters
-}
-
 func testMatrix(t *testing.T, fn func(t *testing.T, auth *goauth.Auth, store db.Store)) {
 	t.Helper()
 	factories := getAvailableAdapterFactories(t)

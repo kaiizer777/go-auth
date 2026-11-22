@@ -608,4 +608,3 @@ func TestHandler_WithStore_MountsSessionAndTOTPRoutes(t *testing.T) {
 		t.Errorf("expected TOTP route to be mounted, got 404")
 	}
 }
-

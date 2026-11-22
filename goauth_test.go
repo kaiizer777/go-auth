@@ -958,4 +958,3 @@ func TestNew_MongoDB_NewWithStoreError_ClosesStore(t *testing.T) {
 		t.Fatal("expected store.Close() to be called on initialization failure")
 	}
 }
-
