@@ -82,11 +82,9 @@ func setupOAuthE2EStack(t *testing.T) (http.Handler, *gorm.DB, *oauth.Registry, 
 func TestE2E_FullBrowserOAuthJourneys(t *testing.T) {
 	t.Parallel()
 
-	mockServers, err := oauthmock.NewMockServers()
-	if err != nil {
-		t.Fatalf("NewMockServers failed: %v", err)
-	}
-	defer mockServers.Close()
+	// Journeys use the stub (real loopback HTTP with PKCE binding); production
+	// adapters cannot point at loopback without an exported endpoint override,
+	// which does not exist. Request-shape coverage: oauth/microsoft_test.go.
 
 	// 1. Journey 1: Microsoft Enterprise Login
 	t.Run("journey 1: microsoft enterprise login", func(t *testing.T) {
