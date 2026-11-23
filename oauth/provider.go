@@ -117,8 +117,7 @@ var SupportedProviders = map[string]struct{}{
 }
 
 // NewProvider instantiates a concrete OAuth provider for the given provider slug.
-// Strictly supports the locked Big 3 ("google", "github", "apple"). Deferred providers
-// (e.g. "discord", "microsoft") return CodeOAuthProviderNotFound.
+// Supports all 7 canonical providers ("google", "github", "apple", "microsoft", "facebook", "discord", "x").
 func NewProvider(id string, cfg config.ProviderConfig) (Provider, error) {
 	switch id {
 	case "google":
@@ -127,6 +126,34 @@ func NewProvider(id string, cfg config.ProviderConfig) (Provider, error) {
 		return NewGitHubProvider(cfg), nil
 	case "apple":
 		return NewAppleProvider(cfg), nil
+	case "microsoft":
+		return NewMicrosoftProvider(config.MicrosoftConfig{
+			ClientID:     cfg.ClientID,
+			ClientSecret: cfg.ClientSecret,
+			RedirectURI:  cfg.RedirectURL,
+			Scopes:       cfg.Scopes,
+		}), nil
+	case "facebook":
+		return NewFacebookProvider(config.FacebookConfig{
+			AppID:        cfg.ClientID,
+			AppSecret:    cfg.ClientSecret,
+			RedirectURI:  cfg.RedirectURL,
+			Scopes:       cfg.Scopes,
+		}), nil
+	case "discord":
+		return NewDiscordProvider(config.DiscordConfig{
+			ClientID:     cfg.ClientID,
+			ClientSecret: cfg.ClientSecret,
+			RedirectURI:  cfg.RedirectURL,
+			Scopes:       cfg.Scopes,
+		}), nil
+	case "x":
+		return NewXProvider(config.XConfig{
+			ClientID:     cfg.ClientID,
+			ClientSecret: cfg.ClientSecret,
+			RedirectURI:  cfg.RedirectURL,
+			Scopes:       cfg.Scopes,
+		}), nil
 	default:
 		return nil, errors.New(errors.CodeOAuthProviderNotFound, "unsupported or deferred oauth provider: "+id, nil)
 	}

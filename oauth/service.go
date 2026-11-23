@@ -36,8 +36,18 @@ type Service interface {
 type service struct {
 	store      db.Store
 	sessionSvc session.Service
+	registry   Registry
 	providers  map[string]Provider
 	cfg        *config.Config
+}
+
+// NewServiceWithRegistry wires the OAuth linking engine using an abstract db.Store and dynamic Registry.
+func NewServiceWithRegistry(store db.Store, sessionSvc session.Service, registry Registry, cfg *config.Config) Service {
+	if cfg == nil {
+		defaultCfg := config.DefaultConfig()
+		cfg = &defaultCfg
+	}
+	return &service{store: store, sessionSvc: sessionSvc, registry: registry, cfg: cfg}
 }
 
 // NewServiceWithStore wires the OAuth linking engine using an abstract db.Store.
@@ -75,11 +85,18 @@ func (s *service) providerFor(providerID string) (Provider, error) {
 	if _, ok := SupportedProviders[providerID]; !ok {
 		return nil, errors.ErrOAuthProviderNotFound
 	}
-	p, ok := s.providers[providerID]
-	if !ok || p == nil {
-		return nil, errors.ErrOAuthProviderNotFound
+	if s.registry != nil {
+		p, err := s.registry.Get(providerID)
+		if err == nil && p != nil {
+			return p, nil
+		}
 	}
-	return p, nil
+	if s.providers != nil {
+		if p, ok := s.providers[providerID]; ok && p != nil {
+			return p, nil
+		}
+	}
+	return nil, errors.ErrOAuthProviderNotFound
 }
 
 // InitiateFlow generates PKCE, persists verifier+state in the signed state

@@ -144,4 +144,25 @@ func TestProviderRegistry(t *testing.T) {
 			t.Fatal("expected registered providers in list")
 		}
 	})
+
+	t.Run("service wires dynamic registry lookup", func(t *testing.T) {
+		reg := NewRegistry()
+		_ = reg.Register(&dummyProvider{id: "google"})
+
+		svc := NewServiceWithRegistry(nil, nil, reg, nil)
+		s, ok := svc.(*service)
+		if !ok {
+			t.Fatalf("expected *service, got %T", svc)
+		}
+
+		p, err := s.providerFor("google")
+		if err != nil || p == nil || p.ID() != "google" {
+			t.Fatalf("expected google provider from registry, got %v, err=%v", p, err)
+		}
+
+		_, err = s.providerFor("x")
+		if !errors.Is(err, errors.ErrOAuthProviderNotFound) {
+			t.Fatalf("expected ErrOAuthProviderNotFound for unregistered x, got %v", err)
+		}
+	})
 }

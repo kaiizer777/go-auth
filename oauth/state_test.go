@@ -161,6 +161,34 @@ func TestSetStateCookie(t *testing.T) {
 			t.Fatalf("len(state) = %d; want %d", len(state), stateTokenLen)
 		}
 	})
+
+	t.Run("records and verifies optional user id for authenticated linking", func(t *testing.T) {
+		t.Parallel()
+		rec := httptest.NewRecorder()
+		cfg := testStateConfig()
+		targetUID := "77777777-8888-9999-aaaa-bbbbccccdddd"
+
+		state, err := SetStateCookieWithUser(rec, cfg, "discord", "v-code", "/settings", targetUID)
+		if err != nil {
+			t.Fatalf("SetStateCookieWithUser failed: %v", err)
+		}
+
+		req := httptest.NewRequest(http.MethodGet, "/auth/oauth/discord/callback?state="+state, nil)
+		for _, c := range rec.Result().Cookies() {
+			req.AddCookie(c)
+		}
+
+		payload, err := ValidateState(httptest.NewRecorder(), req, cfg, "discord", state)
+		if err != nil {
+			t.Fatalf("ValidateState failed: %v", err)
+		}
+		if payload.UserID != targetUID {
+			t.Fatalf("expected UserID %q, got %q", targetUID, payload.UserID)
+		}
+		if payload.RedirectURL != "/settings" {
+			t.Fatalf("expected RedirectURL '/settings', got %q", payload.RedirectURL)
+		}
+	})
 }
 
 func TestValidateState(t *testing.T) {

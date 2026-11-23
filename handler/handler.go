@@ -31,6 +31,7 @@ type Handler struct {
 	sessionSvc      session.Service
 	oauthSvc        oauth.Service
 	oauthProviders  map[string]oauth.Provider
+	oauthRegistry   oauth.Registry
 	sessHandler     *SessionHandler
 	loginLimiter    *ratelimit.Limiter
 	signupLimiter   *ratelimit.Limiter
@@ -72,6 +73,14 @@ func WithOAuthService(svc oauth.Service, providers map[string]oauth.Provider) Op
 	return func(h *Handler) {
 		h.oauthSvc = svc
 		h.oauthProviders = providers
+	}
+}
+
+// WithOAuthRegistry attaches the OAuth linking service and dynamic provider registry.
+func WithOAuthRegistry(svc oauth.Service, registry oauth.Registry) Option {
+	return func(h *Handler) {
+		h.oauthSvc = svc
+		h.oauthRegistry = registry
 	}
 }
 

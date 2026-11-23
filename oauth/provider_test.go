@@ -46,9 +46,9 @@ func TestNewProvider(t *testing.T) {
 	t.Parallel()
 	cfg := config.ProviderConfig{ClientID: "id", ClientSecret: "secret", RedirectURL: "https://app.example.com/cb"}
 
-	t.Run("big 3 resolve with matching IDs", func(t *testing.T) {
+	t.Run("all 7 providers resolve with matching IDs", func(t *testing.T) {
 		t.Parallel()
-		for _, id := range []string{"google", "github", "apple"} {
+		for _, id := range []string{"google", "github", "apple", "microsoft", "facebook", "discord", "x"} {
 			p, err := NewProvider(id, cfg)
 			if err != nil {
 				t.Errorf("NewProvider(%q) = %v", id, err)
@@ -62,7 +62,7 @@ func TestNewProvider(t *testing.T) {
 
 	t.Run("deferred and unknown reject with 404", func(t *testing.T) {
 		t.Parallel()
-		for _, id := range []string{"discord", "microsoft", "facebook", ""} {
+		for _, id := range []string{"slack", "gitlab", "twitch", "unknown", ""} {
 			p, err := NewProvider(id, cfg)
 			if p != nil {
 				t.Errorf("NewProvider(%q) provider = %v; want nil", id, p)
