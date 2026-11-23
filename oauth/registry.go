@@ -1,7 +1,9 @@
 package oauth
 
 import (
+	"fmt"
 	"slices"
+	"strings"
 	"sync"
 
 	"github.com/kaiizer777/go-auth/errors"
@@ -35,8 +37,14 @@ func (r *providerRegistry) Register(p Provider) error {
 	if p == nil {
 		return errors.New(errors.CodeInvalidConfig, "cannot register nil oauth provider", nil)
 	}
+	if strings.TrimSpace(p.ID()) == "" {
+		return errors.New(errors.CodeInvalidConfig, "cannot register provider with empty id", nil)
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if _, exists := r.providers[p.ID()]; exists {
+		return errors.New(errors.CodeInvalidConfig, fmt.Sprintf("oauth provider %q already registered", p.ID()), nil)
+	}
 	r.providers[p.ID()] = p
 	return nil
 }

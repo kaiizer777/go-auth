@@ -46,6 +46,36 @@ func TestProviderRegistry(t *testing.T) {
 		}
 	})
 
+	t.Run("rejects empty or whitespace provider id", func(t *testing.T) {
+		reg := NewRegistry()
+		for _, invalidID := range []string{"", "   ", "\t\n"} {
+			err := reg.Register(&dummyProvider{id: invalidID})
+			if err == nil {
+				t.Fatalf("expected error for empty/whitespace id %q, got nil", invalidID)
+			}
+			var appErr *errors.Error
+			if !errors.As(err, &appErr) || appErr.Code() != errors.CodeInvalidConfig {
+				t.Fatalf("expected CodeInvalidConfig, got %v", err)
+			}
+		}
+	})
+
+	t.Run("rejects duplicate provider registration", func(t *testing.T) {
+		reg := NewRegistry()
+		p := &dummyProvider{id: "google"}
+		if err := reg.Register(p); err != nil {
+			t.Fatalf("unexpected error registering first provider: %v", err)
+		}
+		err := reg.Register(p)
+		if err == nil {
+			t.Fatal("expected error on duplicate registration, got nil")
+		}
+		var appErr *errors.Error
+		if !errors.As(err, &appErr) || appErr.Code() != errors.CodeInvalidConfig {
+			t.Fatalf("expected CodeInvalidConfig, got %v", err)
+		}
+	})
+
 	t.Run("register and get", func(t *testing.T) {
 		reg := NewRegistry()
 		p1 := &dummyProvider{id: "google"}
