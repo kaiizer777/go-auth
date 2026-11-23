@@ -37,6 +37,7 @@ type MockOAuthServers struct {
 	MSRolloverExp    string
 	MSRolloverActive atomic.Bool
 	MSJWKSRequests   atomic.Int32
+	MSKeyIssuer      string // issuer advertised on the primary JWKS entry, e.g. ".../{tenantid}/v2.0"
 	MSTenantID       string
 	MSEmail          string
 	MSName           string
@@ -140,10 +141,10 @@ func NewMockServers() (*MockOAuthServers, error) {
 		case "/keys":
 			m.MSJWKSRequests.Add(1)
 			keys := []map[string]any{
-				BuildJWK(m.MSKeyID, m.MSModulus, m.MSExponent),
+				BuildJWKWithIssuer(m.MSKeyID, m.MSModulus, m.MSExponent, m.MSKeyIssuer),
 			}
 			if m.MSRolloverActive.Load() {
-				keys = append(keys, BuildJWK(m.MSRolloverKeyID, m.MSRolloverMod, m.MSRolloverExp))
+				keys = append(keys, BuildJWKWithIssuer(m.MSRolloverKeyID, m.MSRolloverMod, m.MSRolloverExp, m.MSKeyIssuer))
 			}
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(map[string]any{"keys": keys})

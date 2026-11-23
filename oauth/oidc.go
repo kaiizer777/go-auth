@@ -38,13 +38,14 @@ type OIDCDiscovery struct {
 
 // JWKKey represents a single RSA JSON Web Key.
 type JWKKey struct {
-	Kty string   `json:"kty"`
-	Use string   `json:"use"`
-	Kid string   `json:"kid"`
-	Alg string   `json:"alg"`
-	N   string   `json:"n"`
-	E   string   `json:"e"`
-	X5c []string `json:"x5c,omitempty"`
+	Kty    string   `json:"kty"`
+	Use    string   `json:"use"`
+	Kid    string   `json:"kid"`
+	Alg    string   `json:"alg"`
+	N      string   `json:"n"`
+	E      string   `json:"e"`
+	Issuer string   `json:"issuer,omitempty"` // optional issuer/tenant scope advertised per key
+	X5c    []string `json:"x5c,omitempty"`
 }
 
 // JWKDoc represents a JSON Web Key Set document.
@@ -52,9 +53,15 @@ type JWKDoc struct {
 	Keys []JWKKey `json:"keys"`
 }
 
-// JWKSKeyRetriever retrieves an RSA public key by kid.
+// JWKSKey is a signing key together with the issuer scope advertised by its JWKS entry.
+type JWKSKey struct {
+	Key    *rsa.PublicKey
+	Issuer string
+}
+
+// JWKSKeyRetriever retrieves a signing key and its issuer scope by kid.
 type JWKSKeyRetriever interface {
-	GetKey(ctx context.Context, kid string) (*rsa.PublicKey, error)
+	GetKey(ctx context.Context, kid string) (JWKSKey, error)
 }
 
 // JWKSManager manages dynamic caching, singleflight deduplication, and rollover refresh for JWKS.
@@ -64,7 +71,7 @@ type JWKSManager struct {
 	ttl     time.Duration
 
 	mu      sync.RWMutex
-	keys    map[string]*rsa.PublicKey
+	keys    map[string]JWKSKey
 	expires time.Time
 	gen     uint64
 	sf      singleflight.Group
@@ -82,12 +89,12 @@ func NewJWKSManager(jwksURL string, client *http.Client, ttl time.Duration) *JWK
 		jwksURL: jwksURL,
 		client:  client,
 		ttl:     ttl,
-		keys:    make(map[string]*rsa.PublicKey),
+		keys:    make(map[string]JWKSKey),
 	}
 }
 
-// GetKey retrieves the RSA public key for kid, refreshing if missing or expired.
-func (m *JWKSManager) GetKey(ctx context.Context, kid string) (*rsa.PublicKey, error) {
+// GetKey retrieves the signing key for kid, refreshing if missing or expired.
+func (m *JWKSManager) GetKey(ctx context.Context, kid string) (JWKSKey, error) {
 	m.mu.RLock()
 	key, ok := m.keys[kid]
 	fresh := time.Now().Before(m.expires)
@@ -108,7 +115,7 @@ func (m *JWKSManager) GetKey(ctx context.Context, kid string) (*rsa.PublicKey, e
 		return nil, m.refresh(ctx)
 	})
 	if err != nil {
-		return nil, err
+		return JWKSKey{}, err
 	}
 
 	m.mu.RLock()
@@ -129,7 +136,7 @@ func (m *JWKSManager) GetKey(ctx context.Context, kid string) (*rsa.PublicKey, e
 		return nil, m.refresh(ctx)
 	})
 	if err != nil {
-		return nil, err
+		return JWKSKey{}, err
 	}
 
 	m.mu.RLock()
@@ -137,7 +144,7 @@ func (m *JWKSManager) GetKey(ctx context.Context, kid string) (*rsa.PublicKey, e
 	if key, ok := m.keys[kid]; ok {
 		return key, nil
 	}
-	return nil, errors.New(errors.CodeOAuthIDTokenInvalid, fmt.Sprintf("signing key with kid %q not found in jwks", kid), nil)
+	return JWKSKey{}, errors.New(errors.CodeOAuthIDTokenInvalid, fmt.Sprintf("signing key with kid %q not found in jwks", kid), nil)
 }
 
 func (m *JWKSManager) refresh(ctx context.Context) error {
@@ -170,7 +177,7 @@ func (m *JWKSManager) refresh(ctx context.Context) error {
 		return errors.New(errors.CodeOAuthProviderError, "oauth provider returned invalid jwks response", err)
 	}
 
-	parsedKeys := make(map[string]*rsa.PublicKey, len(doc.Keys))
+	parsedKeys := make(map[string]JWKSKey, len(doc.Keys))
 	for _, k := range doc.Keys {
 		if k.Kid == "" {
 			continue
@@ -180,7 +187,7 @@ func (m *JWKSManager) refresh(ctx context.Context) error {
 		}
 		pubKey, ok := parseRSAPublicKey(k.N, k.E)
 		if ok {
-			parsedKeys[k.Kid] = pubKey
+			parsedKeys[k.Kid] = JWKSKey{Key: pubKey, Issuer: k.Issuer}
 		}
 	}
 
@@ -286,6 +293,9 @@ func VerifyRS256JWT(ctx context.Context, rawJWT string, keyRetriever JWKSKeyRetr
 	if err != nil {
 		return nil, err
 	}
+	if pubKey.Key == nil {
+		return nil, errors.New(errors.CodeOAuthIDTokenInvalid, fmt.Sprintf("signing key with kid %q has no key material", header.Kid), nil)
+	}
 
 	sigBytes, err := base64.RawURLEncoding.DecodeString(parts[2])
 	if err != nil {
@@ -293,7 +303,7 @@ func VerifyRS256JWT(ctx context.Context, rawJWT string, keyRetriever JWKSKeyRetr
 	}
 
 	digest := sha256.Sum256([]byte(parts[0] + "." + parts[1]))
-	if err := rsa.VerifyPKCS1v15(pubKey, crypto.SHA256, digest[:], sigBytes); err != nil {
+	if err := rsa.VerifyPKCS1v15(pubKey.Key, crypto.SHA256, digest[:], sigBytes); err != nil {
 		return nil, errors.New(errors.CodeOAuthIDTokenInvalid, "jwt signature verification failed", err)
 	}
 

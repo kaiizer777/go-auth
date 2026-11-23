@@ -122,7 +122,7 @@ func TestOIDC_DiscoveryAndJWKS(t *testing.T) {
 		if err != nil {
 			t.Fatalf("failed to get key: %v", err)
 		}
-		if key.N.Cmp(privKey.N) != 0 {
+		if key.Key.N.Cmp(privKey.N) != 0 {
 			t.Fatalf("modulus mismatch")
 		}
 
@@ -208,7 +208,7 @@ func TestOIDC_DiscoveryAndJWKS(t *testing.T) {
 		if err != nil {
 			t.Fatalf("failed to get sig key: %v", err)
 		}
-		if sigKey.N.Cmp(privKey.N) != 0 {
+		if sigKey.Key.N.Cmp(privKey.N) != 0 {
 			t.Fatalf("modulus mismatch")
 		}
 		_ = privKeyEnc
