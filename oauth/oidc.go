@@ -11,6 +11,7 @@ import (
 	"io"
 	"math/big"
 	"net/http"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -317,5 +318,46 @@ func VerifyRS256JWT(ctx context.Context, rawJWT string, keyRetriever JWKSKeyRetr
 		return nil, errors.New(errors.CodeOAuthIDTokenInvalid, "invalid jwt payload json", err)
 	}
 
+	if err := verifyKeyIssuer(pubKey, claims); err != nil {
+		return nil, err
+	}
+
 	return claims, nil
+}
+
+// issuerTenantPlaceholder matches Microsoft's templated per-key issuer, e.g. "{tenantid}".
+var issuerTenantPlaceholder = regexp.MustCompile(`(?i)\{tenantid\}`)
+
+// verifyKeyIssuer enforces the key↔issuer binding advertised by the JWKS document.
+// It runs only after the signature verified, so the token's iss is authenticated.
+//
+// Comparison rule:
+//  1. An empty key issuer means the document does not scope the key: accept.
+//  2. A templated key issuer resolves "{tenantid}" with the token's tid claim. Any
+//     placeholder that stays unresolved cannot be evaluated, so the binding is
+//     skipped rather than guessed — a template must not cause false rejections.
+//  3. A concrete key issuer must equal the token's iss exactly; an absent iss on a
+//     concrete-issuer key is rejected, never silently accepted.
+func verifyKeyIssuer(key JWKSKey, claims map[string]any) error {
+	if key.Issuer == "" {
+		return nil
+	}
+
+	expected := key.Issuer
+	if strings.Contains(expected, "{") {
+		tid, _ := claims["tid"].(string)
+		if tid == "" {
+			return nil
+		}
+		expected = issuerTenantPlaceholder.ReplaceAllString(expected, tid)
+		if strings.Contains(expected, "{") {
+			return nil
+		}
+	}
+
+	iss, _ := claims["iss"].(string)
+	if iss != expected {
+		return errors.New(errors.CodeOAuthIDTokenInvalid, fmt.Sprintf("id_token issuer %q does not match signing key issuer %q", iss, expected), nil)
+	}
+	return nil
 }

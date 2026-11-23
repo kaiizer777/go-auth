@@ -215,6 +215,71 @@ func TestOIDC_DiscoveryAndJWKS(t *testing.T) {
 	})
 }
 
+func TestVerifyRS256JWT_KeyIssuerBinding(t *testing.T) {
+	const (
+		tenantAIssuer = "https://login.microsoftonline.com/tenant-a/v2.0"
+		tenantBIssuer = "https://login.microsoftonline.com/tenant-b/v2.0"
+		templated     = "https://login.microsoftonline.com/{tenantid}/v2.0"
+	)
+
+	privKey, nRaw, eRaw := generateTestRSAKey(t)
+	ctx := context.Background()
+
+	newManager := func(t *testing.T, issuer string) *JWKSManager {
+		t.Helper()
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_ = json.NewEncoder(w).Encode(JWKDoc{Keys: []JWKKey{{
+				Kty: "RSA", Use: "sig", Kid: "k1", Alg: "RS256", N: nRaw, E: eRaw, Issuer: issuer,
+			}}})
+		}))
+		t.Cleanup(srv.Close)
+		return NewJWKSManager(srv.URL, srv.Client(), time.Hour)
+	}
+
+	tests := []struct {
+		name      string
+		keyIssuer string
+		iss       string
+		tid       string
+		wantErr   bool
+	}{
+		{name: "matching concrete issuer", keyIssuer: tenantAIssuer, iss: tenantAIssuer, tid: "tenant-a"},
+		{name: "foreign concrete issuer", keyIssuer: tenantAIssuer, iss: tenantBIssuer, tid: "tenant-b", wantErr: true},
+		{name: "templated issuer resolved by tid", keyIssuer: templated, iss: tenantAIssuer, tid: "tenant-a"},
+		{name: "templated issuer rejects iss that disagrees with resolved tid", keyIssuer: templated, iss: tenantBIssuer, tid: "tenant-a", wantErr: true},
+		{name: "unresolvable template is not enforced", keyIssuer: "https://login.example.com/{unknown}/v2.0", iss: tenantAIssuer, tid: "tenant-a"},
+		{name: "absent key issuer is not enforced", keyIssuer: "", iss: tenantAIssuer, tid: "tenant-a"},
+		{name: "concrete issuer with missing token issuer", keyIssuer: tenantAIssuer, iss: "", tid: "tenant-a", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mgr := newManager(t, tt.keyIssuer)
+			rawJWT := signRS256JWT(t, privKey, "k1", map[string]any{
+				"iss": tt.iss,
+				"tid": tt.tid,
+				"sub": "user-1",
+				"aud": "client-1",
+			})
+
+			_, err := VerifyRS256JWT(ctx, rawJWT, mgr)
+			if !tt.wantErr {
+				if err != nil {
+					t.Fatalf("verification failed: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("expected issuer binding rejection, got nil")
+			}
+			var appErr *errors.Error
+			if !errors.As(err, &appErr) || appErr.Code() != errors.CodeOAuthIDTokenInvalid {
+				t.Fatalf("expected CodeOAuthIDTokenInvalid, got %v", err)
+			}
+		})
+	}
+}
+
 func TestMicrosoftProvider(t *testing.T) {
 	privKey, nRaw, eRaw := generateTestRSAKey(t)
 	var jwksRequests atomic.Int32
