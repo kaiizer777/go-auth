@@ -25,6 +25,10 @@ const (
 	defaultJWKSTTL          = 24 * time.Hour
 	minRSAModulusBits       = 2048
 	maxRSAExponent          = 1<<31 - 1
+	// jwksStaleGracePeriod caps how long expired keys stay usable when refresh fails.
+	jwksStaleGracePeriod = time.Hour
+	// unknownKidCooldown caps negative caching for kids still missing after a refresh.
+	unknownKidCooldown = time.Minute
 )
 
 // OIDCDiscovery represents parsed metadata from /.well-known/openid-configuration.
@@ -68,6 +72,9 @@ type JWKSManager struct {
 	expires time.Time
 	gen     uint64
 	sf      singleflight.Group
+	// missCooldown, when in the future, skips upstream fetch for kids
+	// already confirmed missing; guarded by mu.
+	missCooldown time.Time
 }
 
 // NewJWKSManager constructs a thread-safe JWKS manager.
@@ -87,17 +94,23 @@ func NewJWKSManager(jwksURL string, client *http.Client, ttl time.Duration) *JWK
 }
 
 // GetKey retrieves the RSA public key for kid, refreshing if missing or expired.
+// A failed refresh serves last-known-good keys within jwksStaleGracePeriod;
+// kids confirmed missing are negatively cached for unknownKidCooldown.
 func (m *JWKSManager) GetKey(ctx context.Context, kid string) (*rsa.PublicKey, error) {
 	m.mu.RLock()
 	key, ok := m.keys[kid]
 	fresh := time.Now().Before(m.expires)
+	cooldown := time.Now().Before(m.missCooldown)
 	m.mu.RUnlock()
 	if ok && fresh {
 		return key, nil
 	}
+	if !ok && cooldown {
+		return nil, errors.New(errors.CodeOAuthIDTokenInvalid, fmt.Sprintf("signing key with kid %q not found in jwks", kid), nil)
+	}
 
-	// Singleflight deduplication across concurrent cache misses
-	_, err, _ := m.sf.Do("jwks_refresh", func() (any, error) {
+	// Single flight collapses concurrent misses into one upstream fetch.
+	_, err, _ := m.sf.Do("jwks_fetch", func() (any, error) {
 		m.mu.RLock()
 		_, ok := m.keys[kid]
 		fresh := time.Now().Before(m.expires)
@@ -107,37 +120,28 @@ func (m *JWKSManager) GetKey(ctx context.Context, kid string) (*rsa.PublicKey, e
 		}
 		return nil, m.refresh(ctx)
 	})
-	if err != nil {
-		return nil, err
-	}
-
-	m.mu.RLock()
-	if key, ok := m.keys[kid]; ok {
-		m.mu.RUnlock()
-		return key, nil
-	}
-	m.mu.RUnlock()
-
-	// If missing after joiner flight, refresh under singleflight deduplication to avoid stampedes
-	_, err, _ = m.sf.Do("jwks_rollover_refresh", func() (any, error) {
+	if err == nil {
 		m.mu.RLock()
-		if _, ok := m.keys[kid]; ok {
-			m.mu.RUnlock()
-			return nil, nil
-		}
+		key, ok := m.keys[kid]
 		m.mu.RUnlock()
-		return nil, m.refresh(ctx)
-	})
-	if err != nil {
-		return nil, err
+		if ok {
+			return key, nil
+		}
+		m.mu.Lock()
+		m.missCooldown = time.Now().Add(unknownKidCooldown)
+		m.mu.Unlock()
+		return nil, errors.New(errors.CodeOAuthIDTokenInvalid, fmt.Sprintf("signing key with kid %q not found in jwks", kid), nil)
 	}
 
+	refreshErr := err
 	m.mu.RLock()
-	defer m.mu.RUnlock()
-	if key, ok := m.keys[kid]; ok {
+	key, ok = m.keys[kid]
+	expired := m.expires
+	m.mu.RUnlock()
+	if ok && time.Now().Before(expired.Add(jwksStaleGracePeriod)) {
 		return key, nil
 	}
-	return nil, errors.New(errors.CodeOAuthIDTokenInvalid, fmt.Sprintf("signing key with kid %q not found in jwks", kid), nil)
+	return nil, refreshErr
 }
 
 func (m *JWKSManager) refresh(ctx context.Context) error {

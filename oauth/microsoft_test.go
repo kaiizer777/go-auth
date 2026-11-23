@@ -215,6 +215,67 @@ func TestOIDC_DiscoveryAndJWKS(t *testing.T) {
 	})
 }
 
+func TestJWKSManager_UnknownKidSingleFetch(t *testing.T) {
+	_, nRaw, eRaw := generateTestRSAKey(t)
+	var jwksRequests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		jwksRequests.Add(1)
+		_ = json.NewEncoder(w).Encode(JWKDoc{Keys: []JWKKey{
+			{Kty: "RSA", Use: "sig", Kid: "key-1", Alg: "RS256", N: nRaw, E: eRaw},
+		}})
+	}))
+	defer server.Close()
+
+	ctx := context.Background()
+	mgr := NewJWKSManager(server.URL, server.Client(), time.Hour)
+
+	if _, err := mgr.GetKey(ctx, "unknown-kid"); err == nil {
+		t.Fatal("expected not-found error for unknown kid, got nil")
+	}
+	if _, err := mgr.GetKey(ctx, "unknown-kid"); err == nil {
+		t.Fatal("expected not-found error for unknown kid, got nil")
+	}
+	if got := jwksRequests.Load(); got != 1 {
+		t.Fatalf("sequential unknown-kid lookups cost %d fetches, want 1", got)
+	}
+}
+
+func TestJWKSManager_RefreshFailureServesStaleWithinGrace(t *testing.T) {
+	_, nRaw, eRaw := generateTestRSAKey(t)
+	var fail atomic.Bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if fail.Load() {
+			http.Error(w, "upstream down", http.StatusBadGateway)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(JWKDoc{Keys: []JWKKey{
+			{Kty: "RSA", Use: "sig", Kid: "key-1", Alg: "RS256", N: nRaw, E: eRaw},
+		}})
+	}))
+	defer server.Close()
+
+	ctx := context.Background()
+	mgr := NewJWKSManager(server.URL, server.Client(), time.Hour)
+	if _, err := mgr.GetKey(ctx, "key-1"); err != nil {
+		t.Fatalf("warm fetch failed: %v", err)
+	}
+	fail.Store(true)
+
+	mgr.mu.Lock()
+	mgr.expires = time.Now().Add(-30 * time.Minute)
+	mgr.mu.Unlock()
+	if _, err := mgr.GetKey(ctx, "key-1"); err != nil {
+		t.Fatalf("stale within grace failed: %v", err)
+	}
+
+	mgr.mu.Lock()
+	mgr.expires = time.Now().Add(-2 * jwksStaleGracePeriod)
+	mgr.mu.Unlock()
+	if _, err := mgr.GetKey(ctx, "key-1"); err == nil {
+		t.Fatal("expected error beyond stale grace, got nil")
+	}
+}
+
 func TestMicrosoftProvider(t *testing.T) {
 	privKey, nRaw, eRaw := generateTestRSAKey(t)
 	var jwksRequests atomic.Int32
