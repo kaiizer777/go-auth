@@ -72,6 +72,7 @@ func TestOIDC_DiscoveryAndJWKS(t *testing.T) {
 		switch r.URL.Path {
 		case "/.well-known/openid-configuration":
 			disc := OIDCDiscovery{
+				Issuer:                "http://" + r.Host,
 				AuthorizationEndpoint: "https://login.example.com/auth",
 				TokenEndpoint:         "https://login.example.com/token",
 				JWKSURI:               "http://" + r.Host + "/keys",
@@ -112,6 +113,9 @@ func TestOIDC_DiscoveryAndJWKS(t *testing.T) {
 		}
 		if disc.JWKSURI != server.URL+"/keys" {
 			t.Errorf("jwks_uri = %q", disc.JWKSURI)
+		}
+		if disc.Issuer != server.URL {
+			t.Errorf("issuer = %q, want discovery origin %q", disc.Issuer, server.URL)
 		}
 	})
 
@@ -273,6 +277,44 @@ func TestJWKSManager_RefreshFailureServesStaleWithinGrace(t *testing.T) {
 	mgr.mu.Unlock()
 	if _, err := mgr.GetKey(ctx, "key-1"); err == nil {
 		t.Fatal("expected error beyond stale grace, got nil")
+	}
+}
+
+func TestValidateDiscoveryDocument(t *testing.T) {
+	valid := OIDCDiscovery{
+		Issuer:                "https://login.example.com/tenant",
+		AuthorizationEndpoint: "https://login.example.com/auth",
+		TokenEndpoint:         "https://login.example.com/token",
+		JWKSURI:               "https://login.example.com/keys",
+	}
+	discoveryURL := "https://login.example.com/.well-known/openid-configuration"
+	if err := validateDiscoveryDocument(discoveryURL, &valid); err != nil {
+		t.Fatalf("valid doc rejected: %v", err)
+	}
+
+	swapped := valid
+	swapped.Issuer = "https://evil.example.com/tenant"
+	if err := validateDiscoveryDocument(discoveryURL, &swapped); err == nil {
+		t.Fatal("expected issuer mismatch error, got nil")
+	}
+
+	noIssuer := valid
+	noIssuer.Issuer = ""
+	if err := validateDiscoveryDocument(discoveryURL, &noIssuer); err == nil {
+		t.Fatal("expected missing issuer error, got nil")
+	}
+
+	plainHTTP := valid
+	plainHTTP.JWKSURI = "http://login.example.com/keys"
+	if err := validateDiscoveryDocument(discoveryURL, &plainHTTP); err == nil {
+		t.Fatal("expected non-loopback http jwks_uri error, got nil")
+	}
+
+	loopback := valid
+	loopback.Issuer = "http://127.0.0.1:8080"
+	loopback.JWKSURI = "http://127.0.0.1:8080/keys"
+	if err := validateDiscoveryDocument("http://127.0.0.1:8080/.well-known/openid-configuration", &loopback); err != nil {
+		t.Fatalf("loopback http doc rejected: %v", err)
 	}
 }
 

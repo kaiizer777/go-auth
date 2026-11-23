@@ -10,7 +10,9 @@ import (
 	"fmt"
 	"io"
 	"math/big"
+	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -258,7 +260,50 @@ func FetchOIDCDiscovery(ctx context.Context, client *http.Client, discoveryURL s
 	if disc.AuthorizationEndpoint == "" || disc.TokenEndpoint == "" || disc.JWKSURI == "" {
 		return nil, errors.New(errors.CodeOAuthProviderError, "oidc discovery document missing required endpoints", nil)
 	}
+	if err := validateDiscoveryDocument(discoveryURL, &disc); err != nil {
+		return nil, err
+	}
 	return &disc, nil
+}
+
+// validateDiscoveryDocument pins a discovery document to its origin: issuer
+// must match the discovery URL origin and jwks_uri must be https, except for
+// loopback hosts where plain http test servers live.
+func validateDiscoveryDocument(discoveryURL string, disc *OIDCDiscovery) error {
+	du, err := url.Parse(discoveryURL)
+	if err != nil || du.Scheme == "" || du.Host == "" {
+		return errors.New(errors.CodeOAuthProviderError, "invalid oidc discovery url", err)
+	}
+	if disc.Issuer == "" {
+		return errors.New(errors.CodeOAuthProviderError, "oidc discovery document missing issuer", nil)
+	}
+	iss, err := url.Parse(disc.Issuer)
+	if err != nil || iss.Scheme == "" || iss.Host == "" {
+		return errors.New(errors.CodeOAuthProviderError, "oidc discovery document has invalid issuer", err)
+	}
+	if !strings.EqualFold(iss.Scheme, du.Scheme) || !strings.EqualFold(iss.Host, du.Host) {
+		return errors.New(errors.CodeOAuthProviderError, "oidc discovery issuer does not match discovery url origin", nil)
+	}
+	ju, err := url.Parse(disc.JWKSURI)
+	if err != nil || ju.Scheme == "" || ju.Host == "" {
+		return errors.New(errors.CodeOAuthProviderError, "oidc discovery document has invalid jwks_uri", err)
+	}
+	if ju.Scheme != "https" && !isLoopbackHTTP(ju) {
+		return errors.New(errors.CodeOAuthProviderError, "oidc discovery jwks_uri must use https", nil)
+	}
+	return nil
+}
+
+func isLoopbackHTTP(u *url.URL) bool {
+	if u.Scheme != "http" {
+		return false
+	}
+	host := strings.ToLower(u.Hostname())
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // VerifyRS256JWT cryptographically validates an RS256 JWT using keys from keyRetriever and returns the decoded payload map.
