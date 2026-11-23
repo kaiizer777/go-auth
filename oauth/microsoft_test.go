@@ -465,6 +465,63 @@ func TestMicrosoftProvider(t *testing.T) {
 			t.Errorf("expected EmailVerified == true when xms_edov == '1'")
 		}
 
+		// 2b. Boolean true attestation -> EmailVerified must be TRUE
+		claimsBool := map[string]any{
+			"iss":      "https://login.microsoftonline.com/untrusted-guid/v2.0",
+			"sub":      "bool-sub",
+			"aud":      "client-test-id",
+			"exp":      time.Now().Add(10 * time.Minute).Unix(),
+			"email":    "user@attested-corp.com",
+			"tid":      "untrusted-guid",
+			"xms_edov": true,
+		}
+		tokBool := signRS256JWT(t, privKey, "ms-key-1", claimsBool)
+		cBool, err := pCommon.VerifyIDToken(ctx, tokBool, "")
+		if err != nil {
+			t.Fatalf("unexpected verification error: %v", err)
+		}
+		if !cBool.EmailVerified {
+			t.Errorf("expected EmailVerified == true when xms_edov is bool true")
+		}
+
+		// 2c. Numeric 1 attestation -> EmailVerified must be TRUE
+		claimsNum := map[string]any{
+			"iss":      "https://login.microsoftonline.com/untrusted-guid/v2.0",
+			"sub":      "num-sub",
+			"aud":      "client-test-id",
+			"exp":      time.Now().Add(10 * time.Minute).Unix(),
+			"email":    "user@attested-corp.com",
+			"tid":      "untrusted-guid",
+			"xms_edov": 1,
+		}
+		tokNum := signRS256JWT(t, privKey, "ms-key-1", claimsNum)
+		cNum, err := pCommon.VerifyIDToken(ctx, tokNum, "")
+		if err != nil {
+			t.Fatalf("unexpected verification error: %v", err)
+		}
+		if !cNum.EmailVerified {
+			t.Errorf("expected EmailVerified == true when xms_edov is numeric 1")
+		}
+
+		// 2d. Boolean false attestation -> EmailVerified must stay FALSE
+		claimsFalse := map[string]any{
+			"iss":      "https://login.microsoftonline.com/untrusted-guid/v2.0",
+			"sub":      "false-sub",
+			"aud":      "client-test-id",
+			"exp":      time.Now().Add(10 * time.Minute).Unix(),
+			"email":    "user@attested-corp.com",
+			"tid":      "untrusted-guid",
+			"xms_edov": false,
+		}
+		tokFalse := signRS256JWT(t, privKey, "ms-key-1", claimsFalse)
+		cFalse, err := pCommon.VerifyIDToken(ctx, tokFalse, "")
+		if err != nil {
+			t.Fatalf("unexpected verification error: %v", err)
+		}
+		if cFalse.EmailVerified {
+			t.Errorf("expected EmailVerified == false when xms_edov is bool false")
+		}
+
 		// 3. Trusted tenant whitelist match -> EmailVerified must be TRUE
 		claimsTrusted := map[string]any{
 			"iss":   "https://login.microsoftonline.com/trusted-partner-guid/v2.0",

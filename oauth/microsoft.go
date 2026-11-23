@@ -262,9 +262,34 @@ func (p *MicrosoftProvider) isEmailVerified(rawClaims map[string]any, tenantID s
 		}
 	}
 
-	// 4. Microsoft domain ownership attestation claim (xms_edov == "1")
-	if edov, ok := rawClaims["xms_edov"].(string); ok && edov == "1" {
-		return true
+	// 4. Microsoft domain ownership attestation claim. The token
+	// decoder yields bool, string, or numeric shapes depending on the
+	// issuer; accept every attested form, default-deny anything else.
+	switch edov := rawClaims["xms_edov"].(type) {
+	case bool:
+		if edov {
+			return true
+		}
+	case string:
+		if strings.TrimSpace(edov) == "1" {
+			return true
+		}
+	case float64:
+		if edov == 1 {
+			return true
+		}
+	case int:
+		if edov == 1 {
+			return true
+		}
+	case int64:
+		if edov == 1 {
+			return true
+		}
+	case jsonNumber:
+		if n, err := edov.Int64(); err == nil && n == 1 {
+			return true
+		}
 	}
 
 	// Untrusted external tenant without domain verification: fail closed
