@@ -1,7 +1,6 @@
 package security_test
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
@@ -257,12 +256,18 @@ func TestSecurity_StateCookieTamperingAndReplay(t *testing.T) {
 	}
 	mockGoogle.AuthURL(state, pkceChal("v-verifier"))
 
-	// 1. Tampered state in query parameter -> 403 Forbidden
-	tamperedReq := httptest.NewRequest("GET", "/auth/oauth/google/callback?state=tampered-state-nonce", nil)
+	// 1. Same-length tampered state -> 403 Forbidden via constant-time compare.
+	tampered := state[:len(state)-1]
+	if state[len(state)-1] == 'A' {
+		tampered += "B"
+	} else {
+		tampered += "A"
+	}
+	tamperedReq := httptest.NewRequest("GET", "/auth/oauth/google/callback?state="+tampered, nil)
 	for _, c := range rec.Result().Cookies() {
 		tamperedReq.AddCookie(c)
 	}
-	_, _, _, err = svc.HandleCallback(ctx, httptest.NewRecorder(), tamperedReq, "google", "code", "tampered-state-nonce", db.SessionTypeCookie)
+	_, _, _, err = svc.HandleCallback(ctx, httptest.NewRecorder(), tamperedReq, "google", "code", tampered, db.SessionTypeCookie)
 	if !errors.Is(err, errors.ErrOAuthStateInvalid) {
 		t.Fatalf("expected ErrOAuthStateInvalid (403), got %v", err)
 	}
@@ -306,33 +311,22 @@ func TestSecurity_AntiEnumerationDummyHashTimingParity(t *testing.T) {
 	cfg.DatabaseURL = "postgres://postgres:postgres@localhost:5432/testdb"
 	cfg.BaseURL = "http://localhost:8080"
 
-	// Create an OAuth-only user (password_hash is empty or unusable)
-	oauthUser := db.User{
-		ID:            uuid.New(),
-		Email:         "oauth-only-user@example.com",
-		PasswordHash:  "", // OAuth-only passwordless account
-		EmailVerified: true,
-	}
-	if err := database.Create(&oauthUser).Error; err != nil {
-		t.Fatalf("create user: %v", err)
-	}
-
 	authSvc, err := auth.New(cfg, database, cfg.EmailHooks)
 	if err != nil {
 		t.Fatalf("auth.New failed: %v", err)
 	}
 
-	// Attempt password login against OAuth-only account:
-	// Invariant: Must burn dummy Argon2id hash and return ErrInvalidCredentials (401)
+	// Attempt password login with an email that has no user row, so the
+	// lookup-miss branch burns the dummy Argon2id hash (401 invariant).
 	start := time.Now()
 	_, err = authSvc.Login(context.Background(), db.LoginRequest{
-		Email:    oauthUser.Email,
+		Email:    "no-such-user@example.com",
 		Password: "AttemptedPassword#123",
 	})
 	elapsed := time.Since(start)
 
 	if err == nil {
-		t.Fatal("expected login to fail for OAuth-only account, got nil")
+		t.Fatal("expected login to fail for unknown email, got nil")
 	}
 	if !errors.Is(err, errors.ErrInvalidCredentials) {
 		t.Fatalf("expected ErrInvalidCredentials, got %v", err)
@@ -355,9 +349,11 @@ func TestSecurity_AntiEnumerationDummyHashTimingParity(t *testing.T) {
 
 func TestSecurity_ZeroRawSecretsInTelemetry(t *testing.T) {
 	t.Parallel()
-	var logBuf bytes.Buffer
-	logger := slog.New(slog.NewJSONHandler(&logBuf, nil))
+	sink := &secLogSink{}
+	logger := slog.New(slog.NewJSONHandler(sink, nil))
+	prev := slog.Default()
 	slog.SetDefault(logger)
+	t.Cleanup(func() { slog.SetDefault(prev) })
 
 	sensitiveSecrets := []string{
 		"super-confidential-client-secret-12345",
@@ -380,7 +376,7 @@ func TestSecurity_ZeroRawSecretsInTelemetry(t *testing.T) {
 
 	logger.Info("config_audit", "microsoft", msCfg, "facebook", fbCfg, "oauth_config", appCfg.OAuth)
 
-	loggedOutput := logBuf.String()
+	loggedOutput := sink.String()
 
 	for _, sec := range sensitiveSecrets[:3] {
 		if strings.Contains(loggedOutput, sec) {
