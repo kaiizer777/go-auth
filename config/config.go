@@ -82,6 +82,7 @@ type OAuthConfig struct {
 	Microsoft       *MicrosoftConfig `json:"microsoft,omitempty"`
 	Facebook        *FacebookConfig  `json:"facebook,omitempty"`
 	Discord         *DiscordConfig   `json:"discord,omitempty"`
+	X               *XConfig         `json:"x,omitempty"`
 	StateCookieName string           // Default: "oauth_state"
 	StateCookiePath string           // Default: "/" (ensures cookies are sent on /auth/oauth/* and /api/auth/oauth/*)
 	StateTTL        time.Duration    // Default: 10 * time.Minute
@@ -117,6 +118,9 @@ func (o OAuthConfig) LogValue() slog.Value {
 	if o.Discord != nil {
 		attrs = append(attrs, slog.Any("discord", o.Discord.LogValue()))
 	}
+	if o.X != nil {
+		attrs = append(attrs, slog.Any("x", o.X.LogValue()))
+	}
 	return slog.GroupValue(attrs...)
 }
 
@@ -126,8 +130,8 @@ func (o OAuthConfig) String() string {
 	if o.StateSecret == "" {
 		secret = ""
 	}
-	return fmt.Sprintf("OAuthConfig{Providers: %v, Microsoft: %v, Facebook: %v, Discord: %v, StateSecret: %s, CallbackBaseURL: %s}",
-		o.Providers, o.Microsoft, o.Facebook, o.Discord, secret, o.CallbackBaseURL)
+	return fmt.Sprintf("OAuthConfig{Providers: %v, Microsoft: %v, Facebook: %v, Discord: %v, X: %v, StateSecret: %s, CallbackBaseURL: %s}",
+		o.Providers, o.Microsoft, o.Facebook, o.Discord, o.X, secret, o.CallbackBaseURL)
 }
 
 // SecurityHeadersConfig groups HTTP security header policies.
@@ -720,7 +724,7 @@ func (c *Config) Validate() error {
 				return errors.ErrOAuthStateSecretRequired
 			}
 		}
-		if c.OAuth.Microsoft != nil || c.OAuth.Discord != nil || c.OAuth.Facebook != nil {
+		if c.OAuth.Microsoft != nil || c.OAuth.Discord != nil || c.OAuth.Facebook != nil || c.OAuth.X != nil {
 			return errors.ErrOAuthStateSecretRequired
 		}
 	} else if len(c.OAuth.StateSecret) < 32 {
@@ -741,7 +745,7 @@ func (c *Config) Validate() error {
 	}
 	for id, provider := range c.OAuth.Providers {
 		switch id {
-		case "google", "github", "apple", "microsoft", "discord", "facebook":
+		case "google", "github", "apple", "microsoft", "discord", "facebook", "x":
 		default:
 			return errors.ErrOAuthProviderUnknown
 		}
@@ -755,7 +759,7 @@ func (c *Config) Validate() error {
 			return errors.ErrOAuthRedirectURLRequired
 		}
 		switch id {
-		case "google", "github", "microsoft", "discord", "facebook":
+		case "google", "github", "microsoft", "discord", "facebook", "x":
 			if provider.ClientSecret == "" {
 				return errors.ErrOAuthClientSecretRequired
 			}
@@ -825,6 +829,21 @@ func (c *Config) Validate() error {
 		}
 		if len(c.OAuth.Facebook.Scopes) == 0 {
 			c.OAuth.Facebook.Scopes = []string{"email", "public_profile"}
+		}
+	}
+
+	if c.OAuth.X != nil {
+		if c.OAuth.X.ClientID == "" {
+			return errors.ErrOAuthClientIDRequired
+		}
+		if c.OAuth.X.ClientSecret == "" {
+			return errors.ErrOAuthClientSecretRequired
+		}
+		if c.OAuth.X.RedirectURI == "" {
+			return errors.ErrOAuthRedirectURLRequired
+		}
+		if len(c.OAuth.X.Scopes) == 0 {
+			c.OAuth.X.Scopes = []string{"tweet.read", "users.read", "offline.access"}
 		}
 	}
 

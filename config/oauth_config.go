@@ -118,3 +118,35 @@ func (f FacebookConfig) String() string {
 	return fmt.Sprintf("FacebookConfig{AppID: %s, AppSecret: %s, RedirectURI: %s, Scopes: %v, GraphVersion: %s}",
 		f.AppID, secret, f.RedirectURI, f.Scopes, f.GraphVersion)
 }
+
+// XConfig defines configuration for X (formerly Twitter) OAuth 2.0.
+type XConfig struct {
+	ClientID     string   `json:"client_id"`
+	ClientSecret string   `json:"-"` // Redacted in logs
+	RedirectURI  string   `json:"redirect_uri"`
+	Scopes       []string `json:"scopes"`
+}
+
+// LogValue implements slog.LogValuer to ensure ClientSecret is redacted in logs.
+func (x XConfig) LogValue() slog.Value {
+	secretMasked := "[REDACTED]"
+	if x.ClientSecret == "" {
+		secretMasked = ""
+	}
+	return slog.GroupValue(
+		slog.String("client_id", x.ClientID),
+		slog.String("client_secret", secretMasked),
+		slog.String("redirect_uri", x.RedirectURI),
+		slog.Any("scopes", x.Scopes),
+	)
+}
+
+// String implements fmt.Stringer to ensure ClientSecret is masked when printed.
+func (x XConfig) String() string {
+	secret := "[REDACTED]"
+	if x.ClientSecret == "" {
+		secret = ""
+	}
+	return fmt.Sprintf("XConfig{ClientID: %s, ClientSecret: %s, RedirectURI: %s, Scopes: %v}",
+		x.ClientID, secret, x.RedirectURI, x.Scopes)
+}

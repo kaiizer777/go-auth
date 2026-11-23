@@ -483,6 +483,73 @@ func TestConfigValidate_OAuth(t *testing.T) {
 			},
 			wantErr: errors.ErrOAuthStateSecretRequired,
 		},
+		{
+			name: "x enabled valid defaults scopes",
+			mutate: func(c *Config) {
+				c.OAuth.X = &XConfig{
+					ClientID:     "x-id",
+					ClientSecret: "x-secret",
+					RedirectURI:  "https://example.com/callback",
+				}
+			},
+			wantErr: nil,
+		},
+		{
+			name: "x missing client id rejected",
+			mutate: func(c *Config) {
+				c.OAuth.X = &XConfig{
+					ClientID:     "",
+					ClientSecret: "x-secret",
+					RedirectURI:  "https://example.com/callback",
+				}
+			},
+			wantErr: errors.ErrOAuthClientIDRequired,
+		},
+		{
+			name: "x missing client secret rejected",
+			mutate: func(c *Config) {
+				c.OAuth.X = &XConfig{
+					ClientID:     "x-id",
+					ClientSecret: "",
+					RedirectURI:  "https://example.com/callback",
+				}
+			},
+			wantErr: errors.ErrOAuthClientSecretRequired,
+		},
+		{
+			name: "x missing redirect uri rejected",
+			mutate: func(c *Config) {
+				c.OAuth.X = &XConfig{
+					ClientID:     "x-id",
+					ClientSecret: "x-secret",
+					RedirectURI:  "",
+				}
+			},
+			wantErr: errors.ErrOAuthRedirectURLRequired,
+		},
+		{
+			name: "x missing state secret rejected",
+			mutate: func(c *Config) {
+				c.OAuth.StateSecret = ""
+				c.OAuth.X = &XConfig{
+					ClientID:     "x-id",
+					ClientSecret: "x-secret",
+					RedirectURI:  "https://example.com/callback",
+				}
+			},
+			wantErr: errors.ErrOAuthStateSecretRequired,
+		},
+		{
+			name: "x provider map allowed",
+			mutate: func(c *Config) {
+				c.OAuth.Providers = enabled("x", ProviderConfig{
+					ClientID:     "x-id",
+					ClientSecret: "x-secret",
+					RedirectURL:  "https://example.com/callback",
+				})
+			},
+			wantErr: nil,
+		},
 	}
 
 	for _, tt := range tests {
@@ -715,6 +782,68 @@ func TestProviderConfigLogValue(t *testing.T) {
 		}
 		if strings.Contains(str, "fb-secret-leak-test") {
 			t.Fatalf("String() leaked fb secret")
+		}
+	})
+
+	t.Run("XConfig defaults scopes", func(t *testing.T) {
+		cfg := validOAuthBase()
+		cfg.OAuth.X = &XConfig{
+			ClientID:     "x-id",
+			ClientSecret: "x-secret",
+			RedirectURI:  "https://example.com/callback",
+		}
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("Validate = %v", err)
+		}
+		if len(cfg.OAuth.X.Scopes) != 3 || cfg.OAuth.X.Scopes[0] != "tweet.read" || cfg.OAuth.X.Scopes[1] != "users.read" || cfg.OAuth.X.Scopes[2] != "offline.access" {
+			t.Fatalf("Scopes = %v; want [tweet.read users.read offline.access]", cfg.OAuth.X.Scopes)
+		}
+	})
+
+	t.Run("XConfig masks client secret in LogValue and String", func(t *testing.T) {
+		x := XConfig{
+			ClientID:     "x-client-id",
+			ClientSecret: "x-secret-token",
+			RedirectURI:  "https://example.com/callback",
+			Scopes:       []string{"tweet.read", "users.read"},
+		}
+		val := x.LogValue()
+		attrs := make(map[string]string)
+		for _, attr := range val.Group() {
+			attrs[attr.Key] = attr.Value.String()
+		}
+		if attrs["client_secret"] != "[REDACTED]" {
+			t.Errorf("client_secret = %q; want [REDACTED]", attrs["client_secret"])
+		}
+		if strings.Contains(attrs["client_secret"], "x-secret-token") {
+			t.Fatalf("LogValue leaked x client secret")
+		}
+		str := x.String()
+		if strings.Contains(str, "x-secret-token") {
+			t.Fatalf("String() leaked x client secret: %q", str)
+		}
+		if !strings.Contains(str, "[REDACTED]") {
+			t.Fatalf("String() expected [REDACTED], got: %q", str)
+		}
+	})
+
+	t.Run("OAuthConfig masks nested x secrets in LogValue and String", func(t *testing.T) {
+		o := OAuthConfig{
+			StateSecret: "state-secret-super-confidential",
+			X: &XConfig{
+				ClientID:     "x-id",
+				ClientSecret: "x-secret-leak-test",
+			},
+		}
+		val := o.LogValue()
+		for _, attr := range val.Group() {
+			if strings.Contains(attr.Value.String(), "x-secret-leak-test") {
+				t.Fatalf("OAuthConfig.LogValue leaked secrets in %s", attr.Key)
+			}
+		}
+		str := o.String()
+		if strings.Contains(str, "x-secret-leak-test") {
+			t.Fatalf("String() leaked x secret")
 		}
 	})
 }
