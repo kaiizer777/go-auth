@@ -197,6 +197,10 @@ func (s *service) InitiateFlow(w http.ResponseWriter, r *http.Request, providerI
 	if err != nil {
 		return "", err
 	}
+	nonce, err := GenerateNonce()
+	if err != nil {
+		return "", err
+	}
 	redirect := ""
 	logCtx := context.Background()
 	ip, ua := clientIP(r), ""
@@ -214,7 +218,7 @@ func (s *service) InitiateFlow(w http.ResponseWriter, r *http.Request, providerI
 			activeUserID = uid
 		}
 	}
-	state, err := SetStateCookieWithUser(w, s.cfg, providerID, pkce.Verifier, redirect, activeUserID)
+	state, err := SetStateCookieWithUserAndNonce(w, s.cfg, providerID, pkce.Verifier, redirect, activeUserID, nonce)
 	if err != nil {
 		return "", err
 	}
@@ -223,6 +227,9 @@ func (s *service) InitiateFlow(w http.ResponseWriter, r *http.Request, providerI
 		"ip", ip,
 		"user_agent", ua,
 	)
+	if _, ok := p.(OIDCProvider); ok {
+		return p.AuthCodeURL(state, pkce.Challenge, NonceOption(nonce)), nil
+	}
 	return p.AuthURL(state, pkce.Challenge), nil
 }
 
@@ -283,6 +290,15 @@ func (s *service) HandleCallback(ctx context.Context, w http.ResponseWriter, r *
 	// moved behind the link lookup, and it cannot run without a profile.
 	if info == nil {
 		return fail("email_unverified", errors.ErrOAuthEmailUnverified)
+	}
+	// OIDC replay control: re-verify the ID token against the state-stored
+	// nonce. Providers already verified the signature inside FetchUserInfo;
+	// this second pass binds the token to this login. Empty nonces (states
+	// issued before nonce support, or token-only fallbacks) skip the check.
+	if oidc, ok := p.(OIDCProvider); ok && payload.Nonce != "" && tokens.IDToken != "" {
+		if _, verr := oidc.VerifyIDToken(ctx, tokens.IDToken, payload.Nonce); verr != nil {
+			return fail("idtoken_invalid", verr)
+		}
 	}
 
 	activeUserID := payload.UserID

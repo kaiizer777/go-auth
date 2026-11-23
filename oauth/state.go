@@ -24,6 +24,7 @@ type OAuthStatePayload struct {
 	CodeVerifier string    `json:"v"`
 	RedirectURL  string    `json:"r"`
 	UserID       string    `json:"u,omitempty"`
+	Nonce        string    `json:"n,omitempty"`
 	ExpiresAt    time.Time `json:"e"`
 }
 
@@ -33,6 +34,20 @@ const stateTokenBytes = 32
 // stateTokenLen is the issued token width. ValidateState compares against the
 // cookie's own token, not this value, so signed test fixtures stay valid.
 var stateTokenLen = base64.RawURLEncoding.EncodedLen(stateTokenBytes)
+
+// nonceBytes is the CSPRNG entropy size for OIDC nonces.
+const nonceBytes = 16
+
+// GenerateNonce returns a fresh URL-safe OIDC nonce for replay protection.
+// The service stores it in the state payload and verifies the returned
+// ID token claim against it at callback.
+func GenerateNonce() (string, error) {
+	raw := make([]byte, nonceBytes)
+	if _, err := io.ReadFull(rand.Reader, raw); err != nil {
+		return "", ErrOAuthEntropyReadFailed
+	}
+	return base64.RawURLEncoding.EncodeToString(raw), nil
+}
 
 // ErrOAuthEntropyReadFailed surfaces CSPRNG failures as a domain 500
 // so Part 3 handlers matching on domain codes never see a bare stdlib error.
@@ -168,6 +183,12 @@ func verifyStateSignature(signed string, key []byte) (OAuthStatePayload, error) 
 // SetStateCookieWithUser generates a state token, signs the payload including an optional active user ID,
 // sets the state cookie, and returns the raw state value for the provider authorization URL.
 func SetStateCookieWithUser(w http.ResponseWriter, cfg *config.Config, providerID, codeVerifier, redirectURL, userID string) (string, error) {
+	return SetStateCookieWithUserAndNonce(w, cfg, providerID, codeVerifier, redirectURL, userID, "")
+}
+
+// SetStateCookieWithUserAndNonce is SetStateCookieWithUser plus the OIDC
+// nonce carried for callback claim verification.
+func SetStateCookieWithUserAndNonce(w http.ResponseWriter, cfg *config.Config, providerID, codeVerifier, redirectURL, userID, nonce string) (string, error) {
 	cfg = ensureOAuthConfig(cfg)
 	token := make([]byte, stateTokenBytes)
 	if _, err := io.ReadFull(rand.Reader, token); err != nil {
@@ -180,6 +201,7 @@ func SetStateCookieWithUser(w http.ResponseWriter, cfg *config.Config, providerI
 		CodeVerifier: codeVerifier,
 		RedirectURL:  redirectURL,
 		UserID:       userID,
+		Nonce:        nonce,
 		ExpiresAt:    time.Now().Add(cfg.OAuth.StateTTL),
 	}
 	key, err := stateSigningKey(cfg.OAuth.StateSecret)
