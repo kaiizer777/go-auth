@@ -1286,7 +1286,7 @@ func TestOAuthService_X_MissingEmail(t *testing.T) {
 			t.Fatal("session required")
 		}
 
-		initReq := httptest.NewRequest(http.MethodGet, "/auth/oauth/x", nil)
+		initReq := httptest.NewRequest(http.MethodGet, "/auth/oauth/x?link=true", nil)
 		initReq.AddCookie(&http.Cookie{
 			Name:  cfg.SessionCookieName,
 			Value: rawToken,
@@ -1395,7 +1395,7 @@ func TestHandleCallbackActiveSessionUntrustedTenant(t *testing.T) {
 		}}
 		svc := NewService(database, sessSvc, map[string]Provider{"microsoft": untrusted}, cfg)
 
-		initReq := httptest.NewRequest(http.MethodGet, "/auth/oauth/microsoft", nil)
+		initReq := httptest.NewRequest(http.MethodGet, "/auth/oauth/microsoft?link=true", nil)
 		initReq.AddCookie(&http.Cookie{Name: cfg.SessionCookieName, Value: rawToken})
 		initRec := httptest.NewRecorder()
 		authURL, err := svc.InitiateFlow(initRec, initReq, "microsoft")

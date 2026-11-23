@@ -128,6 +128,61 @@ func (s *service) providerFor(providerID string) (Provider, error) {
 	return nil, errors.ErrOAuthProviderNotFound
 }
 
+// linkQueryParam is the explicit link signal on the initiate URL. A bare
+// login initiation never embeds the ambient session user; only ?link=true
+// resolves the signed-in user into the state payload.
+const linkQueryParam = "link"
+
+// linkIntentRequested reports explicit account-link intent for an initiation.
+// Link is opt-in per login: ambient credentials alone never trigger it.
+func linkIntentRequested(r *http.Request) bool {
+	if r == nil || r.URL == nil {
+		return false
+	}
+	return r.URL.Query().Get(linkQueryParam) == "true"
+}
+
+// resolveLinkUserID resolves the signed-in user for an explicit link
+// initiation. Absent, invalid, or expired sessions yield "" so the flow
+// degrades to plain login; store failures are hard errors so an explicit
+// link never silently becomes a registration.
+func (s *service) resolveLinkUserID(r *http.Request) (string, error) {
+	if s.sessionSvc == nil {
+		return "", errors.New(errors.CodeInternalError, "oauth link requires session service", nil)
+	}
+	var rawID string
+	if r.Header.Get("Authorization") != "" {
+		rawID, _ = session.ReadBearerToken(r)
+	} else {
+		rawID, _ = session.ReadSessionCookie(r, s.cfg)
+	}
+	if rawID != "" {
+		sess, gerr := s.sessionSvc.GetSession(r.Context(), rawID)
+		if gerr != nil {
+			var appErr *errors.Error
+			if errors.As(gerr, &appErr) && appErr.Code() == errors.CodeInternalError {
+				return "", errors.New(errors.CodeInternalError, "failed to resolve session for link", gerr)
+			}
+			return "", nil
+		}
+		if sess != nil && sess.UserID != uuid.Nil {
+			return sess.UserID.String(), nil
+		}
+		return "", nil
+	}
+	if v := r.Context().Value("user_id"); v != nil {
+		switch id := v.(type) {
+		case string:
+			return id, nil
+		case uuid.UUID:
+			if id != uuid.Nil {
+				return id.String(), nil
+			}
+		}
+	}
+	return "", nil
+}
+
 // InitiateFlow generates PKCE, persists verifier+state in the signed state
 // cookie, and returns the provider authorization URL for a 302 redirect.
 func (s *service) InitiateFlow(w http.ResponseWriter, r *http.Request, providerID string) (string, error) {
@@ -151,30 +206,12 @@ func (s *service) InitiateFlow(w http.ResponseWriter, r *http.Request, providerI
 		logCtx = r.Context()
 		ua = r.UserAgent()
 
-		if s.sessionSvc != nil {
-			var rawID string
-			if r.Header.Get("Authorization") != "" {
-				rawID, _ = session.ReadBearerToken(r)
-			} else {
-				rawID, _ = session.ReadSessionCookie(r, s.cfg)
+		if linkIntentRequested(r) {
+			uid, lerr := s.resolveLinkUserID(r)
+			if lerr != nil {
+				return "", lerr
 			}
-			if rawID != "" {
-				if sess, gerr := s.sessionSvc.GetSession(r.Context(), rawID); gerr == nil && sess != nil && sess.UserID != uuid.Nil {
-					activeUserID = sess.UserID.String()
-				}
-			}
-		}
-		if activeUserID == "" {
-			if v := r.Context().Value("user_id"); v != nil {
-				switch id := v.(type) {
-				case string:
-					activeUserID = id
-				case uuid.UUID:
-					if id != uuid.Nil {
-						activeUserID = id.String()
-					}
-				}
-			}
+			activeUserID = uid
 		}
 	}
 	state, err := SetStateCookieWithUser(w, s.cfg, providerID, pkce.Verifier, redirect, activeUserID)
@@ -584,19 +621,25 @@ func (s *service) linkOrCreate(ctx context.Context, providerID string, info *Use
 		return db.User{}, false, false, errors.ErrOAuthTenantInvalid
 	}
 
-	// 3. Active session explicit linking: link provider to currently authenticated session user
+	// 3. Active session explicit linking: link provider to currently authenticated session user.
+	// Fail closed: an unresolvable link owner never falls through to registration.
 	if activeUserID != "" {
 		uid, parseErr := uuid.Parse(activeUserID)
-		if parseErr == nil {
-			owner, uerr := s.store.Users().GetByID(ctx, uid)
-			if uerr == nil && owner != nil {
-				if info.ProviderUserID == "" || len(info.ProviderUserID) > providerFieldMaxLen {
-					return db.User{}, false, false, errOAuthProviderIdentityInvalid
-				}
-				user, linked, lerr := s.linkExisting(ctx, *owner, providerID, info)
-				return user, linked, false, lerr
-			}
+		if parseErr != nil {
+			return db.User{}, false, false, errors.New(errors.CodeInternalError, "invalid link identity", parseErr)
 		}
+		owner, uerr := s.store.Users().GetByID(ctx, uid)
+		if uerr != nil {
+			return db.User{}, false, false, errors.New(errors.CodeInternalError, "failed to load link owner", uerr)
+		}
+		if owner == nil {
+			return db.User{}, false, false, errors.New(errors.CodeInternalError, "link owner not found", nil)
+		}
+		if info.ProviderUserID == "" || len(info.ProviderUserID) > providerFieldMaxLen {
+			return db.User{}, false, false, errOAuthProviderIdentityInvalid
+		}
+		user, linked, lerr := s.linkExisting(ctx, *owner, providerID, info)
+		return user, linked, false, lerr
 	}
 
 	// 4. Validate provider identity for unauthenticated registration (requires verified email)
