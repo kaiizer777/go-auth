@@ -511,7 +511,8 @@ func TestMicrosoftProvider(t *testing.T) {
 			t.Errorf("nOauth vulnerability: untrusted tenant should have EmailVerified == false")
 		}
 
-		// 2. Untrusted tenant with xms_edov == '1' -> EmailVerified must be TRUE
+		// 2. Untrusted tenant with xms_edov == '1' under a configured allowlist ->
+		// attestation does not override the allowlist, EmailVerified must be FALSE
 		claimsAttested := map[string]any{
 			"iss":      "https://login.microsoftonline.com/untrusted-guid/v2.0",
 			"sub":      "verified-sub",
@@ -526,8 +527,11 @@ func TestMicrosoftProvider(t *testing.T) {
 		if err != nil {
 			t.Fatalf("unexpected verification error: %v", err)
 		}
-		if !cAttested.EmailVerified {
-			t.Errorf("expected EmailVerified == true when xms_edov == '1'")
+		if cAttested.EmailVerified {
+			t.Errorf("allowlist bypass: attestation must not verify an unlisted tenant")
+		}
+		if !cAttested.UntrustedTenant {
+			t.Errorf("expected untrusted_tenant marker on the rejected attestation path")
 		}
 
 		// 3. Trusted tenant whitelist match -> EmailVerified must be TRUE
@@ -662,6 +666,94 @@ func TestMicrosoftProvider(t *testing.T) {
 			t.Errorf("Name = %q, want Fallback User", user.Name)
 		}
 	})
+}
+
+func TestMicrosoftProvider_DomainOwnershipAttestation(t *testing.T) {
+	privKey, nRaw, eRaw := generateTestRSAKey(t)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(JWKDoc{Keys: []JWKKey{{
+			Kty: "RSA", Use: "sig", Kid: "ms-key-1", Alg: "RS256", N: nRaw, E: eRaw,
+		}}})
+	}))
+	defer server.Close()
+
+	newProvider := func(t *testing.T, trusted []string) *MicrosoftProvider {
+		t.Helper()
+		p := NewMicrosoftProvider(config.MicrosoftConfig{
+			ClientID:       "client-test-id",
+			ClientSecret:   "client-test-secret",
+			Tenant:         "common",
+			TrustedTenants: trusted,
+			RedirectURI:    "https://example.com/callback",
+		})
+		p.client = server.Client()
+		p.jwksMgr = NewJWKSManager(server.URL, p.client, time.Hour)
+		p.jwksRetriever = p.jwksMgr
+		return p
+	}
+
+	const (
+		listedTenant   = "listed-tenant-guid"
+		unlistedTenant = "unlisted-tenant-guid"
+	)
+	allowlist := []string{listedTenant}
+
+	tests := []struct {
+		name         string
+		trusted      []string
+		tenant       string
+		edov         any
+		setEdov      bool
+		wantVerified bool
+	}{
+		{name: "no allowlist string one", tenant: unlistedTenant, edov: "1", setEdov: true, wantVerified: true},
+		{name: "no allowlist string true", tenant: unlistedTenant, edov: "true", setEdov: true, wantVerified: true},
+		{name: "no allowlist bool true", tenant: unlistedTenant, edov: true, setEdov: true, wantVerified: true},
+		{name: "no allowlist string zero", tenant: unlistedTenant, edov: "0", setEdov: true},
+		{name: "no allowlist bool false", tenant: unlistedTenant, edov: false, setEdov: true},
+		{name: "no allowlist missing claim", tenant: unlistedTenant},
+		{name: "allowlist listed tenant unattested", trusted: allowlist, tenant: listedTenant, wantVerified: true},
+		{name: "allowlist listed tenant attested", trusted: allowlist, tenant: listedTenant, edov: "1", setEdov: true, wantVerified: true},
+		{name: "allowlist unlisted tenant string one", trusted: allowlist, tenant: unlistedTenant, edov: "1", setEdov: true},
+		{name: "allowlist unlisted tenant string true", trusted: allowlist, tenant: unlistedTenant, edov: "true", setEdov: true},
+		{name: "allowlist unlisted tenant bool true", trusted: allowlist, tenant: unlistedTenant, edov: true, setEdov: true},
+		{name: "allowlist unlisted tenant string zero", trusted: allowlist, tenant: unlistedTenant, edov: "0", setEdov: true},
+		{name: "allowlist unlisted tenant bool false", trusted: allowlist, tenant: unlistedTenant, edov: false, setEdov: true},
+		{name: "allowlist unlisted tenant missing claim", trusted: allowlist, tenant: unlistedTenant},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := newProvider(t, tt.trusted)
+			claims := map[string]any{
+				"iss":   "https://login.microsoftonline.com/" + tt.tenant + "/v2.0",
+				"sub":   "sub-1",
+				"aud":   "client-test-id",
+				"exp":   time.Now().Add(10 * time.Minute).Unix(),
+				"email": "user@example.com",
+				"tid":   tt.tenant,
+			}
+			if tt.setEdov {
+				claims["xms_edov"] = tt.edov
+			}
+			tok := signRS256JWT(t, privKey, "ms-key-1", claims)
+
+			c, err := p.VerifyIDToken(context.Background(), tok, "")
+			if err != nil {
+				t.Fatalf("VerifyIDToken = %v", err)
+			}
+			if c.EmailVerified != tt.wantVerified {
+				t.Fatalf("EmailVerified = %v; want %v", c.EmailVerified, tt.wantVerified)
+			}
+			if !tt.wantVerified && !c.UntrustedTenant {
+				t.Error("rejected tenant is missing the untrusted_tenant marker")
+			}
+			if tt.wantVerified && c.UntrustedTenant {
+				t.Error("verified tenant carries the untrusted_tenant marker")
+			}
+		})
+	}
 }
 
 func TestMicrosoftProvider_KeyIssuerBinding(t *testing.T) {

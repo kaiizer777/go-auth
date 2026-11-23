@@ -262,8 +262,10 @@ func (p *MicrosoftProvider) isEmailVerified(rawClaims map[string]any, tenantID s
 		}
 	}
 
-	// 4. Microsoft domain ownership attestation claim (xms_edov == "1")
-	if edov, ok := rawClaims["xms_edov"].(string); ok && edov == "1" {
+	// 4. Microsoft domain ownership attestation. Step 3 already returned for an
+	// allowlisted tenant, so a configured allowlist leaves only unlisted tenants
+	// here: their attestation is ignored and they fall through to the rejection.
+	if len(p.trustedTenants) == 0 && hasDomainOwnershipAttestation(rawClaims["xms_edov"]) {
 		return true
 	}
 
@@ -272,6 +274,20 @@ func (p *MicrosoftProvider) isEmailVerified(rawClaims map[string]any, tenantID s
 		rawClaims["untrusted_tenant"] = true
 	}
 	return false
+}
+
+// hasDomainOwnershipAttestation reports whether xms_edov asserts verified domain
+// ownership. String and Boolean encodings are both accepted because tokens
+// observed in the wild carry either; every other value fails closed.
+func hasDomainOwnershipAttestation(claim any) bool {
+	switch v := claim.(type) {
+	case string:
+		return v == "1" || v == "true"
+	case bool:
+		return v
+	default:
+		return false
+	}
 }
 
 // FetchUserInfo retrieves user details using IDToken claims or the /userinfo endpoint.
