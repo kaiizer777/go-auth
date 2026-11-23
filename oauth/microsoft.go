@@ -320,17 +320,15 @@ func (p *MicrosoftProvider) FetchUserInfo(ctx context.Context, token *OAuthToken
 		if claims.UntrustedTenant {
 			user.RawClaims["untrusted_tenant"] = true
 		}
+		if claims.PreferredUsername != "" {
+			user.RawClaims["preferred_username"] = claims.PreferredUsername
+		}
 
 		// ProviderUserID: OID if present, fallback to Subject
 		if claims.OID != "" {
 			user.ProviderUserID = claims.OID
 		} else {
 			user.ProviderUserID = claims.Subject
-		}
-
-		// Fallback email: PreferredUsername
-		if user.Email == "" && strings.Contains(claims.PreferredUsername, "@") {
-			user.Email = strings.ToLower(claims.PreferredUsername)
 		}
 
 		return user, nil

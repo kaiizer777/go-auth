@@ -638,33 +638,60 @@ func TestMicrosoftProvider(t *testing.T) {
 		}
 	})
 
-	t.Run("FetchUserInfo maps OID and PreferredUsername", func(t *testing.T) {
+	t.Run("FetchUserInfo maps OID and uses only the email claim", func(t *testing.T) {
 		p := newTestProvider("common", nil)
-		claims := map[string]any{
-			"iss":                "https://login.microsoftonline.com/tid-1/v2.0",
-			"sub":                "sub-fallback",
-			"oid":                "immutable-oid-guid",
-			"aud":                "client-test-id",
-			"exp":                time.Now().Add(10 * time.Minute).Unix(),
-			"preferred_username": "fallback.user@example.com",
-			"tid":                "tid-1",
-			"name":               "Fallback User",
-		}
-		idTok := signRS256JWT(t, privKey, "ms-key-1", claims)
 
-		user, err := p.FetchUserInfo(ctx, &OAuthToken{IDToken: idTok})
-		if err != nil {
-			t.Fatalf("FetchUserInfo failed: %v", err)
+		newToken := func(t *testing.T, extra map[string]any) string {
+			t.Helper()
+			claims := map[string]any{
+				"iss":                "https://login.microsoftonline.com/tid-1/v2.0",
+				"sub":                "sub-fallback",
+				"oid":                "immutable-oid-guid",
+				"aud":                "client-test-id",
+				"exp":                time.Now().Add(10 * time.Minute).Unix(),
+				"preferred_username": "fallback.user@example.com",
+				"tid":                "tid-1",
+				"name":               "Fallback User",
+			}
+			for k, v := range extra {
+				claims[k] = v
+			}
+			return signRS256JWT(t, privKey, "ms-key-1", claims)
 		}
-		if user.ProviderUserID != "immutable-oid-guid" {
-			t.Errorf("ProviderUserID = %q, want immutable-oid-guid", user.ProviderUserID)
-		}
-		if user.Email != "fallback.user@example.com" {
-			t.Errorf("Email = %q, want fallback.user@example.com", user.Email)
-		}
-		if user.Name != "Fallback User" {
-			t.Errorf("Name = %q, want Fallback User", user.Name)
-		}
+
+		t.Run("preferred_username never becomes the email", func(t *testing.T) {
+			user, err := p.FetchUserInfo(ctx, &OAuthToken{IDToken: newToken(t, nil)})
+			if err != nil {
+				t.Fatalf("FetchUserInfo failed: %v", err)
+			}
+			if user.ProviderUserID != "immutable-oid-guid" {
+				t.Errorf("ProviderUserID = %q, want immutable-oid-guid", user.ProviderUserID)
+			}
+			if user.Email != "" {
+				t.Errorf("Email = %q, want empty without an email claim", user.Email)
+			}
+			if user.EmailVerified {
+				t.Error("EmailVerified = true for a profile without an email claim")
+			}
+			if got := user.RawClaims["preferred_username"]; got != "fallback.user@example.com" {
+				t.Errorf("RawClaims[preferred_username] = %v, want fallback.user@example.com", got)
+			}
+			if err := validateProviderIdentity(user); !errors.Is(err, errors.ErrOAuthEmailRequired) {
+				t.Errorf("validateProviderIdentity = %v, want ErrOAuthEmailRequired", err)
+			}
+		})
+
+		t.Run("email claim wins over preferred_username", func(t *testing.T) {
+			user, err := p.FetchUserInfo(ctx, &OAuthToken{IDToken: newToken(t, map[string]any{
+				"email": "Primary.User@Example.com",
+			})})
+			if err != nil {
+				t.Fatalf("FetchUserInfo failed: %v", err)
+			}
+			if user.Email != "primary.user@example.com" {
+				t.Errorf("Email = %q, want primary.user@example.com", user.Email)
+			}
+		})
 	})
 }
 
