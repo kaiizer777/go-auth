@@ -174,11 +174,18 @@ func (p *FacebookProvider) FetchUserInfo(ctx context.Context, tokens *OAuthToken
 	}
 	q := u.Query()
 	q.Set("fields", "id,name,email,picture.width(200).height(200)")
-	q.Set("access_token", tokens.AccessToken)
-	q.Set("appsecret_proof", proof)
 	u.RawQuery = q.Encode()
 
-	raw, err := getJSON(ctx, p.client, u.String(), tokens.AccessToken)
+	// Credentials travel in headers, never in the URL: a transport
+	// failure stringifies the URL via *url.Error and HandleCallback
+	// logs that string, so any query-embedded secret would leak.
+	req, err := userInfoRequest(ctx, u.String(), tokens.AccessToken)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("X-AppSecret-Proof", proof)
+
+	raw, err := executeJSON[map[string]any](req, p.client, "oauth userinfo request failed")
 	if err != nil {
 		return nil, err
 	}
@@ -192,8 +199,10 @@ func (p *FacebookProvider) FetchUserInfo(ctx context.Context, tokens *OAuthToken
 	email, _ := raw["email"].(string)
 	email = strings.TrimSpace(email)
 
-	// Facebook Graph API omits email if unverified or unregistered; if present and non-empty, it is verified.
-	emailVerified := (email != "")
+	// Facebook Graph API omits email if unverified or unregistered and
+	// exposes no per-address verification signal, so a present address
+	// proves nothing: fail closed and never treat it as verified.
+	emailVerified := false
 
 	var avatarURL string
 	if picMap, ok := raw["picture"].(map[string]any); ok {

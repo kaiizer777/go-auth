@@ -274,8 +274,15 @@ func TestFacebookProvider_FetchUserInfo(t *testing.T) {
 			return
 		}
 		q := r.URL.Query()
-		accessToken := q.Get("access_token")
-		proof := q.Get("appsecret_proof")
+		if q.Get("access_token") != "" || q.Get("appsecret_proof") != "" {
+			http.Error(w, "credentials must not appear in URL query", http.StatusBadRequest)
+			return
+		}
+		var accessToken string
+		if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
+			accessToken = strings.TrimPrefix(auth, "Bearer ")
+		}
+		proof := r.Header.Get("X-AppSecret-Proof")
 		fields := q.Get("fields")
 
 		if !strings.Contains(fields, "id") || !strings.Contains(fields, "email") || !strings.Contains(fields, "picture") {
@@ -336,7 +343,7 @@ func TestFacebookProvider_FetchUserInfo(t *testing.T) {
 	})
 	p.userInfoURL = ts.URL
 
-	t.Run("full profile with verified email and picture avatar", func(t *testing.T) {
+	t.Run("full profile email stays unverified", func(t *testing.T) {
 		tok := &OAuthToken{AccessToken: "token-full-profile"}
 		user, err := p.FetchUserInfo(context.Background(), tok)
 		if err != nil {
@@ -355,8 +362,10 @@ func TestFacebookProvider_FetchUserInfo(t *testing.T) {
 		if user.Email != "alice@fb-test.com" {
 			t.Errorf("Email = %q; want alice@fb-test.com", user.Email)
 		}
-		if !user.EmailVerified {
-			t.Errorf("EmailVerified = false; want true when email is present in Graph API")
+		// Graph exposes no per-address verification signal: a present
+		// address must never imply verified.
+		if user.EmailVerified {
+			t.Errorf("EmailVerified = true; want false for facebook email")
 		}
 		expectedAvatar := "https://platform-lookaside.fbsbx.com/profile.jpg"
 		if user.AvatarURL != expectedAvatar {
@@ -413,6 +422,31 @@ func TestFacebookProvider_FetchUserInfo(t *testing.T) {
 		_, err = p.FetchUserInfo(context.Background(), nil)
 		if err == nil {
 			t.Fatal("expected error for nil token, got nil")
+		}
+	})
+
+	t.Run("transport failure error carries no credentials", func(t *testing.T) {
+		dead := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+		deadURL := dead.URL
+		dead.Close()
+		pDead := NewFacebookProvider(config.FacebookConfig{
+			AppID:        "fb-test-app",
+			AppSecret:    "fb-test-secret",
+			RedirectURI:  "https://myapp.com/callback",
+			GraphVersion: "v19.0",
+		})
+		pDead.userInfoURL = deadURL
+		const token = "leak-check-token-abc123"
+		_, err := pDead.FetchUserInfo(context.Background(), &OAuthToken{AccessToken: token})
+		if err == nil {
+			t.Fatal("expected transport error, got nil")
+		}
+		msg := err.Error()
+		if strings.Contains(msg, token) {
+			t.Errorf("error exposes access token: %q", msg)
+		}
+		if proof := GenerateAppSecretProof(token, "fb-test-secret"); strings.Contains(msg, proof) {
+			t.Errorf("error exposes appsecret_proof: %q", msg)
 		}
 	})
 }
