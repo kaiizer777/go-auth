@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/kaiizer777/go-auth/config"
 	"github.com/kaiizer777/go-auth/errors"
@@ -82,6 +83,86 @@ func TestNewProvider(t *testing.T) {
 			if appErr.HTTPStatus() != http.StatusNotFound {
 				t.Errorf("NewProvider(%q) status = %d; want 404", id, appErr.HTTPStatus())
 			}
+		}
+	})
+}
+
+func TestNewProviderPropagatesAuthoritySettings(t *testing.T) {
+	t.Parallel()
+
+	t.Run("microsoft tenant, allowlist and jwks ttl reach the adapter", func(t *testing.T) {
+		t.Parallel()
+		p, err := NewProvider("microsoft", config.ProviderConfig{
+			ClientID:       "ms-id",
+			ClientSecret:   "ms-secret",
+			RedirectURL:    "https://app.example.com/cb",
+			Tenant:         "tenant-guid",
+			TrustedTenants: []string{"partner-guid"},
+			JWKSCacheTTL:   2 * time.Hour,
+		})
+		if err != nil {
+			t.Fatalf("NewProvider(microsoft) = %v", err)
+		}
+		ms, ok := p.(*MicrosoftProvider)
+		if !ok {
+			t.Fatalf("provider type = %T; want *MicrosoftProvider", p)
+		}
+		if ms.cfg.Tenant != "tenant-guid" {
+			t.Errorf("cfg.Tenant = %q; want tenant-guid", ms.cfg.Tenant)
+		}
+		if _, ok := ms.trustedTenants["partner-guid"]; !ok {
+			t.Errorf("trustedTenants = %v; want partner-guid", ms.trustedTenants)
+		}
+		if ms.jwksMgr.ttl != 2*time.Hour {
+			t.Errorf("jwks ttl = %v; want 2h", ms.jwksMgr.ttl)
+		}
+		if !strings.Contains(ms.authURL, "/tenant-guid/") {
+			t.Errorf("authURL = %q; want tenant-guid authority", ms.authURL)
+		}
+	})
+
+	t.Run("microsoft empty tenant keeps common and no allowlist", func(t *testing.T) {
+		t.Parallel()
+		p, err := NewProvider("microsoft", config.ProviderConfig{
+			ClientID:     "ms-id",
+			ClientSecret: "ms-secret",
+			RedirectURL:  "https://app.example.com/cb",
+		})
+		if err != nil {
+			t.Fatalf("NewProvider(microsoft) = %v", err)
+		}
+		ms := p.(*MicrosoftProvider)
+		if !strings.Contains(ms.authURL, "/common/") {
+			t.Errorf("authURL = %q; want common authority", ms.authURL)
+		}
+		if len(ms.trustedTenants) != 0 {
+			t.Errorf("trustedTenants = %v; want empty (no allowlist)", ms.trustedTenants)
+		}
+		if ms.jwksMgr.ttl != 24*time.Hour {
+			t.Errorf("jwks ttl = %v; want 24h default", ms.jwksMgr.ttl)
+		}
+	})
+
+	t.Run("facebook graph version reaches the adapter", func(t *testing.T) {
+		t.Parallel()
+		p, err := NewProvider("facebook", config.ProviderConfig{
+			ClientID:     "fb-id",
+			ClientSecret: "fb-secret",
+			RedirectURL:  "https://app.example.com/cb",
+			GraphVersion: "v20.0",
+		})
+		if err != nil {
+			t.Fatalf("NewProvider(facebook) = %v", err)
+		}
+		fb, ok := p.(*FacebookProvider)
+		if !ok {
+			t.Fatalf("provider type = %T; want *FacebookProvider", p)
+		}
+		if fb.cfg.GraphVersion != "v20.0" {
+			t.Errorf("cfg.GraphVersion = %q; want v20.0", fb.cfg.GraphVersion)
+		}
+		if !strings.Contains(fb.authURL, "/v20.0/") {
+			t.Errorf("authURL = %q; want v20.0 graph version", fb.authURL)
 		}
 	})
 }

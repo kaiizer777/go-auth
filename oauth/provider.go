@@ -129,17 +129,21 @@ func NewProvider(id string, cfg config.ProviderConfig) (Provider, error) {
 		return NewAppleProvider(cfg), nil
 	case "microsoft":
 		return NewMicrosoftProvider(config.MicrosoftConfig{
-			ClientID:     cfg.ClientID,
-			ClientSecret: cfg.ClientSecret,
-			RedirectURI:  cfg.RedirectURL,
-			Scopes:       cfg.Scopes,
+			ClientID:       cfg.ClientID,
+			ClientSecret:   cfg.ClientSecret,
+			RedirectURI:    cfg.RedirectURL,
+			Scopes:         cfg.Scopes,
+			Tenant:         cfg.Tenant,
+			TrustedTenants: cfg.TrustedTenants,
+			JWKSCacheTTL:   cfg.JWKSCacheTTL,
 		}), nil
 	case "facebook":
 		return NewFacebookProvider(config.FacebookConfig{
-			AppID:       cfg.ClientID,
-			AppSecret:   cfg.ClientSecret,
-			RedirectURI: cfg.RedirectURL,
-			Scopes:      cfg.Scopes,
+			AppID:        cfg.ClientID,
+			AppSecret:    cfg.ClientSecret,
+			RedirectURI:  cfg.RedirectURL,
+			Scopes:       cfg.Scopes,
+			GraphVersion: cfg.GraphVersion,
 		}), nil
 	case "discord":
 		return NewDiscordProvider(config.DiscordConfig{
