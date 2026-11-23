@@ -63,6 +63,7 @@ type OAuthUser struct {
 type UserInfo = OAuthUser
 
 // Provider defines the standard contract required for any OAuth2 / OIDC identity provider.
+// AuthCodeURL is additive to AuthURL: adapters implement it as a one-line AuthURL delegate.
 type Provider interface {
 	// ID returns the canonical provider slug (e.g. "google", "github", "apple", "microsoft").
 	ID() string
@@ -119,7 +120,14 @@ var SupportedProviders = map[string]struct{}{
 
 // NewProvider instantiates a concrete OAuth provider for the given provider slug.
 // Supports all 7 canonical providers ("google", "github", "apple", "microsoft", "facebook", "discord", "x").
-func NewProvider(id string, cfg config.ProviderConfig) (Provider, error) {
+// The optional OAuth config carries the typed Microsoft/Facebook overrides
+// (tenant, trusted tenants, JWKS TTL, graph version) that ProviderConfig cannot
+// express; set typed fields win, generic identity fields fill the gaps.
+func NewProvider(id string, cfg config.ProviderConfig, oCfg ...*config.OAuthConfig) (Provider, error) {
+	var typed *config.OAuthConfig
+	if len(oCfg) > 0 {
+		typed = oCfg[0]
+	}
 	switch id {
 	case "google":
 		return NewGoogleProvider(cfg), nil
@@ -128,19 +136,9 @@ func NewProvider(id string, cfg config.ProviderConfig) (Provider, error) {
 	case "apple":
 		return NewAppleProvider(cfg), nil
 	case "microsoft":
-		return NewMicrosoftProvider(config.MicrosoftConfig{
-			ClientID:     cfg.ClientID,
-			ClientSecret: cfg.ClientSecret,
-			RedirectURI:  cfg.RedirectURL,
-			Scopes:       cfg.Scopes,
-		}), nil
+		return NewMicrosoftProvider(mergeMicrosoftConfig(cfg, typed)), nil
 	case "facebook":
-		return NewFacebookProvider(config.FacebookConfig{
-			AppID:       cfg.ClientID,
-			AppSecret:   cfg.ClientSecret,
-			RedirectURI: cfg.RedirectURL,
-			Scopes:      cfg.Scopes,
-		}), nil
+		return NewFacebookProvider(mergeFacebookConfig(cfg, typed)), nil
 	case "discord":
 		return NewDiscordProvider(config.DiscordConfig{
 			ClientID:     cfg.ClientID,
@@ -158,6 +156,72 @@ func NewProvider(id string, cfg config.ProviderConfig) (Provider, error) {
 	default:
 		return nil, errors.New(errors.CodeOAuthProviderNotFound, "unsupported or deferred oauth provider: "+id, nil)
 	}
+}
+
+// mergeMicrosoftConfig overlays typed Microsoft overrides on generic identity fields.
+func mergeMicrosoftConfig(cfg config.ProviderConfig, typed *config.OAuthConfig) config.MicrosoftConfig {
+	merged := config.MicrosoftConfig{
+		ClientID:     cfg.ClientID,
+		ClientSecret: cfg.ClientSecret,
+		RedirectURI:  cfg.RedirectURL,
+		Scopes:       cfg.Scopes,
+	}
+	if typed == nil || typed.Microsoft == nil {
+		return merged
+	}
+	t := typed.Microsoft
+	if t.ClientID != "" {
+		merged.ClientID = t.ClientID
+	}
+	if t.ClientSecret != "" {
+		merged.ClientSecret = t.ClientSecret
+	}
+	if t.RedirectURI != "" {
+		merged.RedirectURI = t.RedirectURI
+	}
+	if len(t.Scopes) > 0 {
+		merged.Scopes = t.Scopes
+	}
+	if t.Tenant != "" {
+		merged.Tenant = t.Tenant
+	}
+	if len(t.TrustedTenants) > 0 {
+		merged.TrustedTenants = t.TrustedTenants
+	}
+	if t.JWKSCacheTTL != 0 {
+		merged.JWKSCacheTTL = t.JWKSCacheTTL
+	}
+	return merged
+}
+
+// mergeFacebookConfig overlays typed Facebook overrides on generic identity fields.
+func mergeFacebookConfig(cfg config.ProviderConfig, typed *config.OAuthConfig) config.FacebookConfig {
+	merged := config.FacebookConfig{
+		AppID:       cfg.ClientID,
+		AppSecret:   cfg.ClientSecret,
+		RedirectURI: cfg.RedirectURL,
+		Scopes:      cfg.Scopes,
+	}
+	if typed == nil || typed.Facebook == nil {
+		return merged
+	}
+	t := typed.Facebook
+	if t.AppID != "" {
+		merged.AppID = t.AppID
+	}
+	if t.AppSecret != "" {
+		merged.AppSecret = t.AppSecret
+	}
+	if t.RedirectURI != "" {
+		merged.RedirectURI = t.RedirectURI
+	}
+	if len(t.Scopes) > 0 {
+		merged.Scopes = t.Scopes
+	}
+	if t.GraphVersion != "" {
+		merged.GraphVersion = t.GraphVersion
+	}
+	return merged
 }
 
 // oauthHTTPTimeout bounds every outbound provider call.

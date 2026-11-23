@@ -101,13 +101,19 @@ func (o OAuthConfig) LogValue() slog.Value {
 	if o.StateSecret == "" {
 		secretMasked = ""
 	}
+	// Resolve each entry through ProviderConfig.LogValue: slog only resolves
+	// LogValuer at the attr level, so a raw map would serialise secrets verbatim.
+	providers := make([]any, 0, len(o.Providers))
+	for id, pcfg := range o.Providers {
+		providers = append(providers, slog.Any(id, pcfg))
+	}
 	attrs := []slog.Attr{
 		slog.String("state_secret", secretMasked),
 		slog.String("state_cookie_name", o.StateCookieName),
 		slog.String("state_cookie_path", o.StateCookiePath),
 		slog.Duration("state_ttl", o.StateTTL),
 		slog.String("callback_base_url", o.CallbackBaseURL),
-		slog.Any("providers", o.Providers),
+		slog.Group("providers", providers...),
 	}
 	if o.Microsoft != nil {
 		attrs = append(attrs, slog.Any("microsoft", o.Microsoft.LogValue()))
@@ -781,9 +787,25 @@ func (c *Config) Validate() error {
 		if c.OAuth.Microsoft.RedirectURI == "" {
 			return errors.ErrOAuthRedirectURLRequired
 		}
-		if c.OAuth.Microsoft.Tenant == "" {
-			c.OAuth.Microsoft.Tenant = "common"
+		tenant := strings.ToLower(strings.TrimSpace(c.OAuth.Microsoft.Tenant))
+		if tenant == "" {
+			tenant = "common"
 		}
+		c.OAuth.Microsoft.Tenant = tenant
+		switch tenant {
+		case "common", "organizations", "consumers":
+		default:
+			if !isMicrosoftTenantRef(tenant) {
+				return errors.WrapOverride(errors.ErrOAuthTenantInvalid, errors.CodeInvalidConfig, "oauth microsoft tenant is invalid: "+tenant)
+			}
+		}
+		trusted := make([]string, 0, len(c.OAuth.Microsoft.TrustedTenants))
+		for _, t := range c.OAuth.Microsoft.TrustedTenants {
+			if t = strings.ToLower(strings.TrimSpace(t)); t != "" {
+				trusted = append(trusted, t)
+			}
+		}
+		c.OAuth.Microsoft.TrustedTenants = trusted
 		if len(c.OAuth.Microsoft.Scopes) == 0 {
 			c.OAuth.Microsoft.Scopes = []string{"openid", "profile", "email", "offline_access"}
 		}
@@ -980,7 +1002,15 @@ var (
 	dsnSecretRegex       = regexp.MustCompile(`(?i)\b(password|pass|token|secret|api_key|apikey|sslpassword)\b(\s*=\s*)(?:'(?:\\.|[^'\\])*'|"(?:\\.|[^"\\])*"|\S+)`)
 	userinfoRegex        = regexp.MustCompile(`://([^:]+):([^@]+)@`)
 	mysqlUserinfoRegex   = regexp.MustCompile(`(^|[^\w/])([a-zA-Z0-9_\-\.]+):(.+)@((?:tcp|unix)\([^\)]+\)|[a-zA-Z0-9_\-\.]*\/|$)`)
+	tenantGUIDRegex      = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+	tenantDomainRegex    = regexp.MustCompile(`^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}$`)
 )
+
+// isMicrosoftTenantRef reports whether tenant is a GUID or domain name.
+// Callers must lowercase tenant first; named authorities are handled separately.
+func isMicrosoftTenantRef(tenant string) bool {
+	return tenantGUIDRegex.MatchString(tenant) || tenantDomainRegex.MatchString(tenant)
+}
 
 func isSecretParam(k string) bool {
 	switch strings.ToLower(k) {

@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/kaiizer777/go-auth/config"
 	"github.com/kaiizer777/go-auth/errors"
@@ -57,6 +58,55 @@ func TestNewProvider(t *testing.T) {
 			if p.ID() != id {
 				t.Errorf("ID() = %q; want %q", p.ID(), id)
 			}
+		}
+	})
+
+	t.Run("microsoft typed overrides thread through", func(t *testing.T) {
+		t.Parallel()
+		typed := &config.OAuthConfig{
+			Microsoft: &config.MicrosoftConfig{
+				Tenant:         "organizations",
+				TrustedTenants: []string{"partner-guid"},
+				JWKSCacheTTL:   2 * time.Hour,
+			},
+		}
+		p, err := NewProvider("microsoft", cfg, typed)
+		if err != nil {
+			t.Fatalf("NewProvider(microsoft) = %v", err)
+		}
+		mp, ok := p.(*MicrosoftProvider)
+		if !ok {
+			t.Fatalf("type = %T; want *MicrosoftProvider", p)
+		}
+		if mp.cfg.Tenant != "organizations" {
+			t.Errorf("Tenant = %q; want organizations", mp.cfg.Tenant)
+		}
+		if len(mp.trustedTenants) != 1 {
+			t.Fatalf("trustedTenants entries = %d; want 1", len(mp.trustedTenants))
+		}
+		if mp.cfg.JWKSCacheTTL != 2*time.Hour {
+			t.Errorf("JWKSCacheTTL = %v; want 2h", mp.cfg.JWKSCacheTTL)
+		}
+		if !strings.Contains(mp.authURL, "/organizations/") {
+			t.Errorf("authURL = %q; want organizations authority", mp.authURL)
+		}
+	})
+
+	t.Run("facebook typed graph version threads through", func(t *testing.T) {
+		t.Parallel()
+		typed := &config.OAuthConfig{
+			Facebook: &config.FacebookConfig{GraphVersion: "v20.0"},
+		}
+		p, err := NewProvider("facebook", cfg, typed)
+		if err != nil {
+			t.Fatalf("NewProvider(facebook) = %v", err)
+		}
+		fp, ok := p.(*FacebookProvider)
+		if !ok {
+			t.Fatalf("type = %T; want *FacebookProvider", p)
+		}
+		if fp.cfg.GraphVersion != "v20.0" {
+			t.Errorf("GraphVersion = %q; want v20.0", fp.cfg.GraphVersion)
 		}
 	})
 

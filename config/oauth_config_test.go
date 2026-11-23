@@ -1,6 +1,8 @@
 package config
 
 import (
+	"bytes"
+	"log/slog"
 	"net/http"
 	"strings"
 	"testing"
@@ -318,6 +320,43 @@ func TestConfigValidate_OAuth(t *testing.T) {
 			wantErr: errors.ErrOAuthStateSecretRequired,
 		},
 		{
+			name: "microsoft uppercase tenant and trusted tenants normalised",
+			mutate: func(c *Config) {
+				c.OAuth.Microsoft = &MicrosoftConfig{
+					ClientID:       "ms-client-id",
+					ClientSecret:   "ms-client-secret",
+					RedirectURI:    "https://example.com/callback",
+					Tenant:         "  9188040D-6C67-4C5B-B112-36A304B66DAD  ",
+					TrustedTenants: []string{"  PARTNER-GUID ", "", "contoso.onmicrosoft.com"},
+				}
+			},
+			wantErr: nil,
+		},
+		{
+			name: "microsoft garbage tenant rejected",
+			mutate: func(c *Config) {
+				c.OAuth.Microsoft = &MicrosoftConfig{
+					ClientID:     "ms-client-id",
+					ClientSecret: "ms-client-secret",
+					RedirectURI:  "https://example.com/callback",
+					Tenant:       "not a tenant!!",
+				}
+			},
+			wantErr: errors.ErrOAuthTenantInvalid,
+		},
+		{
+			name: "microsoft bare single-label tenant rejected",
+			mutate: func(c *Config) {
+				c.OAuth.Microsoft = &MicrosoftConfig{
+					ClientID:     "ms-client-id",
+					ClientSecret: "ms-client-secret",
+					RedirectURI:  "https://example.com/callback",
+					Tenant:       "mytenant",
+				}
+			},
+			wantErr: errors.ErrOAuthTenantInvalid,
+		},
+		{
 			name: "microsoft provider map allowed",
 			mutate: func(c *Config) {
 				c.OAuth.Providers = enabled("microsoft", ProviderConfig{
@@ -580,6 +619,32 @@ func TestConfigValidate_OAuth(t *testing.T) {
 	}
 }
 
+func TestConfigValidate_MicrosoftTenantNormalisation(t *testing.T) {
+	cfg := validOAuthBase()
+	cfg.OAuth.Microsoft = &MicrosoftConfig{
+		ClientID:       "ms-client-id",
+		ClientSecret:   "ms-client-secret",
+		RedirectURI:    "https://example.com/callback",
+		Tenant:         "  ORGANIZATIONS  ",
+		TrustedTenants: []string{"  PARTNER-GUID ", "", "Contoso.OnMicrosoft.com"},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate = %v; want nil", err)
+	}
+	if cfg.OAuth.Microsoft.Tenant != "organizations" {
+		t.Errorf("Tenant = %q; want lowercased organizations", cfg.OAuth.Microsoft.Tenant)
+	}
+	want := []string{"partner-guid", "contoso.onmicrosoft.com"}
+	if len(cfg.OAuth.Microsoft.TrustedTenants) != len(want) {
+		t.Fatalf("TrustedTenants = %q; want %q", cfg.OAuth.Microsoft.TrustedTenants, want)
+	}
+	for i := range want {
+		if cfg.OAuth.Microsoft.TrustedTenants[i] != want[i] {
+			t.Errorf("TrustedTenants[%d] = %q; want %q", i, cfg.OAuth.Microsoft.TrustedTenants[i], want[i])
+		}
+	}
+}
+
 func TestProviderConfigLogValue(t *testing.T) {
 	t.Run("masks client secret and private key", func(t *testing.T) {
 		p := ProviderConfig{
@@ -682,6 +747,37 @@ func TestProviderConfigLogValue(t *testing.T) {
 		}
 		if !strings.Contains(str, "[REDACTED]") {
 			t.Fatalf("String() expected [REDACTED], got: %q", str)
+		}
+	})
+
+	t.Run("OAuthConfig providers map redacted under JSON handler", func(t *testing.T) {
+		o := OAuthConfig{
+			StateSecret: "state-secret-super-confidential",
+			Providers: map[string]ProviderConfig{
+				"google": {
+					ClientID:     "google-id",
+					ClientSecret: "google-top-secret",
+					RedirectURL:  "https://example.com/callback",
+				},
+				"apple": {
+					ClientID:    "apple-id",
+					TeamID:      "TEAMID1234",
+					KeyID:       "KEYID56789",
+					PrivateKey:  "apple-pem-secret",
+					RedirectURL: "https://example.com/callback",
+				},
+			},
+		}
+		var buf bytes.Buffer
+		slog.New(slog.NewJSONHandler(&buf, nil)).Info("oauth config", slog.Any("oauth", o))
+		out := buf.String()
+		for _, leaked := range []string{"google-top-secret", "apple-pem-secret", "state-secret-super-confidential"} {
+			if strings.Contains(out, leaked) {
+				t.Fatalf("JSON log leaked secret %q: %s", leaked, out)
+			}
+		}
+		if !strings.Contains(out, "[REDACTED]") {
+			t.Fatalf("expected [REDACTED] in JSON log, got: %s", out)
 		}
 	})
 
