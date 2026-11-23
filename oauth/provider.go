@@ -105,11 +105,15 @@ type IDTokenClaims struct {
 	Roles             []string `json:"roles,omitempty"`
 }
 
-// SupportedProviders defines the canonical set of locked Big 3 providers supported in v1.
+// SupportedProviders defines the canonical set of supported OAuth providers.
 var SupportedProviders = map[string]struct{}{
-	"google": {},
-	"github": {},
-	"apple":  {},
+	"google":    {},
+	"github":    {},
+	"apple":     {},
+	"microsoft": {},
+	"facebook":  {},
+	"discord":   {},
+	"x":         {},
 }
 
 // NewProvider instantiates a concrete OAuth provider for the given provider slug.

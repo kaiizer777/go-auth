@@ -180,6 +180,9 @@ func (s *service) HandleCallback(ctx context.Context, w http.ResponseWriter, r *
 		// Gate sentinels map to their historical literal reasons before the
 		// code-derived fallback, which stays the producer of UPPER_SNAKE
 		// reasons such as OAUTH_ACCOUNT_LINK_CONFLICT.
+		if errors.Is(err, errors.ErrOAuthEmailRequired) {
+			return fail("email_required", err)
+		}
 		if errors.Is(err, errors.ErrOAuthEmailUnverified) {
 			return fail("email_unverified", err)
 		}
@@ -296,6 +299,9 @@ const providerFieldMaxLen = 255
 // resolve a local account by email. Order is load-bearing: an unverified
 // identity reports OAUTH_EMAIL_UNVERIFIED before any field-validity rejection.
 func validateProviderIdentity(info *UserInfo) error {
+	if strings.TrimSpace(info.Email) == "" {
+		return errors.ErrOAuthEmailRequired
+	}
 	if !info.EmailVerified {
 		return errors.ErrOAuthEmailUnverified
 	}
