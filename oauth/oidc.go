@@ -109,16 +109,14 @@ func (m *JWKSManager) GetKey(ctx context.Context, kid string) (JWKSKey, error) {
 	if err != nil {
 		return JWKSKey{}, err
 	}
-	// A concurrent commit can supersede this fetch; the document still proves the
-	// provider served kid, so use it before escalating to the rollover flight.
-	if key, ok := fetched[kid]; ok {
+	// A concurrent commit can supersede this fetch; committed material wins because
+	// generation only proves "someone committed later", not which document is newer.
+	if key, ok := m.cachedKey(kid); ok {
 		return key, nil
 	}
-
-	m.mu.RLock()
-	key, ok = m.keys[kid]
-	m.mu.RUnlock()
-	if ok {
+	// The superseded document still proves the provider served kid, so it covers
+	// kids the committed cache genuinely lacks.
+	if key, ok := fetched[kid]; ok {
 		return key, nil
 	}
 
@@ -127,16 +125,20 @@ func (m *JWKSManager) GetKey(ctx context.Context, kid string) (JWKSKey, error) {
 	if err != nil {
 		return JWKSKey{}, err
 	}
+	if key, ok := m.cachedKey(kid); ok {
+		return key, nil
+	}
 	if key, ok := fetched[kid]; ok {
 		return key, nil
 	}
+	return JWKSKey{}, errors.New(errors.CodeOAuthIDTokenInvalid, fmt.Sprintf("signing key with kid %q not found in jwks", kid), nil)
+}
 
+func (m *JWKSManager) cachedKey(kid string) (JWKSKey, bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	if key, ok := m.keys[kid]; ok {
-		return key, nil
-	}
-	return JWKSKey{}, errors.New(errors.CodeOAuthIDTokenInvalid, fmt.Sprintf("signing key with kid %q not found in jwks", kid), nil)
+	key, ok := m.keys[kid]
+	return key, ok
 }
 
 // refreshFlight runs one deduplicated refresh unless the key is already cached and fresh.
