@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"fmt"
+	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
@@ -208,6 +209,9 @@ func TestIntegration_MultiProviderCallbackExecution(t *testing.T) {
 	for _, c := range recD.Result().Cookies() {
 		reqD.AddCookie(c)
 	}
+	// Live session must accompany the link callback: the service links on
+	// the embedded user only when it matches the request session.
+	reqD.AddCookie(&http.Cookie{Name: cfg.SessionCookieName, Value: rawIDG})
 
 	sessD, _, _, err := svc.HandleCallback(ctx, httptest.NewRecorder(), reqD, "discord", "code-d", stateD, db.SessionTypeCookie)
 	if err != nil {
@@ -228,6 +232,7 @@ func TestIntegration_MultiProviderCallbackExecution(t *testing.T) {
 	for _, c := range recX.Result().Cookies() {
 		reqX.AddCookie(c)
 	}
+	reqX.AddCookie(&http.Cookie{Name: cfg.SessionCookieName, Value: rawIDG})
 
 	sessX, _, _, err := svc.HandleCallback(ctx, httptest.NewRecorder(), reqX, "x", "code-x", stateX, db.SessionTypeCookie)
 	if err != nil {
