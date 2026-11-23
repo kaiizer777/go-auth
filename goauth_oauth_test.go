@@ -1,6 +1,7 @@
 package goauth
 
 import (
+	"encoding/json"
 	"net/url"
 	"strings"
 	"testing"
@@ -22,208 +23,23 @@ func providerQuery(t *testing.T, p oauth.Provider) (url.Values, string) {
 	return u.Query(), u.Path
 }
 
-func TestNewOAuthProviders_RegistersTypedConfigsWithoutMapEntries(t *testing.T) {
-	t.Parallel()
-
-	providers, err := newOAuthProviders(config.OAuthConfig{
-		Microsoft: &config.MicrosoftConfig{
-			ClientID:       "ms-id",
-			ClientSecret:   "ms-secret",
-			Tenant:         "tenant-guid",
-			TrustedTenants: []string{"partner-guid"},
-			RedirectURI:    "https://app.example.com/ms",
-			JWKSCacheTTL:   3 * time.Hour,
-		},
-		Facebook: &config.FacebookConfig{
-			AppID:        "fb-id",
-			AppSecret:    "fb-secret",
-			RedirectURI:  "https://app.example.com/fb",
-			GraphVersion: "v20.0",
-		},
-		Discord: &config.DiscordConfig{
-			ClientID:     "dc-id",
-			ClientSecret: "dc-secret",
-			RedirectURI:  "https://app.example.com/dc",
-		},
-		X: &config.XConfig{
-			ClientID:     "x-id",
-			ClientSecret: "x-secret",
-			RedirectURI:  "https://app.example.com/x",
-		},
-	})
-	if err != nil {
-		t.Fatalf("newOAuthProviders = %v", err)
+// validatedOAuthConfig builds a valid config and runs the startup validation so
+// provider tests exercise the same config production wires.
+func validatedOAuthConfig(t *testing.T, mutate func(*config.Config)) config.Config {
+	t.Helper()
+	cfg := config.DefaultConfig()
+	cfg.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+	cfg.BaseURL = "https://auth.example.com"
+	cfg.OAuth.StateSecret = "test-state-secret-at-least-32-bytes!"
+	mutate(&cfg)
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate = %v", err)
 	}
-	if len(providers) != 4 {
-		t.Fatalf("providers = %d; want 4", len(providers))
-	}
-	for _, id := range []string{"microsoft", "facebook", "discord", "x"} {
-		p, ok := providers[id]
-		if !ok {
-			t.Fatalf("missing provider %q", id)
-		}
-		if p.ID() != id {
-			t.Errorf("ID() = %q; want %q", p.ID(), id)
-		}
-	}
-
-	msQuery, msPath := providerQuery(t, providers["microsoft"])
-	if msQuery.Get("client_id") != "ms-id" {
-		t.Errorf("microsoft client_id = %q; want ms-id", msQuery.Get("client_id"))
-	}
-	if !strings.Contains(msPath, "/tenant-guid/") {
-		t.Errorf("microsoft auth path = %q; want tenant-guid authority", msPath)
-	}
-
-	fbQuery, fbPath := providerQuery(t, providers["facebook"])
-	if fbQuery.Get("client_id") != "fb-id" {
-		t.Errorf("facebook client_id = %q; want fb-id", fbQuery.Get("client_id"))
-	}
-	if !strings.Contains(fbPath, "/v20.0/") {
-		t.Errorf("facebook auth path = %q; want v20.0", fbPath)
-	}
+	return cfg
 }
 
-func TestOAuthProviderConfigs_Precedence(t *testing.T) {
-	t.Parallel()
-
-	t.Run("non-zero typed fields overlay the map entry and register once", func(t *testing.T) {
-		t.Parallel()
-		providers, err := newOAuthProviders(config.OAuthConfig{
-			Providers: map[string]config.ProviderConfig{
-				"microsoft": {
-					ClientID:     "map-id",
-					ClientSecret: "map-secret",
-					RedirectURL:  "https://map.example/cb",
-					Enabled:      true,
-					Tenant:       "map-tenant",
-				},
-			},
-			Microsoft: &config.MicrosoftConfig{
-				ClientID:     "typed-id",
-				ClientSecret: "typed-secret",
-				RedirectURI:  "https://typed.example/cb",
-				Tenant:       "typed-tenant",
-			},
-		})
-		if err != nil {
-			t.Fatalf("newOAuthProviders = %v", err)
-		}
-		if len(providers) != 1 {
-			t.Fatalf("providers = %d; want 1 (no double registration)", len(providers))
-		}
-		query, path := providerQuery(t, providers["microsoft"])
-		if query.Get("client_id") != "typed-id" {
-			t.Errorf("client_id = %q; want typed-id", query.Get("client_id"))
-		}
-		if query.Get("redirect_uri") != "https://typed.example/cb" {
-			t.Errorf("redirect_uri = %q; want typed https://typed.example/cb", query.Get("redirect_uri"))
-		}
-		if !strings.Contains(path, "/typed-tenant/") {
-			t.Errorf("auth path = %q; want typed-tenant authority", path)
-		}
-	})
-
-	t.Run("typed fields left zero inherit the map entry", func(t *testing.T) {
-		t.Parallel()
-		providers, err := newOAuthProviders(config.OAuthConfig{
-			Providers: map[string]config.ProviderConfig{
-				"microsoft": {
-					ClientID:     "map-id",
-					ClientSecret: "map-secret",
-					RedirectURL:  "https://map.example/cb",
-					Enabled:      true,
-				},
-			},
-			Microsoft: &config.MicrosoftConfig{
-				ClientID: "typed-id",
-				Tenant:   "typed-tenant",
-			},
-		})
-		if err != nil {
-			t.Fatalf("newOAuthProviders = %v", err)
-		}
-		query, _ := providerQuery(t, providers["microsoft"])
-		if query.Get("client_id") != "typed-id" {
-			t.Errorf("client_id = %q; want typed-id", query.Get("client_id"))
-		}
-		if query.Get("redirect_uri") != "https://map.example/cb" {
-			t.Errorf("redirect_uri = %q; want inherited https://map.example/cb", query.Get("redirect_uri"))
-		}
-	})
-
-	t.Run("disabled map entry alone stays unregistered", func(t *testing.T) {
-		t.Parallel()
-		providers, err := newOAuthProviders(config.OAuthConfig{
-			Providers: map[string]config.ProviderConfig{
-				"microsoft": {
-					ClientID:     "map-id",
-					ClientSecret: "map-secret",
-					RedirectURL:  "https://map.example/cb",
-					Enabled:      false,
-				},
-			},
-		})
-		if err != nil {
-			t.Fatalf("newOAuthProviders = %v", err)
-		}
-		if len(providers) != 0 {
-			t.Fatalf("providers = %v; want none", providers)
-		}
-	})
-
-	t.Run("typed config registers over a disabled map entry", func(t *testing.T) {
-		t.Parallel()
-		providers, err := newOAuthProviders(config.OAuthConfig{
-			Providers: map[string]config.ProviderConfig{
-				"microsoft": {
-					ClientID:     "map-id",
-					ClientSecret: "map-secret",
-					RedirectURL:  "https://map.example/cb",
-					Enabled:      false,
-				},
-			},
-			Microsoft: &config.MicrosoftConfig{
-				ClientID:     "typed-id",
-				ClientSecret: "typed-secret",
-				RedirectURI:  "https://typed.example/cb",
-			},
-		})
-		if err != nil {
-			t.Fatalf("newOAuthProviders = %v", err)
-		}
-		if len(providers) != 1 {
-			t.Fatalf("providers = %d; want 1", len(providers))
-		}
-	})
-
-	t.Run("typed config without client id is ignored entirely", func(t *testing.T) {
-		t.Parallel()
-		providers, err := newOAuthProviders(config.OAuthConfig{
-			Providers: map[string]config.ProviderConfig{
-				"microsoft": {
-					ClientID:     "map-id",
-					ClientSecret: "map-secret",
-					RedirectURL:  "https://map.example/cb",
-					Enabled:      true,
-				},
-			},
-			Microsoft: &config.MicrosoftConfig{Tenant: "typed-tenant"},
-		})
-		if err != nil {
-			t.Fatalf("newOAuthProviders = %v", err)
-		}
-		query, path := providerQuery(t, providers["microsoft"])
-		if query.Get("client_id") != "map-id" {
-			t.Errorf("client_id = %q; want map-id", query.Get("client_id"))
-		}
-		if !strings.Contains(path, "/common/") {
-			t.Errorf("auth path = %q; want common (typed config not applied)", path)
-		}
-	})
-}
-
-func TestNewWithDB_RegistersTypedOAuthProviders(t *testing.T) {
+func openTestSQLite(t *testing.T) *gorm.DB {
+	t.Helper()
 	sqliteDB, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{DisableAutomaticPing: true})
 	if err != nil {
 		t.Fatalf("failed to open sqlite: %v", err)
@@ -260,7 +76,272 @@ func TestNewWithDB_RegistersTypedOAuthProviders(t *testing.T) {
 	if err := sqliteDB.Exec(ddl).Error; err != nil {
 		t.Fatalf("failed to execute sqlite ddl: %v", err)
 	}
+	return sqliteDB
+}
 
+func microsoftAuthority(t *testing.T, p oauth.Provider) string {
+	t.Helper()
+	u, err := url.Parse(p.AuthURL("state", "challenge"))
+	if err != nil {
+		t.Fatalf("invalid microsoft auth url: %v", err)
+	}
+	if u.Host != "login.microsoftonline.com" {
+		t.Fatalf("microsoft auth host = %q; want login.microsoftonline.com", u.Host)
+	}
+	// Path is /{tenant}/oauth2/v2.0/authorize.
+	segments := strings.Split(strings.TrimPrefix(u.Path, "/"), "/")
+	if len(segments) < 2 || segments[1] != "oauth2" {
+		t.Fatalf("microsoft auth path = %q; want /{tenant}/oauth2/...", u.Path)
+	}
+	return segments[0]
+}
+
+func TestNewOAuthProviders_RegistersTypedConfigsWithoutMapEntries(t *testing.T) {
+	t.Parallel()
+
+	cfg := validatedOAuthConfig(t, func(c *config.Config) {
+		c.OAuth.Microsoft = &config.MicrosoftConfig{
+			ClientID:       "ms-id",
+			ClientSecret:   "ms-secret",
+			Tenant:         "tenant-guid",
+			TrustedTenants: []string{"partner-guid"},
+			RedirectURI:    "https://app.example.com/ms",
+			JWKSCacheTTL:   3 * time.Hour,
+		}
+		c.OAuth.Facebook = &config.FacebookConfig{
+			AppID:        "fb-id",
+			AppSecret:    "fb-secret",
+			RedirectURI:  "https://app.example.com/fb",
+			GraphVersion: "v20.0",
+		}
+		c.OAuth.Discord = &config.DiscordConfig{
+			ClientID:     "dc-id",
+			ClientSecret: "dc-secret",
+			RedirectURI:  "https://app.example.com/dc",
+		}
+		c.OAuth.X = &config.XConfig{
+			ClientID:     "x-id",
+			ClientSecret: "x-secret",
+			RedirectURI:  "https://app.example.com/x",
+		}
+	})
+
+	providers, err := newOAuthProviders(cfg.OAuth)
+	if err != nil {
+		t.Fatalf("newOAuthProviders = %v", err)
+	}
+	if len(providers) != 4 {
+		t.Fatalf("providers = %d; want 4", len(providers))
+	}
+	for _, id := range []string{"microsoft", "facebook", "discord", "x"} {
+		p, ok := providers[id]
+		if !ok {
+			t.Fatalf("missing provider %q", id)
+		}
+		if p.ID() != id {
+			t.Errorf("ID() = %q; want %q", p.ID(), id)
+		}
+	}
+
+	msQuery, _ := providerQuery(t, providers["microsoft"])
+	if msQuery.Get("client_id") != "ms-id" {
+		t.Errorf("microsoft client_id = %q; want ms-id", msQuery.Get("client_id"))
+	}
+	if got := microsoftAuthority(t, providers["microsoft"]); got != "tenant-guid" {
+		t.Errorf("microsoft authority = %q; want tenant-guid", got)
+	}
+
+	fbQuery, fbPath := providerQuery(t, providers["facebook"])
+	if fbQuery.Get("client_id") != "fb-id" {
+		t.Errorf("facebook client_id = %q; want fb-id", fbQuery.Get("client_id"))
+	}
+	if !strings.Contains(fbPath, "/v20.0/") {
+		t.Errorf("facebook auth path = %q; want v20.0", fbPath)
+	}
+}
+
+func TestNewOAuthProviders_TenantPrecedence(t *testing.T) {
+	t.Parallel()
+
+	t.Run("map tenant survives a typed section that omits it", func(t *testing.T) {
+		t.Parallel()
+		cfg := validatedOAuthConfig(t, func(c *config.Config) {
+			c.OAuth.Providers = map[string]config.ProviderConfig{
+				"microsoft": {
+					ClientID:     "map-id",
+					ClientSecret: "map-secret",
+					RedirectURL:  "https://map.example/cb",
+					Enabled:      true,
+					Tenant:       "corp-guid",
+				},
+			}
+			c.OAuth.Microsoft = &config.MicrosoftConfig{
+				ClientID:     "typed-id",
+				ClientSecret: "typed-secret",
+				RedirectURI:  "https://typed.example/cb",
+			}
+		})
+
+		providers, err := newOAuthProviders(cfg.OAuth)
+		if err != nil {
+			t.Fatalf("newOAuthProviders = %v", err)
+		}
+		if len(providers) != 1 {
+			t.Fatalf("providers = %d; want 1 (no double registration)", len(providers))
+		}
+		if got := microsoftAuthority(t, providers["microsoft"]); got != "corp-guid" {
+			t.Errorf("microsoft authority = %q; want corp-guid", got)
+		}
+	})
+
+	t.Run("typed tenant wins over the map entry", func(t *testing.T) {
+		t.Parallel()
+		cfg := validatedOAuthConfig(t, func(c *config.Config) {
+			c.OAuth.Providers = map[string]config.ProviderConfig{
+				"microsoft": {
+					ClientID:     "map-id",
+					ClientSecret: "map-secret",
+					RedirectURL:  "https://map.example/cb",
+					Enabled:      true,
+					Tenant:       "map-guid",
+				},
+			}
+			c.OAuth.Microsoft = &config.MicrosoftConfig{
+				ClientID:     "typed-id",
+				ClientSecret: "typed-secret",
+				RedirectURI:  "https://typed.example/cb",
+				Tenant:       "typed-guid",
+			}
+		})
+
+		providers, err := newOAuthProviders(cfg.OAuth)
+		if err != nil {
+			t.Fatalf("newOAuthProviders = %v", err)
+		}
+		if got := microsoftAuthority(t, providers["microsoft"]); got != "typed-guid" {
+			t.Errorf("microsoft authority = %q; want typed-guid", got)
+		}
+	})
+
+	t.Run("json map tenant survives defaults", func(t *testing.T) {
+		t.Parallel()
+		raw := `{
+			"DatabaseURL": "postgres://user:pass@localhost:5432/testdb",
+			"BaseURL": "https://auth.example.com",
+			"OAuth": {
+				"StateSecret": "test-state-secret-at-least-32-bytes!",
+				"Providers": {
+					"microsoft": {
+						"ClientID": "map-id",
+						"ClientSecret": "map-secret",
+						"RedirectURL": "https://auth.example.com/auth/oauth/microsoft/callback",
+						"Enabled": true,
+						"tenant": "corp-guid"
+					}
+				}
+			}
+		}`
+		cfg := config.DefaultConfig()
+		if err := json.Unmarshal([]byte(raw), &cfg); err != nil {
+			t.Fatalf("unmarshal config: %v", err)
+		}
+
+		a, err := NewWithDB(openTestSQLite(t), cfg)
+		if err != nil {
+			t.Fatalf("NewWithDB = %v", err)
+		}
+		defer func() { _ = a.Close() }()
+
+		providers, err := newOAuthProviders(a.cfg.OAuth)
+		if err != nil {
+			t.Fatalf("newOAuthProviders = %v", err)
+		}
+		p, ok := providers["microsoft"]
+		if !ok {
+			t.Fatal("json map entry did not register a microsoft provider")
+		}
+		if got := microsoftAuthority(t, p); got != "corp-guid" {
+			t.Errorf("microsoft authority = %q; want corp-guid", got)
+		}
+	})
+}
+
+func TestNewOAuthProviders_EnabledPrecedence(t *testing.T) {
+	t.Parallel()
+
+	microsoftTyped := func(enable *bool) *config.MicrosoftConfig {
+		return &config.MicrosoftConfig{
+			ClientID:     "typed-id",
+			ClientSecret: "typed-secret",
+			RedirectURI:  "https://typed.example/cb",
+			Enabled:      enable,
+		}
+	}
+	disabledMapEntry := func() map[string]config.ProviderConfig {
+		return map[string]config.ProviderConfig{
+			"microsoft": {
+				ClientID:     "map-id",
+				ClientSecret: "map-secret",
+				RedirectURL:  "https://map.example/cb",
+				Enabled:      false,
+			},
+		}
+	}
+
+	t.Run("map entry enabled false vetoes a typed provider", func(t *testing.T) {
+		t.Parallel()
+		cfg := validatedOAuthConfig(t, func(c *config.Config) {
+			c.OAuth.Providers = disabledMapEntry()
+			c.OAuth.Microsoft = microsoftTyped(nil)
+		})
+		providers, err := newOAuthProviders(cfg.OAuth)
+		if err != nil {
+			t.Fatalf("newOAuthProviders = %v", err)
+		}
+		if len(providers) != 0 {
+			t.Fatalf("providers = %v; want none", providers)
+		}
+	})
+
+	t.Run("typed enabled false vetoes an enabled map entry", func(t *testing.T) {
+		t.Parallel()
+		off := false
+		cfg := validatedOAuthConfig(t, func(c *config.Config) {
+			c.OAuth.Providers = map[string]config.ProviderConfig{
+				"microsoft": {
+					ClientID:     "map-id",
+					ClientSecret: "map-secret",
+					RedirectURL:  "https://map.example/cb",
+					Enabled:      true,
+				},
+			}
+			c.OAuth.Microsoft = microsoftTyped(&off)
+		})
+		providers, err := newOAuthProviders(cfg.OAuth)
+		if err != nil {
+			t.Fatalf("newOAuthProviders = %v", err)
+		}
+		if len(providers) != 0 {
+			t.Fatalf("providers = %v; want none", providers)
+		}
+	})
+
+	t.Run("disabled map entry alone stays unregistered", func(t *testing.T) {
+		t.Parallel()
+		cfg := validatedOAuthConfig(t, func(c *config.Config) {
+			c.OAuth.Providers = disabledMapEntry()
+		})
+		providers, err := newOAuthProviders(cfg.OAuth)
+		if err != nil {
+			t.Fatalf("newOAuthProviders = %v", err)
+		}
+		if len(providers) != 0 {
+			t.Fatalf("providers = %v; want none", providers)
+		}
+	})
+}
+
+func TestNewWithDB_RegistersTypedOAuthProviders(t *testing.T) {
 	cfg := config.DefaultConfig()
 	cfg.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
 	cfg.BaseURL = "https://auth.example.com"
@@ -273,7 +354,7 @@ func TestNewWithDB_RegistersTypedOAuthProviders(t *testing.T) {
 		RedirectURI:    "https://auth.example.com/auth/oauth/microsoft/callback",
 	}
 
-	a, err := NewWithDB(sqliteDB, cfg)
+	a, err := NewWithDB(openTestSQLite(t), cfg)
 	if err != nil {
 		t.Fatalf("NewWithDB = %v", err)
 	}

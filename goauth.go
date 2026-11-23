@@ -203,11 +203,12 @@ func NewWithStore(store db.Store, cfg config.Config) (*Auth, error) {
 	return a, nil
 }
 
-// newOAuthProviders instantiates every configured OAuth provider.
+// newOAuthProviders instantiates every enabled entry of the resolved provider
+// config. cfg must have passed Config.Validate, which merges the typed sections
+// into cfg.Providers and applies defaults.
 func newOAuthProviders(cfg config.OAuthConfig) (map[string]oauth.Provider, error) {
-	merged := oauthProviderConfigs(cfg)
-	providers := make(map[string]oauth.Provider, len(merged))
-	for id, pcfg := range merged {
+	providers := make(map[string]oauth.Provider, len(cfg.Providers))
+	for id, pcfg := range cfg.Providers {
 		if !pcfg.Enabled {
 			continue
 		}
@@ -218,101 +219,6 @@ func newOAuthProviders(cfg config.OAuthConfig) (map[string]oauth.Provider, error
 		providers[id] = p
 	}
 	return providers, nil
-}
-
-// oauthProviderConfigs resolves the typed per-provider configs
-// (OAuth.Microsoft/Facebook/Discord/X) against the Providers map. Precedence:
-// the map entry is the base and every non-zero typed field overlays it, so the
-// typed surface always wins where it speaks. A provider registers when its
-// merged entry is enabled; a typed config is enabled by construction (it is
-// credential-validated at startup whenever non-nil) and is ignored entirely
-// when it carries no client ID, so it can never half-apply over a map entry.
-func oauthProviderConfigs(cfg config.OAuthConfig) map[string]config.ProviderConfig {
-	merged := make(map[string]config.ProviderConfig, len(cfg.Providers)+4)
-	for id, pcfg := range cfg.Providers {
-		merged[id] = pcfg
-	}
-	for id, typed := range typedProviderConfigs(cfg) {
-		if typed.ClientID == "" {
-			continue
-		}
-		merged[id] = overlayProviderConfig(merged[id], typed)
-	}
-	return merged
-}
-
-// typedProviderConfigs projects the typed configs onto the neutral shape; empty
-// entries are omitted so a nil typed config never shadows a map entry.
-func typedProviderConfigs(cfg config.OAuthConfig) map[string]config.ProviderConfig {
-	typed := make(map[string]config.ProviderConfig, 4)
-	if m := cfg.Microsoft; m != nil {
-		typed["microsoft"] = config.ProviderConfig{
-			ClientID:       m.ClientID,
-			ClientSecret:   m.ClientSecret,
-			RedirectURL:    m.RedirectURI,
-			Scopes:         m.Scopes,
-			Tenant:         m.Tenant,
-			TrustedTenants: m.TrustedTenants,
-			JWKSCacheTTL:   m.JWKSCacheTTL,
-		}
-	}
-	if f := cfg.Facebook; f != nil {
-		typed["facebook"] = config.ProviderConfig{
-			ClientID:     f.AppID,
-			ClientSecret: f.AppSecret,
-			RedirectURL:  f.RedirectURI,
-			Scopes:       f.Scopes,
-			GraphVersion: f.GraphVersion,
-		}
-	}
-	if d := cfg.Discord; d != nil {
-		typed["discord"] = config.ProviderConfig{
-			ClientID:     d.ClientID,
-			ClientSecret: d.ClientSecret,
-			RedirectURL:  d.RedirectURI,
-			Scopes:       d.Scopes,
-		}
-	}
-	if x := cfg.X; x != nil {
-		typed["x"] = config.ProviderConfig{
-			ClientID:     x.ClientID,
-			ClientSecret: x.ClientSecret,
-			RedirectURL:  x.RedirectURI,
-			Scopes:       x.Scopes,
-		}
-	}
-	return typed
-}
-
-// overlayProviderConfig applies the non-zero fields of typed onto base and marks
-// the result enabled.
-func overlayProviderConfig(base, typed config.ProviderConfig) config.ProviderConfig {
-	if typed.ClientID != "" {
-		base.ClientID = typed.ClientID
-	}
-	if typed.ClientSecret != "" {
-		base.ClientSecret = typed.ClientSecret
-	}
-	if typed.RedirectURL != "" {
-		base.RedirectURL = typed.RedirectURL
-	}
-	if len(typed.Scopes) > 0 {
-		base.Scopes = typed.Scopes
-	}
-	if typed.Tenant != "" {
-		base.Tenant = typed.Tenant
-	}
-	if len(typed.TrustedTenants) > 0 {
-		base.TrustedTenants = typed.TrustedTenants
-	}
-	if typed.JWKSCacheTTL != 0 {
-		base.JWKSCacheTTL = typed.JWKSCacheTTL
-	}
-	if typed.GraphVersion != "" {
-		base.GraphVersion = typed.GraphVersion
-	}
-	base.Enabled = true
-	return base
 }
 
 // NewWithDB initializes Auth using an existing GORM database connection.
