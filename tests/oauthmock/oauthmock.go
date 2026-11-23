@@ -38,6 +38,7 @@ type Mock struct {
 	challenges      map[string]struct{}
 	requireVerifier string
 	profile         *oauth.UserInfo
+	rawClaims       map[string]any
 
 	// SingleUseCodes rejects an auth code on second use (replay tests).
 	SingleUseCodes bool
@@ -228,10 +229,17 @@ func (m *Mock) FetchUserInfo(ctx context.Context, tokens *oauth.TokenResponse) (
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	var claims map[string]any
+	if m.rawClaims != nil {
+		claims = make(map[string]any, len(m.rawClaims))
+		for k, v := range m.rawClaims {
+			claims[k] = v
+		}
+	}
 	return &oauth.UserInfo{
 		ProviderID: m.id, ProviderUserID: raw.Sub,
 		Email: raw.Email, EmailVerified: verified || m.profile.EmailVerified,
-		Name: raw.Name,
+		Name: raw.Name, RawClaims: claims,
 	}, nil
 }
 
@@ -247,6 +255,15 @@ func (m *Mock) SetRequireVerifier(v string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.requireVerifier = v
+}
+
+// SetRawClaims pins extra claims (e.g. untrusted_tenant) onto the profile
+// FetchUserInfo returns. Opt-in: mocks without pinned claims keep the
+// previous nil-RawClaims behavior for all other consumers.
+func (m *Mock) SetRawClaims(claims map[string]any) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.rawClaims = claims
 }
 
 // drainBody discards and closes a mock provider response body.

@@ -138,18 +138,11 @@ func TestSecurity_Microsoft_nOauth_UntrustedTenantTakeover(t *testing.T) {
 	cfg.OAuth.StateSecret = "super-secret-anti-hijack-test-state-key-32b"
 	sessSvc := session.NewService(database, &cfg)
 
-	// External untrusted tenant ID attempting to claim victim@company.com without domain verification
-	untrustedInfo := &oauth.UserInfo{
-		ProviderID:     "microsoft",
-		ProviderUserID: "ms-attacker-controlled-sub",
-		Email:          "victim@company.com",
-		EmailVerified:  false,
-		Name:           "Attacker Azure AD Admin",
-		RawClaims: map[string]any{
-			"untrusted_tenant": true,
-		},
-	}
-	mockMS := oauthmock.New("microsoft", untrustedInfo.ProviderUserID, untrustedInfo.Email, false)
+	// External untrusted tenant ID attempting to claim victim@company.com without domain verification.
+	// Verified email pins the test to the tenant gate: the email gate must
+	// NOT be able to satisfy this assertion on its own.
+	mockMS := oauthmock.New("microsoft", "ms-attacker-controlled-sub", "victim@company.com", true)
+	mockMS.SetRawClaims(map[string]any{"untrusted_tenant": true})
 	defer mockMS.Close()
 
 	reg := oauth.NewRegistry()
@@ -169,17 +162,24 @@ func TestSecurity_Microsoft_nOauth_UntrustedTenantTakeover(t *testing.T) {
 		cbReq.AddCookie(c)
 	}
 
-	// Also simulate untrusted tenant tag via Mock if needed
-	// In service, untrusted external tenant returns ErrOAuthTenantInvalid
+	// The profile is verified, so only the untrusted-tenant gate can fail
+	// this closed: assert its exact sentinel, not either-or.
 	cbRec := httptest.NewRecorder()
 	_, _, _, err = svc.HandleCallback(ctx, cbRec, cbReq, "microsoft", "code-ms", state, db.SessionTypeCookie)
 
-	// Since mockMS returns unverified email (false), it should fail closed
 	if err == nil {
-		t.Fatal("expected unverified tenant to fail, got nil")
+		t.Fatal("expected untrusted tenant to fail, got nil")
 	}
-	if !errors.Is(err, errors.ErrOAuthEmailUnverified) && !errors.Is(err, errors.ErrOAuthTenantInvalid) {
-		t.Fatalf("expected ErrOAuthTenantInvalid or ErrOAuthEmailUnverified, got: %v", err)
+	if !errors.Is(err, errors.ErrOAuthTenantInvalid) {
+		t.Fatalf("expected ErrOAuthTenantInvalid, got: %v", err)
+	}
+
+	var count int64
+	if err := database.Model(&db.OAuthAccount{}).Count(&count).Error; err != nil {
+		t.Fatalf("count links: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("expected 0 oauth links created, got %d", count)
 	}
 }
 
