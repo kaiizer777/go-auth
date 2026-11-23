@@ -31,10 +31,11 @@ func requireProviderError(t *testing.T, err error) {
 
 func TestSupportedProviders(t *testing.T) {
 	t.Parallel()
-	if len(SupportedProviders) != 3 {
-		t.Fatalf("len = %d; want 3", len(SupportedProviders))
+	expected := []string{"google", "github", "apple", "microsoft", "facebook", "discord", "x"}
+	if len(SupportedProviders) != len(expected) {
+		t.Fatalf("len = %d; want %d", len(SupportedProviders), len(expected))
 	}
-	for _, id := range []string{"google", "github", "apple"} {
+	for _, id := range expected {
 		if _, ok := SupportedProviders[id]; !ok {
 			t.Errorf("missing provider %q", id)
 		}

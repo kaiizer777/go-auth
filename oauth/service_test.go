@@ -1199,3 +1199,72 @@ func TestService_CreateUserAndLink_RetryIsolation(t *testing.T) {
 		}
 	})
 }
+
+func TestOAuthService_X_MissingEmail(t *testing.T) {
+	database := serviceTestDB(t)
+	cfg := serviceTestConfig()
+
+	xInfo := &UserInfo{
+		ProviderID:     "x",
+		ProviderUserID: "x-user-999",
+		Email:          "",
+		EmailVerified:  false,
+		Name:           "X User",
+		AvatarURL:      "https://example.com/avatar.png",
+	}
+
+	stub := &stubProvider{id: "x", info: xInfo}
+	svc := NewService(database, session.NewService(database, cfg),
+		map[string]Provider{"x": stub}, cfg)
+
+	t.Run("unauthenticated registration with missing email fails closed", func(t *testing.T) {
+		state, cookie := mustInitiate(t, svc, cfg, "x")
+		req := httptest.NewRequest(http.MethodGet, "/auth/oauth/x/callback", nil)
+		req.AddCookie(cookie)
+		rec := httptest.NewRecorder()
+
+		_, _, _, err := svc.HandleCallback(context.Background(), rec, req, "x", "test-code", state, db.SessionTypeCookie)
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+		if !errors.Is(err, errors.ErrOAuthEmailRequired) {
+			t.Fatalf("expected ErrOAuthEmailRequired, got %v", err)
+		}
+
+		// Invariant: zero synthetic users or link rows created in database
+		var userCount, linkCount int64
+		if err := database.Model(&db.User{}).Count(&userCount).Error; err != nil {
+			t.Fatalf("count users: %v", err)
+		}
+		if err := database.Model(&db.OAuthAccount{}).Count(&linkCount).Error; err != nil {
+			t.Fatalf("count links: %v", err)
+		}
+		if userCount != 0 {
+			t.Fatalf("expected 0 users created, got %d", userCount)
+		}
+		if linkCount != 0 {
+			t.Fatalf("expected 0 links created, got %d", linkCount)
+		}
+	})
+
+	t.Run("returning user with pre-linked account succeeds without email", func(t *testing.T) {
+		owner := seedLinkedIdentity(t, database, "x", "x-user-999")
+
+		state, cookie := mustInitiate(t, svc, cfg, "x")
+		req := httptest.NewRequest(http.MethodGet, "/auth/oauth/x/callback", nil)
+		req.AddCookie(cookie)
+		rec := httptest.NewRecorder()
+
+		sess, rawID, _, err := svc.HandleCallback(context.Background(), rec, req, "x", "test-code", state, db.SessionTypeCookie)
+		if err != nil {
+			t.Fatalf("unexpected callback error: %v", err)
+		}
+		if sess == nil || rawID == "" {
+			t.Fatal("expected valid session and token")
+		}
+		if sess.UserID != owner.ID {
+			t.Fatalf("sess.UserID = %v; want %v", sess.UserID, owner.ID)
+		}
+	})
+}
+
