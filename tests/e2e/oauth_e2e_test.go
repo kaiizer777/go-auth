@@ -1,12 +1,15 @@
 package e2e_test
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"testing"
+	"time"
 
 	"github.com/glebarez/sqlite"
 	"github.com/google/uuid"
@@ -32,7 +35,7 @@ func setupOAuthE2EStack(t *testing.T) (http.Handler, *gorm.DB, *oauth.Registry, 
 	}
 	ddl := `
 	CREATE TABLE IF NOT EXISTS users (
-		id TEXT PRIMARY KEY, email TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL,
+		id TEXT PRIMARY KEY, email TEXT COLLATE NOCASE UNIQUE NOT NULL, password_hash TEXT NOT NULL,
 		credential_version INTEGER NOT NULL DEFAULT 0, email_verified INTEGER NOT NULL DEFAULT 0,
 		created_at DATETIME, updated_at DATETIME
 	);
@@ -43,16 +46,34 @@ func setupOAuthE2EStack(t *testing.T) (http.Handler, *gorm.DB, *oauth.Registry, 
 		CONSTRAINT uq_oauth_accounts_provider_uid UNIQUE (provider_id, provider_user_id),
 		FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 	);
+	CREATE TABLE IF NOT EXISTS verification_tokens (
+		token_hash BLOB PRIMARY KEY, user_id TEXT NOT NULL, expires_at DATETIME NOT NULL, created_at DATETIME,
+		FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+	);
+	CREATE TABLE IF NOT EXISTS password_reset_tokens (
+		token_hash BLOB PRIMARY KEY, user_id TEXT NOT NULL, expires_at DATETIME NOT NULL, created_at DATETIME,
+		FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+	);
 	CREATE TABLE IF NOT EXISTS sessions (
 		id TEXT PRIMARY KEY, user_id TEXT NOT NULL, id_hash CHAR(64) UNIQUE NOT NULL,
 		session_type VARCHAR(10) NOT NULL DEFAULT 'cookie', ip_address VARCHAR(45) NOT NULL DEFAULT '',
 		user_agent TEXT NOT NULL DEFAULT '', credential_version INTEGER NOT NULL DEFAULT 0,
-		last_active_at DATETIME NOT NULL, absolute_expires_at DATETIME NOT NULL, created_at DATETIME
+		last_active_at DATETIME NOT NULL, absolute_expires_at DATETIME NOT NULL, created_at DATETIME,
+		FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 	);`
 	if err := database.Exec(ddl).Error; err != nil {
 		t.Fatalf("schema error: %v", err)
 	}
-	_ = database.Exec("PRAGMA foreign_keys = ON;")
+	// PRAGMA is per-connection while database/sql pools connections: pin the
+	// pool so FK enforcement cannot pass or fail by connection reuse.
+	sqlDB, err := database.DB()
+	if err != nil {
+		t.Fatalf("sql db: %v", err)
+	}
+	sqlDB.SetMaxOpenConns(1)
+	if err := database.Exec("PRAGMA foreign_keys = ON;").Error; err != nil {
+		t.Fatalf("enable foreign_keys: %v", err)
+	}
 
 	cfg := config.DefaultConfig()
 	cfg.DatabaseURL = "postgres://postgres:postgres@localhost:5432/testdb"
@@ -384,42 +405,90 @@ func TestE2E_FullBrowserOAuthJourneys(t *testing.T) {
 			t.Fatalf("expected 302 Found on Facebook callback, got %d (%s)", cbRec.Code, cbRec.Body.String())
 		}
 
-		var count int64
-		if err := dbConn.Model(&db.OAuthAccount{}).Where("provider_id = ?", "facebook").Count(&count).Error; err != nil || count != 1 {
-			t.Fatalf("expected 1 facebook link row, got count=%d, err=%v", count, err)
+		var sessionCookie *http.Cookie
+		for _, c := range cbRec.Result().Cookies() {
+			if c.Name == cfg.SessionCookieName {
+				sessionCookie = c
+				break
+			}
+		}
+		if sessionCookie == nil {
+			t.Fatal("expected session cookie set on Facebook callback")
+		}
+
+		var user db.User
+		if err := dbConn.Where("email = ?", "fb-user@example.com").First(&user).Error; err != nil {
+			t.Fatalf("user record not found: %v", err)
+		}
+		var link db.OAuthAccount
+		if err := dbConn.Where("provider_id = ? AND user_id = ?", "facebook", user.ID).First(&link).Error; err != nil {
+			t.Fatalf("facebook link record not found: %v", err)
+		}
+		if link.ProviderUserID != "fb-app-scoped-uid-444" {
+			t.Fatalf("link provider_user_id = %q; want %q", link.ProviderUserID, "fb-app-scoped-uid-444")
+		}
+
+		var sessCount int64
+		if err := dbConn.Model(&db.Session{}).Where("user_id = ?", user.ID).Count(&sessCount).Error; err != nil || sessCount != 1 {
+			t.Fatalf("expected 1 session row for facebook user, got count=%d, err=%v", sessCount, err)
 		}
 	})
 
 	// 5. Journey 5: Hard delete cascade
 	t.Run("journey 5: hard delete cascade deletes oauth_accounts", func(t *testing.T) {
 		_, dbConn, _, _ := setupOAuthE2EStack(t)
+		ctx := context.Background()
+		store := gormstore.New(dbConn)
 
 		u := db.User{
 			ID:            uuid.New(),
 			Email:         "cascade-test@example.com",
 			EmailVerified: true,
 		}
-		_ = dbConn.Create(&u)
-		_ = dbConn.Create(&db.OAuthAccount{
+		if err := store.Users().Create(ctx, &u); err != nil {
+			t.Fatalf("create user failed: %v", err)
+		}
+		if err := store.OAuthAccounts().Create(ctx, &db.OAuthAccount{
 			ID:             uuid.New(),
 			UserID:         u.ID,
 			ProviderID:     "microsoft",
 			ProviderUserID: "ms-cascade-sub",
 			Email:          u.Email,
-		})
-
-		var count int64
-		_ = dbConn.Model(&db.OAuthAccount{}).Where("user_id = ?", u.ID).Count(&count)
-		if count != 1 {
-			t.Fatalf("expected 1 link row, got %d", count)
+		}); err != nil {
+			t.Fatalf("create link failed: %v", err)
+		}
+		if err := dbConn.Create(&db.Session{
+			ID:                uuid.New(),
+			UserID:            u.ID,
+			IDHash:            uuid.NewString(),
+			SessionType:       db.SessionTypeCookie,
+			LastActiveAt:      time.Now().UTC(),
+			AbsoluteExpiresAt: time.Now().UTC().Add(time.Hour),
+		}).Error; err != nil {
+			t.Fatalf("create session failed: %v", err)
 		}
 
-		// Delete user
-		_ = dbConn.Exec("DELETE FROM users WHERE id = ?", u.ID.String())
+		var count int64
+		if err := dbConn.Model(&db.OAuthAccount{}).Where("user_id = ?", u.ID).Count(&count).Error; err != nil || count != 1 {
+			t.Fatalf("expected 1 link row, got count=%d, err=%v", count, err)
+		}
+		if err := dbConn.Model(&db.Session{}).Where("user_id = ?", u.ID).Count(&count).Error; err != nil || count != 1 {
+			t.Fatalf("expected 1 session row, got count=%d, err=%v", count, err)
+		}
 
-		_ = dbConn.Model(&db.OAuthAccount{}).Where("user_id = ?", u.ID).Count(&count)
-		if count != 0 {
-			t.Fatalf("expected 0 link rows after cascade delete, got %d", count)
+		// Delete through the product path, not raw SQL.
+		if err := store.Users().Delete(ctx, u.ID); err != nil {
+			t.Fatalf("delete user failed: %v", err)
+		}
+
+		if _, err := store.Users().GetByID(ctx, u.ID); !errors.Is(err, gorm.ErrRecordNotFound) {
+			t.Fatalf("expected user to be gone, got err=%v", err)
+		}
+		if err := dbConn.Model(&db.OAuthAccount{}).Where("user_id = ?", u.ID).Count(&count).Error; err != nil || count != 0 {
+			t.Fatalf("expected 0 link rows after cascade delete, got count=%d, err=%v", count, err)
+		}
+		if err := dbConn.Model(&db.Session{}).Where("user_id = ?", u.ID).Count(&count).Error; err != nil || count != 0 {
+			t.Fatalf("expected 0 session rows after cascade delete, got count=%d, err=%v", count, err)
 		}
 	})
 }

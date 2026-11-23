@@ -35,7 +35,7 @@ func setupOAuthFlow(t *testing.T, mocks map[string]*oauthmock.Mock, modifyCfg ..
 	}
 	ddl := `
 	CREATE TABLE IF NOT EXISTS users (
-		id TEXT PRIMARY KEY, email TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL,
+		id TEXT PRIMARY KEY, email TEXT COLLATE NOCASE UNIQUE NOT NULL, password_hash TEXT NOT NULL,
 		credential_version INTEGER NOT NULL DEFAULT 0, email_verified INTEGER NOT NULL DEFAULT 0,
 		created_at DATETIME, updated_at DATETIME
 	);
@@ -43,19 +43,23 @@ func setupOAuthFlow(t *testing.T, mocks map[string]*oauthmock.Mock, modifyCfg ..
 		id TEXT PRIMARY KEY, user_id TEXT NOT NULL, provider_id VARCHAR(32) NOT NULL,
 		provider_user_id VARCHAR(255) NOT NULL, email VARCHAR(255) NOT NULL,
 		created_at DATETIME, updated_at DATETIME,
-		CONSTRAINT uq_oauth_accounts_provider_uid UNIQUE (provider_id, provider_user_id)
+		CONSTRAINT uq_oauth_accounts_provider_uid UNIQUE (provider_id, provider_user_id),
+		FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 	);
 	CREATE TABLE IF NOT EXISTS verification_tokens (
-		token_hash BLOB PRIMARY KEY, user_id TEXT NOT NULL, expires_at DATETIME NOT NULL, created_at DATETIME
+		token_hash BLOB PRIMARY KEY, user_id TEXT NOT NULL, expires_at DATETIME NOT NULL, created_at DATETIME,
+		FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 	);
 	CREATE TABLE IF NOT EXISTS password_reset_tokens (
-		token_hash BLOB PRIMARY KEY, user_id TEXT NOT NULL, expires_at DATETIME NOT NULL, created_at DATETIME
+		token_hash BLOB PRIMARY KEY, user_id TEXT NOT NULL, expires_at DATETIME NOT NULL, created_at DATETIME,
+		FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 	);
 	CREATE TABLE IF NOT EXISTS sessions (
 		id TEXT PRIMARY KEY, user_id TEXT NOT NULL, id_hash CHAR(64) UNIQUE NOT NULL,
 		session_type VARCHAR(10) NOT NULL DEFAULT 'cookie', ip_address VARCHAR(45) NOT NULL DEFAULT '',
 		user_agent TEXT NOT NULL DEFAULT '', credential_version INTEGER NOT NULL DEFAULT 0,
-		last_active_at DATETIME NOT NULL, absolute_expires_at DATETIME NOT NULL, created_at DATETIME
+		last_active_at DATETIME NOT NULL, absolute_expires_at DATETIME NOT NULL, created_at DATETIME,
+		FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 	);`
 	if err := database.Exec(ddl).Error; err != nil {
 		t.Fatalf("schema: %v", err)
