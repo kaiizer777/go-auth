@@ -140,11 +140,6 @@ func parseXErrorWithHeader(statusCode int, body []byte, header http.Header) erro
 	return errors.New(errors.CodeOAuthProviderError, fmt.Sprintf("oauth provider responded with status %d", statusCode), nil)
 }
 
-// parseXError inspects HTTP status and body for RFC 7807 problem details or rate limit conditions.
-func parseXError(statusCode int, body []byte) error {
-	return parseXErrorWithHeader(statusCode, body, nil)
-}
-
 // ExchangeCode exchanges an authorization code and PKCE code verifier for tokens via POST /2/oauth2/token.
 // It authenticates using HTTP Basic Auth per RFC 6749 §2.3.1. client_id MUST NOT be in the body.
 func (p *XProvider) ExchangeCode(ctx context.Context, code, codeVerifier string) (*OAuthToken, error) {

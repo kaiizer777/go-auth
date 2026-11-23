@@ -263,7 +263,7 @@ func (s *service) HandleCallback(ctx context.Context, w http.ResponseWriter, r *
 			return fail("tenant_invalid", err)
 		}
 		if errors.Is(err, errors.ErrOAuthAccountLinkConflict) {
-			return fail("account_link_conflict", err)
+			return fail(string(errors.CodeOAuthAccountLinkConflict), err)
 		}
 		if errors.Is(err, errOAuthProviderIdentityInvalid) {
 			return fail("userinfo_invalid", err)
