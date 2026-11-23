@@ -522,7 +522,7 @@ func TestMicrosoftProvider(t *testing.T) {
 			t.Errorf("expected EmailVerified == false when xms_edov is bool false")
 		}
 
-		// 3. Trusted tenant whitelist match -> EmailVerified must be TRUE
+		// 3. Whitelist alone never verifies the email value.
 		claimsTrusted := map[string]any{
 			"iss":   "https://login.microsoftonline.com/trusted-partner-guid/v2.0",
 			"sub":   "partner-sub",
@@ -536,8 +536,27 @@ func TestMicrosoftProvider(t *testing.T) {
 		if err != nil {
 			t.Fatalf("unexpected verification error: %v", err)
 		}
-		if !cTrusted.EmailVerified {
-			t.Errorf("expected EmailVerified == true for whitelisted trusted tenant")
+		if cTrusted.EmailVerified {
+			t.Errorf("whitelist alone must leave EmailVerified == false")
+		}
+
+		// 3b. Whitelist + attestation verifies.
+		claimsTrustedAttested := map[string]any{
+			"iss":      "https://login.microsoftonline.com/trusted-partner-guid/v2.0",
+			"sub":      "partner-sub",
+			"aud":      "client-test-id",
+			"exp":      time.Now().Add(10 * time.Minute).Unix(),
+			"email":    "partner@partner.com",
+			"tid":      "trusted-partner-guid",
+			"xms_edov": true,
+		}
+		tokTrustedAttested := signRS256JWT(t, privKey, "ms-key-1", claimsTrustedAttested)
+		cTrustedAttested, err := pCommon.VerifyIDToken(ctx, tokTrustedAttested, "")
+		if err != nil {
+			t.Fatalf("unexpected verification error: %v", err)
+		}
+		if !cTrustedAttested.EmailVerified {
+			t.Errorf("expected EmailVerified == true for whitelisted tenant with xms_edov")
 		}
 	})
 
@@ -652,6 +671,35 @@ func TestMicrosoftProvider(t *testing.T) {
 		}
 		if user.Name != "Fallback User" {
 			t.Errorf("Name = %q, want Fallback User", user.Name)
+		}
+		if user.EmailVerified {
+			t.Errorf("preferred_username fallback must leave EmailVerified == false")
+		}
+	})
+
+	t.Run("FetchUserInfo preferred_username fallback never verifies", func(t *testing.T) {
+		p := newTestProvider("target-tenant-uuid", nil)
+		claims := map[string]any{
+			"iss":                "https://login.microsoftonline.com/target-tenant-uuid/v2.0",
+			"sub":                "sub-single-fallback",
+			"oid":                "immutable-oid-guid",
+			"aud":                "client-test-id",
+			"exp":                time.Now().Add(10 * time.Minute).Unix(),
+			"preferred_username": "victim@local.com",
+			"tid":                "target-tenant-uuid",
+			"name":               "Fallback Victim",
+		}
+		idTok := signRS256JWT(t, privKey, "ms-key-1", claims)
+
+		user, err := p.FetchUserInfo(ctx, &OAuthToken{IDToken: idTok})
+		if err != nil {
+			t.Fatalf("FetchUserInfo failed: %v", err)
+		}
+		if user.Email != "victim@local.com" {
+			t.Errorf("Email = %q, want victim@local.com", user.Email)
+		}
+		if user.EmailVerified {
+			t.Errorf("UPN fallback must force EmailVerified == false even on trusted tenant")
 		}
 	})
 }

@@ -251,14 +251,11 @@ func (p *MicrosoftProvider) isEmailVerified(rawClaims map[string]any, tenantID s
 		return true
 	}
 
-	// 3. Trusted tenant whitelist match
-	if len(p.trustedTenants) > 0 {
-		if _, ok := p.trustedTenants[tenantID]; ok {
-			return true
-		}
-	}
+	// Trusted-tenant whitelist attests tenant identity only, never the email
+	// value: tenant admins can claim foreign-domain addresses, so fall
+	// through to xms_edov attestation below and fail closed otherwise.
 
-	// 4. Microsoft domain ownership attestation claim. The token
+	// 3. Microsoft domain ownership attestation claim. The token
 	// decoder yields bool, string, or numeric shapes depending on the
 	// issuer; accept every attested form, default-deny anything else.
 	switch edov := rawClaims["xms_edov"].(type) {
@@ -333,9 +330,10 @@ func (p *MicrosoftProvider) FetchUserInfo(ctx context.Context, token *OAuthToken
 			user.ProviderUserID = claims.Subject
 		}
 
-		// Fallback email: PreferredUsername
+		// Fallback from admin-mutable UPN never verifies the address.
 		if user.Email == "" && strings.Contains(claims.PreferredUsername, "@") {
 			user.Email = strings.ToLower(claims.PreferredUsername)
+			user.EmailVerified = false
 		}
 
 		return user, nil
