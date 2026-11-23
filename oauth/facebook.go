@@ -89,20 +89,20 @@ func (p *FacebookProvider) debugToken(ctx context.Context, userToken string) err
 	appToken := p.cfg.AppID + "|" + p.cfg.AppSecret
 	proof := GenerateAppSecretProof(appToken, p.cfg.AppSecret)
 
-	u, err := url.Parse(p.debugURL)
-	if err != nil {
-		return errors.ErrOAuthTokenExchangeFailed
-	}
-	q := u.Query()
-	q.Set("input_token", userToken)
-	q.Set("access_token", appToken)
-	q.Set("appsecret_proof", proof)
-	u.RawQuery = q.Encode()
+	// Credentials travel in the POST body, never in the URL: a transport
+	// failure stringifies the URL via *url.Error and HandleCallback
+	// logs that string, so any query-embedded secret would leak (same
+	// invariant as FetchUserInfo below; Graph accepts form-encoded POST).
+	form := url.Values{}
+	form.Set("input_token", userToken)
+	form.Set("access_token", appToken)
+	form.Set("appsecret_proof", proof)
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.debugURL, strings.NewReader(form.Encode()))
 	if err != nil {
 		return errors.ErrOAuthTokenExchangeFailed
 	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Accept", "application/json")
 
 	resp, err := p.client.Do(req)

@@ -157,14 +157,21 @@ func TestFacebookProvider_ExchangeCode_And_ConfusedDeputyDefense(t *testing.T) {
 			})
 
 		case "/debug_token":
-			if r.Method != http.MethodGet {
+			if r.Method != http.MethodPost {
 				http.Error(w, "bad method", http.StatusMethodNotAllowed)
 				return
 			}
-			q := r.URL.Query()
-			inputToken := q.Get("input_token")
-			accessToken := q.Get("access_token")
-			proof := q.Get("appsecret_proof")
+			if q := r.URL.Query(); q.Get("access_token") != "" || q.Get("appsecret_proof") != "" {
+				http.Error(w, "credentials must not appear in URL query", http.StatusBadRequest)
+				return
+			}
+			if err := r.ParseForm(); err != nil {
+				http.Error(w, "invalid form", http.StatusBadRequest)
+				return
+			}
+			inputToken := r.FormValue("input_token")
+			accessToken := r.FormValue("access_token")
+			proof := r.FormValue("appsecret_proof")
 
 			if accessToken != "fb-valid-app-id|fb-valid-app-secret" {
 				http.Error(w, "invalid app token", http.StatusUnauthorized)
