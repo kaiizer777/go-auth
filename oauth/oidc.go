@@ -306,7 +306,9 @@ func isLoopbackHTTP(u *url.URL) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
-// VerifyRS256JWT cryptographically validates an RS256 JWT using keys from keyRetriever and returns the decoded payload map.
+// VerifyRS256JWT verifies the RS256 signature of rawJWT and returns its claims.
+// Signature-only: it does NOT validate exp, aud, iss, or nonce. Callers must
+// validate claims for their authority; see MicrosoftProvider.VerifyIDToken.
 func VerifyRS256JWT(ctx context.Context, rawJWT string, keyRetriever JWKSKeyRetriever) (map[string]any, error) {
 	parts := strings.Split(rawJWT, ".")
 	if len(parts) != 3 {
