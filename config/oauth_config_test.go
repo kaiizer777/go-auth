@@ -818,8 +818,9 @@ func TestProviderConfigLogValue(t *testing.T) {
 		if err := cfg.Validate(); err != nil {
 			t.Fatalf("Validate = %v", err)
 		}
-		if len(cfg.OAuth.X.Scopes) != 3 || cfg.OAuth.X.Scopes[0] != "tweet.read" || cfg.OAuth.X.Scopes[1] != "users.read" || cfg.OAuth.X.Scopes[2] != "offline.access" {
-			t.Fatalf("Scopes = %v; want [tweet.read users.read offline.access]", cfg.OAuth.X.Scopes)
+		scopes := cfg.OAuth.Providers["x"].Scopes
+		if len(scopes) != 3 || scopes[0] != "tweet.read" || scopes[1] != "users.read" || scopes[2] != "offline.access" {
+			t.Fatalf("Scopes = %v; want [tweet.read users.read offline.access]", scopes)
 		}
 	})
 
@@ -957,4 +958,125 @@ func TestOAuthConfigLogValueEmptyProviders(t *testing.T) {
 			t.Fatalf("providers = %v; want a group object", raw)
 		}
 	}
+}
+
+func TestOAuthConfig_ResolvesProvidersAfterDefaults(t *testing.T) {
+	msMap := func(tenant string) map[string]ProviderConfig {
+		return map[string]ProviderConfig{"microsoft": {
+			ClientID:     "map-id",
+			ClientSecret: "map-secret",
+			RedirectURL:  "https://example.com/cb",
+			Enabled:      true,
+			Tenant:       tenant,
+		}}
+	}
+	msTyped := func(tenant string) *MicrosoftConfig {
+		return &MicrosoftConfig{
+			ClientID:     "typed-id",
+			ClientSecret: "typed-secret",
+			RedirectURI:  "https://example.com/cb",
+			Tenant:       tenant,
+		}
+	}
+
+	t.Run("map tenant survives defaults", func(t *testing.T) {
+		cfg := validOAuthBase()
+		cfg.OAuth.Providers = msMap("corp-guid")
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("Validate = %v", err)
+		}
+		p := cfg.OAuth.Providers["microsoft"]
+		if p.Tenant != "corp-guid" {
+			t.Errorf("Tenant = %q; want corp-guid", p.Tenant)
+		}
+		if len(p.Scopes) != 4 {
+			t.Errorf("Scopes = %v; want defaults", p.Scopes)
+		}
+		if p.JWKSCacheTTL != 24*time.Hour {
+			t.Errorf("JWKSCacheTTL = %v; want 24h", p.JWKSCacheTTL)
+		}
+	})
+
+	t.Run("typed tenant wins over map tenant", func(t *testing.T) {
+		cfg := validOAuthBase()
+		cfg.OAuth.Providers = msMap("map-guid")
+		cfg.OAuth.Microsoft = msTyped("typed-guid")
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("Validate = %v", err)
+		}
+		if got := cfg.OAuth.Providers["microsoft"].Tenant; got != "typed-guid" {
+			t.Errorf("Tenant = %q; want typed-guid", got)
+		}
+	})
+
+	t.Run("typed tenant wins when map omits it", func(t *testing.T) {
+		cfg := validOAuthBase()
+		cfg.OAuth.Providers = map[string]ProviderConfig{"microsoft": {
+			ClientID:     "map-id",
+			ClientSecret: "map-secret",
+			RedirectURL:  "https://example.com/cb",
+			Enabled:      true,
+		}}
+		cfg.OAuth.Microsoft = msTyped("typed-guid")
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("Validate = %v", err)
+		}
+		if got := cfg.OAuth.Providers["microsoft"].Tenant; got != "typed-guid" {
+			t.Errorf("Tenant = %q; want typed-guid", got)
+		}
+	})
+
+	t.Run("common remains reachable when nothing configures a tenant", func(t *testing.T) {
+		cfg := validOAuthBase()
+		cfg.OAuth.Microsoft = msTyped("")
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("Validate = %v", err)
+		}
+		if got := cfg.OAuth.Providers["microsoft"].Tenant; got != "common" {
+			t.Errorf("Tenant = %q; want common", got)
+		}
+	})
+
+	t.Run("typed provider registers without a map entry", func(t *testing.T) {
+		cfg := validOAuthBase()
+		cfg.OAuth.Microsoft = msTyped("")
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("Validate = %v", err)
+		}
+		if !cfg.OAuth.Providers["microsoft"].Enabled {
+			t.Error("merged microsoft entry is disabled; want enabled")
+		}
+	})
+
+	t.Run("explicit map enabled false disables a typed provider", func(t *testing.T) {
+		off := false
+		cfg := validOAuthBase()
+		cfg.OAuth.Providers = msMap("corp-guid")
+		entry := cfg.OAuth.Providers["microsoft"]
+		entry.Enabled = off
+		cfg.OAuth.Providers["microsoft"] = entry
+		cfg.OAuth.Microsoft = msTyped("")
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("Validate = %v", err)
+		}
+		if cfg.OAuth.Providers["microsoft"].Enabled {
+			t.Error("merged microsoft entry is enabled; want disabled")
+		}
+	})
+
+	t.Run("explicit typed enabled false disables the provider", func(t *testing.T) {
+		off := false
+		cfg := validOAuthBase()
+		cfg.OAuth.StateSecret = ""
+		cfg.OAuth.Providers = msMap("corp-guid")
+		typed := msTyped("")
+		typed.Enabled = &off
+		cfg.OAuth.Microsoft = typed
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("Validate = %v; want nil (disabled provider needs no state secret)", err)
+		}
+		if cfg.OAuth.Providers["microsoft"].Enabled {
+			t.Error("merged microsoft entry is enabled; want disabled")
+		}
+	})
 }

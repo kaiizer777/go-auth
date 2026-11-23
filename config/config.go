@@ -94,6 +94,8 @@ func (p ProviderConfig) String() string {
 // OAuthConfig groups configurations for all external identity providers.
 type OAuthConfig struct {
 	// Providers maps provider ID ("google", "github", "apple", "microsoft") to provider configuration.
+	// Validate merges the typed sections below into this map and applies provider
+	// defaults there, so after validation this map is the authoritative source.
 	Providers       map[string]ProviderConfig
 	Microsoft       *MicrosoftConfig `json:"microsoft,omitempty"`
 	Facebook        *FacebookConfig  `json:"facebook,omitempty"`
@@ -741,12 +743,7 @@ func (c *Config) Validate() error {
 	// verify across replicas and restarts, which a per-process fallback key
 	// cannot do. With no providers enabled OAuth is inert and empty stays valid.
 	if c.OAuth.StateSecret == "" {
-		for _, provider := range c.OAuth.Providers {
-			if provider.Enabled {
-				return errors.ErrOAuthStateSecretRequired
-			}
-		}
-		if c.OAuth.Microsoft != nil || c.OAuth.Discord != nil || c.OAuth.Facebook != nil || c.OAuth.X != nil {
+		if c.OAuth.anyProviderEnabled() {
 			return errors.ErrOAuthStateSecretRequired
 		}
 	} else if len(c.OAuth.StateSecret) < 32 {
@@ -803,15 +800,6 @@ func (c *Config) Validate() error {
 		if c.OAuth.Microsoft.RedirectURI == "" {
 			return errors.ErrOAuthRedirectURLRequired
 		}
-		if c.OAuth.Microsoft.Tenant == "" {
-			c.OAuth.Microsoft.Tenant = "common"
-		}
-		if len(c.OAuth.Microsoft.Scopes) == 0 {
-			c.OAuth.Microsoft.Scopes = []string{"openid", "profile", "email", "offline_access"}
-		}
-		if c.OAuth.Microsoft.JWKSCacheTTL == 0 {
-			c.OAuth.Microsoft.JWKSCacheTTL = 24 * time.Hour
-		}
 	}
 
 	if c.OAuth.Discord != nil {
@@ -823,9 +811,6 @@ func (c *Config) Validate() error {
 		}
 		if c.OAuth.Discord.RedirectURI == "" {
 			return errors.ErrOAuthRedirectURLRequired
-		}
-		if len(c.OAuth.Discord.Scopes) == 0 {
-			c.OAuth.Discord.Scopes = []string{"identify", "email"}
 		}
 	}
 
@@ -839,18 +824,14 @@ func (c *Config) Validate() error {
 		if c.OAuth.Facebook.RedirectURI == "" {
 			return errors.ErrOAuthRedirectURLRequired
 		}
-		if c.OAuth.Facebook.GraphVersion == "" {
-			c.OAuth.Facebook.GraphVersion = "v19.0"
-		}
-		if !strings.HasPrefix(c.OAuth.Facebook.GraphVersion, "v") {
-			return errors.ErrOAuthGraphVersionInvalid
-		}
-		ver, err := strconv.ParseFloat(strings.TrimPrefix(c.OAuth.Facebook.GraphVersion, "v"), 64)
-		if err != nil || ver < 19.0 {
-			return errors.ErrOAuthGraphVersionInvalid
-		}
-		if len(c.OAuth.Facebook.Scopes) == 0 {
-			c.OAuth.Facebook.Scopes = []string{"email", "public_profile"}
+		if c.OAuth.Facebook.GraphVersion != "" {
+			if !strings.HasPrefix(c.OAuth.Facebook.GraphVersion, "v") {
+				return errors.ErrOAuthGraphVersionInvalid
+			}
+			ver, err := strconv.ParseFloat(strings.TrimPrefix(c.OAuth.Facebook.GraphVersion, "v"), 64)
+			if err != nil || ver < 19.0 {
+				return errors.ErrOAuthGraphVersionInvalid
+			}
 		}
 	}
 
@@ -864,10 +845,11 @@ func (c *Config) Validate() error {
 		if c.OAuth.X.RedirectURI == "" {
 			return errors.ErrOAuthRedirectURLRequired
 		}
-		if len(c.OAuth.X.Scopes) == 0 {
-			c.OAuth.X.Scopes = []string{"tweet.read", "users.read", "offline.access"}
-		}
 	}
+
+	// Resolve after validation: defaults are applied once, to the merged result,
+	// so no default can overwrite explicit map or typed configuration.
+	c.OAuth.resolveProviders()
 
 	if c.TOTP.Issuer == "" {
 		c.TOTP.Issuer = "go-auth"
