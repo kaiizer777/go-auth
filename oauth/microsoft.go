@@ -89,11 +89,7 @@ func (p *MicrosoftProvider) AuthCodeURL(state, codeChallenge string, opts ...Aut
 	q.Set("response_mode", "query")
 	q.Set("prompt", "select_account")
 
-	for _, opt := range opts {
-		if opt.Key != "" {
-			q.Set(opt.Key, opt.Value)
-		}
-	}
+	applyAuthCodeOptions(q, opts)
 
 	return p.authURL + "?" + q.Encode()
 }

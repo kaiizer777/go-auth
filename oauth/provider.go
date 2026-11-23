@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -22,6 +23,29 @@ type AuthCodeOption struct {
 // AccessTypeOffline specifies offline access for refresh token issuance.
 func AccessTypeOffline() AuthCodeOption {
 	return AuthCodeOption{Key: "access_type", Value: "offline"}
+}
+
+// isReservedAuthorizeParam reports security-critical authorize keys the
+// service generates per login. Adapters set these before applying options;
+// matching is case-insensitive because query keys cross trust boundaries.
+func isReservedAuthorizeParam(key string) bool {
+	switch strings.ToLower(key) {
+	case "response_type", "client_id", "redirect_uri",
+		"state", "code_challenge", "code_challenge_method":
+		return true
+	}
+	return false
+}
+
+// applyAuthCodeOptions copies caller options into q, dropping reserved keys
+// so options can only add parameters, never replace mandatory ones.
+func applyAuthCodeOptions(q url.Values, opts []AuthCodeOption) {
+	for _, opt := range opts {
+		if opt.Key == "" || isReservedAuthorizeParam(opt.Key) {
+			continue
+		}
+		q.Set(opt.Key, opt.Value)
+	}
 }
 
 // PromptOption specifies prompt behavior (e.g. consent, select_account).

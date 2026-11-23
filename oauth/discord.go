@@ -59,11 +59,7 @@ func (p *DiscordProvider) AuthCodeURL(state, codeChallenge string, opts ...AuthC
 	q.Set("code_challenge", codeChallenge)
 	q.Set("code_challenge_method", "S256")
 
-	for _, opt := range opts {
-		if opt.Key != "" {
-			q.Set(opt.Key, opt.Value)
-		}
-	}
+	applyAuthCodeOptions(q, opts)
 
 	return p.authURL + "?" + q.Encode()
 }

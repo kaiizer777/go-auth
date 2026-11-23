@@ -49,11 +49,7 @@ func (p *GoogleProvider) AuthCodeURL(state, codeChallenge string, opts ...AuthCo
 	q.Set("code_challenge_method", "S256")
 	q.Set("access_type", "offline")
 	q.Set("prompt", "select_account")
-	for _, opt := range opts {
-		if opt.Key != "" {
-			q.Set(opt.Key, opt.Value)
-		}
-	}
+	applyAuthCodeOptions(q, opts)
 	return p.authURL + "?" + q.Encode()
 }
 
