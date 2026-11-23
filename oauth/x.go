@@ -125,11 +125,14 @@ func parseXErrorWithHeader(statusCode int, body []byte, header http.Header) erro
 				return errors.ErrOAuthRateLimitExceeded
 			}
 		}
+		// Upstream-controlled text must never become the caller-facing message:
+		// WriteJSON renders only Message on the wire, while the cause stays
+		// server-side for logs. Carry detail/title as the cause.
 		if problem.Detail != "" {
-			return errors.New(errors.CodeOAuthProviderError, problem.Detail, nil)
+			return errors.New(errors.CodeOAuthProviderError, "oauth provider request failed", errors.New(errors.CodeOAuthProviderError, "upstream detail: "+problem.Detail, nil))
 		}
 		if problem.Title != "" {
-			return errors.New(errors.CodeOAuthProviderError, problem.Title, nil)
+			return errors.New(errors.CodeOAuthProviderError, "oauth provider request failed", errors.New(errors.CodeOAuthProviderError, "upstream title: "+problem.Title, nil))
 		}
 	}
 

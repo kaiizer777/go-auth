@@ -218,8 +218,14 @@ func TestXProvider_ExchangeCode(t *testing.T) {
 		if !errors.As(err, &appErr) || appErr.Code() != errors.CodeOAuthProviderError {
 			t.Fatalf("expected CodeOAuthProviderError, got %v", err)
 		}
+		if appErr.Message() != "oauth provider request failed" {
+			t.Fatalf("expected generic wire message, got %q", appErr.Message())
+		}
+		if strings.Contains(appErr.Message(), "Value passed for authorization code was invalid") {
+			t.Fatalf("upstream detail reflected in wire message: %q", appErr.Message())
+		}
 		if !strings.Contains(err.Error(), "Value passed for authorization code was invalid") {
-			t.Fatalf("expected detail in error message, got %v", err)
+			t.Fatalf("expected upstream detail preserved in cause chain, got %v", err)
 		}
 	})
 
