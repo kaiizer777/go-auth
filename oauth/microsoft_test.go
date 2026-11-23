@@ -445,6 +445,9 @@ func TestMicrosoftProvider(t *testing.T) {
 		if cUntrusted.EmailVerified {
 			t.Errorf("nOauth vulnerability: untrusted tenant should have EmailVerified == false")
 		}
+		if !cUntrusted.UntrustedTenant {
+			t.Errorf("untrusted tenant must set UntrustedTenant == true")
+		}
 
 		// 2. Untrusted tenant with xms_edov == '1' -> EmailVerified must be TRUE
 		claimsAttested := map[string]any{
@@ -463,6 +466,9 @@ func TestMicrosoftProvider(t *testing.T) {
 		}
 		if !cAttested.EmailVerified {
 			t.Errorf("expected EmailVerified == true when xms_edov == '1'")
+		}
+		if cAttested.UntrustedTenant {
+			t.Errorf("attested tenant must leave UntrustedTenant == false")
 		}
 
 		// 2b. Boolean true attestation -> EmailVerified must be TRUE
@@ -483,6 +489,9 @@ func TestMicrosoftProvider(t *testing.T) {
 		if !cBool.EmailVerified {
 			t.Errorf("expected EmailVerified == true when xms_edov is bool true")
 		}
+		if cBool.UntrustedTenant {
+			t.Errorf("attested tenant must leave UntrustedTenant == false")
+		}
 
 		// 2c. Numeric 1 attestation -> EmailVerified must be TRUE
 		claimsNum := map[string]any{
@@ -501,6 +510,9 @@ func TestMicrosoftProvider(t *testing.T) {
 		}
 		if !cNum.EmailVerified {
 			t.Errorf("expected EmailVerified == true when xms_edov is numeric 1")
+		}
+		if cNum.UntrustedTenant {
+			t.Errorf("attested tenant must leave UntrustedTenant == false")
 		}
 
 		// 2d. Boolean false attestation -> EmailVerified must stay FALSE
@@ -521,6 +533,9 @@ func TestMicrosoftProvider(t *testing.T) {
 		if cFalse.EmailVerified {
 			t.Errorf("expected EmailVerified == false when xms_edov is bool false")
 		}
+		if !cFalse.UntrustedTenant {
+			t.Errorf("denied attestation must set UntrustedTenant == true")
+		}
 
 		// 3. Whitelist alone never verifies the email value.
 		claimsTrusted := map[string]any{
@@ -538,6 +553,9 @@ func TestMicrosoftProvider(t *testing.T) {
 		}
 		if cTrusted.EmailVerified {
 			t.Errorf("whitelist alone must leave EmailVerified == false")
+		}
+		if !cTrusted.UntrustedTenant {
+			t.Errorf("whitelist alone must set UntrustedTenant == true")
 		}
 
 		// 3b. Whitelist + attestation verifies.
@@ -557,6 +575,9 @@ func TestMicrosoftProvider(t *testing.T) {
 		}
 		if !cTrustedAttested.EmailVerified {
 			t.Errorf("expected EmailVerified == true for whitelisted tenant with xms_edov")
+		}
+		if cTrustedAttested.UntrustedTenant {
+			t.Errorf("attested whitelisted tenant must leave UntrustedTenant == false")
 		}
 	})
 
