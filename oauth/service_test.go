@@ -1374,3 +1374,56 @@ func TestOAuthService_X_MissingEmail(t *testing.T) {
 		}
 	})
 }
+
+func TestHandleCallbackActiveSessionUntrustedTenant(t *testing.T) {
+	t.Run("signed-in link with untrusted tenant fails closed", func(t *testing.T) {
+		t.Parallel()
+		database, cfg, _, _ := setupServiceTest(t, verifiedInfo())
+		sessSvc := session.NewService(database, cfg)
+		user := db.User{ID: uuid.New(), Email: "victim@example.com", PasswordHash: "hash", EmailVerified: true}
+		if err := database.Create(&user).Error; err != nil {
+			t.Fatalf("create user: %v", err)
+		}
+		_, rawToken, err := sessSvc.CreateSession(context.Background(), user.ID, 0, db.SessionTypeCookie, "127.0.0.1", "ua")
+		if err != nil {
+			t.Fatalf("create session: %v", err)
+		}
+		untrusted := &stubProvider{id: "microsoft", info: &UserInfo{
+			ProviderID: "microsoft", ProviderUserID: "ms-attacker-sub",
+			Email: "victim@example.com", EmailVerified: true, Name: "Attacker",
+			RawClaims: map[string]any{"untrusted_tenant": true},
+		}}
+		svc := NewService(database, sessSvc, map[string]Provider{"microsoft": untrusted}, cfg)
+
+		initReq := httptest.NewRequest(http.MethodGet, "/auth/oauth/microsoft", nil)
+		initReq.AddCookie(&http.Cookie{Name: cfg.SessionCookieName, Value: rawToken})
+		initRec := httptest.NewRecorder()
+		authURL, err := svc.InitiateFlow(initRec, initReq, "microsoft")
+		if err != nil {
+			t.Fatalf("initiate flow failed: %v", err)
+		}
+		u, err := url.Parse(authURL)
+		if err != nil {
+			t.Fatalf("parse auth url: %v", err)
+		}
+		state := u.Query().Get("state")
+		var stateCookie *http.Cookie
+		for _, c := range initRec.Result().Cookies() {
+			if c.Name == cfg.OAuth.StateCookieName {
+				stateCookie = c
+			}
+		}
+		if stateCookie == nil {
+			t.Fatal("state cookie required")
+		}
+		cbReq := httptest.NewRequest(http.MethodGet, "/auth/oauth/microsoft/callback", nil)
+		cbReq.AddCookie(stateCookie)
+		_, _, _, err = svc.HandleCallback(context.Background(), httptest.NewRecorder(), cbReq, "microsoft", "code-1", state, db.SessionTypeCookie)
+		if !errors.Is(err, errors.ErrOAuthTenantInvalid) {
+			t.Fatalf("expected ErrOAuthTenantInvalid, got %v", err)
+		}
+		if n := countRows(t, database, &db.OAuthAccount{}); n != 0 {
+			t.Fatalf("oauth_accounts = %d; want 0", n)
+		}
+	})
+}

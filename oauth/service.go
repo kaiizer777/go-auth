@@ -577,7 +577,14 @@ func (s *service) linkOrCreate(ctx context.Context, providerID string, info *Use
 		return user, false, false, err
 	}
 
-	// 2. Active session explicit linking: link provider to currently authenticated session user
+	// 2. Microsoft "nOauth" defense: fail closed on untrusted external tenants.
+	// Runs before the active-session branch so a signed-in callback cannot
+	// persist an attacker-tenant identity onto the victim's account.
+	if isUntrusted, _ := info.RawClaims["untrusted_tenant"].(bool); isUntrusted {
+		return db.User{}, false, false, errors.ErrOAuthTenantInvalid
+	}
+
+	// 3. Active session explicit linking: link provider to currently authenticated session user
 	if activeUserID != "" {
 		uid, parseErr := uuid.Parse(activeUserID)
 		if parseErr == nil {
@@ -590,11 +597,6 @@ func (s *service) linkOrCreate(ctx context.Context, providerID string, info *Use
 				return user, linked, false, lerr
 			}
 		}
-	}
-
-	// 3. Microsoft "nOauth" defense: fail closed on untrusted external tenants
-	if isUntrusted, _ := info.RawClaims["untrusted_tenant"].(bool); isUntrusted {
-		return db.User{}, false, false, errors.ErrOAuthTenantInvalid
 	}
 
 	// 4. Validate provider identity for unauthenticated registration (requires verified email)
