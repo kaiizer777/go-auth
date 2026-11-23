@@ -42,6 +42,18 @@ type ProviderConfig struct {
 	TeamID     string // 10-character Apple Developer Team ID
 	KeyID      string // 10-character Apple Developer Key ID
 	PrivateKey string // PEM-encoded PKCS#8 ECDSA private key (.p8 content)
+
+	// Authority settings shared across adapters; currently consumed only by
+	// Microsoft Entra ID. Empty Tenant and non-positive JWKSCacheTTL fall back
+	// to provider defaults ("common" / 24h); empty TrustedTenants means no
+	// allowlist, not deny-all.
+	Tenant         string        `json:"tenant,omitempty"`
+	TrustedTenants []string      `json:"trusted_tenants,omitempty"`
+	JWKSCacheTTL   time.Duration `json:"jwks_cache_ttl,omitempty"`
+
+	// GraphVersion pins the Facebook Graph API version (e.g. "v19.0"); ignored
+	// by every other adapter.
+	GraphVersion string `json:"graph_version,omitempty"`
 }
 
 // LogValue implements slog.LogValuer to ensure ClientSecret and PrivateKey are masked in logs.
@@ -63,6 +75,10 @@ func (p ProviderConfig) LogValue() slog.Value {
 		slog.String("team_id", p.TeamID),
 		slog.String("key_id", p.KeyID),
 		slog.String("private_key", keyMasked),
+		slog.String("tenant", p.Tenant),
+		slog.Any("trusted_tenants", p.TrustedTenants),
+		slog.Duration("jwks_cache_ttl", p.JWKSCacheTTL),
+		slog.String("graph_version", p.GraphVersion),
 	)
 }
 

@@ -583,6 +583,26 @@ func TestConfigValidate_OAuth(t *testing.T) {
 	}
 }
 
+func TestProviderConfigJSONTags(t *testing.T) {
+	var p ProviderConfig
+	raw := `{"client_id":"id","tenant":"tenant-guid","trusted_tenants":["partner-guid"],"jwks_cache_ttl":3600000000000,"graph_version":"v20.0"}`
+	if err := json.Unmarshal([]byte(raw), &p); err != nil {
+		t.Fatalf("unmarshal ProviderConfig: %v", err)
+	}
+	if p.Tenant != "tenant-guid" {
+		t.Errorf("Tenant = %q; want tenant-guid", p.Tenant)
+	}
+	if len(p.TrustedTenants) != 1 || p.TrustedTenants[0] != "partner-guid" {
+		t.Errorf("TrustedTenants = %v; want [partner-guid]", p.TrustedTenants)
+	}
+	if p.JWKSCacheTTL != time.Hour {
+		t.Errorf("JWKSCacheTTL = %v; want 1h", p.JWKSCacheTTL)
+	}
+	if p.GraphVersion != "v20.0" {
+		t.Errorf("GraphVersion = %q; want v20.0", p.GraphVersion)
+	}
+}
+
 func TestProviderConfigLogValue(t *testing.T) {
 	t.Run("masks client secret and private key", func(t *testing.T) {
 		p := ProviderConfig{
