@@ -31,6 +31,9 @@ const (
 	jwksStaleGracePeriod = time.Hour
 	// unknownKidCooldown caps negative caching for kids still missing after a refresh.
 	unknownKidCooldown = time.Minute
+	// unknownKidMaxNegEntries bounds the per-kid negative cache; unknown kids
+	// are attacker-controlled so the map must not grow without limit.
+	unknownKidMaxNegEntries = 128
 )
 
 // OIDCDiscovery represents parsed metadata from /.well-known/openid-configuration.
@@ -74,9 +77,10 @@ type JWKSManager struct {
 	expires time.Time
 	gen     uint64
 	sf      singleflight.Group
-	// missCooldown, when in the future, skips upstream fetch for kids
-	// already confirmed missing; guarded by mu.
-	missCooldown time.Time
+	// misses negatively caches kids confirmed missing after a refresh,
+	// keyed per kid so one unknown kid never suppresses fetch for another
+	// (e.g. a genuine rotation). Guarded by mu.
+	misses map[string]time.Time
 }
 
 // NewJWKSManager constructs a thread-safe JWKS manager.
@@ -92,6 +96,7 @@ func NewJWKSManager(jwksURL string, client *http.Client, ttl time.Duration) *JWK
 		client:  client,
 		ttl:     ttl,
 		keys:    make(map[string]*rsa.PublicKey),
+		misses:  make(map[string]time.Time),
 	}
 }
 
@@ -102,12 +107,12 @@ func (m *JWKSManager) GetKey(ctx context.Context, kid string) (*rsa.PublicKey, e
 	m.mu.RLock()
 	key, ok := m.keys[kid]
 	fresh := time.Now().Before(m.expires)
-	cooldown := time.Now().Before(m.missCooldown)
+	missExp, neg := m.misses[kid]
 	m.mu.RUnlock()
 	if ok && fresh {
 		return key, nil
 	}
-	if !ok && cooldown {
+	if !ok && neg && time.Now().Before(missExp) {
 		return nil, errors.New(errors.CodeOAuthIDTokenInvalid, fmt.Sprintf("signing key with kid %q not found in jwks", kid), nil)
 	}
 
@@ -123,14 +128,29 @@ func (m *JWKSManager) GetKey(ctx context.Context, kid string) (*rsa.PublicKey, e
 		return nil, m.refresh(ctx)
 	})
 	if err == nil {
-		m.mu.RLock()
+		m.mu.Lock()
 		key, ok := m.keys[kid]
-		m.mu.RUnlock()
 		if ok {
+			delete(m.misses, kid)
+			m.mu.Unlock()
 			return key, nil
 		}
-		m.mu.Lock()
-		m.missCooldown = time.Now().Add(unknownKidCooldown)
+		if m.misses == nil {
+			m.misses = make(map[string]time.Time)
+		}
+		now := time.Now()
+		for k, exp := range m.misses {
+			if !now.Before(exp) {
+				delete(m.misses, k)
+			}
+		}
+		if len(m.misses) >= unknownKidMaxNegEntries {
+			for k := range m.misses {
+				delete(m.misses, k)
+				break
+			}
+		}
+		m.misses[kid] = now.Add(unknownKidCooldown)
 		m.mu.Unlock()
 		return nil, errors.New(errors.CodeOAuthIDTokenInvalid, fmt.Sprintf("signing key with kid %q not found in jwks", kid), nil)
 	}
@@ -202,6 +222,9 @@ func (m *JWKSManager) refresh(ctx context.Context) error {
 	m.keys = parsedKeys
 	m.expires = time.Now().Add(m.ttl)
 	m.gen++
+	for kid := range parsedKeys {
+		delete(m.misses, kid)
+	}
 	return nil
 }
 

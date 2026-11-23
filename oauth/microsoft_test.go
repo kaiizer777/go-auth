@@ -244,6 +244,63 @@ func TestJWKSManager_UnknownKidSingleFetch(t *testing.T) {
 	}
 }
 
+func TestJWKSManager_UnknownKidPerKidCooldown(t *testing.T) {
+	_, n1, e1 := generateTestRSAKey(t)
+	_, n2, e2 := generateTestRSAKey(t)
+	var jwksRequests atomic.Int32
+	var rotated atomic.Bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		jwksRequests.Add(1)
+		keys := []JWKKey{
+			{Kty: "RSA", Use: "sig", Kid: "key-1", Alg: "RS256", N: n1, E: e1},
+		}
+		if rotated.Load() {
+			keys = append(keys, JWKKey{Kty: "RSA", Use: "sig", Kid: "key-2", Alg: "RS256", N: n2, E: e2})
+		}
+		_ = json.NewEncoder(w).Encode(JWKDoc{Keys: keys})
+	}))
+	defer server.Close()
+
+	ctx := context.Background()
+	mgr := NewJWKSManager(server.URL, server.Client(), time.Hour)
+
+	if _, err := mgr.GetKey(ctx, "unknown-a"); err == nil {
+		t.Fatal("expected not-found for unknown-a, got nil")
+	}
+	if got := jwksRequests.Load(); got != 1 {
+		t.Fatalf("first miss cost %d fetches, want 1", got)
+	}
+	// Genuine rotation: key-2 appears after unknown-a miss; lookup must fetch,
+	// not fail closed on unknown-a's cooldown.
+	rotated.Store(true)
+	if _, err := mgr.GetKey(ctx, "key-2"); err != nil {
+		t.Fatalf("rotation pickup failed: %v (fetches=%d)", err, jwksRequests.Load())
+	}
+	if got := jwksRequests.Load(); got != 2 {
+		t.Fatalf("rotation lookup cost %d fetches, want 2", got)
+	}
+	// A different unknown kid must also fetch, not ride unknown-a's cooldown.
+	if _, err := mgr.GetKey(ctx, "unknown-b"); err == nil {
+		t.Fatal("expected not-found for unknown-b, got nil")
+	}
+	if got := jwksRequests.Load(); got != 3 {
+		t.Fatalf("different unknown kid cost %d fetches, want 3", got)
+	}
+	// Same-kid negative cache still holds.
+	if _, err := mgr.GetKey(ctx, "unknown-b"); err == nil {
+		t.Fatal("expected not-found for unknown-b repeat, got nil")
+	}
+	if got := jwksRequests.Load(); got != 3 {
+		t.Fatalf("repeat unknown-b cost %d fetches, want 3", got)
+	}
+	if _, err := mgr.GetKey(ctx, "unknown-a"); err == nil {
+		t.Fatal("expected not-found for unknown-a repeat, got nil")
+	}
+	if got := jwksRequests.Load(); got != 3 {
+		t.Fatalf("repeat unknown-a cost %d fetches, want 3", got)
+	}
+}
+
 func TestJWKSManager_RefreshFailureServesStaleWithinGrace(t *testing.T) {
 	_, nRaw, eRaw := generateTestRSAKey(t)
 	var fail atomic.Bool
