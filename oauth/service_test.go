@@ -1324,6 +1324,7 @@ func TestOAuthService_X_MissingEmail(t *testing.T) {
 
 		cbReq := httptest.NewRequest(http.MethodGet, "/auth/oauth/x/callback?code=valid-code&state="+state, nil)
 		cbReq.AddCookie(stateCookie)
+		cbReq.AddCookie(&http.Cookie{Name: cfg.SessionCookieName, Value: rawToken})
 		cbRec := httptest.NewRecorder()
 
 		cbSess, _, _, err := activeSvc.HandleCallback(context.Background(), cbRec, cbReq, "x", "valid-code", state, db.SessionTypeCookie)
@@ -1418,6 +1419,7 @@ func TestHandleCallbackActiveSessionUntrustedTenant(t *testing.T) {
 		}
 		cbReq := httptest.NewRequest(http.MethodGet, "/auth/oauth/microsoft/callback", nil)
 		cbReq.AddCookie(stateCookie)
+		cbReq.AddCookie(&http.Cookie{Name: cfg.SessionCookieName, Value: rawToken})
 		_, _, _, err = svc.HandleCallback(context.Background(), httptest.NewRecorder(), cbReq, "microsoft", "code-1", state, db.SessionTypeCookie)
 		if !errors.Is(err, errors.ErrOAuthTenantInvalid) {
 			t.Fatalf("expected ErrOAuthTenantInvalid, got %v", err)

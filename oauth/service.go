@@ -285,7 +285,25 @@ func (s *service) HandleCallback(ctx context.Context, w http.ResponseWriter, r *
 		return fail("email_unverified", errors.ErrOAuthEmailUnverified)
 	}
 
-	user, linked, created, err := s.linkOrCreate(ctx, providerID, info, payload.UserID)
+	activeUserID := payload.UserID
+	if activeUserID != "" {
+		// Never link on the embedded value alone: a planted state cookie
+		// would attach the victim's provider identity to the attacker's
+		// account. Re-resolve the live session and require equality. A
+		// missing session falls back to plain login; a different session
+		// rejects the callback.
+		live, rerr := s.resolveLinkUserID(r)
+		if rerr != nil {
+			return fail("session_failed", rerr)
+		}
+		if live == "" {
+			activeUserID = ""
+		} else if live != activeUserID {
+			return fail("link_conflict", errors.ErrOAuthAccountAlreadyLinked)
+		}
+	}
+
+	user, linked, created, err := s.linkOrCreate(ctx, providerID, info, activeUserID)
 	if err != nil {
 		// Gate sentinels map to their historical literal reasons before the
 		// code-derived fallback, which stays the producer of UPPER_SNAKE

@@ -137,3 +137,82 @@ func TestLinkOrCreateFailClosed(t *testing.T) {
 		requireIdentityRows(t, database, 0, 0, 0)
 	})
 }
+
+func TestCallbackSessionRecheck(t *testing.T) {
+	t.Run("swapped session rejects link with 409", func(t *testing.T) {
+		t.Parallel()
+		database, cfg, _, svc := setupServiceTest(t,
+			&UserInfo{ProviderID: "google", ProviderUserID: "sub-fix", Email: "fix@example.com", EmailVerified: true})
+		sessSvc := session.NewService(database, cfg)
+		mkUser := func(email string) (db.User, string) {
+			t.Helper()
+			u := db.User{ID: uuid.New(), Email: email, PasswordHash: "hash", EmailVerified: true}
+			if err := database.Create(&u).Error; err != nil {
+				t.Fatalf("seed user: %v", err)
+			}
+			_, tok, err := sessSvc.CreateSession(context.Background(), u.ID, 0, db.SessionTypeCookie, "127.0.0.1", "ua")
+			if err != nil {
+				t.Fatalf("create session: %v", err)
+			}
+			return u, tok
+		}
+		_, tokA := mkUser("victim-a@example.com")
+		_, tokB := mkUser("victim-b@example.com")
+		state, cookie := signedInitiate(t, svc, cfg, "google", "/auth/oauth/google?link=true", tokA)
+		rec, req := callbackRequest(state, cookie)
+		req.AddCookie(&http.Cookie{Name: cfg.SessionCookieName, Value: tokB})
+		_, _, _, err := svc.HandleCallback(req.Context(), rec, req, "google", "code-1", state, db.SessionTypeCookie)
+		requireCode(t, err, errors.CodeOAuthAccountAlreadyLinked, http.StatusConflict)
+		if n := countRows(t, database, &db.OAuthAccount{}); n != 0 {
+			t.Fatalf("oauth_accounts = %d; want 0 (no foreign link)", n)
+		}
+	})
+
+	t.Run("expired session falls back to login", func(t *testing.T) {
+		t.Parallel()
+		database, cfg, _, svc := setupServiceTest(t,
+			&UserInfo{ProviderID: "google", ProviderUserID: "sub-fb", Email: "fallback@example.com", EmailVerified: true})
+		sessSvc := session.NewService(database, cfg)
+		user := db.User{ID: uuid.New(), Email: "gone@example.com", PasswordHash: "hash", EmailVerified: true}
+		if err := database.Create(&user).Error; err != nil {
+			t.Fatalf("seed user: %v", err)
+		}
+		_, rawToken, err := sessSvc.CreateSession(context.Background(), user.ID, 0, db.SessionTypeCookie, "127.0.0.1", "ua")
+		if err != nil {
+			t.Fatalf("create session: %v", err)
+		}
+		state, cookie := signedInitiate(t, svc, cfg, "google", "/auth/oauth/google?link=true", rawToken)
+		// Session cookie withheld: expiry between initiate and callback.
+		rec, req := callbackRequest(state, cookie)
+		sess, _, _, err := svc.HandleCallback(req.Context(), rec, req, "google", "code-1", state, db.SessionTypeCookie)
+		if err != nil {
+			t.Fatalf("HandleCallback = %v; want login fallback, not rejection", err)
+		}
+		if sess.UserID == user.ID {
+			t.Fatalf("fallback linked expired session user %v; want fresh login", user.ID)
+		}
+		requireIdentityRows(t, database, 2, 1, 2)
+	})
+
+	t.Run("failing store at callback is 500", func(t *testing.T) {
+		t.Parallel()
+		database, cfg, stub, svc := setupServiceTest(t, verifiedInfo())
+		sessSvc := session.NewService(database, cfg)
+		user := db.User{ID: uuid.New(), Email: "cb500@example.com", PasswordHash: "hash", EmailVerified: true}
+		if err := database.Create(&user).Error; err != nil {
+			t.Fatalf("seed user: %v", err)
+		}
+		_, rawToken, err := sessSvc.CreateSession(context.Background(), user.ID, 0, db.SessionTypeCookie, "127.0.0.1", "ua")
+		if err != nil {
+			t.Fatalf("create session: %v", err)
+		}
+		state, cookie := signedInitiate(t, svc, cfg, "google", "/auth/oauth/google?link=true", rawToken)
+		broken := NewService(database,
+			&failGetSessionSvc{err: errors.New(errors.CodeInternalError, "db down", nil)},
+			map[string]Provider{"google": stub}, cfg)
+		rec, req := callbackRequest(state, cookie)
+		req.AddCookie(&http.Cookie{Name: cfg.SessionCookieName, Value: rawToken})
+		_, _, _, err = broken.HandleCallback(req.Context(), rec, req, "google", "code-1", state, db.SessionTypeCookie)
+		requireCode(t, err, errors.CodeInternalError, http.StatusInternalServerError)
+	})
+}
