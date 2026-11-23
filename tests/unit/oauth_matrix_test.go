@@ -227,6 +227,14 @@ func TestOAuthMatrix_AuthURLParametersAcross7Providers(t *testing.T) {
 			if q.Get("redirect_uri") != "https://app.example.com/callback" {
 				t.Fatalf("expected redirect_uri=https://app.example.com/callback, got %q", q.Get("redirect_uri"))
 			}
+
+			// Invariant: no secret material in the authorize URL
+			if q.Get("client_secret") != "" {
+				t.Fatalf("authorize URL must not carry client_secret, got %q", q.Get("client_secret"))
+			}
+			if q.Get("appsecret_proof") != "" {
+				t.Fatalf("authorize URL must not carry appsecret_proof, got %q", q.Get("appsecret_proof"))
+			}
 		})
 	}
 }

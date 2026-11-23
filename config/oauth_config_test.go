@@ -746,6 +746,15 @@ func TestProviderConfigLogValue(t *testing.T) {
 		if attrs["state_secret"] != "[REDACTED]" {
 			t.Errorf("state_secret = %q; want [REDACTED]", attrs["state_secret"])
 		}
+		var buf bytes.Buffer
+		slog.New(slog.NewJSONHandler(&buf, nil)).Info("oauth config", slog.Any("oauth", o))
+		out := buf.String()
+		if strings.Contains(out, "ms-secret") {
+			t.Fatalf("LogValue leaked nested microsoft secret: %s", out)
+		}
+		if !strings.Contains(out, "[REDACTED]") {
+			t.Fatalf("expected [REDACTED] in log output, got: %s", out)
+		}
 	})
 
 	t.Run("MicrosoftConfig String masks client secret", func(t *testing.T) {
