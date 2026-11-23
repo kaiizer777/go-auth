@@ -804,6 +804,34 @@ type nilUserStore struct{ db.UserStore }
 
 func (nilUserStore) GetByID(context.Context, uuid.UUID) (*db.User, error) { return nil, nil }
 
+// gatedMissLinkStore reports a miss for its first `remaining` GetByProvider
+// probes, holding each caller until release closes. Both concurrent callbacks
+// therefore clear the already-linked branch before either can insert.
+type gatedMissLinkStore struct {
+	db.OAuthAccountStore
+	remaining atomic.Int32
+	conflicts atomic.Int32
+	arrived   chan struct{}
+	release   chan struct{}
+}
+
+func (g *gatedMissLinkStore) GetByProvider(ctx context.Context, providerID, providerUserID string) (*db.OAuthAccount, error) {
+	if g.remaining.Add(-1) < 0 {
+		return g.OAuthAccountStore.GetByProvider(ctx, providerID, providerUserID)
+	}
+	g.arrived <- struct{}{}
+	<-g.release
+	return nil, gorm.ErrRecordNotFound
+}
+
+func (g *gatedMissLinkStore) Create(ctx context.Context, a *db.OAuthAccount) error {
+	err := g.OAuthAccountStore.Create(ctx, a)
+	if isUniqueViolation(err) {
+		g.conflicts.Add(1)
+	}
+	return err
+}
+
 // hideFirstLinkStore hides an existing link from the first GetByProvider probe,
 // so the callback skips the already-linked branch and loses the insert race.
 type hideFirstLinkStore struct {
@@ -864,6 +892,77 @@ func TestHandleCallbackLinkConflictForeignOwner(t *testing.T) {
 	if link.UserID != foreign.ID {
 		t.Fatalf("link owner = %v; want untouched %v", link.UserID, foreign.ID)
 	}
+}
+
+func TestHandleCallbackLinkConflictSameOwnerConverges(t *testing.T) {
+	database, cfg, stub, rawSvc := setupServiceTest(t, &UserInfo{
+		ProviderID: "google", ProviderUserID: "sub-same-owner",
+		Email: "provider-owner@personal.example", EmailVerified: true,
+	})
+	ctx := context.Background()
+	sessSvc := session.NewService(database, cfg)
+	active := db.User{ID: uuid.New(), Email: "active@work.example", PasswordHash: "hash", EmailVerified: true}
+	if err := database.Create(&active).Error; err != nil {
+		t.Fatalf("seed user: %v", err)
+	}
+	_, rawSession, err := sessSvc.CreateSession(ctx, active.ID, active.CredentialVersion, db.SessionTypeCookie, "127.0.0.1", "ua")
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	base := rawSvc.(*service).store
+	gate := &gatedMissLinkStore{
+		OAuthAccountStore: base.OAuthAccounts(),
+		arrived:           make(chan struct{}, 2),
+		release:           make(chan struct{}),
+	}
+	gate.remaining.Store(2)
+	svc := NewServiceWithStore(&wrappedTxStore{Store: base, oauth: gate},
+		sessSvc, map[string]Provider{"google": stub}, cfg)
+
+	states := make([]string, 2)
+	cookies := make([]*http.Cookie, 2)
+	for i := range states {
+		states[i], cookies[i] = initiateLinked(t, svc, cfg, "google", rawSession)
+	}
+	type outcome struct {
+		userID uuid.UUID
+		err    error
+	}
+	results := make([]outcome, len(states))
+	var wg sync.WaitGroup
+	for i := range states {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			rec, req := callbackRequest(states[i], cookies[i])
+			sess, _, _, err := svc.HandleCallback(req.Context(), rec, req, "google", "code-1", states[i], db.SessionTypeCookie)
+			if sess != nil {
+				results[i].userID = sess.UserID
+			}
+			results[i].err = err
+		}(i)
+	}
+	// Hold both callbacks at their first link probe until both have arrived, so
+	// one insert wins and the other takes the conflict-recovery path.
+	<-gate.arrived
+	<-gate.arrived
+	close(gate.release)
+	wg.Wait()
+	if n := gate.conflicts.Load(); n != 1 {
+		t.Fatalf("unique conflicts = %d; want 1 (loser must take the relink path)", n)
+	}
+
+	for i, r := range results {
+		if r.err != nil {
+			t.Fatalf("callback %d: %v; want same-owner convergence", i, r.err)
+		}
+		if r.userID != active.ID {
+			t.Fatalf("callback %d session user = %v; want %v", i, r.userID, active.ID)
+		}
+	}
+	// One active-user session plus one per callback; both linked to the owner.
+	requireIdentityRows(t, database, 1, 1, 3)
 }
 
 func TestHandleCallbackNilGuards(t *testing.T) {
