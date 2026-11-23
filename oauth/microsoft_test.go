@@ -663,3 +663,55 @@ func TestMicrosoftProvider(t *testing.T) {
 		}
 	})
 }
+
+func TestMicrosoftProvider_KeyIssuerBinding(t *testing.T) {
+	const (
+		tenantA = "tenant-a"
+		tenantB = "tenant-b"
+	)
+
+	privKey, nRaw, eRaw := generateTestRSAKey(t)
+	ctx := context.Background()
+
+	serve := func(t *testing.T, keyIssuer string) *MicrosoftProvider {
+		t.Helper()
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_ = json.NewEncoder(w).Encode(JWKDoc{Keys: []JWKKey{{
+				Kty: "RSA", Use: "sig", Kid: "ms-key-1", Alg: "RS256", N: nRaw, E: eRaw, Issuer: keyIssuer,
+			}}})
+		}))
+		t.Cleanup(srv.Close)
+
+		p := NewMicrosoftProvider(config.MicrosoftConfig{
+			ClientID:    "client-test-id",
+			Tenant:      tenantA,
+			RedirectURI: "https://example.com/callback",
+		})
+		p.client = srv.Client()
+		p.jwksMgr = NewJWKSManager(srv.URL, p.client, time.Hour)
+		p.jwksRetriever = p.jwksMgr
+		return p
+	}
+
+	rawJWT := signRS256JWT(t, privKey, "ms-key-1", map[string]any{
+		"iss": "https://login.microsoftonline.com/" + tenantA + "/v2.0",
+		"tid": tenantA,
+		"sub": "sub-1",
+		"aud": "client-test-id",
+		"exp": time.Now().Add(10 * time.Minute).Unix(),
+	})
+
+	t.Run("key scoped to a foreign tenant is rejected", func(t *testing.T) {
+		p := serve(t, "https://login.microsoftonline.com/"+tenantB+"/v2.0")
+		if _, err := p.VerifyIDToken(ctx, rawJWT, ""); err == nil {
+			t.Fatal("token verified with a key scoped to another tenant")
+		}
+	})
+
+	t.Run("templated key issuer resolves to the token tenant", func(t *testing.T) {
+		p := serve(t, "https://login.microsoftonline.com/{tenantid}/v2.0")
+		if _, err := p.VerifyIDToken(ctx, rawJWT, ""); err != nil {
+			t.Fatalf("verification failed: %v", err)
+		}
+	})
+}
