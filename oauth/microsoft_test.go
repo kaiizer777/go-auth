@@ -323,6 +323,24 @@ func TestMicrosoftProvider(t *testing.T) {
 		}
 	})
 
+	t.Run("per-authority URL construction", func(t *testing.T) {
+		cases := []struct{ tenant, want string }{
+			{"common", "common"},
+			{"consumers", "consumers"},
+			{"organizations", "organizations"},
+			{"target-tenant-uuid", "target-tenant-uuid"},
+			{"", "common"},
+		}
+		for _, tc := range cases {
+			p := NewMicrosoftProvider(config.MicrosoftConfig{ClientID: "cid", Tenant: tc.tenant})
+			for name, got := range map[string]string{"authURL": p.authURL, "tokenURL": p.tokenURL, "jwksURL": p.jwksURL} {
+				if !strings.Contains(got, "/"+tc.want+"/") {
+					t.Errorf("tenant %q: %s = %q, want segment %q", tc.tenant, name, got, tc.want)
+				}
+			}
+		}
+	})
+
 	t.Run("ExchangeCode success and failure", func(t *testing.T) {
 		p := newTestProvider("common", nil)
 		tok, err := p.ExchangeCode(ctx, "good-code", "verifier-123")
