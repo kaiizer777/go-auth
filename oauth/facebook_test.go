@@ -85,11 +85,13 @@ func TestFacebookProvider_AuthCodeURL(t *testing.T) {
 func TestGenerateAppSecretProof(t *testing.T) {
 	t.Parallel()
 
-	// Verification with known test vectors:
-	// key = "test-secret", data = "test-token"
-	// HMAC-SHA256("test-secret", "test-token")
-	// Expected lowercase hex:
+	// Known-answer vector, pinned out-of-band and never derived from the
+	// function under test: HMAC-SHA256(key="test-secret", data="test-token").
+	const wantProof = "4bd72343ca044f8aab1d98f07606cdb1cf47df0c089ff7b5b2df44e40d869970"
 	proof := GenerateAppSecretProof("test-token", "test-secret")
+	if proof != wantProof {
+		t.Fatalf("proof = %q; want known vector %q", proof, wantProof)
+	}
 	if len(proof) != 64 {
 		t.Fatalf("proof length = %d; want 64", len(proof))
 	}
@@ -107,6 +109,12 @@ func TestGenerateAppSecretProof(t *testing.T) {
 	proofDiff := GenerateAppSecretProof("diff-token", "test-secret")
 	if proof == proofDiff {
 		t.Fatalf("different tokens produced identical proof")
+	}
+
+	// Wrong key must not verify against the pinned vector
+	proofWrongKey := GenerateAppSecretProof("test-token", "wrong-secret")
+	if proofWrongKey == wantProof {
+		t.Fatalf("wrong key produced the pinned vector")
 	}
 }
 
@@ -177,8 +185,12 @@ func TestFacebookProvider_ExchangeCode_And_ConfusedDeputyDefense(t *testing.T) {
 				http.Error(w, "invalid app token", http.StatusUnauthorized)
 				return
 			}
-			expectedProof := GenerateAppSecretProof(accessToken, "fb-valid-app-secret")
-			if proof != expectedProof {
+			// Independent pin: HMAC-SHA256(key="fb-valid-app-secret",
+			// data="fb-valid-app-id|fb-valid-app-secret"), computed
+			// out-of-band. The mock must not call GenerateAppSecretProof
+			// or a broken HMAC would stay green.
+			const wantProof = "984f912f793e78b6beb7895b9373cbbb1137f9f1d11121e72947f5d61d705e0a"
+			if proof != wantProof {
 				http.Error(w, "invalid proof", http.StatusForbidden)
 				return
 			}

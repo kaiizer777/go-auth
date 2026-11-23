@@ -7,8 +7,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/kaiizer777/go-auth/config"
 	"github.com/kaiizer777/go-auth/errors"
@@ -126,7 +128,31 @@ func TestXProvider_ExchangeCode(t *testing.T) {
 
 		code := r.FormValue("code")
 		if code == "rate-limited-code" {
-			w.Header().Set("x-rate-limit-reset", "1700000000")
+			w.Header().Set("x-rate-limit-reset", strconv.FormatInt(time.Now().Add(90*time.Second).Unix(), 10))
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"title":  "Too Many Requests",
+				"detail": "Too Many Requests",
+				"type":   "about:blank",
+				"status": 429,
+			})
+			return
+		}
+		if code == "rate-limited-retry-after-code" {
+			w.Header().Set("Retry-After", "45")
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"title":  "Too Many Requests",
+				"detail": "Too Many Requests",
+				"type":   "about:blank",
+				"status": 429,
+			})
+			return
+		}
+		if code == "rate-limited-past-code" {
+			w.Header().Set("x-rate-limit-reset", strconv.FormatInt(time.Now().Add(-60*time.Second).Unix(), 10))
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusTooManyRequests)
 			_ = json.NewEncoder(w).Encode(map[string]any{
@@ -207,6 +233,41 @@ func TestXProvider_ExchangeCode(t *testing.T) {
 		if !errors.Is(err, errors.ErrOAuthRateLimitExceeded) {
 			t.Fatalf("expected ErrOAuthRateLimitExceeded, got %v", err)
 		}
+		retryAfter, ok := RetryAfterFromError(err)
+		if !ok {
+			t.Fatalf("expected RetryAfter value, got none in %v", err)
+		}
+		if retryAfter < 85 || retryAfter > 90 {
+			t.Fatalf("RetryAfter = %d; want within [85, 90] (90s future reset)", retryAfter)
+		}
+	})
+
+	t.Run("429 Retry-After header takes precedence", func(t *testing.T) {
+		_, err := p.ExchangeCode(context.Background(), "rate-limited-retry-after-code", "test-code-verifier")
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+		if !errors.Is(err, errors.ErrOAuthRateLimitExceeded) {
+			t.Fatalf("expected ErrOAuthRateLimitExceeded, got %v", err)
+		}
+		retryAfter, ok := RetryAfterFromError(err)
+		if !ok || retryAfter != 45 {
+			t.Fatalf("RetryAfter = %d, ok = %v; want 45, true", retryAfter, ok)
+		}
+	})
+
+	t.Run("429 past reset clamps to one second", func(t *testing.T) {
+		_, err := p.ExchangeCode(context.Background(), "rate-limited-past-code", "test-code-verifier")
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+		if !errors.Is(err, errors.ErrOAuthRateLimitExceeded) {
+			t.Fatalf("expected ErrOAuthRateLimitExceeded, got %v", err)
+		}
+		retryAfter, ok := RetryAfterFromError(err)
+		if !ok || retryAfter != 1 {
+			t.Fatalf("RetryAfter = %d, ok = %v; want 1, true", retryAfter, ok)
+		}
 	})
 
 	t.Run("RFC 7807 error parsed", func(t *testing.T) {
@@ -264,7 +325,7 @@ func TestXProvider_FetchUserInfo(t *testing.T) {
 		authHeader := r.Header.Get("Authorization")
 		if authHeader != "Bearer valid-token" && authHeader != "Bearer username-fallback-token" {
 			if authHeader == "Bearer rate-limited-token" {
-				w.Header().Set("x-rate-limit-reset", "1700000000")
+				w.Header().Set("x-rate-limit-reset", strconv.FormatInt(time.Now().Add(120*time.Second).Unix(), 10))
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusTooManyRequests)
 				_ = json.NewEncoder(w).Encode(map[string]any{
@@ -395,6 +456,13 @@ func TestXProvider_FetchUserInfo(t *testing.T) {
 		}
 		if !errors.Is(err, errors.ErrOAuthRateLimitExceeded) {
 			t.Fatalf("expected ErrOAuthRateLimitExceeded, got %v", err)
+		}
+		retryAfter, ok := RetryAfterFromError(err)
+		if !ok {
+			t.Fatalf("expected RetryAfter value, got none in %v", err)
+		}
+		if retryAfter < 115 || retryAfter > 120 {
+			t.Fatalf("RetryAfter = %d; want within [115, 120] (120s future reset)", retryAfter)
 		}
 	})
 
