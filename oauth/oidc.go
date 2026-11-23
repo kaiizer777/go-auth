@@ -105,39 +105,30 @@ func (m *JWKSManager) GetKey(ctx context.Context, kid string) (JWKSKey, error) {
 	}
 
 	// Singleflight deduplication across concurrent cache misses
-	_, err, _ := m.sf.Do("jwks_refresh", func() (any, error) {
-		m.mu.RLock()
-		_, ok := m.keys[kid]
-		fresh := time.Now().Before(m.expires)
-		m.mu.RUnlock()
-		if ok && fresh {
-			return nil, nil
-		}
-		return nil, m.refresh(ctx)
-	})
+	fetched, err := m.refreshFlight("jwks_refresh", kid, ctx)
 	if err != nil {
 		return JWKSKey{}, err
+	}
+	// A concurrent commit can supersede this fetch; the document still proves the
+	// provider served kid, so use it before escalating to the rollover flight.
+	if key, ok := fetched[kid]; ok {
+		return key, nil
 	}
 
 	m.mu.RLock()
-	if key, ok := m.keys[kid]; ok {
-		m.mu.RUnlock()
+	key, ok = m.keys[kid]
+	m.mu.RUnlock()
+	if ok {
 		return key, nil
 	}
-	m.mu.RUnlock()
 
 	// If missing after joiner flight, refresh under singleflight deduplication to avoid stampedes
-	_, err, _ = m.sf.Do("jwks_rollover_refresh", func() (any, error) {
-		m.mu.RLock()
-		if _, ok := m.keys[kid]; ok {
-			m.mu.RUnlock()
-			return nil, nil
-		}
-		m.mu.RUnlock()
-		return nil, m.refresh(ctx)
-	})
+	fetched, err = m.refreshFlight("jwks_rollover_refresh", kid, ctx)
 	if err != nil {
 		return JWKSKey{}, err
+	}
+	if key, ok := fetched[kid]; ok {
+		return key, nil
 	}
 
 	m.mu.RLock()
@@ -148,7 +139,27 @@ func (m *JWKSManager) GetKey(ctx context.Context, kid string) (JWKSKey, error) {
 	return JWKSKey{}, errors.New(errors.CodeOAuthIDTokenInvalid, fmt.Sprintf("signing key with kid %q not found in jwks", kid), nil)
 }
 
-func (m *JWKSManager) refresh(ctx context.Context) error {
+// refreshFlight runs one deduplicated refresh unless the key is already cached and fresh.
+// The fetched set is returned even when another flight committed first.
+func (m *JWKSManager) refreshFlight(name, kid string, ctx context.Context) (map[string]JWKSKey, error) {
+	v, err, _ := m.sf.Do(name, func() (any, error) {
+		m.mu.RLock()
+		_, ok := m.keys[kid]
+		fresh := time.Now().Before(m.expires)
+		m.mu.RUnlock()
+		if ok && fresh {
+			return nil, nil
+		}
+		return m.refresh(ctx)
+	})
+	if err != nil {
+		return nil, err
+	}
+	fetched, _ := v.(map[string]JWKSKey)
+	return fetched, nil
+}
+
+func (m *JWKSManager) refresh(ctx context.Context) (map[string]JWKSKey, error) {
 	m.mu.RLock()
 	startGen := m.gen
 	m.mu.RUnlock()
@@ -158,24 +169,24 @@ func (m *JWKSManager) refresh(ctx context.Context) error {
 
 	req, err := http.NewRequestWithContext(fetchCtx, http.MethodGet, m.jwksURL, nil)
 	if err != nil {
-		return errors.New(errors.CodeOAuthProviderError, "oauth jwks request failed", err)
+		return nil, errors.New(errors.CodeOAuthProviderError, "oauth jwks request failed", err)
 	}
 	req.Header.Set("Accept", "application/json")
 
 	resp, err := m.client.Do(req)
 	if err != nil {
-		return errors.New(errors.CodeOAuthProviderError, "oauth jwks fetch failed", err)
+		return nil, errors.New(errors.CodeOAuthProviderError, "oauth jwks fetch failed", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, oauthBodyLimit))
-		return errors.New(errors.CodeOAuthProviderError, fmt.Sprintf("oauth provider jwks responded with status %d", resp.StatusCode), nil)
+		return nil, errors.New(errors.CodeOAuthProviderError, fmt.Sprintf("oauth provider jwks responded with status %d", resp.StatusCode), nil)
 	}
 
 	var doc JWKDoc
 	if err := json.NewDecoder(io.LimitReader(resp.Body, oauthBodyLimit)).Decode(&doc); err != nil {
-		return errors.New(errors.CodeOAuthProviderError, "oauth provider returned invalid jwks response", err)
+		return nil, errors.New(errors.CodeOAuthProviderError, "oauth provider returned invalid jwks response", err)
 	}
 
 	parsedKeys := make(map[string]JWKSKey, len(doc.Keys))
@@ -193,18 +204,20 @@ func (m *JWKSManager) refresh(ctx context.Context) error {
 	}
 
 	if len(parsedKeys) == 0 {
-		return errors.New(errors.CodeOAuthProviderError, "oauth provider returned jwks with no valid rsa keys", nil)
+		return nil, errors.New(errors.CodeOAuthProviderError, "oauth provider returned jwks with no valid rsa keys", nil)
 	}
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.gen != startGen {
-		return nil
+	// gen flags that another flight committed since the snapshot. It is not an
+	// ordering guarantee, so a superseded response is never written over the cache;
+	// the caller that fetched it decides whether it satisfies its own request.
+	if m.gen == startGen {
+		m.keys = parsedKeys
+		m.expires = time.Now().Add(m.ttl)
+		m.gen++
 	}
-	m.keys = parsedKeys
-	m.expires = time.Now().Add(m.ttl)
-	m.gen++
-	return nil
+	return parsedKeys, nil
 }
 
 // parseRSAPublicKey converts base64url-encoded modulus (n) and exponent (e) to *rsa.PublicKey.
