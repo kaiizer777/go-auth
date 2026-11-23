@@ -3,6 +3,7 @@ package oauth
 import (
 	"bytes"
 	"context"
+	stderrors "errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -177,6 +178,30 @@ func callbackRequest(state string, cookie *http.Cookie) (*httptest.ResponseRecor
 	req := httptest.NewRequest(http.MethodGet, "/auth/oauth/google/callback", nil)
 	req.AddCookie(cookie)
 	return rec, req
+}
+
+// initiateLinked starts a flow for an authenticated user so the state cookie
+// carries activeUserID exactly as a real account-link request does.
+func initiateLinked(t *testing.T, svc Service, cfg *config.Config, providerID, rawSession string) (string, *http.Cookie) {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/auth/oauth/"+providerID, nil)
+	req.AddCookie(&http.Cookie{Name: cfg.SessionCookieName, Value: rawSession})
+	authURL, err := svc.InitiateFlow(rec, req, providerID)
+	if err != nil {
+		t.Fatalf("InitiateFlow = %v", err)
+	}
+	u, err := url.Parse(authURL)
+	if err != nil {
+		t.Fatalf("parse authURL: %v", err)
+	}
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == cfg.OAuth.StateCookieName {
+			return u.Query().Get("state"), c
+		}
+	}
+	t.Fatalf("no %q cookie issued", cfg.OAuth.StateCookieName)
+	return "", nil
 }
 
 func countRows(t *testing.T, database *gorm.DB, model any) int64 {
@@ -651,6 +676,177 @@ func TestHandleCallbackLinking(t *testing.T) {
 			t.Error("state cookie not cleared on callback success")
 		}
 	})
+}
+
+func TestHandleCallbackActiveSessionLinking(t *testing.T) {
+	// Provider emails in this block all differ from the active user's address:
+	// a shared address would let email matching hide a broken owner lookup.
+	t.Run("vanished owner fails closed instead of linking by provider email", func(t *testing.T) {
+		database, cfg, _, svc := setupServiceTest(t, &UserInfo{
+			ProviderID: "google", ProviderUserID: "sub-orphan",
+			Email: "provider-owner@personal.example", EmailVerified: true,
+		})
+		ctx := context.Background()
+		sessSvc := session.NewService(database, cfg)
+		active := db.User{ID: uuid.New(), Email: "active@work.example", PasswordHash: "hash", EmailVerified: true}
+		other := db.User{ID: uuid.New(), Email: "provider-owner@personal.example", PasswordHash: "hash", EmailVerified: true}
+		for _, u := range []db.User{active, other} {
+			if err := database.Create(&u).Error; err != nil {
+				t.Fatalf("seed user: %v", err)
+			}
+		}
+		_, rawSession, err := sessSvc.CreateSession(ctx, active.ID, active.CredentialVersion, db.SessionTypeCookie, "127.0.0.1", "ua")
+		if err != nil {
+			t.Fatalf("create session: %v", err)
+		}
+		state, stateCookie := initiateLinked(t, svc, cfg, "google", rawSession)
+		// Hard delete between initiate and callback: the linked owner is gone.
+		if err := database.Delete(&db.User{}, "id = ?", active.ID).Error; err != nil {
+			t.Fatalf("delete active user: %v", err)
+		}
+		rec, req := callbackRequest(state, stateCookie)
+		sess, _, _, err := svc.HandleCallback(ctx, rec, req, "google", "code-1", state, db.SessionTypeCookie)
+		if sess != nil {
+			t.Fatalf("session issued for %v; want none", sess.UserID)
+		}
+		requireCode(t, err, errors.CodeOAuthAccountNotLinked, http.StatusNotFound)
+		// Only the pre-created session row survives: no session was minted for
+		// the callback and the provider identity stayed unlinked.
+		requireIdentityRows(t, database, 1, 0, 1)
+	})
+
+	t.Run("non-uuid active user id fails closed", func(t *testing.T) {
+		database, _, _, rawSvc := setupServiceTest(t, nil)
+		info := &UserInfo{ProviderID: "google", ProviderUserID: "sub-bad-id",
+			Email: "provider-owner@personal.example", EmailVerified: true}
+		_, _, _, err := rawSvc.(*service).linkOrCreate(context.Background(), "google", info, "not-a-uuid")
+		requireCode(t, err, errors.CodeOAuthAccountNotLinked, http.StatusNotFound)
+		requireIdentityRows(t, database, 0, 0, 0)
+	})
+
+	t.Run("store failure stays a domain error", func(t *testing.T) {
+		_, _, _, rawSvc := setupServiceTest(t, nil)
+		base := rawSvc.(*service).store
+		broken := &failingGetByIDStore{
+			Store: base,
+			users: &failingGetByIDUserStore{UserStore: base.Users(), err: stderrors.New("dial tcp: connection refused")},
+		}
+		svc := NewServiceWithStore(broken, nil, nil, serviceTestConfig()).(*service)
+		_, _, _, err := svc.linkOrCreate(context.Background(), "google", verifiedInfo(), uuid.New().String())
+		requireCode(t, err, errors.CodeInternalError, http.StatusInternalServerError)
+	})
+
+	t.Run("provider email differing from the active user links to the active user", func(t *testing.T) {
+		database, cfg, _, svc := setupServiceTest(t, &UserInfo{
+			ProviderID: "google", ProviderUserID: "sub-active",
+			Email: "provider-owner@personal.example", EmailVerified: true,
+		})
+		ctx := context.Background()
+		sessSvc := session.NewService(database, cfg)
+		active := db.User{ID: uuid.New(), Email: "active@work.example", PasswordHash: "hash", EmailVerified: true}
+		if err := database.Create(&active).Error; err != nil {
+			t.Fatalf("seed user: %v", err)
+		}
+		_, rawSession, err := sessSvc.CreateSession(ctx, active.ID, active.CredentialVersion, db.SessionTypeCookie, "127.0.0.1", "ua")
+		if err != nil {
+			t.Fatalf("create session: %v", err)
+		}
+		state, stateCookie := initiateLinked(t, svc, cfg, "google", rawSession)
+		rec, req := callbackRequest(state, stateCookie)
+		sess, _, _, err := svc.HandleCallback(ctx, rec, req, "google", "code-1", state, db.SessionTypeCookie)
+		if err != nil {
+			t.Fatalf("HandleCallback = %v", err)
+		}
+		if sess.UserID != active.ID {
+			t.Fatalf("session user = %v; want active user %v", sess.UserID, active.ID)
+		}
+		var link db.OAuthAccount
+		if err := database.Where("provider_id = ? AND provider_user_id = ?", "google", "sub-active").First(&link).Error; err != nil {
+			t.Fatalf("load link: %v", err)
+		}
+		if link.UserID != active.ID {
+			t.Fatalf("link owner = %v; want %v", link.UserID, active.ID)
+		}
+	})
+}
+
+// failingGetByIDStore swaps the user store so GetByID can fail like a dead DB link.
+type failingGetByIDStore struct {
+	db.Store
+	users db.UserStore
+}
+
+func (f *failingGetByIDStore) Users() db.UserStore { return f.users }
+
+type failingGetByIDUserStore struct {
+	db.UserStore
+	err error
+}
+
+func (f *failingGetByIDUserStore) GetByID(context.Context, uuid.UUID) (*db.User, error) {
+	return nil, f.err
+}
+
+// hideFirstLinkStore hides an existing link from the first GetByProvider probe,
+// so the callback skips the already-linked branch and loses the insert race.
+type hideFirstLinkStore struct {
+	db.OAuthAccountStore
+	hidden bool
+}
+
+func (h *hideFirstLinkStore) GetByProvider(ctx context.Context, providerID, providerUserID string) (*db.OAuthAccount, error) {
+	if h.hidden {
+		h.hidden = false
+		return nil, gorm.ErrRecordNotFound
+	}
+	return h.OAuthAccountStore.GetByProvider(ctx, providerID, providerUserID)
+}
+
+func TestHandleCallbackLinkConflictForeignOwner(t *testing.T) {
+	database, cfg, stub, rawSvc := setupServiceTest(t, &UserInfo{
+		ProviderID: "google", ProviderUserID: "sub-conflict",
+		Email: "provider-owner@personal.example", EmailVerified: true,
+	})
+	ctx := context.Background()
+	sessSvc := session.NewService(database, cfg)
+	active := db.User{ID: uuid.New(), Email: "active@work.example", PasswordHash: "hash", EmailVerified: true}
+	foreign := db.User{ID: uuid.New(), Email: "foreign@personal.example", PasswordHash: "hash", EmailVerified: true}
+	for _, u := range []db.User{active, foreign} {
+		if err := database.Create(&u).Error; err != nil {
+			t.Fatalf("seed user: %v", err)
+		}
+	}
+	won := db.OAuthAccount{ID: uuid.New(), UserID: foreign.ID, ProviderID: "google",
+		ProviderUserID: "sub-conflict", Email: foreign.Email}
+	if err := database.Create(&won).Error; err != nil {
+		t.Fatalf("seed link: %v", err)
+	}
+	_, rawSession, err := sessSvc.CreateSession(ctx, active.ID, active.CredentialVersion, db.SessionTypeCookie, "127.0.0.1", "ua")
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	base := rawSvc.(*service).store
+	svc := NewServiceWithStore(&wrappedTxStore{
+		Store: base,
+		oauth: &hideFirstLinkStore{OAuthAccountStore: base.OAuthAccounts(), hidden: true},
+	}, sessSvc, map[string]Provider{"google": stub}, cfg)
+
+	state, stateCookie := initiateLinked(t, svc, cfg, "google", rawSession)
+	rec, req := callbackRequest(state, stateCookie)
+	sess, _, _, err := svc.HandleCallback(ctx, rec, req, "google", "code-1", state, db.SessionTypeCookie)
+	if sess != nil {
+		t.Fatalf("session issued for %v; want none for the foreign owner", sess.UserID)
+	}
+	requireCode(t, err, errors.CodeOAuthAccountAlreadyLinked, http.StatusConflict)
+	requireIdentityRows(t, database, 2, 1, 1)
+	var link db.OAuthAccount
+	if err := database.Where("provider_id = ? AND provider_user_id = ?", "google", "sub-conflict").First(&link).Error; err != nil {
+		t.Fatalf("load link: %v", err)
+	}
+	if link.UserID != foreign.ID {
+		t.Fatalf("link owner = %v; want untouched %v", link.UserID, foreign.ID)
+	}
 }
 
 func TestHandleCallbackNilGuards(t *testing.T) {

@@ -7,7 +7,9 @@ import (
 	"encoding/base64"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -181,6 +183,148 @@ func TestSecurity_Microsoft_nOauth_UntrustedTenantTakeover(t *testing.T) {
 	if !errors.Is(err, errors.ErrOAuthEmailUnverified) && !errors.Is(err, errors.ErrOAuthTenantInvalid) {
 		t.Fatalf("expected ErrOAuthTenantInvalid or ErrOAuthEmailUnverified, got: %v", err)
 	}
+}
+
+// initiateState starts a flow, optionally authenticated as rawSession, and
+// returns the state plus the signed state cookie carrying the selected user.
+func initiateState(t *testing.T, svc oauth.Service, cfg *config.Config, providerID, rawSession string) (string, *http.Cookie) {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/auth/oauth/"+providerID, nil)
+	if rawSession != "" {
+		req.AddCookie(&http.Cookie{Name: cfg.SessionCookieName, Value: rawSession})
+	}
+	authURL, err := svc.InitiateFlow(rec, req, providerID)
+	if err != nil {
+		t.Fatalf("InitiateFlow = %v", err)
+	}
+	u, err := url.Parse(authURL)
+	if err != nil {
+		t.Fatalf("parse authURL: %v", err)
+	}
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == cfg.OAuth.StateCookieName {
+			return u.Query().Get("state"), c
+		}
+	}
+	t.Fatalf("no %q cookie issued", cfg.OAuth.StateCookieName)
+	return "", nil
+}
+
+func TestSecurity_UntrustedTenantNotLinkedForActiveSession(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	database, store := setupAntiHijackingDB(t)
+
+	cfg := config.DefaultConfig()
+	cfg.OAuth.StateSecret = "super-secret-anti-hijack-test-state-key-32b"
+	sessSvc := session.NewService(database, &cfg)
+
+	active := db.User{ID: uuid.New(), Email: "active@company.com", PasswordHash: "hash", EmailVerified: true}
+	if err := database.Create(&active).Error; err != nil {
+		t.Fatalf("create active user: %v", err)
+	}
+	_, rawSession, err := sessSvc.CreateSession(ctx, active.ID, active.CredentialVersion, db.SessionTypeCookie, "127.0.0.1", "ua")
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	// Verified email, differing from the active user's: only the tenant marker
+	// may reject this flow, and email matching must not bind it either.
+	info := &oauth.UserInfo{
+		ProviderID:     "microsoft",
+		ProviderUserID: "ms-untrusted-active-sub",
+		Email:          "untrusted@external-tenant.example",
+		EmailVerified:  true,
+		RawClaims:      map[string]any{"untrusted_tenant": true},
+	}
+	reg := oauth.NewRegistry()
+	_ = reg.Register(&untrustedTenantProvider{info: info})
+	svc := oauth.NewServiceWithRegistry(store, sessSvc, reg, &cfg)
+
+	state, stateCookie := initiateState(t, svc, &cfg, "microsoft", rawSession)
+	cbReq := httptest.NewRequest(http.MethodGet, "/auth/oauth/microsoft/callback?state="+state, nil)
+	cbReq.AddCookie(stateCookie)
+	sess, _, _, err := svc.HandleCallback(ctx, httptest.NewRecorder(), cbReq, "microsoft", "code-ms", state, db.SessionTypeCookie)
+
+	if sess != nil {
+		t.Fatalf("session issued for %v; want none", sess.UserID)
+	}
+	if !errors.Is(err, errors.ErrOAuthTenantInvalid) {
+		t.Fatalf("expected ErrOAuthTenantInvalid (403), got %v", err)
+	}
+	var links int64
+	if err := database.Model(&db.OAuthAccount{}).Count(&links).Error; err != nil {
+		t.Fatalf("count links: %v", err)
+	}
+	if links != 0 {
+		t.Fatalf("expected 0 oauth links for an untrusted tenant, got %d", links)
+	}
+}
+
+func TestSecurity_UntrustedTenantKeepsExistingLink(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	database, store := setupAntiHijackingDB(t)
+
+	cfg := config.DefaultConfig()
+	cfg.OAuth.StateSecret = "super-secret-anti-hijack-test-state-key-32b"
+	sessSvc := session.NewService(database, &cfg)
+
+	owner := db.User{ID: uuid.New(), Email: "linked@company.com", PasswordHash: "hash", EmailVerified: true}
+	if err := database.Create(&owner).Error; err != nil {
+		t.Fatalf("create owner: %v", err)
+	}
+	link := db.OAuthAccount{ID: uuid.New(), UserID: owner.ID, ProviderID: "microsoft",
+		ProviderUserID: "ms-untrusted-linked-sub", Email: owner.Email}
+	if err := database.Create(&link).Error; err != nil {
+		t.Fatalf("create link: %v", err)
+	}
+
+	info := &oauth.UserInfo{
+		ProviderID:     "microsoft",
+		ProviderUserID: "ms-untrusted-linked-sub",
+		Email:          "untrusted@external-tenant.example",
+		EmailVerified:  true,
+		RawClaims:      map[string]any{"untrusted_tenant": true},
+	}
+	reg := oauth.NewRegistry()
+	_ = reg.Register(&untrustedTenantProvider{info: info})
+	svc := oauth.NewServiceWithRegistry(store, sessSvc, reg, &cfg)
+
+	state, stateCookie := initiateState(t, svc, &cfg, "microsoft", "")
+	cbReq := httptest.NewRequest(http.MethodGet, "/auth/oauth/microsoft/callback?state="+state, nil)
+	cbReq.AddCookie(stateCookie)
+	sess, _, _, err := svc.HandleCallback(ctx, httptest.NewRecorder(), cbReq, "microsoft", "code-ms", state, db.SessionTypeCookie)
+	if err != nil {
+		t.Fatalf("existing link must keep signing in, got %v", err)
+	}
+	if sess.UserID != owner.ID {
+		t.Fatalf("session user = %v; want %v", sess.UserID, owner.ID)
+	}
+}
+
+// untrustedTenantProvider serves a fixed profile carrying the Microsoft
+// adapter's untrusted_tenant marker with a verified email, so the tenant guard
+// is the only gate that can reject the flow.
+type untrustedTenantProvider struct{ info *oauth.UserInfo }
+
+func (p *untrustedTenantProvider) ID() string { return p.info.ProviderID }
+
+func (p *untrustedTenantProvider) AuthURL(state, codeChallenge string) string {
+	return "https://login.example.test/auth?state=" + state + "&code_challenge=" + codeChallenge
+}
+
+func (p *untrustedTenantProvider) AuthCodeURL(state, codeChallenge string, _ ...oauth.AuthCodeOption) string {
+	return p.AuthURL(state, codeChallenge)
+}
+
+func (p *untrustedTenantProvider) ExchangeCode(context.Context, string, string) (*oauth.TokenResponse, error) {
+	return &oauth.TokenResponse{AccessToken: "tenant-access-token"}, nil
+}
+
+func (p *untrustedTenantProvider) FetchUserInfo(context.Context, *oauth.TokenResponse) (*oauth.UserInfo, error) {
+	return p.info, nil
 }
 
 func TestSecurity_MissingEmailFailClosed(t *testing.T) {
