@@ -27,14 +27,14 @@ type MockOAuthServers struct {
 	DiscordServer   *httptest.Server
 
 	// Microsoft settings
-	MSPrivKey       *rsa.PrivateKey
-	MSKeyID         string
-	MSModulus       string
-	MSExponent      string
-	MSRolloverPriv  *rsa.PrivateKey
-	MSRolloverKeyID string
-	MSRolloverMod   string
-	MSRolloverExp   string
+	MSPrivKey        *rsa.PrivateKey
+	MSKeyID          string
+	MSModulus        string
+	MSExponent       string
+	MSRolloverPriv   *rsa.PrivateKey
+	MSRolloverKeyID  string
+	MSRolloverMod    string
+	MSRolloverExp    string
 	MSRolloverActive atomic.Bool
 	MSJWKSRequests   atomic.Int32
 	MSTenantID       string
@@ -56,14 +56,14 @@ type MockOAuthServers struct {
 	XTokenRequests  atomic.Int32
 
 	// Facebook settings
-	FBAppID         string
-	FBAppSecret     string
-	FBUserID        string
-	FBEmail         string
-	FBName          string
-	FBInvalidProof  atomic.Bool
-	FBTokenValid    atomic.Bool
-	FBWrongAppID    atomic.Bool
+	FBAppID        string
+	FBAppSecret    string
+	FBUserID       string
+	FBEmail        string
+	FBName         string
+	FBInvalidProof atomic.Bool
+	FBTokenValid   atomic.Bool
+	FBWrongAppID   atomic.Bool
 
 	// Discord settings
 	DiscordClientID string
@@ -97,23 +97,23 @@ func NewMockServers() (*MockOAuthServers, error) {
 		MSRolloverKeyID: "ms-rollover-key-2",
 		MSRolloverMod:   rollMod,
 		MSRolloverExp:   rollExp,
-		MSTenantID:       "9188040d-6c67-4c5b-b112-36a304b66dad", // Default consumer tenant
-		MSEmail:          "test-ms-user@example.com",
-		MSName:           "Microsoft Test User",
-		MSEmailVerified:  true,
-		MSEDov:           "1",
+		MSTenantID:      "9188040d-6c67-4c5b-b112-36a304b66dad", // Default consumer tenant
+		MSEmail:         "test-ms-user@example.com",
+		MSName:          "Microsoft Test User",
+		MSEmailVerified: true,
+		MSEDov:          "1",
 
-		XClientID:       "mock-x-client-id",
-		XClientSecret:   "mock-x-client-secret",
-		XUserID:         "x-123456789",
-		XUsername:       "x_test_user",
-		XProfileImage:   "https://abs.twimg.com/mock_normal.jpg",
+		XClientID:     "mock-x-client-id",
+		XClientSecret: "mock-x-client-secret",
+		XUserID:       "x-123456789",
+		XUsername:     "x_test_user",
+		XProfileImage: "https://abs.twimg.com/mock_normal.jpg",
 
-		FBAppID:         "mock-fb-app-id-123",
-		FBAppSecret:     "mock-fb-app-secret-456",
-		FBUserID:        "fb-user-987654",
-		FBEmail:         "fb-user@example.com",
-		FBName:          "Facebook Test User",
+		FBAppID:     "mock-fb-app-id-123",
+		FBAppSecret: "mock-fb-app-secret-456",
+		FBUserID:    "fb-user-987654",
+		FBEmail:     "fb-user@example.com",
+		FBName:      "Facebook Test User",
 
 		DiscordClientID: "mock-discord-client-id",
 		DiscordSecret:   "mock-discord-secret",
@@ -228,7 +228,7 @@ func NewMockServers() (*MockOAuthServers, error) {
 			// RFC 6749 §2.3.1 Client Authentication via Basic Auth check
 			authHeader := r.Header.Get("Authorization")
 			expectedBasic := "Basic " + base64.StdEncoding.EncodeToString(
-				[]byte(url.QueryEscape(m.XClientID) + ":" + url.QueryEscape(m.XClientSecret)),
+				[]byte(url.QueryEscape(m.XClientID)+":"+url.QueryEscape(m.XClientSecret)),
 			)
 			if authHeader != expectedBasic {
 				http.Error(w, `{"error":"invalid_client"}`, http.StatusUnauthorized)

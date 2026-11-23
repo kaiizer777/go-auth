@@ -18,8 +18,8 @@ const (
 // MicrosoftConfig defines configuration for Microsoft Entra ID (Azure AD).
 type MicrosoftConfig struct {
 	ClientID       string        `json:"client_id"`
-	ClientSecret   string        `json:"-"` // Redacted in logs
-	Tenant         string        `json:"tenant"` // "common", "organizations", "consumers", or specific tenant GUID
+	ClientSecret   string        `json:"-"`                         // Redacted in logs
+	Tenant         string        `json:"tenant"`                    // "common", "organizations", "consumers", or specific tenant GUID
 	TrustedTenants []string      `json:"trusted_tenants,omitempty"` // Whitelisted tenant GUIDs for multi-tenant linking
 	RedirectURI    string        `json:"redirect_uri"`
 	Scopes         []string      `json:"scopes"`

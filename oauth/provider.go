@@ -136,10 +136,10 @@ func NewProvider(id string, cfg config.ProviderConfig) (Provider, error) {
 		}), nil
 	case "facebook":
 		return NewFacebookProvider(config.FacebookConfig{
-			AppID:        cfg.ClientID,
-			AppSecret:    cfg.ClientSecret,
-			RedirectURI:  cfg.RedirectURL,
-			Scopes:       cfg.Scopes,
+			AppID:       cfg.ClientID,
+			AppSecret:   cfg.ClientSecret,
+			RedirectURI: cfg.RedirectURL,
+			Scopes:      cfg.Scopes,
 		}), nil
 	case "discord":
 		return NewDiscordProvider(config.DiscordConfig{
