@@ -122,7 +122,6 @@ func TestJWKSManager_CommittedMaterialWinsSameKidRotation(t *testing.T) {
 	releaseRollover := make(chan struct{})
 	var releaseOnce sync.Once
 	release := func() { releaseOnce.Do(func() { close(releaseRollover) }) }
-	defer release()
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		switch requests.Add(1) {
@@ -137,6 +136,9 @@ func TestJWKSManager_CommittedMaterialWinsSameKidRotation(t *testing.T) {
 		}
 	}))
 	defer srv.Close()
+	// Registered after Close so it runs first (LIFO): a Fatal must not leave a
+	// handler parked on releaseRollover while Close waits for it.
+	defer release()
 
 	mgr := NewJWKSManager(srv.URL, srv.Client(), time.Hour)
 
@@ -172,6 +174,109 @@ func TestJWKSManager_CommittedMaterialWinsSameKidRotation(t *testing.T) {
 	}
 	if res.key.Key.N.Cmp(newPriv.N) != 0 {
 		t.Fatal("superseded fetch returned older material than the committed cache")
+	}
+	if got := requests.Load(); got != 3 {
+		t.Fatalf("jwks requests = %d; want 3", got)
+	}
+}
+
+// Primary-flight ordering: caller A's first fetch returns pre-rotation material for
+// a kid whose newer material another flight committed before A resolved its fetch.
+func TestJWKSManager_SupersededPrimaryFlightPrefersCommittedKey(t *testing.T) {
+	_, otherN, otherE := generateTestRSAKey(t)
+	_, oldN, oldE := generateTestRSAKey(t)
+	newPriv, newN, newE := generateTestRSAKey(t)
+
+	otherSet := JWKDoc{Keys: []JWKKey{
+		{Kty: "RSA", Use: "sig", Kid: "kid_other", Alg: "RS256", N: otherN, E: otherE},
+	}}
+	oldSet := JWKDoc{Keys: []JWKKey{
+		{Kty: "RSA", Use: "sig", Kid: "kid_rot", Alg: "RS256", N: oldN, E: oldE},
+	}}
+	newSet := JWKDoc{Keys: []JWKKey{
+		{Kty: "RSA", Use: "sig", Kid: "kid_rot", Alg: "RS256", N: newN, E: newE},
+	}}
+
+	var requests atomic.Int32
+	rolloverStarted := make(chan struct{})
+	rolloverRelease := make(chan struct{})
+	primaryStarted := make(chan struct{})
+	primaryRelease := make(chan struct{})
+	var rolloverOnce, primaryOnce sync.Once
+	unblockRollover := func() { rolloverOnce.Do(func() { close(rolloverRelease) }) }
+	unblockPrimary := func() { primaryOnce.Do(func() { close(primaryRelease) }) }
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		switch requests.Add(1) {
+		case 1:
+			_ = json.NewEncoder(w).Encode(otherSet)
+		case 2:
+			close(rolloverStarted)
+			<-rolloverRelease
+			_ = json.NewEncoder(w).Encode(newSet)
+		case 3:
+			close(primaryStarted)
+			<-primaryRelease
+			_ = json.NewEncoder(w).Encode(oldSet)
+		default:
+			_ = json.NewEncoder(w).Encode(newSet)
+		}
+	}))
+	defer srv.Close()
+	// Registered after Close so they run first (LIFO): a Fatal must not leave a
+	// handler parked on a release channel while Close waits for it.
+	defer unblockPrimary()
+	defer unblockRollover()
+
+	mgr := NewJWKSManager(srv.URL, srv.Client(), time.Hour)
+
+	type result struct {
+		key JWKSKey
+		err error
+	}
+
+	// B parks in the rollover flight; its fetch commits the newer document.
+	bDone := make(chan result, 1)
+	go func() {
+		key, err := mgr.GetKey(context.Background(), "kid_rot")
+		bDone <- result{key: key, err: err}
+	}()
+
+	select {
+	case <-rolloverStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("rollover fetch never started")
+	}
+
+	// A's primary flight is unjoined now, so its fetch can race B's commit.
+	aDone := make(chan result, 1)
+	go func() {
+		key, err := mgr.GetKey(context.Background(), "kid_rot")
+		aDone <- result{key: key, err: err}
+	}()
+
+	select {
+	case <-primaryStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("primary fetch never started")
+	}
+
+	unblockRollover()
+	if res := <-bDone; res.err != nil {
+		t.Fatalf("rollover refresh failed: %v", res.err)
+	}
+	if got := requests.Load(); got != 3 {
+		t.Fatalf("jwks requests before primary release = %d; want 3", got)
+	}
+
+	unblockPrimary()
+
+	res := <-aDone
+	if res.err != nil {
+		t.Fatalf("superseded primary flight lost the key: %v", res.err)
+	}
+	if res.key.Key.N.Cmp(newPriv.N) != 0 {
+		t.Fatal("superseded primary fetch returned older material than the committed cache")
 	}
 	if got := requests.Load(); got != 3 {
 		t.Fatalf("jwks requests = %d; want 3", got)
