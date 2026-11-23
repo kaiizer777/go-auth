@@ -711,7 +711,7 @@ func TestLinkOrCreateConcurrent(t *testing.T) {
 			wg.Add(1)
 			go func(i int) {
 				defer wg.Done()
-				u, _, _, err := svc.linkOrCreate(context.Background(), "google", info)
+				u, _, _, err := svc.linkOrCreate(context.Background(), "google", info, "")
 				outs[i] = outcome{u, err}
 			}(i)
 		}
@@ -1264,6 +1264,113 @@ func TestOAuthService_X_MissingEmail(t *testing.T) {
 		}
 		if sess.UserID != owner.ID {
 			t.Fatalf("sess.UserID = %v; want %v", sess.UserID, owner.ID)
+		}
+	})
+
+	t.Run("active session links provider account without email", func(t *testing.T) {
+		sessSvc := session.NewService(database, cfg)
+		user := db.User{
+			ID:            uuid.New(),
+			Email:         "active-session-user@example.com",
+			EmailVerified: true,
+		}
+		if err := database.Create(&user).Error; err != nil {
+			t.Fatalf("create user: %v", err)
+		}
+
+		sess, rawToken, err := sessSvc.CreateSession(context.Background(), user.ID, 0, db.SessionTypeCookie, "127.0.0.1", "ua")
+		if err != nil {
+			t.Fatalf("create session: %v", err)
+		}
+		if sess == nil || rawToken == "" {
+			t.Fatal("session required")
+		}
+
+		initReq := httptest.NewRequest(http.MethodGet, "/auth/oauth/x", nil)
+		initReq.AddCookie(&http.Cookie{
+			Name:  cfg.SessionCookieName,
+			Value: rawToken,
+		})
+		initRec := httptest.NewRecorder()
+
+		activeStub := &stubProvider{id: "x", info: &UserInfo{ProviderID: "x", ProviderUserID: "x-active-user-123", Email: ""}}
+		activeSvc := NewService(database, sessSvc, map[string]Provider{"x": activeStub}, cfg)
+
+		authURL, err := activeSvc.InitiateFlow(initRec, initReq, "x")
+		if err != nil {
+			t.Fatalf("initiate flow failed: %v", err)
+		}
+		if authURL == "" {
+			t.Fatal("expected non-empty auth url")
+		}
+
+		var stateCookie *http.Cookie
+		for _, c := range initRec.Result().Cookies() {
+			if c.Name == cfg.OAuth.StateCookieName {
+				stateCookie = c
+				break
+			}
+		}
+		if stateCookie == nil {
+			t.Fatal("state cookie required")
+		}
+
+		// Extract state query param from authURL
+		u, err := url.Parse(authURL)
+		if err != nil {
+			t.Fatalf("parse auth url: %v", err)
+		}
+		state := u.Query().Get("state")
+
+		cbReq := httptest.NewRequest(http.MethodGet, "/auth/oauth/x/callback?code=valid-code&state="+state, nil)
+		cbReq.AddCookie(stateCookie)
+		cbRec := httptest.NewRecorder()
+
+		cbSess, _, _, err := activeSvc.HandleCallback(context.Background(), cbRec, cbReq, "x", "valid-code", state, db.SessionTypeCookie)
+		if err != nil {
+			t.Fatalf("callback failed for active user link: %v", err)
+		}
+		if cbSess.UserID != user.ID {
+			t.Fatalf("expected session user %v, got %v", user.ID, cbSess.UserID)
+		}
+
+		// Verify oauth_accounts link was created
+		var count int64
+		if err := database.Model(&db.OAuthAccount{}).Where("provider_id = ? AND user_id = ?", "x", user.ID).Count(&count).Error; err != nil {
+			t.Fatalf("count links: %v", err)
+		}
+		if count != 1 {
+			t.Fatalf("expected 1 link for user, got %d", count)
+		}
+	})
+
+	t.Run("untrusted tenant token is rejected with ErrOAuthTenantInvalid", func(t *testing.T) {
+		sessSvc := session.NewService(database, cfg)
+		// Mock profile carrying untrusted_tenant claim
+		untrustedInfo := &UserInfo{
+			ProviderID:     "microsoft",
+			ProviderUserID: "ms-untrusted-sub",
+			Email:          "victim@example.com",
+			EmailVerified:  false,
+			Name:           "Untrusted Tenant User",
+			RawClaims: map[string]any{
+				"untrusted_tenant": true,
+			},
+		}
+		mockMS := &stubProvider{
+			id:   "microsoft",
+			info: untrustedInfo,
+		}
+		msSvc := NewService(database, sessSvc, map[string]Provider{"microsoft": mockMS}, cfg)
+
+		state, cookie := mustInitiate(t, msSvc, cfg, "microsoft")
+		req := httptest.NewRequest(http.MethodGet, "/auth/oauth/microsoft/callback", nil)
+		req.AddCookie(cookie)
+		rec := httptest.NewRecorder()
+
+		_, _, _, err := msSvc.HandleCallback(context.Background(), rec, req, "microsoft", "code", state, db.SessionTypeCookie)
+		if !errors.Is(err, errors.ErrOAuthTenantInvalid) {
+			t.Fatalf("expected ErrOAuthTenantInvalid, got %v", err)
 		}
 	})
 }

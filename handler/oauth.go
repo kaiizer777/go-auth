@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/kaiizer777/go-auth/csrf"
@@ -93,6 +94,9 @@ func (h *Handler) OAuthCallback(w http.ResponseWriter, r *http.Request) {
 	}
 	sess, rawToken, redirect, err := h.oauthSvc.HandleCallback(r.Context(), w, r, providerID, code, state, sessType)
 	if err != nil {
+		if retryAfter, ok := oauth.RetryAfterFromError(err); ok {
+			w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
+		}
 		errors.WriteHTTP(w, err)
 		return
 	}

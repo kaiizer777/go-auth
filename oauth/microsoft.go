@@ -191,6 +191,9 @@ func (p *MicrosoftProvider) VerifyIDToken(ctx context.Context, rawIDToken, nonce
 
 	// "nOauth" anti-account-takeover defense: compute EmailVerified
 	claims.EmailVerified = p.isEmailVerified(rawClaims, claims.TenantID)
+	if isUntrusted, _ := rawClaims["untrusted_tenant"].(bool); isUntrusted {
+		claims.UntrustedTenant = true
+	}
 
 	return claims, nil
 }
@@ -228,7 +231,7 @@ func (p *MicrosoftProvider) verifyIssuer(issuer, tenantID string) error {
 		// Specific tenant GUID or domain
 		expected := fmt.Sprintf("https://login.microsoftonline.com/%s/v2.0", tenant)
 		if issuer != expected {
-			return errors.New(errors.CodeOAuthIDTokenInvalid, fmt.Sprintf("invalid issuer %q for specific tenant %q, expected %q", issuer, tenant, expected), nil)
+			return errors.New(errors.CodeOAuthTenantInvalid, fmt.Sprintf("invalid issuer %q for specific tenant %q, expected %q", issuer, tenant, expected), nil)
 		}
 	}
 
@@ -265,6 +268,9 @@ func (p *MicrosoftProvider) isEmailVerified(rawClaims map[string]any, tenantID s
 	}
 
 	// Untrusted external tenant without domain verification: fail closed
+	if rawClaims != nil {
+		rawClaims["untrusted_tenant"] = true
+	}
 	return false
 }
 
@@ -294,6 +300,9 @@ func (p *MicrosoftProvider) FetchUserInfo(ctx context.Context, token *OAuthToken
 				"aud":  claims.Audience,
 				"name": claims.Name,
 			},
+		}
+		if claims.UntrustedTenant {
+			user.RawClaims["untrusted_tenant"] = true
 		}
 
 		// ProviderUserID: OID if present, fallback to Subject

@@ -8,7 +8,9 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/kaiizer777/go-auth/config"
 	"github.com/kaiizer777/go-auth/errors"
@@ -69,9 +71,33 @@ func (p *XProvider) AuthCodeURL(state, codeChallenge string, opts ...AuthCodeOpt
 	return p.authURL + "?" + q.Encode()
 }
 
-// parseXError inspects HTTP status and body for RFC 7807 problem details or rate limit conditions.
-func parseXError(statusCode int, body []byte) error {
+// parseXErrorWithHeader inspects HTTP status, body, and response headers for rate limit details or RFC 7807 problem details.
+func parseXErrorWithHeader(statusCode int, body []byte, header http.Header) error {
+	var retryAfterSec int
+	if header != nil {
+		if ra := header.Get("Retry-After"); ra != "" {
+			if sec, err := strconv.Atoi(strings.TrimSpace(ra)); err == nil && sec > 0 {
+				retryAfterSec = sec
+			}
+		}
+		if retryAfterSec == 0 {
+			if rst := header.Get("x-rate-limit-reset"); rst != "" {
+				if resetUnix, err := strconv.ParseInt(strings.TrimSpace(rst), 10, 64); err == nil {
+					diff := int(resetUnix - time.Now().Unix())
+					if diff > 0 {
+						retryAfterSec = diff
+					} else {
+						retryAfterSec = 1
+					}
+				}
+			}
+		}
+	}
+
 	if statusCode == http.StatusTooManyRequests {
+		if retryAfterSec > 0 {
+			return &RateLimitError{RetryAfter: retryAfterSec, Err: errors.ErrOAuthRateLimitExceeded}
+		}
 		return errors.ErrOAuthRateLimitExceeded
 	}
 
@@ -90,10 +116,16 @@ func parseXError(statusCode int, body []byte) error {
 
 	if err := json.Unmarshal(body, &problem); err == nil {
 		if problem.Status == http.StatusTooManyRequests || strings.EqualFold(problem.Title, "Too Many Requests") {
+			if retryAfterSec > 0 {
+				return &RateLimitError{RetryAfter: retryAfterSec, Err: errors.ErrOAuthRateLimitExceeded}
+			}
 			return errors.ErrOAuthRateLimitExceeded
 		}
 		for _, e := range problem.Errors {
 			if e.Status == http.StatusTooManyRequests || strings.EqualFold(e.Title, "Too Many Requests") {
+				if retryAfterSec > 0 {
+					return &RateLimitError{RetryAfter: retryAfterSec, Err: errors.ErrOAuthRateLimitExceeded}
+				}
 				return errors.ErrOAuthRateLimitExceeded
 			}
 		}
@@ -106,6 +138,11 @@ func parseXError(statusCode int, body []byte) error {
 	}
 
 	return errors.New(errors.CodeOAuthProviderError, fmt.Sprintf("oauth provider responded with status %d", statusCode), nil)
+}
+
+// parseXError inspects HTTP status and body for RFC 7807 problem details or rate limit conditions.
+func parseXError(statusCode int, body []byte) error {
+	return parseXErrorWithHeader(statusCode, body, nil)
 }
 
 // ExchangeCode exchanges an authorization code and PKCE code verifier for tokens via POST /2/oauth2/token.
@@ -145,7 +182,7 @@ func (p *XProvider) ExchangeCode(ctx context.Context, code, codeVerifier string)
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return nil, parseXError(resp.StatusCode, bodyBytes)
+		return nil, parseXErrorWithHeader(resp.StatusCode, bodyBytes, resp.Header)
 	}
 
 	var raw map[string]any
@@ -196,7 +233,7 @@ func (p *XProvider) FetchUserInfo(ctx context.Context, tokens *OAuthToken) (*OAu
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return nil, parseXError(resp.StatusCode, bodyBytes)
+		return nil, parseXErrorWithHeader(resp.StatusCode, bodyBytes, resp.Header)
 	}
 
 	var payload struct {

@@ -33,6 +33,35 @@ type Service interface {
 	HandleCallback(ctx context.Context, w http.ResponseWriter, r *http.Request, providerID, code, state string, sessType db.SessionType) (*session.Session, string, string, error)
 }
 
+// RateLimitError wraps an upstream rate limit with its Retry-After duration in seconds.
+type RateLimitError struct {
+	RetryAfter int
+	Err        error
+}
+
+func (e *RateLimitError) Error() string {
+	if e.Err != nil {
+		return e.Err.Error()
+	}
+	return "oauth provider rate limit exceeded"
+}
+
+func (e *RateLimitError) Unwrap() error {
+	if e.Err != nil {
+		return e.Err
+	}
+	return errors.ErrOAuthRateLimitExceeded
+}
+
+// RetryAfterFromError extracts the retry-after duration in seconds if err is or wraps RateLimitError.
+func RetryAfterFromError(err error) (int, bool) {
+	var rle *RateLimitError
+	if stderrors.As(err, &rle) && rle.RetryAfter > 0 {
+		return rle.RetryAfter, true
+	}
+	return 0, false
+}
+
 type service struct {
 	store      db.Store
 	sessionSvc session.Service
@@ -116,12 +145,39 @@ func (s *service) InitiateFlow(w http.ResponseWriter, r *http.Request, providerI
 	redirect := ""
 	logCtx := context.Background()
 	ip, ua := clientIP(r), ""
+	var activeUserID string
 	if r != nil {
 		redirect = r.URL.Query().Get("redirect_url")
 		logCtx = r.Context()
 		ua = r.UserAgent()
+
+		if s.sessionSvc != nil {
+			var rawID string
+			if r.Header.Get("Authorization") != "" {
+				rawID, _ = session.ReadBearerToken(r)
+			} else {
+				rawID, _ = session.ReadSessionCookie(r, s.cfg)
+			}
+			if rawID != "" {
+				if sess, gerr := s.sessionSvc.GetSession(r.Context(), rawID); gerr == nil && sess != nil && sess.UserID != uuid.Nil {
+					activeUserID = sess.UserID.String()
+				}
+			}
+		}
+		if activeUserID == "" {
+			if v := r.Context().Value("user_id"); v != nil {
+				switch id := v.(type) {
+				case string:
+					activeUserID = id
+				case uuid.UUID:
+					if id != uuid.Nil {
+						activeUserID = id.String()
+					}
+				}
+			}
+		}
 	}
-	state, err := SetStateCookie(w, s.cfg, providerID, pkce.Verifier, redirect)
+	state, err := SetStateCookieWithUser(w, s.cfg, providerID, pkce.Verifier, redirect, activeUserID)
 	if err != nil {
 		return "", err
 	}
@@ -192,7 +248,7 @@ func (s *service) HandleCallback(ctx context.Context, w http.ResponseWriter, r *
 		return fail("email_unverified", errors.ErrOAuthEmailUnverified)
 	}
 
-	user, linked, created, err := s.linkOrCreate(ctx, providerID, info)
+	user, linked, created, err := s.linkOrCreate(ctx, providerID, info, payload.UserID)
 	if err != nil {
 		// Gate sentinels map to their historical literal reasons before the
 		// code-derived fallback, which stays the producer of UPPER_SNAKE
@@ -202,6 +258,12 @@ func (s *service) HandleCallback(ctx context.Context, w http.ResponseWriter, r *
 		}
 		if errors.Is(err, errors.ErrOAuthEmailUnverified) {
 			return fail("email_unverified", err)
+		}
+		if errors.Is(err, errors.ErrOAuthTenantInvalid) {
+			return fail("tenant_invalid", err)
+		}
+		if errors.Is(err, errors.ErrOAuthAccountLinkConflict) {
+			return fail("account_link_conflict", err)
 		}
 		if errors.Is(err, errOAuthProviderIdentityInvalid) {
 			return fail("userinfo_invalid", err)
@@ -392,7 +454,11 @@ func (s *service) insertLink(ctx context.Context, accountStore db.OAuthAccountSt
 // linkExisting attaches the provider identity to owner. Losing the unique race
 // converges on the winner's row, which reports linked=false.
 func (s *service) linkExisting(ctx context.Context, owner db.User, providerID string, info *UserInfo) (db.User, bool, error) {
-	if err := s.insertLink(ctx, s.store.OAuthAccounts(), owner.ID, providerID, info.ProviderUserID, info.Email); err != nil {
+	email := info.Email
+	if email == "" {
+		email = owner.Email
+	}
+	if err := s.insertLink(ctx, s.store.OAuthAccounts(), owner.ID, providerID, info.ProviderUserID, email); err != nil {
 		if errors.Is(err, errLinkConflict) {
 			user, _, _, rerr := s.relinkExisting(ctx, providerID, info.ProviderUserID)
 			return user, false, rerr
@@ -500,17 +566,43 @@ func (s *service) createUserAndLink(ctx context.Context, providerID string, info
 // whether an oauth_accounts row was inserted and whether the user was created.
 // Concurrent duplicate callbacks converge idempotently: a unique-constraint
 // loss re-reads the winner instead of 500ing.
-func (s *service) linkOrCreate(ctx context.Context, providerID string, info *UserInfo) (db.User, bool, bool, error) {
+func (s *service) linkOrCreate(ctx context.Context, providerID string, info *UserInfo, activeUserID string) (db.User, bool, bool, error) {
+	// 1. Returning user check: if linked by (provider_id, provider_user_id), return owner
 	if user, found, err := s.linkedUser(ctx, providerID, info.ProviderUserID); found || err != nil {
+		if found && activeUserID != "" {
+			if user.ID.String() != activeUserID {
+				return db.User{}, false, false, errors.ErrOAuthAccountAlreadyLinked
+			}
+		}
 		return user, false, false, err
 	}
 
-	// The identity fields become the account key, so validate them before the
-	// email lookup, the link row, or the user row are written.
+	// 2. Active session explicit linking: link provider to currently authenticated session user
+	if activeUserID != "" {
+		uid, parseErr := uuid.Parse(activeUserID)
+		if parseErr == nil {
+			owner, uerr := s.store.Users().GetByID(ctx, uid)
+			if uerr == nil && owner != nil {
+				if info.ProviderUserID == "" || len(info.ProviderUserID) > providerFieldMaxLen {
+					return db.User{}, false, false, errOAuthProviderIdentityInvalid
+				}
+				user, linked, lerr := s.linkExisting(ctx, *owner, providerID, info)
+				return user, linked, false, lerr
+			}
+		}
+	}
+
+	// 3. Microsoft "nOauth" defense: fail closed on untrusted external tenants
+	if isUntrusted, _ := info.RawClaims["untrusted_tenant"].(bool); isUntrusted {
+		return db.User{}, false, false, errors.ErrOAuthTenantInvalid
+	}
+
+	// 4. Validate provider identity for unauthenticated registration (requires verified email)
 	if gerr := validateProviderIdentity(info); gerr != nil {
 		return db.User{}, false, false, gerr
 	}
 
+	// 5. Existing local user check by verified email
 	existing, err := s.findUserByEmail(ctx, info.Email)
 	if err == nil {
 		// Pre-hijacking defense: never link onto an unverified local account.

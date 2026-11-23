@@ -103,6 +103,7 @@ type IDTokenClaims struct {
 	TenantID          string   `json:"tid,omitempty"`
 	OID               string   `json:"oid,omitempty"`
 	Roles             []string `json:"roles,omitempty"`
+	UntrustedTenant   bool     `json:"untrusted_tenant,omitempty"`
 }
 
 // SupportedProviders defines the canonical set of supported OAuth providers.

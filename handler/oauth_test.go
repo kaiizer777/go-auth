@@ -654,6 +654,21 @@ func TestOAuthCallbackFailureHasNoCacheHeaders(t *testing.T) {
 	}
 }
 
+type stubCallbackOAuthService struct {
+	callbackFn func(ctx context.Context, w http.ResponseWriter, r *http.Request, providerID, code, state string, sessType db.SessionType) (*session.Session, string, string, error)
+}
+
+func (s *stubCallbackOAuthService) InitiateFlow(w http.ResponseWriter, r *http.Request, providerID string) (string, error) {
+	return "https://example.com/auth", nil
+}
+
+func (s *stubCallbackOAuthService) HandleCallback(ctx context.Context, w http.ResponseWriter, r *http.Request, providerID, code, state string, sessType db.SessionType) (*session.Session, string, string, error) {
+	if s.callbackFn != nil {
+		return s.callbackFn(ctx, w, r, providerID, code, state, sessType)
+	}
+	return nil, "", "", nil
+}
+
 func TestOAuthRateLimited(t *testing.T) {
 	rlInfo := &oauth.UserInfo{ProviderID: "google", ProviderUserID: "sub-rl", Email: "rl@example.com", EmailVerified: true}
 
@@ -698,6 +713,24 @@ func TestOAuthRateLimited(t *testing.T) {
 		h.ServeHTTP(rec, req)
 		if rec.Code != http.StatusFound {
 			t.Fatalf("initiate with default limiter: status = %d; want 302", rec.Code)
+		}
+	})
+
+	t.Run("upstream rate limit with Retry-After header", func(t *testing.T) {
+		mockSvc := &stubCallbackOAuthService{
+			callbackFn: func(ctx context.Context, w http.ResponseWriter, r *http.Request, providerID, code, state string, sessType db.SessionType) (*session.Session, string, string, error) {
+				return nil, "", "", &oauth.RateLimitError{RetryAfter: 42, Err: errors.ErrOAuthRateLimitExceeded}
+			},
+		}
+		h := New(nil, config.DefaultConfig(), nil, WithOAuthService(mockSvc, map[string]oauth.Provider{"x": &stubOAuthProvider{id: "x"}}))
+		req := httptest.NewRequest(http.MethodGet, "/auth/oauth/x/callback?code=c&state=s", nil)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusTooManyRequests {
+			t.Fatalf("expected 429 Too Many Requests, got %d", rec.Code)
+		}
+		if ra := rec.Header().Get("Retry-After"); ra != "42" {
+			t.Fatalf("expected Retry-After 42, got %q", ra)
 		}
 	})
 }
