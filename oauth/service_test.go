@@ -736,6 +736,17 @@ func TestHandleCallbackActiveSessionLinking(t *testing.T) {
 		requireCode(t, err, errors.CodeInternalError, http.StatusInternalServerError)
 	})
 
+	t.Run("nil user from store fails closed", func(t *testing.T) {
+		_, _, _, rawSvc := setupServiceTest(t, nil)
+		base := rawSvc.(*service).store
+		svc := NewServiceWithStore(&wrappedTxStore{
+			Store: base,
+			users: nilUserStore{UserStore: base.Users()},
+		}, nil, nil, serviceTestConfig()).(*service)
+		_, _, _, err := svc.linkOrCreate(context.Background(), "google", verifiedInfo(), uuid.New().String())
+		requireCode(t, err, errors.CodeOAuthAccountNotLinked, http.StatusNotFound)
+	})
+
 	t.Run("provider email differing from the active user links to the active user", func(t *testing.T) {
 		database, cfg, _, svc := setupServiceTest(t, &UserInfo{
 			ProviderID: "google", ProviderUserID: "sub-active",
@@ -786,6 +797,12 @@ type failingGetByIDUserStore struct {
 func (f *failingGetByIDUserStore) GetByID(context.Context, uuid.UUID) (*db.User, error) {
 	return nil, f.err
 }
+
+// nilUserStore returns (nil, nil) for GetByID: Store is a pluggable interface,
+// so a third-party implementation may violate the miss contract.
+type nilUserStore struct{ db.UserStore }
+
+func (nilUserStore) GetByID(context.Context, uuid.UUID) (*db.User, error) { return nil, nil }
 
 // hideFirstLinkStore hides an existing link from the first GetByProvider probe,
 // so the callback skips the already-linked branch and loses the insert race.

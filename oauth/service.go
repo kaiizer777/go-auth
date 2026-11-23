@@ -602,6 +602,11 @@ func (s *service) linkOrCreate(ctx context.Context, providerID string, info *Use
 			}
 			return db.User{}, false, false, errors.New(errors.CodeInternalError, "failed to load linking user", uerr)
 		}
+		// Store is pluggable: (nil, nil) violates the miss contract but must
+		// fail closed rather than panic on the dereference below.
+		if owner == nil {
+			return db.User{}, false, false, errors.ErrOAuthAccountNotLinked
+		}
 		if info.ProviderUserID == "" || len(info.ProviderUserID) > providerFieldMaxLen {
 			return db.User{}, false, false, errOAuthProviderIdentityInvalid
 		}
