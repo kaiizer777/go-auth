@@ -109,6 +109,11 @@ func TestDiscordProvider_ExchangeCode(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(map[string]any{"error": "invalid_grant"})
 			return
 		}
+		if code == "ok-200-error" {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"error": "invalid_grant"})
+			return
+		}
 		if code == "server-error" {
 			http.Error(w, "internal server error", http.StatusInternalServerError)
 			return
@@ -172,6 +177,17 @@ func TestDiscordProvider_ExchangeCode(t *testing.T) {
 		_, err := p.ExchangeCode(context.Background(), "server-error", "test-code-verifier")
 		if err == nil {
 			t.Fatal("expected error, got nil")
+		}
+	})
+
+	t.Run("200 with error body rejects exchange", func(t *testing.T) {
+		_, err := p.ExchangeCode(context.Background(), "ok-200-error", "test-code-verifier")
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+		var appErr *errors.Error
+		if !errors.As(err, &appErr) || appErr.Code() != errors.CodeOAuthProviderError {
+			t.Fatalf("expected CodeOAuthProviderError, got: %v", err)
 		}
 	})
 }
