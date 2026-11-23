@@ -49,11 +49,13 @@ func TestConfigValidate_OAuth(t *testing.T) {
 	}
 
 	tests := []struct {
-		name         string
-		mutate       func(*Config)
-		wantErr      *errors.Error
-		wantTTL      time.Duration
-		wantSameSite http.SameSite
+		name                 string
+		mutate               func(*Config)
+		wantErr              *errors.Error
+		wantTTL              time.Duration
+		wantSameSite         http.SameSite
+		wantMicrosoftTenant  string
+		wantMicrosoftJWKSTTL time.Duration
 	}{
 		{
 			name:    "no providers passes",
@@ -277,7 +279,9 @@ func TestConfigValidate_OAuth(t *testing.T) {
 					RedirectURI:  "https://example.com/callback",
 				}
 			},
-			wantErr: nil,
+			wantErr:              nil,
+			wantMicrosoftTenant:  "common",
+			wantMicrosoftJWKSTTL: 24 * time.Hour,
 		},
 		{
 			name: "microsoft config missing client id rejected",
@@ -605,6 +609,16 @@ func TestConfigValidate_OAuth(t *testing.T) {
 				}
 				if tt.wantSameSite != 0 && cfg.OAuth.StateCookieSameSite != tt.wantSameSite {
 					t.Fatalf("StateCookieSameSite = %v; want %v", cfg.OAuth.StateCookieSameSite, tt.wantSameSite)
+				}
+				if tt.wantMicrosoftTenant != "" {
+					if cfg.OAuth.Microsoft == nil || cfg.OAuth.Microsoft.Tenant != tt.wantMicrosoftTenant {
+						t.Fatalf("Microsoft.Tenant = %v; want %v", cfg.OAuth.Microsoft, tt.wantMicrosoftTenant)
+					}
+				}
+				if tt.wantMicrosoftJWKSTTL != 0 {
+					if cfg.OAuth.Microsoft == nil || cfg.OAuth.Microsoft.JWKSCacheTTL != tt.wantMicrosoftJWKSTTL {
+						t.Fatalf("Microsoft.JWKSCacheTTL = %v; want %v", cfg.OAuth.Microsoft, tt.wantMicrosoftJWKSTTL)
+					}
 				}
 				return
 			}
