@@ -101,13 +101,19 @@ func (o OAuthConfig) LogValue() slog.Value {
 	if o.StateSecret == "" {
 		secretMasked = ""
 	}
+	providerAttrs := make([]slog.Attr, 0, len(o.Providers))
+	for name, provider := range o.Providers {
+		providerAttrs = append(providerAttrs, slog.Any(name, provider.LogValue()))
+	}
 	attrs := []slog.Attr{
 		slog.String("state_secret", secretMasked),
 		slog.String("state_cookie_name", o.StateCookieName),
 		slog.String("state_cookie_path", o.StateCookiePath),
 		slog.Duration("state_ttl", o.StateTTL),
 		slog.String("callback_base_url", o.CallbackBaseURL),
-		slog.Any("providers", o.Providers),
+	}
+	if len(providerAttrs) > 0 {
+		attrs = append(attrs, slog.Attr{Key: "providers", Value: slog.GroupValue(providerAttrs...)})
 	}
 	if o.Microsoft != nil {
 		attrs = append(attrs, slog.Any("microsoft", o.Microsoft.LogValue()))

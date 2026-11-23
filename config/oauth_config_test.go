@@ -1,6 +1,9 @@
 package config
 
 import (
+	"bytes"
+	"encoding/json"
+	"log/slog"
 	"net/http"
 	"strings"
 	"testing"
@@ -846,4 +849,92 @@ func TestProviderConfigLogValue(t *testing.T) {
 			t.Fatalf("String() leaked x secret")
 		}
 	})
+}
+
+// A JSON handler resolves LogValuer only on slog.Attr values, so assertions on
+// slog.Value.String() cannot catch an unredacted map element.
+func TestOAuthConfigLogValueJSONRedaction(t *testing.T) {
+	o := OAuthConfig{
+		StateSecret: "state-secret-serialized-leak",
+		Providers: map[string]ProviderConfig{
+			"google": {
+				ClientID:     "google-client-id",
+				ClientSecret: "google-client-secret-leak",
+				RedirectURL:  "https://example.com/callback",
+				Scopes:       []string{"openid", "email"},
+				Enabled:      true,
+			},
+			"apple": {
+				ClientID:   "apple-client-id",
+				TeamID:     "TEAM123456",
+				KeyID:      "KEY1234567",
+				PrivateKey: "-----BEGIN PRIVATE KEY-----\napple-p8-leak\n-----END PRIVATE KEY-----",
+				Enabled:    true,
+			},
+			"secretless": {ClientID: "public-client"},
+		},
+	}
+
+	var buf bytes.Buffer
+	slog.New(slog.NewJSONHandler(&buf, nil)).Info("oauth config", "oauth", o)
+
+	line := buf.String()
+	for _, leaked := range []string{"state-secret-serialized-leak", "google-client-secret-leak", "apple-p8-leak"} {
+		if strings.Contains(line, leaked) {
+			t.Fatalf("serialized log line leaked %q: %s", leaked, line)
+		}
+	}
+
+	var entry map[string]any
+	if err := json.Unmarshal(buf.Bytes(), &entry); err != nil {
+		t.Fatalf("log line is not valid json: %v", err)
+	}
+	oauth, ok := entry["oauth"].(map[string]any)
+	if !ok {
+		t.Fatalf("oauth group missing from log line: %s", line)
+	}
+	providers, ok := oauth["providers"].(map[string]any)
+	if !ok {
+		t.Fatalf("providers group missing from log line: %s", line)
+	}
+	google, ok := providers["google"].(map[string]any)
+	if !ok {
+		t.Fatalf("google provider missing from log line: %s", line)
+	}
+	if google["client_secret"] != "[REDACTED]" {
+		t.Fatalf("google client_secret = %v; want [REDACTED]", google["client_secret"])
+	}
+	apple, ok := providers["apple"].(map[string]any)
+	if !ok {
+		t.Fatalf("apple provider missing from log line: %s", line)
+	}
+	if apple["private_key"] != "[REDACTED]" {
+		t.Fatalf("apple private_key = %v; want [REDACTED]", apple["private_key"])
+	}
+	secretless, ok := providers["secretless"].(map[string]any)
+	if !ok {
+		t.Fatalf("secretless provider missing from log line: %s", line)
+	}
+	if secretless["client_secret"] != "" {
+		t.Fatalf("secretless client_secret = %v; want empty", secretless["client_secret"])
+	}
+}
+
+func TestOAuthConfigLogValueEmptyProviders(t *testing.T) {
+	var buf bytes.Buffer
+	slog.New(slog.NewJSONHandler(&buf, nil)).Info("oauth config", "oauth", OAuthConfig{})
+
+	var entry map[string]any
+	if err := json.Unmarshal(buf.Bytes(), &entry); err != nil {
+		t.Fatalf("log line is not valid json: %v", err)
+	}
+	oauth, ok := entry["oauth"].(map[string]any)
+	if !ok {
+		t.Fatalf("oauth group missing from log line: %s", buf.String())
+	}
+	if raw, present := oauth["providers"]; present {
+		if _, isObject := raw.(map[string]any); !isObject {
+			t.Fatalf("providers = %v; want a group object", raw)
+		}
+	}
 }
