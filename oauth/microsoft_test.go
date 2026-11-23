@@ -242,6 +242,22 @@ func TestMicrosoftProvider(t *testing.T) {
 				return
 			}
 			_ = r.ParseForm()
+			if r.FormValue("client_id") != "client-test-id" || r.FormValue("client_secret") != "client-test-secret" {
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+			if r.FormValue("grant_type") != "authorization_code" {
+				http.Error(w, "bad grant_type", http.StatusBadRequest)
+				return
+			}
+			if r.FormValue("redirect_uri") != "https://example.com/callback" {
+				http.Error(w, "bad redirect_uri", http.StatusBadRequest)
+				return
+			}
+			if r.FormValue("code_verifier") != "verifier-123" {
+				http.Error(w, "bad verifier", http.StatusBadRequest)
+				return
+			}
 			if r.FormValue("code") == "bad-code" {
 				w.WriteHeader(http.StatusBadRequest)
 				_ = json.NewEncoder(w).Encode(map[string]any{"error": "invalid_grant"})

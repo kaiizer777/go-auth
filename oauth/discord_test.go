@@ -94,6 +94,14 @@ func TestDiscordProvider_ExchangeCode(t *testing.T) {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
+		if r.FormValue("grant_type") != "authorization_code" {
+			http.Error(w, "bad grant_type", http.StatusBadRequest)
+			return
+		}
+		if r.FormValue("redirect_uri") != "https://myapp.com/callback" {
+			http.Error(w, "bad redirect_uri", http.StatusBadRequest)
+			return
+		}
 
 		code := r.FormValue("code")
 		if code == "bad-code" {
