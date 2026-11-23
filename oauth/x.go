@@ -29,8 +29,10 @@ var _ Provider = (*XProvider)(nil)
 
 // NewXProvider constructs a new X (Twitter) OAuth 2.0 provider adapter.
 func NewXProvider(cfg config.XConfig) *XProvider {
+	// Login needs only users.read (/2/users/me); tweet.read and
+	// offline.access are opt-in via config when the feature needs them.
 	if len(cfg.Scopes) == 0 {
-		cfg.Scopes = []string{"tweet.read", "users.read", "offline.access"}
+		cfg.Scopes = []string{"users.read"}
 	}
 	return &XProvider{
 		cfg:         cfg,
@@ -57,7 +59,7 @@ func (p *XProvider) AuthCodeURL(state, codeChallenge string, opts ...AuthCodeOpt
 	q.Set("response_type", "code")
 	q.Set("client_id", p.cfg.ClientID)
 	q.Set("redirect_uri", p.cfg.RedirectURI)
-	q.Set("scope", scopesOrDefault(p.cfg.Scopes, "tweet.read", "users.read", "offline.access"))
+	q.Set("scope", scopesOrDefault(p.cfg.Scopes, "users.read"))
 	q.Set("state", state)
 	q.Set("code_challenge", codeChallenge)
 	q.Set("code_challenge_method", "S256")

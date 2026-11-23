@@ -70,8 +70,8 @@ func TestXProvider_AuthCodeURL(t *testing.T) {
 		RedirectURI:  "https://myapp.com/cb",
 	})
 	u2, _ := url.Parse(emptyScopeProvider.AuthURL("st", "ch"))
-	if u2.Query().Get("scope") != "tweet.read users.read offline.access" {
-		t.Errorf("default scope = %q; want 'tweet.read users.read offline.access'", u2.Query().Get("scope"))
+	if u2.Query().Get("scope") != "users.read" {
+		t.Errorf("default scope = %q; want 'users.read'", u2.Query().Get("scope"))
 	}
 }
 

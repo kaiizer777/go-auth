@@ -865,7 +865,7 @@ func (c *Config) Validate() error {
 			return errors.ErrOAuthRedirectURLRequired
 		}
 		if len(c.OAuth.X.Scopes) == 0 {
-			c.OAuth.X.Scopes = []string{"tweet.read", "users.read", "offline.access"}
+			c.OAuth.X.Scopes = []string{"users.read"}
 		}
 	}
 

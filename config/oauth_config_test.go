@@ -891,8 +891,8 @@ func TestProviderConfigLogValue(t *testing.T) {
 		if err := cfg.Validate(); err != nil {
 			t.Fatalf("Validate = %v", err)
 		}
-		if len(cfg.OAuth.X.Scopes) != 3 || cfg.OAuth.X.Scopes[0] != "tweet.read" || cfg.OAuth.X.Scopes[1] != "users.read" || cfg.OAuth.X.Scopes[2] != "offline.access" {
-			t.Fatalf("Scopes = %v; want [tweet.read users.read offline.access]", cfg.OAuth.X.Scopes)
+		if len(cfg.OAuth.X.Scopes) != 1 || cfg.OAuth.X.Scopes[0] != "users.read" {
+			t.Fatalf("Scopes = %v; want [users.read]", cfg.OAuth.X.Scopes)
 		}
 	})
 
