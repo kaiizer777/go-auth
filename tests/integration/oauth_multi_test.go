@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -107,6 +108,13 @@ func TestIntegration_MultiProviderLinkageAndHardDeleteCascade(t *testing.T) {
 		if fetched == nil || fetched.UserID != user.ID {
 			t.Fatalf("provider %q returned unexpected user: got %v, want %v", p, fetched, user.ID)
 		}
+	}
+
+	// Cross-provider isolation: a provider_user_id from one provider must not
+	// resolve under a different provider_id (guards a provider_id-blind lookup).
+	crossUID := fmt.Sprintf("%s-uid-%d", providers[1], 1000+1)
+	if _, err := store.OAuthAccounts().GetByProvider(ctx, providers[0], crossUID); !errors.Is(err, gorm.ErrRecordNotFound) {
+		t.Fatalf("GetByProvider(%q, %q) = mismatched provider pair must not resolve, got err=%v", providers[0], crossUID, err)
 	}
 
 	// Verify total links in database is 7

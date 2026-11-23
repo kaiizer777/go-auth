@@ -174,6 +174,9 @@ func TestE2E_FullBrowserOAuthJourneys(t *testing.T) {
 		if err := dbConn.Where("provider_id = ? AND user_id = ?", "microsoft", user.ID).First(&link).Error; err != nil {
 			t.Fatalf("link record not found: %v", err)
 		}
+		if link.ProviderUserID != "ms-user-oid-1" {
+			t.Fatalf("link provider_user_id = %q; want %q", link.ProviderUserID, "ms-user-oid-1")
+		}
 	})
 
 	// 2. Journey 2: Discord Account Linking to existing active authenticated session
@@ -258,6 +261,16 @@ func TestE2E_FullBrowserOAuthJourneys(t *testing.T) {
 		}
 		if len(links) != 2 {
 			t.Fatalf("expected 2 linked identities (microsoft and discord), got %d", len(links))
+		}
+		gotKeys := map[string]string{}
+		for _, l := range links {
+			gotKeys[l.ProviderID] = l.ProviderUserID
+		}
+		if gotKeys["microsoft"] != "ms-user-oid-2" {
+			t.Fatalf("microsoft link provider_user_id = %q; want %q", gotKeys["microsoft"], "ms-user-oid-2")
+		}
+		if gotKeys["discord"] != "discord-snowflake-888" {
+			t.Fatalf("discord link provider_user_id = %q; want %q", gotKeys["discord"], "discord-snowflake-888")
 		}
 	})
 
