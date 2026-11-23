@@ -580,16 +580,33 @@ func (s *service) linkOrCreate(ctx context.Context, providerID string, info *Use
 	// 2. Active session explicit linking: link provider to currently authenticated session user
 	if activeUserID != "" {
 		uid, parseErr := uuid.Parse(activeUserID)
-		if parseErr == nil {
-			owner, uerr := s.store.Users().GetByID(ctx, uid)
-			if uerr == nil && owner != nil {
-				if info.ProviderUserID == "" || len(info.ProviderUserID) > providerFieldMaxLen {
-					return db.User{}, false, false, errOAuthProviderIdentityInvalid
-				}
-				user, linked, lerr := s.linkExisting(ctx, *owner, providerID, info)
-				return user, linked, false, lerr
-			}
+		if parseErr != nil {
+			// A selected user that cannot be resolved must never fall through:
+			// the email path would bind the identity to whoever owns the
+			// provider address (or create a fresh account) instead of the
+			// requested owner.
+			return db.User{}, false, false, errors.ErrOAuthAccountNotLinked
 		}
+		owner, uerr := s.store.Users().GetByID(ctx, uid)
+		if uerr != nil {
+			if errors.Is(uerr, gorm.ErrRecordNotFound) || errors.Is(uerr, errors.ErrUserNotFound) {
+				return db.User{}, false, false, errors.ErrOAuthAccountNotLinked
+			}
+			return db.User{}, false, false, errors.New(errors.CodeInternalError, "failed to load linking user", uerr)
+		}
+		if info.ProviderUserID == "" || len(info.ProviderUserID) > providerFieldMaxLen {
+			return db.User{}, false, false, errOAuthProviderIdentityInvalid
+		}
+		user, linked, lerr := s.linkExisting(ctx, *owner, providerID, info)
+		if lerr != nil {
+			return db.User{}, false, false, lerr
+		}
+		// Losing the insert race converges on the winning row; handing back a
+		// foreign owner would mint their session for this flow.
+		if user.ID != owner.ID {
+			return db.User{}, false, false, errors.ErrOAuthAccountAlreadyLinked
+		}
+		return user, linked, false, nil
 	}
 
 	// 3. Microsoft "nOauth" defense: fail closed on untrusted external tenants
