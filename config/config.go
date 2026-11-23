@@ -824,15 +824,6 @@ func (c *Config) Validate() error {
 		if c.OAuth.Facebook.RedirectURI == "" {
 			return errors.ErrOAuthRedirectURLRequired
 		}
-		if c.OAuth.Facebook.GraphVersion != "" {
-			if !strings.HasPrefix(c.OAuth.Facebook.GraphVersion, "v") {
-				return errors.ErrOAuthGraphVersionInvalid
-			}
-			ver, err := strconv.ParseFloat(strings.TrimPrefix(c.OAuth.Facebook.GraphVersion, "v"), 64)
-			if err != nil || ver < 19.0 {
-				return errors.ErrOAuthGraphVersionInvalid
-			}
-		}
 	}
 
 	if c.OAuth.X != nil {
@@ -847,9 +838,16 @@ func (c *Config) Validate() error {
 		}
 	}
 
-	// Resolve after validation: defaults are applied once, to the merged result,
-	// so no default can overwrite explicit map or typed configuration.
+	// Resolve after the per-surface credential checks: defaults are applied once,
+	// to the merged result, so no default can overwrite explicit map or typed
+	// configuration. The graph version only matters on the merged entry, so it is
+	// validated here — one check for both surfaces.
 	c.OAuth.resolveProviders()
+	if fb, ok := c.OAuth.Providers["facebook"]; ok {
+		if err := validateGraphVersion(fb.GraphVersion); err != nil {
+			return err
+		}
+	}
 
 	if c.TOTP.Issuer == "" {
 		c.TOTP.Issuer = "go-auth"
@@ -946,6 +944,23 @@ func isToken(s string) bool {
 		}
 	}
 	return true
+}
+
+// validateGraphVersion accepts an empty value (defaulted after the merge) and
+// requires the "v" prefix with a numeric part of at least 19.0, below which
+// Facebook no longer serves the OAuth dialog.
+func validateGraphVersion(version string) error {
+	if version == "" {
+		return nil
+	}
+	if !strings.HasPrefix(version, "v") {
+		return errors.ErrOAuthGraphVersionInvalid
+	}
+	ver, err := strconv.ParseFloat(strings.TrimPrefix(version, "v"), 64)
+	if err != nil || ver < 19.0 {
+		return errors.ErrOAuthGraphVersionInvalid
+	}
+	return nil
 }
 
 func isCookiePath(s string) bool {

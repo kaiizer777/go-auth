@@ -475,6 +475,30 @@ func TestConfigValidate_OAuth(t *testing.T) {
 			wantErr: nil,
 		},
 		{
+			name: "facebook map graph version missing v prefix rejected",
+			mutate: func(c *Config) {
+				c.OAuth.Providers = enabled("facebook", ProviderConfig{
+					ClientID:     "fb-app-id",
+					ClientSecret: "fb-app-secret",
+					RedirectURL:  "https://example.com/callback",
+					GraphVersion: "18.0",
+				})
+			},
+			wantErr: errors.ErrOAuthGraphVersionInvalid,
+		},
+		{
+			name: "facebook map graph version below 19 rejected",
+			mutate: func(c *Config) {
+				c.OAuth.Providers = enabled("facebook", ProviderConfig{
+					ClientID:     "fb-app-id",
+					ClientSecret: "fb-app-secret",
+					RedirectURL:  "https://example.com/callback",
+					GraphVersion: "v18.0",
+				})
+			},
+			wantErr: errors.ErrOAuthGraphVersionInvalid,
+		},
+		{
 			name: "facebook missing state secret rejected",
 			mutate: func(c *Config) {
 				c.OAuth.StateSecret = ""

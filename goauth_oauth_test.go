@@ -160,6 +160,34 @@ func TestNewOAuthProviders_RegistersTypedConfigsWithoutMapEntries(t *testing.T) 
 	}
 }
 
+func TestNewOAuthProviders_MapGraphVersionReachesProvider(t *testing.T) {
+	t.Parallel()
+
+	cfg := validatedOAuthConfig(t, func(c *config.Config) {
+		c.OAuth.Providers = map[string]config.ProviderConfig{
+			"facebook": {
+				Enabled:      true,
+				ClientID:     "fb-id",
+				ClientSecret: "fb-secret",
+				RedirectURL:  "https://app.example.com/fb",
+				GraphVersion: "v21.0",
+			},
+		}
+	})
+
+	providers, err := newOAuthProviders(cfg.OAuth)
+	if err != nil {
+		t.Fatalf("newOAuthProviders = %v", err)
+	}
+	fb, ok := providers["facebook"]
+	if !ok {
+		t.Fatal("missing facebook provider")
+	}
+	if _, fbPath := providerQuery(t, fb); !strings.Contains(fbPath, "/v21.0/") {
+		t.Errorf("facebook auth path = %q; want v21.0", fbPath)
+	}
+}
+
 func TestNewOAuthProviders_TenantPrecedence(t *testing.T) {
 	t.Parallel()
 
