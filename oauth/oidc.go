@@ -155,38 +155,28 @@ func errUnknownKid(kid string) error {
 	return errors.New(errors.CodeOAuthIDTokenInvalid, fmt.Sprintf("signing key with kid %q not found in jwks", kid), nil)
 }
 
-// cacheFresh reports whether the committed key set is still within its TTL.
-func (m *JWKSManager) cacheFresh() bool {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return time.Now().Before(m.expires)
-}
-
 // resolveRefreshFailure classifies a failed flight. The committed set decides the
 // outcome: a fresh set that lacks the kid is an auth failure, not a provider
-// outage, so only a stale set may surface the refresh error.
+// outage, so only a stale set may surface the refresh error. A single RLock
+// snapshot coordinates the decision so concurrent refreshes or clock steps cannot
+// misclassify a 401 as a 502 (or vice-versa) across fragmented locks.
 func (m *JWKSManager) resolveRefreshFailure(kid string, refreshErr error) (JWKSKey, error) {
-	if key, ok := m.cachedKey(kid); ok {
+	m.mu.RLock()
+	key, ok := m.keys[kid]
+	expires := m.expires
+	m.mu.RUnlock()
+
+	now := time.Now()
+	fresh := now.Before(expires)
+	if ok && fresh {
 		m.clearMiss(kid)
 		return key, nil
 	}
-	if m.cacheFresh() {
+	if fresh {
 		m.recordMiss(kid)
 		return JWKSKey{}, errUnknownKid(kid)
 	}
-	return m.staleOrError(kid, refreshErr)
-}
-
-// staleOrError serves the last-known-good key while it is still inside the
-// stale grace period, so a transient JWKS outage degrades to older keys
-// instead of locking out every login. Beyond the grace period the refresh
-// error is returned.
-func (m *JWKSManager) staleOrError(kid string, refreshErr error) (JWKSKey, error) {
-	m.mu.RLock()
-	key, ok := m.keys[kid]
-	expired := m.expires
-	m.mu.RUnlock()
-	if ok && time.Now().Before(expired.Add(jwksStaleGracePeriod)) {
+	if ok && now.Before(expires.Add(jwksStaleGracePeriod)) {
 		return key, nil
 	}
 	return JWKSKey{}, refreshErr
