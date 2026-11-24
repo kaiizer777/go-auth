@@ -295,8 +295,15 @@ func TestOAuthCallbackRoute(t *testing.T) {
 			t.Fatal("user EmailVerified = true; want false")
 		}
 		var links, sessions int64
-		if err := database.Model(&db.OAuthAccount{}).Count(&links).Error; err != nil || links != 0 {
-			t.Fatalf("links = %d, err = %v; want 0 for an unverified address", links, err)
+		if err := database.Model(&db.OAuthAccount{}).Count(&links).Error; err != nil || links != 1 {
+			t.Fatalf("links = %d, err = %v; want 1 unverified link", links, err)
+		}
+		var link db.OAuthAccount
+		if err := database.First(&link).Error; err != nil {
+			t.Fatalf("load link: %v", err)
+		}
+		if link.Verified {
+			t.Fatal("link Verified = true; want false for an unattested address")
 		}
 		if err := database.Model(&db.Session{}).Count(&sessions).Error; err != nil || sessions != 1 {
 			t.Fatalf("sessions = %d, err = %v; want 1", sessions, err)

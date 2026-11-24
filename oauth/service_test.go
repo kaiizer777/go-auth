@@ -141,6 +141,12 @@ func serviceTestDB(t *testing.T) *gorm.DB {
 		expires_at DATETIME NOT NULL,
 		created_at DATETIME
 	);
+	CREATE TABLE IF NOT EXISTS password_reset_tokens (
+		token_hash BLOB PRIMARY KEY,
+		user_id TEXT NOT NULL,
+		expires_at DATETIME NOT NULL,
+		created_at DATETIME
+	);
 	`
 	if err := database.Exec(ddl).Error; err != nil {
 		t.Fatalf("create schema: %v", err)
@@ -495,8 +501,16 @@ func TestHandleCallbackEmailGate(t *testing.T) {
 		if user.EmailVerified {
 			t.Fatal("unverified provider email minted a verified local user")
 		}
-		// No link: an unproven address must not leave a binding behind.
-		requireIdentityRows(t, database, 1, 0, 1)
+		// The link is persisted unverified: it can sign in this account and
+		// nothing else.
+		requireIdentityRows(t, database, 1, 1, 1)
+		var link db.OAuthAccount
+		if err := database.Where("provider_user_id = ?", "sub-9").First(&link).Error; err != nil {
+			t.Fatalf("load link: %v", err)
+		}
+		if link.Verified {
+			t.Fatal("unverified provider email must persist verified=false")
+		}
 	})
 
 	t.Run("nil userinfo keeps the 400", func(t *testing.T) {
@@ -582,12 +596,10 @@ func TestHandleCallbackEmailGate(t *testing.T) {
 	})
 }
 
-// TestUnverifiedSignupNeverBindsLink pins the invariant that a provider email
-// the provider did not verify never leaves a durable account binding behind:
-// the link is minted only after the address is proven, so whoever later proves
-// ownership of the address never inherits a provider identity someone else
-// attached to it.
-func TestUnverifiedSignupNeverBindsLink(t *testing.T) {
+// TestUnverifiedSignupLinkProvenance pins what an unverified provider claim
+// leaves behind: a link row marked unverified that signs in its own account and
+// dies the moment a password claims the address it named.
+func TestUnverifiedSignupLinkProvenance(t *testing.T) {
 	const addr = "victim@example.com"
 	unverified := func() *UserInfo {
 		return &UserInfo{ProviderID: "google", ProviderUserID: "sub-unverified-bind", Email: addr}
@@ -614,14 +626,18 @@ func TestUnverifiedSignupNeverBindsLink(t *testing.T) {
 		return sess, err
 	}
 
-	t.Run("oauth then password never inherits the provider link", func(t *testing.T) {
+	t.Run("oauth signup persists an unverified link that dies on password takeover", func(t *testing.T) {
 		database, cfg, _, svc := setupServiceTest(t, unverified())
 		first, err := callback(t, svc, cfg)
 		if err != nil {
 			t.Fatalf("unverified oauth signup = %v", err)
 		}
-		if n := countRows(t, database, &db.OAuthAccount{}); n != 0 {
-			t.Errorf("oauth_accounts = %d; want 0 for an unverified address", n)
+		var link db.OAuthAccount
+		if err := database.First(&link).Error; err != nil {
+			t.Fatalf("load link: %v", err)
+		}
+		if link.UserID != first.UserID || link.Verified {
+			t.Fatalf("link = (%v, verified=%v); want (%v, unverified)", link.UserID, link.Verified, first.UserID)
 		}
 		passwordSignup(t, database, cfg)
 		var owner db.User
@@ -650,7 +666,7 @@ func TestUnverifiedSignupNeverBindsLink(t *testing.T) {
 		requireIdentityRows(t, database, 1, 0, 0)
 	})
 
-	t.Run("concurrent unverified signups converge without a link", func(t *testing.T) {
+	t.Run("concurrent unverified signups converge on one link", func(t *testing.T) {
 		database, _, _, rawSvc := setupServiceTest(t, nil)
 		svc := rawSvc.(*service)
 		info := unverified()
@@ -677,12 +693,12 @@ func TestUnverifiedSignupNeverBindsLink(t *testing.T) {
 		if outs[0].user.ID != outs[1].user.ID {
 			t.Fatalf("converged users differ: %v vs %v", outs[0].user.ID, outs[1].user.ID)
 		}
-		requireIdentityRows(t, database, 1, 0, 0)
+		requireIdentityRows(t, database, 1, 1, 0)
 	})
 
 	// The winner's commit may become visible before the losing goroutine reads
 	// the address at all; that ordering must converge exactly like the raced one.
-	t.Run("visible pending row converges without a link", func(t *testing.T) {
+	t.Run("visible pending row converges without a duplicate user", func(t *testing.T) {
 		database, _, _, rawSvc := setupServiceTest(t, nil)
 		pending := db.User{ID: uuid.New(), Email: addr, PasswordHash: "", EmailVerified: false}
 		if err := database.Create(&pending).Error; err != nil {
@@ -2023,8 +2039,16 @@ func TestFacebookFirstSignup(t *testing.T) {
 		if user.Email != "alice@fb-test.com" || user.EmailVerified {
 			t.Fatalf("user email=%q verified=%v; want alice@fb-test.com/false", user.Email, user.EmailVerified)
 		}
-		// No durable binding is minted for a claim the provider did not attest.
-		requireIdentityRows(t, database, 1, 0, 1)
+		// The row records that Meta did not attest the address, which is what
+		// keeps it out of merge, recovery, and email resolution.
+		requireIdentityRows(t, database, 1, 1, 1)
+		var link db.OAuthAccount
+		if err := database.Where("provider_id = ?", "facebook").First(&link).Error; err != nil {
+			t.Fatalf("load link: %v", err)
+		}
+		if link.Verified {
+			t.Fatal("facebook graph email must persist verified=false")
+		}
 	})
 
 	t.Run("first signup without a Graph email is rejected", func(t *testing.T) {

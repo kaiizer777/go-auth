@@ -533,8 +533,15 @@ func TestE2E_FullBrowserOAuthJourneys(t *testing.T) {
 			t.Fatal("an unverified Graph email must not create a verified user")
 		}
 		var linkCount int64
-		if err := dbConn.Model(&db.OAuthAccount{}).Where("provider_id = ?", "facebook").Count(&linkCount).Error; err != nil || linkCount != 0 {
-			t.Fatalf("expected no durable facebook link for an unproven address, got count=%d err=%v", linkCount, err)
+		if err := dbConn.Model(&db.OAuthAccount{}).Where("provider_id = ?", "facebook").Count(&linkCount).Error; err != nil || linkCount != 1 {
+			t.Fatalf("expected 1 unverified facebook link for the first signup, got count=%d err=%v", linkCount, err)
+		}
+		var fbLink db.OAuthAccount
+		if err := dbConn.Where("provider_id = ?", "facebook").First(&fbLink).Error; err != nil {
+			t.Fatalf("load facebook link: %v", err)
+		}
+		if fbLink.Verified {
+			t.Fatal("unverified Graph email must persist a verified=false link")
 		}
 
 		var sessCount int64
