@@ -445,9 +445,15 @@ func (c *Config) Validate() error {
 }
 
 // clone isolates the sections validate writes into, so a failed validation
-// cannot reach the caller through the typed provider pointers.
+// cannot reach the caller through the typed provider pointers or the
+// AllowedOrigins backing array.
 func (c *Config) clone() *Config {
 	cp := *c
+	// validate normalizes origins in place; a shared backing array would mutate
+	// the caller's slice even when the config is rejected.
+	if c.AllowedOrigins != nil {
+		cp.AllowedOrigins = append([]string(nil), c.AllowedOrigins...)
+	}
 	if c.OAuth.Microsoft != nil {
 		v := *c.OAuth.Microsoft
 		cp.OAuth.Microsoft = &v

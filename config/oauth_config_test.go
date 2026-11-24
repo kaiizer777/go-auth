@@ -919,6 +919,22 @@ func TestFacebookAssertEmailVerifiedWiring(t *testing.T) {
 	})
 }
 
+// TestValidateRejectedConfigLeavesAllowedOriginsAlone pins the clone boundary: a
+// rejected config must not normalize the caller's origin slice in place, which a
+// shared backing array would do even though the error discards the config.
+func TestValidateRejectedConfigLeavesAllowedOriginsAlone(t *testing.T) {
+	cfg := validOAuthBase()
+	origins := []string{" https://app.example.com/ ", "app.example.com"}
+	cfg.AllowedOrigins = origins
+
+	if err := cfg.Validate(); !errors.Is(err, errors.ErrAllowedOriginInvalid) {
+		t.Fatalf("Validate = %v; want %v", err, errors.ErrAllowedOriginInvalid)
+	}
+	if origins[0] != " https://app.example.com/ " {
+		t.Fatalf("caller origin = %q; want the input left untouched", origins[0])
+	}
+}
+
 func TestProviderConfigJSONTags(t *testing.T) {
 	var p ProviderConfig
 	raw := `{"client_id":"id","tenant":"tenant-guid","trusted_tenants":["partner-guid"],"jwks_cache_ttl":3600000000000,"graph_version":"v20.0"}`
