@@ -696,6 +696,41 @@ func (s *service) linkedUser(ctx context.Context, providerID, providerUserID str
 	return user, link, true, nil
 }
 
+// resolveLinkedUser resolves the owner and row of an existing provider link.
+// If the primary lookup by providerUserID misses, and the provider is Microsoft
+// with an oid claim present in RawClaims, it falls back to looking up by oid.
+// When found via fallback, the link is updated to sub so the legacy row is migrated.
+func (s *service) resolveLinkedUser(ctx context.Context, providerID string, info *UserInfo) (db.User, db.OAuthAccount, bool, error) {
+	user, link, found, err := s.linkedUser(ctx, providerID, info.ProviderUserID)
+	if err != nil || found {
+		return user, link, found, err
+	}
+	if providerID != "microsoft" || info.RawClaims == nil {
+		return db.User{}, db.OAuthAccount{}, false, nil
+	}
+	oid, _ := info.RawClaims["oid"].(string)
+	if oid == "" || oid == info.ProviderUserID {
+		return db.User{}, db.OAuthAccount{}, false, nil
+	}
+	legacyLink, legacyFound, lerr := s.findLink(ctx, providerID, oid)
+	if lerr != nil || !legacyFound {
+		return db.User{}, db.OAuthAccount{}, legacyFound, lerr
+	}
+	// Migrate the legacy link row's provider_user_id to the primary sub key.
+	if uerr := s.store.OAuthAccounts().UpdateProviderUserID(ctx, legacyLink.ID, info.ProviderUserID); uerr != nil {
+		if isUniqueViolation(uerr) {
+			return s.linkedUser(ctx, providerID, info.ProviderUserID)
+		}
+		return db.User{}, db.OAuthAccount{}, false, errors.New(errors.CodeInternalError, "failed to update provider user id", uerr)
+	}
+	legacyLink.ProviderUserID = info.ProviderUserID
+	owner, oerr := s.loadLinkedUser(ctx, legacyLink)
+	if oerr != nil {
+		return db.User{}, legacyLink, true, oerr
+	}
+	return owner, legacyLink, true, nil
+}
+
 // relinkExisting re-reads the link row that won a concurrent insert race and
 // loads its owner. Used when our insert hits the unique constraint.
 func (s *service) relinkExisting(ctx context.Context, providerID, providerUserID string) (db.User, bool, bool, error) {
@@ -741,6 +776,17 @@ func (s *service) mergeOrConverge(ctx context.Context, providerID string, existi
 			link, found, err := s.findLink(ctx, providerID, info.ProviderUserID)
 			if err != nil {
 				return db.User{}, false, false, errors.New(errors.CodeInternalError, "failed to query oauth account", err)
+			}
+			if !found && providerID == "microsoft" && info.RawClaims != nil {
+				if oid, _ := info.RawClaims["oid"].(string); oid != "" && oid != info.ProviderUserID {
+					if legacyLink, legacyFound, lerr := s.findLink(ctx, providerID, oid); lerr == nil && legacyFound {
+						link = legacyLink
+						found = true
+						if uerr := s.store.OAuthAccounts().UpdateProviderUserID(ctx, link.ID, info.ProviderUserID); uerr == nil {
+							link.ProviderUserID = info.ProviderUserID
+						}
+					}
+				}
 			}
 			if found && link.UserID == existing.ID {
 				return existing, false, false, nil
@@ -853,7 +899,7 @@ func (s *service) linkOrCreate(ctx context.Context, providerID string, info *Use
 	// proves the address locally, the link is spent and is deleted here rather
 	// than allowed to outlive its trust. Subject-only identities carry no email
 	// and are immune to unverified-link invalidation.
-	user, link, found, err := s.linkedUser(ctx, providerID, info.ProviderUserID)
+	user, link, found, err := s.resolveLinkedUser(ctx, providerID, info)
 	if err != nil {
 		return db.User{}, false, false, err
 	}

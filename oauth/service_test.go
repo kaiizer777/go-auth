@@ -2370,6 +2370,182 @@ func TestHandleCallbackActiveSessionUntrustedTenant(t *testing.T) {
 	})
 }
 
+func TestHandleCallback_MicrosoftLegacyOIDFallback(t *testing.T) {
+	t.Run("resolves legacy oid link on unattested email and migrates to sub", func(t *testing.T) {
+		t.Parallel()
+		database, cfg, _, _ := setupServiceTest(t, verifiedInfo())
+		sessSvc := session.NewService(database, cfg)
+
+		user := db.User{
+			ID:            uuid.New(),
+			Email:         "ms-user@example.com",
+			EmailVerified: true,
+		}
+		if err := database.Create(&user).Error; err != nil {
+			t.Fatalf("create user: %v", err)
+		}
+		legacyLink := db.OAuthAccount{
+			ID:             uuid.New(),
+			UserID:         user.ID,
+			ProviderID:     "microsoft",
+			ProviderUserID: "legacy-oid-guid-123",
+			Email:          user.Email,
+			Verified:       true,
+		}
+		if err := database.Create(&legacyLink).Error; err != nil {
+			t.Fatalf("create legacy link: %v", err)
+		}
+
+		msInfo := &UserInfo{
+			ProviderID:     "microsoft",
+			ProviderUserID: "new-pairwise-sub-456",
+			Email:          "ms-user@example.com",
+			EmailVerified:  false,
+			Name:           "MS User",
+			RawClaims: map[string]any{
+				"sub": "new-pairwise-sub-456",
+				"oid": "legacy-oid-guid-123",
+			},
+		}
+		mockMS := &stubProvider{id: "microsoft", info: msInfo}
+		svc := NewService(database, sessSvc, map[string]Provider{"microsoft": mockMS}, cfg)
+
+		state, cookie := mustInitiate(t, svc, cfg, "microsoft")
+		req := httptest.NewRequest(http.MethodGet, "/auth/oauth/microsoft/callback", nil)
+		req.AddCookie(cookie)
+		rec := httptest.NewRecorder()
+
+		sess, _, _, err := svc.HandleCallback(context.Background(), rec, req, "microsoft", "code", state, db.SessionTypeCookie)
+		if err != nil {
+			t.Fatalf("HandleCallback failed: %v", err)
+		}
+		if sess == nil || sess.UserID != user.ID {
+			t.Fatalf("expected session for user %s, got %v", user.ID, sess)
+		}
+
+		var updatedLink db.OAuthAccount
+		if err := database.Where("id = ?", legacyLink.ID).First(&updatedLink).Error; err != nil {
+			t.Fatalf("failed to query updated link: %v", err)
+		}
+		if updatedLink.ProviderUserID != "new-pairwise-sub-456" {
+			t.Fatalf("expected link to be migrated to new-pairwise-sub-456, got %s", updatedLink.ProviderUserID)
+		}
+		if n := countRows(t, database, &db.OAuthAccount{}); n != 1 {
+			t.Fatalf("expected exactly 1 oauth_accounts row, found %d", n)
+		}
+	})
+
+	t.Run("resolves link directly by sub when already migrated", func(t *testing.T) {
+		t.Parallel()
+		database, cfg, _, _ := setupServiceTest(t, verifiedInfo())
+		sessSvc := session.NewService(database, cfg)
+
+		user := db.User{
+			ID:            uuid.New(),
+			Email:         "ms-sub@example.com",
+			EmailVerified: true,
+		}
+		if err := database.Create(&user).Error; err != nil {
+			t.Fatalf("create user: %v", err)
+		}
+		link := db.OAuthAccount{
+			ID:             uuid.New(),
+			UserID:         user.ID,
+			ProviderID:     "microsoft",
+			ProviderUserID: "direct-sub-789",
+			Email:          user.Email,
+			Verified:       true,
+		}
+		if err := database.Create(&link).Error; err != nil {
+			t.Fatalf("create link: %v", err)
+		}
+
+		msInfo := &UserInfo{
+			ProviderID:     "microsoft",
+			ProviderUserID: "direct-sub-789",
+			Email:          "ms-sub@example.com",
+			EmailVerified:  true,
+			Name:           "MS Sub User",
+			RawClaims: map[string]any{
+				"sub": "direct-sub-789",
+				"oid": "directory-oid-999",
+			},
+		}
+		mockMS := &stubProvider{id: "microsoft", info: msInfo}
+		svc := NewService(database, sessSvc, map[string]Provider{"microsoft": mockMS}, cfg)
+
+		state, cookie := mustInitiate(t, svc, cfg, "microsoft")
+		req := httptest.NewRequest(http.MethodGet, "/auth/oauth/microsoft/callback", nil)
+		req.AddCookie(cookie)
+		rec := httptest.NewRecorder()
+
+		sess, _, _, err := svc.HandleCallback(context.Background(), rec, req, "microsoft", "code", state, db.SessionTypeCookie)
+		if err != nil {
+			t.Fatalf("HandleCallback failed: %v", err)
+		}
+		if sess == nil || sess.UserID != user.ID {
+			t.Fatalf("expected session for user %s, got %v", user.ID, sess)
+		}
+	})
+
+	t.Run("legacy oid fallback does not insert duplicate when email is attested", func(t *testing.T) {
+		t.Parallel()
+		database, cfg, _, _ := setupServiceTest(t, verifiedInfo())
+		sessSvc := session.NewService(database, cfg)
+
+		user := db.User{
+			ID:            uuid.New(),
+			Email:         "ms-attested@example.com",
+			EmailVerified: true,
+		}
+		if err := database.Create(&user).Error; err != nil {
+			t.Fatalf("create user: %v", err)
+		}
+		legacyLink := db.OAuthAccount{
+			ID:             uuid.New(),
+			UserID:         user.ID,
+			ProviderID:     "microsoft",
+			ProviderUserID: "legacy-oid-attested",
+			Email:          user.Email,
+			Verified:       true,
+		}
+		if err := database.Create(&legacyLink).Error; err != nil {
+			t.Fatalf("create legacy link: %v", err)
+		}
+
+		msInfo := &UserInfo{
+			ProviderID:     "microsoft",
+			ProviderUserID: "sub-attested-new",
+			Email:          "ms-attested@example.com",
+			EmailVerified:  true,
+			Name:           "MS Attested User",
+			RawClaims: map[string]any{
+				"sub": "sub-attested-new",
+				"oid": "legacy-oid-attested",
+			},
+		}
+		mockMS := &stubProvider{id: "microsoft", info: msInfo}
+		svc := NewService(database, sessSvc, map[string]Provider{"microsoft": mockMS}, cfg)
+
+		state, cookie := mustInitiate(t, svc, cfg, "microsoft")
+		req := httptest.NewRequest(http.MethodGet, "/auth/oauth/microsoft/callback", nil)
+		req.AddCookie(cookie)
+		rec := httptest.NewRecorder()
+
+		sess, _, _, err := svc.HandleCallback(context.Background(), rec, req, "microsoft", "code", state, db.SessionTypeCookie)
+		if err != nil {
+			t.Fatalf("HandleCallback failed: %v", err)
+		}
+		if sess == nil || sess.UserID != user.ID {
+			t.Fatalf("expected session for user %s, got %v", user.ID, sess)
+		}
+
+		if n := countRows(t, database, &db.OAuthAccount{}); n != 1 {
+			t.Fatalf("expected 1 row (migrated, not duplicated), got %d", n)
+		}
+	})
+}
+
 // TestFacebookFirstSignup drives the real Facebook adapter through the linking
 // engine: the Graph email decides whether a first-time signup can complete.
 func TestFacebookFirstSignup(t *testing.T) {
