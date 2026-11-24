@@ -192,13 +192,6 @@ func TestIntegration_MultiProviderCallbackExecution(t *testing.T) {
 	cfg.OAuth.StateSecret = "super-secret-integration-test-state-key-32b"
 	sessSvc := session.NewService(database, &cfg)
 
-	// Set up mock IDP servers
-	mockServers, err := oauthmock.NewMockServers()
-	if err != nil {
-		t.Fatalf("NewMockServers failed: %v", err)
-	}
-	defer mockServers.Close()
-
 	reg := oauth.NewRegistry()
 
 	// Register all 7 providers using mock or concrete adapters
@@ -214,13 +207,13 @@ func TestIntegration_MultiProviderCallbackExecution(t *testing.T) {
 	_ = reg.Register(big3MockApple)
 
 	// Create and register mock providers for Microsoft, Facebook, Discord, X
-	mockDiscord := oauthmock.New("discord", mockServers.DiscordUserID, mockServers.DiscordEmail, true)
+	mockDiscord := oauthmock.New("discord", "discord-sub-88", "discord-user@example.com", true)
 	defer mockDiscord.Close()
-	mockFacebook := oauthmock.New("facebook", mockServers.FBUserID, mockServers.FBEmail, true)
+	mockFacebook := oauthmock.New("facebook", "fb-sub-77", "fb-user@example.com", true)
 	defer mockFacebook.Close()
-	mockMicrosoft := oauthmock.New("microsoft", "ms-sub-778899", mockServers.MSEmail, true)
+	mockMicrosoft := oauthmock.New("microsoft", "ms-sub-778899", "ms-user@example.com", true)
 	defer mockMicrosoft.Close()
-	mockX := oauthmock.New("x", mockServers.XUserID, "", false)
+	mockX := oauthmock.New("x", "x-sub-66", "", false)
 	defer mockX.Close()
 
 	_ = reg.Register(mockDiscord)

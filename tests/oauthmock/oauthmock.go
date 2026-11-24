@@ -1,8 +1,7 @@
-// Package oauthmock fronts httptest token/userinfo servers (plus a JWKS
-// server for apple) while implementing oauth.Provider. The token server
-// binds the verifier to the challenge observed at authorize time and
-// enforces single-use codes, so PKCE-tamper and replay paths fail exactly
-// like a real provider with invalid_grant.
+// Package oauthmock provides two test doubles for OAuth flows: Mock implements
+// oauth.Provider for provider-agnostic service and handler tests, while the IdP
+// servers (NewMicrosoftIdP and friends) emulate a provider's real HTTP surface
+// so adapter tests can drive the actual adapter through oauth.WithEndpoints.
 package oauthmock
 
 import (
