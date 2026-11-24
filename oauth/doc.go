@@ -25,6 +25,12 @@
 // Unverified links never merge, recover, or resolve an account by email, and
 // ?link=true cannot persist an unattested address.
 //
+// Facebook attestation: Graph returns a primary address when the email
+// permission is granted but documents no proof of ownership, so the adapter
+// reports it EmailVerified=false unless the operator sets assert_email_verified,
+// which states the app-review guarantee and unlocks the merge. The default is
+// fail-closed: a non-empty Graph email never implies verification.
+//
 // Provider compatibility: Provider is unchanged and AuthCodeURLProvider is still
 // optional. An OIDCProvider that does not implement it now receives the login
 // nonce as a "nonce" query parameter on the URL returned by AuthURL, because the
