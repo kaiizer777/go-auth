@@ -223,9 +223,40 @@ func TestOAuthCallbackRoute(t *testing.T) {
 		}
 	})
 
-	t.Run("unverified email 400s with zero writes", func(t *testing.T) {
+	t.Run("unverified email registers unverified user", func(t *testing.T) {
 		database, h := oauthTestEnv(t,
-			&oauth.UserInfo{ProviderID: "google", ProviderUserID: "sub-9", Email: "victim@example.com"})
+			&oauth.UserInfo{ProviderID: "google", ProviderUserID: "sub-9", Email: "new@example.com"})
+		state, cookies, _ := driveInitiate(t, h, "/auth/oauth/google")
+		req := httptest.NewRequest(http.MethodGet, "/auth/oauth/google/callback?code=c&state="+state, nil)
+		req.AddCookie(stateCookie(t, cookies))
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusFound {
+			t.Fatalf("status = %d; want 302 (%s)", rec.Code, rec.Body.String())
+		}
+		var user db.User
+		if err := database.Where("email = ?", "new@example.com").First(&user).Error; err != nil {
+			t.Fatalf("load user: %v", err)
+		}
+		if user.EmailVerified {
+			t.Fatal("user EmailVerified = true; want false")
+		}
+		var links, sessions int64
+		if err := database.Model(&db.OAuthAccount{}).Count(&links).Error; err != nil || links != 1 {
+			t.Fatalf("links = %d, err = %v; want 1", links, err)
+		}
+		if err := database.Model(&db.Session{}).Count(&sessions).Error; err != nil || sessions != 1 {
+			t.Fatalf("sessions = %d, err = %v; want 1", sessions, err)
+		}
+	})
+
+	t.Run("unverified email cannot merge into existing account", func(t *testing.T) {
+		database, h := oauthTestEnv(t,
+			&oauth.UserInfo{ProviderID: "google", ProviderUserID: "sub-10", Email: "victim@example.com"})
+		victim := db.User{ID: uuid.New(), Email: "victim@example.com", PasswordHash: "hash", EmailVerified: true}
+		if err := database.Create(&victim).Error; err != nil {
+			t.Fatalf("seed: %v", err)
+		}
 		state, cookies, _ := driveInitiate(t, h, "/auth/oauth/google")
 		req := httptest.NewRequest(http.MethodGet, "/auth/oauth/google/callback?code=c&state="+state, nil)
 		req.AddCookie(stateCookie(t, cookies))
@@ -237,11 +268,21 @@ func TestOAuthCallbackRoute(t *testing.T) {
 		if code := decodeErrCode(t, rec); code != errors.CodeOAuthEmailUnverified {
 			t.Fatalf("code = %s; want OAUTH_EMAIL_UNVERIFIED", code)
 		}
-		for _, m := range []any{&db.User{}, &db.OAuthAccount{}, &db.Session{}} {
+		for _, m := range []struct {
+			model any
+			want  int64
+		}{{&db.User{}, 1}, {&db.OAuthAccount{}, 0}, {&db.Session{}, 0}} {
 			var n int64
-			if err := database.Model(m).Count(&n).Error; err != nil || n != 0 {
-				t.Fatalf("model %T count = %d, err = %v; want 0", m, n, err)
+			if err := database.Model(m.model).Count(&n).Error; err != nil || n != m.want {
+				t.Fatalf("model %T count = %d, err = %v; want %d", m.model, n, err, m.want)
 			}
+		}
+		var after db.User
+		if err := database.Where("id = ?", victim.ID).First(&after).Error; err != nil {
+			t.Fatalf("victim missing: %v", err)
+		}
+		if after.PasswordHash != "hash" || !after.EmailVerified {
+			t.Fatalf("victim mutated: %+v", after)
 		}
 	})
 
@@ -637,7 +678,11 @@ func TestOAuthCallbackRedirectSetsNoStore(t *testing.T) {
 }
 
 func TestOAuthCallbackFailureHasNoCacheHeaders(t *testing.T) {
-	_, h := oauthTestEnv(t, &oauth.UserInfo{ProviderID: "google", ProviderUserID: "sub-nostore-fail", Email: "nostore-fail@example.com"})
+	database, h := oauthTestEnv(t, &oauth.UserInfo{ProviderID: "google", ProviderUserID: "sub-nostore-fail", Email: "nostore-fail@example.com"})
+	existing := db.User{ID: uuid.New(), Email: "nostore-fail@example.com", PasswordHash: "hash", EmailVerified: true}
+	if err := database.Create(&existing).Error; err != nil {
+		t.Fatalf("seed: %v", err)
+	}
 	state, cookies, _ := driveInitiate(t, h, "/auth/oauth/google")
 	req := httptest.NewRequest(http.MethodGet, "/auth/oauth/google/callback?code=c&state="+state, nil)
 	req.AddCookie(stateCookie(t, cookies))
@@ -645,6 +690,9 @@ func TestOAuthCallbackFailureHasNoCacheHeaders(t *testing.T) {
 	h.ServeHTTP(rec, req)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d; want 400 (%s)", rec.Code, rec.Body.String())
+	}
+	if code := decodeErrCode(t, rec); code != errors.CodeOAuthEmailUnverified {
+		t.Fatalf("code = %s; want OAUTH_EMAIL_UNVERIFIED", code)
 	}
 	if got := rec.Header().Get("Cache-Control"); got != "" {
 		t.Errorf("Cache-Control = %q; want empty on failure", got)
