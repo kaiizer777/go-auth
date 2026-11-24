@@ -456,6 +456,37 @@ func TestMigration000007_DownRefusesOnLinkedAccounts(t *testing.T) {
 	}
 }
 
+func TestMigration000009_BackfillTrustsVerifiedOwners(t *testing.T) {
+	data, err := defaultMigrationsFS.ReadFile("migrations/000009_add_oauth_account_verified.up.sql")
+	if err != nil {
+		t.Fatalf("failed to read migration 9 up: %v", err)
+	}
+	content := string(data)
+
+	alterIdx := strings.Index(content, "ALTER TABLE oauth_accounts ADD COLUMN IF NOT EXISTS verified BOOLEAN NOT NULL DEFAULT FALSE")
+	if alterIdx == -1 {
+		t.Fatal("migration 9 up must add oauth_accounts.verified as NOT NULL DEFAULT FALSE")
+	}
+	backfillIdx := strings.Index(content, "UPDATE oauth_accounts SET verified = TRUE")
+	if backfillIdx == -1 {
+		t.Fatal("migration 9 up must backfill verified from the owning account")
+	}
+	if alterIdx > backfillIdx {
+		t.Errorf("migration 9 column add (idx %d) must precede the backfill (idx %d)", alterIdx, backfillIdx)
+	}
+
+	backfill := content[backfillIdx:]
+	if semi := strings.Index(backfill, ";"); semi != -1 {
+		backfill = backfill[:semi]
+	}
+	if !strings.Contains(backfill, "users.email_verified") {
+		t.Errorf("migration 9 backfill must gate trust on users.email_verified: %q", backfill)
+	}
+	if !strings.Contains(backfill, "users.id = oauth_accounts.user_id") {
+		t.Errorf("migration 9 backfill must correlate the link to its owning user: %q", backfill)
+	}
+}
+
 func TestMigrations_NoExplicitTransactionWrappers(t *testing.T) {
 	files := []string{
 		"migrations/000001_create_users.up.sql",

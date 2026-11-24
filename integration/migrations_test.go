@@ -420,8 +420,9 @@ func TestMigration000008_DownRefusedOnSeededDB(t *testing.T) {
 }
 
 // TestMigration000009_UpAndDown pins the trust flag's migration contract: the
-// column backfills legacy rows to false and the down removes only the column,
-// leaving every link row intact.
+// column backfills from the owning account's local verification so legacy users
+// keep signing in, while links whose owner was never locally verified stay
+// unverified. The down removes only the column, leaving every link row intact.
 func TestMigration000009_UpAndDown(t *testing.T) {
 	dbURL := resolveDatabaseURL()
 
@@ -453,31 +454,61 @@ func TestMigration000009_UpAndDown(t *testing.T) {
 		t.Fatalf("m.Migrate(8) failed: %v", err)
 	}
 
-	// A link created before 000009 carries no value for the flag.
-	if _, err := sqlDB.Exec(`INSERT INTO users (email, password_hash, credential_version) VALUES ('legacy-link@example.com', 'hash', 1)`); err != nil {
-		t.Fatalf("failed to seed user: %v", err)
+	// A link created before 000009 carries no value for the flag. Three owners:
+	// a locally verified address, an unclaimed address, and a password-claimed
+	// address with no local verification.
+	if _, err := sqlDB.Exec(`INSERT INTO users (email, password_hash, credential_version, email_verified) VALUES
+		('legacy-trusted@example.com', 'hash', 1, true),
+		('legacy-untrusted@example.com', '', 1, false),
+		('legacy-password-only@example.com', 'hash', 1, false)`); err != nil {
+		t.Fatalf("failed to seed users: %v", err)
 	}
-	if _, err := sqlDB.Exec(`INSERT INTO oauth_accounts (user_id, provider_id, provider_user_id, email) SELECT id, 'google', 'legacy-link-sub', 'legacy-link@example.com' FROM users WHERE email = 'legacy-link@example.com'`); err != nil {
-		t.Fatalf("failed to seed link: %v", err)
+	for sub, addr := range map[string]string{
+		"legacy-trusted-sub":       "legacy-trusted@example.com",
+		"legacy-untrusted-sub":     "legacy-untrusted@example.com",
+		"legacy-password-only-sub": "legacy-password-only@example.com",
+	} {
+		if _, err := sqlDB.Exec(`INSERT INTO oauth_accounts (user_id, provider_id, provider_user_id, email) SELECT id, 'google', $1, email FROM users WHERE email = $2`, sub, addr); err != nil {
+			t.Fatalf("failed to seed link %s: %v", sub, err)
+		}
 	}
 
 	if err := m.Steps(1); err != nil {
 		t.Fatalf("000009 up migration failed: %v", err)
 	}
 
-	var nullable, verified bool
+	var nullable bool
 	if err := sqlDB.QueryRow(`
-		SELECT is_nullable = 'YES', COALESCE((SELECT verified FROM oauth_accounts WHERE provider_user_id = 'legacy-link-sub'), TRUE)
+		SELECT is_nullable = 'YES'
 		FROM information_schema.columns
 		WHERE table_schema = 'public' AND table_name = 'oauth_accounts' AND column_name = 'verified'
-	`).Scan(&nullable, &verified); err != nil {
+	`).Scan(&nullable); err != nil {
 		t.Fatalf("failed to inspect verified column: %v", err)
 	}
 	if nullable {
 		t.Fatal("oauth_accounts.verified must be NOT NULL")
 	}
-	if verified {
-		t.Fatal("legacy oauth link must backfill as unverified")
+
+	requireLinkVerified := func(t *testing.T, sub string, want bool) {
+		t.Helper()
+		var verified bool
+		if err := sqlDB.QueryRow(`SELECT verified FROM oauth_accounts WHERE provider_user_id = $1`, sub).Scan(&verified); err != nil {
+			t.Fatalf("failed to read %s.verified: %v", sub, err)
+		}
+		if verified != want {
+			t.Fatalf("%s verified = %v; want %v", sub, verified, want)
+		}
+	}
+	// Trust survives only where the owner's address was verified locally.
+	requireLinkVerified(t, "legacy-trusted-sub", true)
+	requireLinkVerified(t, "legacy-untrusted-sub", false)
+	requireLinkVerified(t, "legacy-password-only-sub", false)
+
+	// A link the provider attested after 000009 on a password-claimed account is
+	// the data a down/up cycle cannot restore: the flag is re-derived from
+	// users.email_verified, which is false here.
+	if _, err := sqlDB.Exec(`UPDATE oauth_accounts SET verified = TRUE WHERE provider_user_id = 'legacy-password-only-sub'`); err != nil {
+		t.Fatalf("failed to attest link: %v", err)
 	}
 
 	if err := m.Steps(-1); err != nil {
@@ -493,18 +524,24 @@ func TestMigration000009_UpAndDown(t *testing.T) {
 		t.Fatal("000009 down must drop the verified column")
 	}
 	var links int
-	if err := sqlDB.QueryRow(`SELECT COUNT(*) FROM oauth_accounts WHERE provider_user_id = 'legacy-link-sub'`).Scan(&links); err != nil {
+	if err := sqlDB.QueryRow(`SELECT COUNT(*) FROM oauth_accounts WHERE provider_user_id LIKE 'legacy-%-sub'`).Scan(&links); err != nil {
 		t.Fatalf("failed to count links after down: %v", err)
 	}
-	if links != 1 {
-		t.Fatalf("links after 000009 down = %d; want 1 (down drops the flag, not the links)", links)
+	if links != 3 {
+		t.Fatalf("links after 000009 down = %d; want 3 (down drops the flag, not the links)", links)
 	}
 
-	if _, err := sqlDB.Exec(`DELETE FROM oauth_accounts WHERE provider_user_id = 'legacy-link-sub'`); err != nil {
-		t.Fatalf("failed to remove seed link: %v", err)
+	if err := m.Steps(1); err != nil {
+		t.Fatalf("re-applying 000009 failed: %v", err)
 	}
-	if _, err := sqlDB.Exec(`DELETE FROM users WHERE email = 'legacy-link@example.com'`); err != nil {
-		t.Fatalf("failed to remove seed user: %v", err)
+	requireLinkVerified(t, "legacy-trusted-sub", true)
+	requireLinkVerified(t, "legacy-password-only-sub", false)
+
+	if _, err := sqlDB.Exec(`DELETE FROM oauth_accounts WHERE provider_user_id LIKE 'legacy-%-sub'`); err != nil {
+		t.Fatalf("failed to remove seed links: %v", err)
+	}
+	if _, err := sqlDB.Exec(`DELETE FROM users WHERE email LIKE 'legacy-%@example.com'`); err != nil {
+		t.Fatalf("failed to remove seed users: %v", err)
 	}
 	if err := m.Up(); err != nil && err != migrate.ErrNoChange {
 		t.Fatalf("restoring head failed: %v", err)
