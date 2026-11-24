@@ -129,6 +129,12 @@ func (p *MicrosoftProvider) VerifyIDToken(ctx context.Context, rawIDToken, nonce
 	claims.TenantID, _ = rawClaims["tid"].(string)
 	claims.OID, _ = rawClaims["oid"].(string)
 
+	// oid and sub are the only stable identity keys; a token carrying neither
+	// would key every such login onto an empty provider_user_id.
+	if claims.OID == "" && claims.Subject == "" {
+		return nil, errors.New(errors.CodeOAuthIDTokenInvalid, "id_token missing both oid and sub claims", nil)
+	}
+
 	switch expVal := rawClaims["exp"].(type) {
 	case float64:
 		claims.Expiration = int64(expVal)

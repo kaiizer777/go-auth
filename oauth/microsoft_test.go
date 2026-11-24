@@ -933,6 +933,38 @@ func TestMicrosoftProvider(t *testing.T) {
 		}
 	})
 
+	t.Run("VerifyIDToken requires an identity claim", func(t *testing.T) {
+		p := newTestProvider("common", nil)
+
+		claimsMissing := map[string]any{
+			"iss": "https://login.microsoftonline.com/tid-1/v2.0",
+			"aud": "client-test-id",
+			"exp": time.Now().Add(10 * time.Minute).Unix(),
+			"tid": "tid-1",
+		}
+		tokMissing := signRS256JWT(t, privKey, "ms-key-1", claimsMissing)
+		_, err := p.VerifyIDToken(ctx, tokMissing, "")
+		if err == nil {
+			t.Fatal("expected rejection for token missing sub and oid")
+		}
+		var appErr *errors.Error
+		if !errors.As(err, &appErr) || appErr.Code() != errors.CodeOAuthIDTokenInvalid {
+			t.Fatalf("expected CodeOAuthIDTokenInvalid, got %v", err)
+		}
+
+		claimsOIDOnly := map[string]any{
+			"iss": "https://login.microsoftonline.com/tid-1/v2.0",
+			"oid": "oid-only",
+			"aud": "client-test-id",
+			"exp": time.Now().Add(10 * time.Minute).Unix(),
+			"tid": "tid-1",
+		}
+		tokOIDOnly := signRS256JWT(t, privKey, "ms-key-1", claimsOIDOnly)
+		if _, err := p.VerifyIDToken(ctx, tokOIDOnly, ""); err != nil {
+			t.Fatalf("token with oid but no sub must verify: %v", err)
+		}
+	})
+
 	t.Run("FetchUserInfo maps OID and uses only the email claim", func(t *testing.T) {
 		p := newTestProvider("common", nil)
 
