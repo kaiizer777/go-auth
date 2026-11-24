@@ -30,7 +30,6 @@ func TestJWKSManager_SupersededRefreshServesRequestedKid(t *testing.T) {
 	releaseRollover := make(chan struct{})
 	var releaseOnce sync.Once
 	release := func() { releaseOnce.Do(func() { close(releaseRollover) }) }
-	defer release()
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		switch requests.Add(1) {
@@ -45,6 +44,9 @@ func TestJWKSManager_SupersededRefreshServesRequestedKid(t *testing.T) {
 		}
 	}))
 	defer srv.Close()
+	// Registered after Close so it runs first (LIFO): a Fatal must not leave a
+	// handler parked on releaseRollover while Close waits for it.
+	defer release()
 
 	mgr := NewJWKSManager(srv.URL, srv.Client(), time.Hour)
 
