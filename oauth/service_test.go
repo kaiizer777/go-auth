@@ -118,6 +118,7 @@ func serviceTestDB(t *testing.T) *gorm.DB {
 		provider_id VARCHAR(32) NOT NULL,
 		provider_user_id VARCHAR(255) NOT NULL,
 		email VARCHAR(255) NOT NULL,
+		verified INTEGER NOT NULL DEFAULT 0,
 		created_at DATETIME,
 		updated_at DATETIME,
 		CONSTRAINT uq_oauth_accounts_provider_uid UNIQUE (provider_id, provider_user_id)
@@ -301,7 +302,7 @@ func seedLinkedIdentity(t *testing.T, database *gorm.DB, providerID, providerUse
 		t.Fatalf("seed user: %v", err)
 	}
 	link := db.OAuthAccount{ID: uuid.New(), UserID: owner.ID, ProviderID: providerID,
-		ProviderUserID: providerUserID, Email: owner.Email}
+		ProviderUserID: providerUserID, Email: owner.Email, Verified: true}
 	if err := database.Create(&link).Error; err != nil {
 		t.Fatalf("seed link: %v", err)
 	}

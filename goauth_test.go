@@ -797,6 +797,7 @@ func TestNew_MySQL(t *testing.T) {
 		provider_id TEXT NOT NULL,
 		provider_user_id TEXT NOT NULL,
 		email TEXT NOT NULL,
+		verified INTEGER NOT NULL DEFAULT 0,
 		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
 		updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 	);
@@ -913,6 +914,7 @@ func TestNew_MongoDB_Success(t *testing.T) {
 		provider_id TEXT NOT NULL,
 		provider_user_id TEXT NOT NULL,
 		email TEXT NOT NULL,
+		verified INTEGER NOT NULL DEFAULT 0,
 		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
 		updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 	);
