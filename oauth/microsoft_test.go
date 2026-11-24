@@ -1184,15 +1184,41 @@ func TestMicrosoftProvider_DomainOwnershipAttestation(t *testing.T) {
 	}
 }
 
+const (
+	contosoTenantGUID = "11111111-2222-3333-4444-555555555555"
+	otherTenantGUID   = "99999999-8888-7777-6666-555555555555"
+)
+
 func TestMicrosoftProvider_TenantAllowlist(t *testing.T) {
 	privKey, nRaw, eRaw := generateTestRSAKey(t)
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	var serverURL string
+	discovery := map[string]string{
+		"contoso.onmicrosoft.com": contosoTenantGUID,
+		"other.onmicrosoft.com":   otherTenantGUID,
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		domain, ok := strings.CutSuffix(r.URL.Path, "/v2.0/.well-known/openid-configuration")
+		if ok {
+			guid, found := discovery[strings.TrimPrefix(domain, "/")]
+			if !found {
+				http.NotFound(w, r)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(OIDCDiscovery{
+				Issuer:                serverURL + "/" + guid + "/v2.0",
+				AuthorizationEndpoint: serverURL + "/authorize",
+				TokenEndpoint:         serverURL + "/token",
+				JWKSURI:               serverURL + "/keys",
+			})
+			return
+		}
 		_ = json.NewEncoder(w).Encode(JWKDoc{Keys: []JWKKey{{
 			Kty: "RSA", Use: "sig", Kid: "ms-key-1", Alg: "RS256", N: nRaw, E: eRaw,
 		}}})
 	}))
 	defer server.Close()
+	serverURL = server.URL
 
 	newProvider := func(t *testing.T, tenant string, trusted []string) *MicrosoftProvider {
 		t.Helper()
@@ -1206,6 +1232,7 @@ func TestMicrosoftProvider_TenantAllowlist(t *testing.T) {
 			RedirectURI:    "https://example.com/callback",
 		})
 		p.client = server.Client()
+		p.discoveryBaseURL = server.URL
 		p.jwksMgr = NewJWKSManager(server.URL, p.client, time.Hour)
 		p.jwksRetriever = p.jwksMgr
 		return p
@@ -1224,9 +1251,10 @@ func TestMicrosoftProvider_TenantAllowlist(t *testing.T) {
 		{name: "listed guid", trusted: []string{"tenant-a"}, tid: "tenant-a", wantTrusted: true, wantVerified: true},
 		{name: "listed guid uppercase entry", trusted: []string{"TENANT-A"}, tid: "tenant-a", wantTrusted: true, wantVerified: true},
 		{name: "listed guid uppercase tid", trusted: []string{"tenant-a"}, tid: "TENANT-A", wantTrusted: true, wantVerified: true},
-		{name: "listed domain", trusted: []string{"contoso.onmicrosoft.com"}, tid: "contoso.onmicrosoft.com", wantTrusted: true, wantVerified: true},
-		{name: "listed domain uppercase entry", trusted: []string{"Contoso.OnMicrosoft.com"}, tid: "contoso.onmicrosoft.com", wantTrusted: true, wantVerified: true},
-		{name: "listed domain authority matches issuer segment", tenantCfg: "contoso.onmicrosoft.com", trusted: []string{"contoso.onmicrosoft.com"}, tid: "tenant-guid", issuer: "https://login.microsoftonline.com/contoso.onmicrosoft.com/v2.0", wantTrusted: true},
+		{name: "listed domain resolves to guid", trusted: []string{"contoso.onmicrosoft.com"}, tid: contosoTenantGUID, wantTrusted: true, wantVerified: true},
+		{name: "listed domain uppercase entry", trusted: []string{"Contoso.OnMicrosoft.com"}, tid: contosoTenantGUID, wantTrusted: true, wantVerified: true},
+		{name: "domain tenant and domain allowlist", tenantCfg: "contoso.onmicrosoft.com", trusted: []string{"contoso.onmicrosoft.com"}, tid: contosoTenantGUID, wantTrusted: true, wantVerified: true},
+		{name: "allowlist domain does not match", trusted: []string{"contoso.onmicrosoft.com"}, tid: otherTenantGUID},
 		{name: "unlisted tenant rejected despite attestation", trusted: []string{"tenant-a"}, tid: "tenant-b"},
 		{name: "unlisted domain rejected", trusted: []string{"tenant-a"}, tid: "evil.example.com"},
 	}
@@ -1263,15 +1291,125 @@ func TestMicrosoftProvider_TenantAllowlist(t *testing.T) {
 	}
 }
 
-func TestMicrosoftProvider_SingleTenantVerification(t *testing.T) {
+// TestMicrosoftProvider_TenantIdentityResolution pins the domain-vs-GUID rule:
+// Microsoft always emits a GUID tid and a GUID issuer, so a domain configured
+// as the authority or in the allowlist must be resolved to its tenant GUID.
+func TestMicrosoftProvider_TenantIdentityResolution(t *testing.T) {
 	privKey, nRaw, eRaw := generateTestRSAKey(t)
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	var serverURL string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		domain, ok := strings.CutSuffix(r.URL.Path, "/v2.0/.well-known/openid-configuration")
+		if ok {
+			guid, found := map[string]string{
+				"contoso.onmicrosoft.com": contosoTenantGUID,
+			}[strings.TrimPrefix(domain, "/")]
+			if !found {
+				http.NotFound(w, r)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(OIDCDiscovery{
+				Issuer:                serverURL + "/" + guid + "/v2.0",
+				AuthorizationEndpoint: serverURL + "/authorize",
+				TokenEndpoint:         serverURL + "/token",
+				JWKSURI:               serverURL + "/keys",
+			})
+			return
+		}
 		_ = json.NewEncoder(w).Encode(JWKDoc{Keys: []JWKKey{{
 			Kty: "RSA", Use: "sig", Kid: "ms-key-1", Alg: "RS256", N: nRaw, E: eRaw,
 		}}})
 	}))
 	defer server.Close()
+	serverURL = server.URL
+
+	tests := []struct {
+		name          string
+		tenant        string
+		trusted       []string
+		tid           string
+		wantErrCode   errors.Code
+		wantVerified  bool
+		wantUntrusted bool
+	}{
+		{name: "domain tenant succeeds", tenant: "contoso.onmicrosoft.com", tid: contosoTenantGUID, wantVerified: true},
+		{name: "guid tenant succeeds", tenant: contosoTenantGUID, tid: contosoTenantGUID, wantVerified: true},
+		{name: "unlisted tenant rejected and marked", tenant: "common", trusted: []string{otherTenantGUID}, tid: contosoTenantGUID, wantUntrusted: true},
+		{name: "allowlist domain matches", tenant: "common", trusted: []string{"contoso.onmicrosoft.com"}, tid: contosoTenantGUID, wantVerified: true},
+		{name: "allowlist domain does not match", tenant: "common", trusted: []string{"contoso.onmicrosoft.com"}, tid: otherTenantGUID, wantUntrusted: true},
+		{name: "unresolvable domain surfaces a config error", tenant: "unresolvable.onmicrosoft.com", tid: contosoTenantGUID, wantErrCode: errors.CodeOAuthProviderError},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := NewMicrosoftProvider(config.MicrosoftConfig{
+				ClientID:       "client-test-id",
+				Tenant:         tt.tenant,
+				TrustedTenants: tt.trusted,
+				RedirectURI:    "https://example.com/callback",
+			})
+			p.client = server.Client()
+			p.discoveryBaseURL = server.URL
+			p.jwksMgr = NewJWKSManager(server.URL+"/keys", p.client, time.Hour)
+			p.jwksRetriever = p.jwksMgr
+
+			claims := map[string]any{
+				"iss":   "https://login.microsoftonline.com/" + tt.tid + "/v2.0",
+				"sub":   "sub-1",
+				"aud":   "client-test-id",
+				"exp":   time.Now().Add(10 * time.Minute).Unix(),
+				"email": "user@contoso.com",
+				"tid":   tt.tid,
+			}
+			if tt.tenant == "common" {
+				claims["xms_edov"] = true
+			}
+			tok := signRS256JWT(t, privKey, "ms-key-1", claims)
+
+			c, err := p.VerifyIDToken(context.Background(), tok, "")
+			if tt.wantErrCode != "" {
+				if err == nil {
+					t.Fatal("expected error, got nil")
+				}
+				var appErr *errors.Error
+				if !errors.As(err, &appErr) || appErr.Code() != tt.wantErrCode {
+					t.Fatalf("error = %v; want code %q", err, tt.wantErrCode)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("VerifyIDToken = %v", err)
+			}
+			if c.EmailVerified != tt.wantVerified {
+				t.Errorf("EmailVerified = %v; want %v", c.EmailVerified, tt.wantVerified)
+			}
+			if c.UntrustedTenant != tt.wantUntrusted {
+				t.Errorf("UntrustedTenant = %v; want %v", c.UntrustedTenant, tt.wantUntrusted)
+			}
+		})
+	}
+}
+
+func TestMicrosoftProvider_SingleTenantVerification(t *testing.T) {
+	privKey, nRaw, eRaw := generateTestRSAKey(t)
+
+	var serverURL string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, ok := strings.CutSuffix(r.URL.Path, "/v2.0/.well-known/openid-configuration"); ok {
+			_ = json.NewEncoder(w).Encode(OIDCDiscovery{
+				Issuer:                serverURL + "/" + contosoTenantGUID + "/v2.0",
+				AuthorizationEndpoint: serverURL + "/authorize",
+				TokenEndpoint:         serverURL + "/token",
+				JWKSURI:               serverURL + "/keys",
+			})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(JWKDoc{Keys: []JWKKey{{
+			Kty: "RSA", Use: "sig", Kid: "ms-key-1", Alg: "RS256", N: nRaw, E: eRaw,
+		}}})
+	}))
+	defer server.Close()
+	serverURL = server.URL
 
 	newProvider := func(t *testing.T, tenant string) *MicrosoftProvider {
 		t.Helper()
@@ -1281,6 +1419,7 @@ func TestMicrosoftProvider_SingleTenantVerification(t *testing.T) {
 			RedirectURI: "https://example.com/callback",
 		})
 		p.client = server.Client()
+		p.discoveryBaseURL = server.URL
 		p.jwksMgr = NewJWKSManager(server.URL, p.client, time.Hour)
 		p.jwksRetriever = p.jwksMgr
 		return p
@@ -1296,9 +1435,11 @@ func TestMicrosoftProvider_SingleTenantVerification(t *testing.T) {
 	}{
 		{name: "matching tid inherits verification", tenantCfg: "contoso-guid", issuerTenant: "contoso-guid", tid: "contoso-guid", wantVerified: true},
 		{name: "matching tid is case insensitive", tenantCfg: "contoso-guid", issuerTenant: "contoso-guid", tid: "CONTOSO-GUID", wantVerified: true},
-		{name: "domain tenant inherits verification", tenantCfg: "contoso.onmicrosoft.com", issuerTenant: "contoso.onmicrosoft.com", tid: "contoso.onmicrosoft.com", wantVerified: true},
+		{name: "domain tenant inherits verification by resolved guid", tenantCfg: "contoso.onmicrosoft.com", issuerTenant: contosoTenantGUID, tid: contosoTenantGUID, wantVerified: true},
+		{name: "domain tenant foreign tid does not inherit verification", tenantCfg: "contoso.onmicrosoft.com", issuerTenant: contosoTenantGUID, tid: otherTenantGUID},
 		{name: "foreign tid does not inherit verification", tenantCfg: "contoso-guid", issuerTenant: "contoso-guid", tid: "other-guid"},
 		{name: "foreign issuer rejected", tenantCfg: "contoso-guid", issuerTenant: "other-guid", tid: "contoso-guid", wantErr: true},
+		{name: "domain tenant foreign issuer rejected", tenantCfg: "contoso.onmicrosoft.com", issuerTenant: otherTenantGUID, tid: contosoTenantGUID, wantErr: true},
 	}
 
 	for _, tt := range tests {

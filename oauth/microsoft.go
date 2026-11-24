@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/kaiizer777/go-auth/config"
@@ -14,6 +16,8 @@ import (
 
 // MicrosoftConsumerTenantGUID is the canonical Microsoft tenant GUID for personal consumer accounts.
 const MicrosoftConsumerTenantGUID = "9188040d-6c67-4c5b-b112-36a304b66dad"
+
+const microsoftDiscoveryBaseURL = "https://login.microsoftonline.com"
 
 // MicrosoftProvider implements OAuth 2.0 and OIDC authentication for Microsoft Entra ID (Azure AD).
 type MicrosoftProvider struct {
@@ -26,6 +30,13 @@ type MicrosoftProvider struct {
 	jwksRetriever  JWKSKeyRetriever
 	userinfoURL    string
 	trustedTenants map[string]struct{}
+
+	// discoveryBaseURL roots domain→tenant-GUID lookups; tests point it at a
+	// loopback server. resolveMu guards the caches below.
+	discoveryBaseURL string
+	resolveMu        sync.Mutex
+	tenantGUID       string
+	resolvedTrusted  map[string]string
 }
 
 // NewMicrosoftProvider constructs a Microsoft Entra ID adapter.
@@ -59,15 +70,16 @@ func NewMicrosoftProvider(cfg config.MicrosoftConfig, opts ...EndpointOption) *M
 	mgr := NewJWKSManager(ep.JWKSURL, client, cfg.JWKSCacheTTL)
 
 	return &MicrosoftProvider{
-		cfg:            cfg,
-		client:         client,
-		authURL:        ep.AuthorizeURL,
-		tokenURL:       ep.TokenURL,
-		jwksURL:        ep.JWKSURL,
-		jwksMgr:        mgr,
-		jwksRetriever:  mgr,
-		userinfoURL:    ep.UserInfoURL,
-		trustedTenants: trusted,
+		cfg:              cfg,
+		client:           client,
+		authURL:          ep.AuthorizeURL,
+		tokenURL:         ep.TokenURL,
+		jwksURL:          ep.JWKSURL,
+		jwksMgr:          mgr,
+		jwksRetriever:    mgr,
+		userinfoURL:      ep.UserInfoURL,
+		trustedTenants:   trusted,
+		discoveryBaseURL: microsoftDiscoveryBaseURL,
 	}
 }
 
@@ -76,36 +88,120 @@ func normalizeTenant(tenant string) string {
 	return strings.ToLower(strings.TrimSuffix(strings.TrimSpace(tenant), "."))
 }
 
-// issuerTenant returns the tenant segment of a Microsoft v2 issuer.
+var tenantGUIDPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+
+// isTenantDomain reports whether a normalized authority is a domain name
+// rather than a named authority or tenant GUID.
+func isTenantDomain(tenant string) bool {
+	return strings.Contains(tenant, ".")
+}
+
+// issuerTenant returns the tenant segment of an issuer URL. The host is not
+// pinned here: callers validate the issuer itself, and this also has to read
+// the GUID from a loopback discovery origin in tests.
 func issuerTenant(issuer string) string {
-	const prefix = "https://login.microsoftonline.com/"
-	if !strings.HasPrefix(issuer, prefix) {
+	u, err := url.Parse(issuer)
+	if err != nil {
 		return ""
 	}
-	segment := strings.TrimPrefix(issuer, prefix)
-	if i := strings.IndexByte(segment, '/'); i >= 0 {
-		segment = segment[:i]
-	}
+	segment, _, _ := strings.Cut(strings.TrimPrefix(u.Path, "/"), "/")
 	return segment
 }
 
-// tenantTrusted reports whether the allowlist accepts the verified tenant.
-// Identifiers compare verbatim and case-insensitively, so entries may be
-// GUIDs or tenant domains; the issuer segment covers domain-form authorities.
-// An empty allowlist keeps multi-tenant mode.
-func (p *MicrosoftProvider) tenantTrusted(tenantID, issuer string) bool {
-	if len(p.trustedTenants) == 0 {
-		return true
+// tenantAuthority resolves the configured authority to the tenant GUID form
+// Microsoft emits in iss and tid. Entra tokens always name the tenant GUID,
+// even when the authority was configured as a domain, so a domain is looked up
+// through its v2 discovery issuer once and cached. Resolution failures are
+// returned and never cached, so a transient outage does not brick logins.
+func (p *MicrosoftProvider) tenantAuthority(ctx context.Context) (string, error) {
+	authority := normalizeTenant(p.cfg.Tenant)
+	if authority == "" {
+		authority = "common"
 	}
-	for _, id := range []string{tenantID, issuerTenant(issuer)} {
-		if id == "" {
+	if !isTenantDomain(authority) {
+		return authority, nil
+	}
+	p.resolveMu.Lock()
+	defer p.resolveMu.Unlock()
+	if p.tenantGUID != "" {
+		return p.tenantGUID, nil
+	}
+	guid, err := p.fetchTenantGUID(ctx, authority)
+	if err != nil {
+		return "", err
+	}
+	p.tenantGUID = guid
+	return guid, nil
+}
+
+// fetchTenantGUID reads the tenant GUID from a domain's v2 discovery issuer.
+func (p *MicrosoftProvider) fetchTenantGUID(ctx context.Context, domain string) (string, error) {
+	base := strings.TrimSuffix(p.discoveryBaseURL, "/")
+	if base == "" {
+		base = microsoftDiscoveryBaseURL
+	}
+	discoveryURL := fmt.Sprintf("%s/%s/v2.0/.well-known/openid-configuration", base, domain)
+	doc, err := FetchOIDCDiscovery(ctx, p.client, discoveryURL)
+	if err != nil {
+		return "", errors.New(errors.CodeOAuthProviderError,
+			fmt.Sprintf("microsoft tenant domain %q could not be resolved to a tenant id", domain), err)
+	}
+	guid := normalizeTenant(issuerTenant(doc.Issuer))
+	if !tenantGUIDPattern.MatchString(guid) {
+		return "", errors.New(errors.CodeOAuthProviderError,
+			fmt.Sprintf("microsoft tenant domain %q resolved to non-GUID issuer %q", domain, doc.Issuer), nil)
+	}
+	return guid, nil
+}
+
+// resolveTrustedDomain resolves and caches a domain-form allowlist entry.
+func (p *MicrosoftProvider) resolveTrustedDomain(ctx context.Context, domain string) (string, error) {
+	p.resolveMu.Lock()
+	defer p.resolveMu.Unlock()
+	if guid, ok := p.resolvedTrusted[domain]; ok {
+		return guid, nil
+	}
+	guid, err := p.fetchTenantGUID(ctx, domain)
+	if err != nil {
+		return "", err
+	}
+	if p.resolvedTrusted == nil {
+		p.resolvedTrusted = make(map[string]string)
+	}
+	p.resolvedTrusted[domain] = guid
+	return guid, nil
+}
+
+// tenantTrusted reports whether the allowlist accepts the verified tenant.
+// Entries may be GUIDs or domains; a domain entry is resolved to its GUID so
+// it matches the GUID the token actually carries. An empty allowlist keeps
+// multi-tenant mode. An unresolvable domain entry fails closed and surfaces
+// the resolution error instead of silently rejecting the tenant.
+func (p *MicrosoftProvider) tenantTrusted(ctx context.Context, tenantID, issuer string) (bool, error) {
+	if len(p.trustedTenants) == 0 {
+		return true, nil
+	}
+	ids := []string{normalizeTenant(tenantID), normalizeTenant(issuerTenant(issuer))}
+	for entry := range p.trustedTenants {
+		for _, id := range ids {
+			if id != "" && entry == id {
+				return true, nil
+			}
+		}
+		if !isTenantDomain(entry) {
 			continue
 		}
-		if _, ok := p.trustedTenants[normalizeTenant(id)]; ok {
-			return true
+		guid, err := p.resolveTrustedDomain(ctx, entry)
+		if err != nil {
+			return false, err
+		}
+		for _, id := range ids {
+			if id != "" && id == guid {
+				return true, nil
+			}
 		}
 	}
-	return false
+	return false, nil
 }
 
 // ID returns the canonical provider slug.
@@ -153,6 +249,11 @@ func (p *MicrosoftProvider) ExchangeCode(ctx context.Context, code, codeVerifier
 func (p *MicrosoftProvider) VerifyIDToken(ctx context.Context, rawIDToken, nonce string) (*IDTokenClaims, error) {
 	if rawIDToken == "" {
 		return nil, errors.New(errors.CodeOAuthIDTokenInvalid, "missing raw id_token", nil)
+	}
+
+	authority, err := p.tenantAuthority(ctx)
+	if err != nil {
+		return nil, err
 	}
 
 	rawClaims, err := VerifyRS256JWT(ctx, rawIDToken, p.jwksRetriever)
@@ -229,17 +330,21 @@ func (p *MicrosoftProvider) VerifyIDToken(ctx context.Context, rawIDToken, nonce
 	}
 
 	// Dynamic issuer verification
-	if err := p.verifyIssuer(claims.Issuer, claims.TenantID); err != nil {
+	if err := p.verifyIssuer(authority, claims.Issuer, claims.TenantID); err != nil {
 		return nil, err
 	}
 
 	// "nOauth" anti-account-takeover defense: compute EmailVerified
-	claims.EmailVerified = p.isEmailVerified(rawClaims, claims.TenantID)
+	claims.EmailVerified = p.isEmailVerified(authority, rawClaims, claims.TenantID)
 
 	// The allowlist bounds which external tenants may hold accounts here.
 	// Attestation never overrides it: an unlisted tenant is untrusted even
 	// when it presents xms_edov.
-	if !p.tenantTrusted(claims.TenantID, claims.Issuer) {
+	trusted, err := p.tenantTrusted(ctx, claims.TenantID, claims.Issuer)
+	if err != nil {
+		return nil, err
+	}
+	if !trusted {
 		claims.EmailVerified = false
 		rawClaims["untrusted_tenant"] = true
 	}
@@ -251,14 +356,10 @@ func (p *MicrosoftProvider) VerifyIDToken(ctx context.Context, rawIDToken, nonce
 	return claims, nil
 }
 
-// verifyIssuer validates that the token issuer matches the configured authority mode.
-func (p *MicrosoftProvider) verifyIssuer(issuer, tenantID string) error {
-	tenant := p.cfg.Tenant
-	if tenant == "" {
-		tenant = "common"
-	}
-
-	switch tenant {
+// verifyIssuer validates that the token issuer matches the configured authority
+// mode. authority is the tenant GUID a domain-form configuration resolved to.
+func (p *MicrosoftProvider) verifyIssuer(authority, issuer, tenantID string) error {
+	switch authority {
 	case "consumers":
 		expected := fmt.Sprintf("https://login.microsoftonline.com/%s/v2.0", MicrosoftConsumerTenantGUID)
 		if issuer != expected {
@@ -281,10 +382,10 @@ func (p *MicrosoftProvider) verifyIssuer(issuer, tenantID string) error {
 			return errors.New(errors.CodeOAuthIDTokenInvalid, fmt.Sprintf("invalid issuer %q for common mode, expected %q", issuer, expected), nil)
 		}
 	default:
-		// Specific tenant GUID or domain
-		expected := fmt.Sprintf("https://login.microsoftonline.com/%s/v2.0", tenant)
+		// Specific tenant, already resolved to the GUID form Microsoft emits.
+		expected := fmt.Sprintf("https://login.microsoftonline.com/%s/v2.0", authority)
 		if issuer != expected {
-			return errors.New(errors.CodeOAuthTenantInvalid, fmt.Sprintf("invalid issuer %q for specific tenant %q, expected %q", issuer, tenant, expected), nil)
+			return errors.New(errors.CodeOAuthTenantInvalid, fmt.Sprintf("invalid issuer %q for specific tenant %q, expected %q", issuer, p.cfg.Tenant, expected), nil)
 		}
 	}
 
@@ -292,21 +393,17 @@ func (p *MicrosoftProvider) verifyIssuer(issuer, tenantID string) error {
 }
 
 // isEmailVerified implements Microsoft's "nOauth" anti-takeover verification gate.
-func (p *MicrosoftProvider) isEmailVerified(rawClaims map[string]any, tenantID string) bool {
-	tenant := p.cfg.Tenant
-	if tenant == "" {
-		tenant = "common"
-	}
-
+// authority is the resolved tenant GUID a domain-form configuration named.
+func (p *MicrosoftProvider) isEmailVerified(authority string, rawClaims map[string]any, tenantID string) bool {
 	// 1. Single-tenant mode (not common, organizations, or consumers). The
 	// authority pins one tenant, but verification is inherited only when the
 	// token actually names that tenant; the caller has validated the issuer.
-	if tenant != "common" && tenant != "organizations" && tenant != "consumers" {
-		return normalizeTenant(tenantID) == normalizeTenant(tenant)
+	if authority != "common" && authority != "organizations" && authority != "consumers" {
+		return normalizeTenant(tenantID) == authority
 	}
 
 	// 2. Personal consumer account (Microsoft verifies email on registration)
-	if tenant == "consumers" || tenantID == MicrosoftConsumerTenantGUID {
+	if authority == "consumers" || tenantID == MicrosoftConsumerTenantGUID {
 		return true
 	}
 
@@ -424,7 +521,11 @@ func (p *MicrosoftProvider) FetchUserInfo(ctx context.Context, token *OAuthToken
 	// can be evaluated here; an allowlist miss fails closed on the same marker
 	// the ID-token path sets.
 	tid, _ := raw["tid"].(string)
-	if !p.tenantTrusted(tid, "") {
+	trusted, err := p.tenantTrusted(ctx, tid, "")
+	if err != nil {
+		return nil, err
+	}
+	if !trusted {
 		raw["untrusted_tenant"] = true
 	}
 
