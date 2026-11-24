@@ -990,9 +990,10 @@ func TestNew_MongoDB_NewWithStoreError_ClosesStore(t *testing.T) {
 	orig := mongoConnectFn
 	defer func() { mongoConnectFn = orig }()
 
-	providersMap := make(map[string]config.ProviderConfig)
+	// Provider config is a map shared with New's copy of cfg, so adding an
+	// unknown provider here surfaces in the post-connect validation.
 	mongoConnectFn = func(cfg config.Config) (db.Store, error) {
-		providersMap["invalid_provider"] = config.ProviderConfig{Enabled: true}
+		cfg.OAuth.Providers["invalid_provider"] = config.ProviderConfig{Enabled: true}
 		return tracker, nil
 	}
 
@@ -1001,13 +1002,16 @@ func TestNew_MongoDB_NewWithStoreError_ClosesStore(t *testing.T) {
 		DatabaseURL:  "mongodb://localhost:27017/test_db",
 		BaseURL:      "http://localhost:8080",
 		OAuth: config.OAuthConfig{
-			Providers: providersMap,
+			StateSecret: "test-state-secret-at-least-32-bytes!",
 		},
 	}
 
 	auth, err := New(cfg)
 	if err == nil {
 		t.Fatal("expected error from New, got nil")
+	}
+	if !errors.Is(err, errors.ErrOAuthProviderUnknown) {
+		t.Fatalf("expected ErrOAuthProviderUnknown, got: %v", err)
 	}
 	if auth != nil {
 		t.Fatal("expected nil auth on initialization failure")
