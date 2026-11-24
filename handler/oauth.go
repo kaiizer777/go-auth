@@ -17,7 +17,7 @@ import (
 // OAuthInitiate starts the provider dance: state cookie set, 302 to provider.
 func (h *Handler) OAuthInitiate(w http.ResponseWriter, r *http.Request) {
 	providerID := r.PathValue("provider")
-	if _, ok := oauth.SupportedProviders[providerID]; !ok {
+	if !oauth.IsSupportedProvider(providerID) {
 		errors.WriteHTTP(w, errors.ErrOAuthProviderNotFound)
 		return
 	}
@@ -44,7 +44,7 @@ func (h *Handler) OAuthInitiate(w http.ResponseWriter, r *http.Request) {
 // receive its raw token; a bare Accept: application/json stays cookie-typed.
 func (h *Handler) OAuthCallback(w http.ResponseWriter, r *http.Request) {
 	providerID := r.PathValue("provider")
-	if _, ok := oauth.SupportedProviders[providerID]; !ok {
+	if !oauth.IsSupportedProvider(providerID) {
 		errors.WriteHTTP(w, errors.ErrOAuthProviderNotFound)
 		return
 	}

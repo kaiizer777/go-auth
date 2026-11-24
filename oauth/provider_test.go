@@ -40,6 +40,14 @@ func TestSupportedProviders(t *testing.T) {
 		if _, ok := SupportedProviders[id]; !ok {
 			t.Errorf("missing provider %q", id)
 		}
+		if !IsSupportedProvider(id) {
+			t.Errorf("IsSupportedProvider(%q) = false; want true", id)
+		}
+	}
+	for _, id := range []string{"", "slack", "GOOGLE", "google "} {
+		if IsSupportedProvider(id) {
+			t.Errorf("IsSupportedProvider(%q) = true; want false", id)
+		}
 	}
 }
 

@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"time"
 
@@ -87,7 +88,8 @@ type OAuthUser struct {
 type UserInfo = OAuthUser
 
 // Provider defines the standard contract required for any OAuth2 / OIDC identity provider.
-// AuthCodeURL is additive to AuthURL: adapters implement it as a one-line AuthURL delegate.
+// AuthURL is the option-free shortcut; AuthCodeURL carries provider-specific
+// authorization options such as the OIDC nonce.
 type Provider interface {
 	// ID returns the canonical provider slug (e.g. "google", "github", "apple", "microsoft").
 	ID() string
@@ -131,15 +133,25 @@ type IDTokenClaims struct {
 	UntrustedTenant   bool     `json:"untrusted_tenant,omitempty"`
 }
 
-// SupportedProviders defines the canonical set of supported OAuth providers.
-var SupportedProviders = map[string]struct{}{
-	"google":    {},
-	"github":    {},
-	"apple":     {},
-	"microsoft": {},
-	"facebook":  {},
-	"discord":   {},
-	"x":         {},
+// supportedProviderIDs is the canonical, immutable provider set. Authorization
+// decisions read this slice so no package-level map mutation can widen it.
+var supportedProviderIDs = [...]string{
+	"google", "github", "apple", "microsoft", "facebook", "discord", "x",
+}
+
+// SupportedProviders is a snapshot kept for source compatibility. Mutating it
+// does not affect authorization decisions; call IsSupportedProvider instead.
+var SupportedProviders = func() map[string]struct{} {
+	m := make(map[string]struct{}, len(supportedProviderIDs))
+	for _, id := range supportedProviderIDs {
+		m[id] = struct{}{}
+	}
+	return m
+}()
+
+// IsSupportedProvider reports whether id is a canonical provider slug.
+func IsSupportedProvider(id string) bool {
+	return slices.Contains(supportedProviderIDs[:], id)
 }
 
 // NewProvider instantiates a concrete OAuth provider for the given provider slug.
