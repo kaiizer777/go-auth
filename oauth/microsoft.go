@@ -417,6 +417,14 @@ func (p *MicrosoftProvider) FetchUserInfo(ctx context.Context, token *OAuthToken
 	name, _ := raw["name"].(string)
 	picture, _ := raw["picture"].(string)
 
+	// The userinfo response carries no signed issuer, so only the tenant claim
+	// can be evaluated here; an allowlist miss fails closed on the same marker
+	// the ID-token path sets.
+	tid, _ := raw["tid"].(string)
+	if !p.tenantTrusted(tid, "") {
+		raw["untrusted_tenant"] = true
+	}
+
 	return &OAuthUser{
 		ProviderID:     "microsoft",
 		ProviderUserID: providerUserID(oid, sub),

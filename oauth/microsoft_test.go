@@ -1287,6 +1287,57 @@ func TestMicrosoftProvider_SingleTenantVerification(t *testing.T) {
 	}
 }
 
+func TestMicrosoftProvider_UserInfoTenantGate(t *testing.T) {
+	var userinfoClaims atomic.Value
+	userinfo := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(userinfoClaims.Load())
+	}))
+	defer userinfo.Close()
+
+	newProvider := func(t *testing.T, trusted []string) *MicrosoftProvider {
+		t.Helper()
+		p := NewMicrosoftProvider(config.MicrosoftConfig{
+			ClientID:       "client-test-id",
+			Tenant:         "common",
+			TrustedTenants: trusted,
+			RedirectURI:    "https://example.com/callback",
+		})
+		p.client = userinfo.Client()
+		p.userinfoURL = userinfo.URL
+		return p
+	}
+
+	tests := []struct {
+		name        string
+		trusted     []string
+		claims      map[string]any
+		wantUntrust bool
+	}{
+		{name: "no allowlist keeps userinfo untrusted-free", claims: map[string]any{"sub": "sub-1", "tid": "tenant-a"}},
+		{name: "listed tenant", trusted: []string{"tenant-a"}, claims: map[string]any{"sub": "sub-1", "tid": "tenant-a"}},
+		{name: "listed tenant uppercase", trusted: []string{"TENANT-A"}, claims: map[string]any{"sub": "sub-1", "tid": "tenant-a"}},
+		{name: "unlisted tenant", trusted: []string{"tenant-a"}, claims: map[string]any{"sub": "sub-1", "tid": "tenant-b"}, wantUntrust: true},
+		{name: "missing tid with allowlist fails closed", trusted: []string{"tenant-a"}, claims: map[string]any{"sub": "sub-1"}, wantUntrust: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			userinfoClaims.Store(tt.claims)
+			user, err := newProvider(t, tt.trusted).FetchUserInfo(context.Background(), &OAuthToken{AccessToken: "access-token"})
+			if err != nil {
+				t.Fatalf("FetchUserInfo = %v", err)
+			}
+			if user.EmailVerified {
+				t.Error("userinfo alone must never verify the email")
+			}
+			untrusted, _ := user.RawClaims["untrusted_tenant"].(bool)
+			if untrusted != tt.wantUntrust {
+				t.Errorf("RawClaims[untrusted_tenant] = %v; want %v", user.RawClaims["untrusted_tenant"], tt.wantUntrust)
+			}
+		})
+	}
+}
+
 func TestMicrosoftProvider_ProviderUserIDConsistency(t *testing.T) {
 	privKey, nRaw, eRaw := generateTestRSAKey(t)
 
