@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -20,11 +21,23 @@ import (
 // IdPs below emulate each provider's HTTP surface (authorize, token, userinfo,
 // JWKS) so tests can drive the real adapter instead of a Provider stub: point
 // the adapter at Server with oauth.WithEndpoints. The authorize leg validates
-// the adapter's PKCE S256 request and records the redirect_uri and scope it
-// issued; the token leg redeems the code once against that challenge and
-// rejects a token request that does not replay both, so a broken authorize URL,
-// a dropped verifier, or a mismatched redirect fails the journey rather than
-// passing through a mock.
+// the adapter's PKCE S256 request, and rejects a redirect_uri or scope the
+// client did not register, then records the grant; the token leg redeems the
+// code once against that challenge and rejects a token request that does not
+// replay both, so a broken authorize URL, a dropped verifier, or a mismatched
+// redirect fails the journey rather than passing through a mock.
+
+// DefaultRedirectURI is the callback the IdPs have on file when a test does not
+// register the adapter's configured redirect URI.
+const DefaultRedirectURI = "http://app.example/callback"
+
+// registeredRedirect returns the first non-empty override, or the default.
+func registeredRedirect(override []string) string {
+	if len(override) > 0 && override[0] != "" {
+		return override[0]
+	}
+	return DefaultRedirectURI
+}
 
 const msAccessToken = "ms-idp-access-token"
 
@@ -78,7 +91,9 @@ type MicrosoftIdP struct {
 func (i *MicrosoftIdP) AttestDomain() { i.edov = "1" }
 
 // NewMicrosoftIdP starts a Microsoft-shaped IdP with consumer-safe defaults.
-func NewMicrosoftIdP() (*MicrosoftIdP, error) {
+// redirectURI is the callback the provider has on file; it defaults to
+// DefaultRedirectURI when omitted.
+func NewMicrosoftIdP(redirectURI ...string) (*MicrosoftIdP, error) {
 	priv, n, e, err := GenerateRSAKey()
 	if err != nil {
 		return nil, fmt.Errorf("generate microsoft idp key: %w", err)
@@ -97,6 +112,11 @@ func NewMicrosoftIdP() (*MicrosoftIdP, error) {
 		n:            n,
 		e:            e,
 	}
+	idp.codes.registerClient(
+		registeredRedirect(redirectURI),
+		[]string{"openid", "profile", "email", "offline_access"},
+		[]string{"email"},
+	)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/authorize", func(w http.ResponseWriter, r *http.Request) {
 		idp.codes.authorize(w, r, idp.ClientID)
@@ -173,10 +193,7 @@ func (i *MicrosoftIdP) token(w http.ResponseWriter, r *http.Request) {
 	if !i.OmitIDToken {
 		resp["id_token"] = idToken
 	}
-	if ac.scope != "" {
-		resp["scope"] = ac.scope
-	}
-	writeJSON(w, resp)
+	writeJSON(w, grantedScope(resp, ac))
 }
 
 // corruptSignature flips one signature byte. The header and claims stay intact,
@@ -245,7 +262,9 @@ type FacebookIdP struct {
 }
 
 // NewFacebookIdP starts a Graph-shaped IdP with an email-returning profile.
-func NewFacebookIdP() *FacebookIdP {
+// redirectURI is the callback the provider has on file; it defaults to
+// DefaultRedirectURI when omitted.
+func NewFacebookIdP(redirectURI ...string) *FacebookIdP {
 	idp := &FacebookIdP{
 		AppID:     "fb-idp-app-id",
 		AppSecret: "fb-idp-app-secret",
@@ -256,6 +275,11 @@ func NewFacebookIdP() *FacebookIdP {
 		Debug:     DebugToken{IsValid: true},
 		codes:     newAuthorizeCodes(),
 	}
+	idp.codes.registerClient(
+		registeredRedirect(redirectURI),
+		[]string{"email", "public_profile"},
+		[]string{"email"},
+	)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/"+facebookGraphVersion+"/dialog/oauth", func(w http.ResponseWriter, r *http.Request) {
 		idp.codes.authorize(w, r, idp.AppID)
@@ -362,7 +386,9 @@ type DiscordIdP struct {
 }
 
 // NewDiscordIdP starts a Discord-shaped IdP with a verified email profile.
-func NewDiscordIdP() *DiscordIdP {
+// redirectURI is the callback the provider has on file; it defaults to
+// DefaultRedirectURI when omitted.
+func NewDiscordIdP(redirectURI ...string) *DiscordIdP {
 	idp := &DiscordIdP{
 		ClientID:     "discord-idp-client-id",
 		ClientSecret: "discord-idp-client-secret",
@@ -373,6 +399,11 @@ func NewDiscordIdP() *DiscordIdP {
 		Avatar:       "a_idp_avatar_hash",
 		codes:        newAuthorizeCodes(),
 	}
+	idp.codes.registerClient(
+		registeredRedirect(redirectURI),
+		[]string{"identify", "email"},
+		[]string{"email"},
+	)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/oauth2/authorize", func(w http.ResponseWriter, r *http.Request) {
 		idp.codes.authorize(w, r, idp.ClientID)
@@ -442,7 +473,9 @@ type XIdP struct {
 }
 
 // NewXIdP starts an X-shaped IdP.
-func NewXIdP() *XIdP {
+// redirectURI is the callback the provider has on file; it defaults to
+// DefaultRedirectURI when omitted.
+func NewXIdP(redirectURI ...string) *XIdP {
 	idp := &XIdP{
 		ClientID:     "x-idp-client-id",
 		ClientSecret: "x-idp-client-secret",
@@ -451,6 +484,11 @@ func NewXIdP() *XIdP {
 		Avatar:       "https://pbs.twimg.com/idp_normal.jpg",
 		codes:        newAuthorizeCodes(),
 	}
+	idp.codes.registerClient(
+		registeredRedirect(redirectURI),
+		[]string{"users.read", "tweet.read", "offline.access"},
+		[]string{"users.read"},
+	)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/i/oauth2/authorize", func(w http.ResponseWriter, r *http.Request) {
 		idp.codes.authorize(w, r, idp.ClientID)
@@ -520,10 +558,29 @@ type authorizeCode struct {
 type authorizeCodes struct {
 	mu    sync.Mutex
 	codes map[string]authorizeCode
+
+	// The single client this IdP serves. An empty redirectURI rejects every
+	// authorize request, so a forgotten registration fails closed.
+	redirectURI    string
+	supported      map[string]struct{}
+	requiredScopes []string
 }
 
 func newAuthorizeCodes() *authorizeCodes {
 	return &authorizeCodes{codes: make(map[string]authorizeCode)}
+}
+
+// registerClient pins the callback and scope set the provider has on file.
+// Authorize grants at most this set, and required scopes must be requested.
+func (c *authorizeCodes) registerClient(redirectURI string, supported, required []string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.redirectURI = redirectURI
+	c.supported = make(map[string]struct{}, len(supported))
+	for _, s := range supported {
+		c.supported[s] = struct{}{}
+	}
+	c.requiredScopes = append([]string(nil), required...)
 }
 
 // authorize validates the adapter's authorize request, records its challenge
@@ -538,21 +595,44 @@ func (c *authorizeCodes) authorize(w http.ResponseWriter, r *http.Request, clien
 		http.Error(w, "PKCE S256 required", http.StatusBadRequest)
 		return
 	}
-	redirect, err := url.Parse(q.Get("redirect_uri"))
+	redirectRaw := q.Get("redirect_uri")
+	redirect, err := url.Parse(redirectRaw)
 	if err != nil || redirect.Scheme == "" || redirect.Host == "" {
 		http.Error(w, "invalid redirect_uri", http.StatusBadRequest)
 		return
 	}
+
+	c.mu.Lock()
+	if redirectRaw != c.redirectURI {
+		c.mu.Unlock()
+		http.Error(w, "unregistered redirect_uri", http.StatusBadRequest)
+		return
+	}
+	requested := strings.Fields(q.Get("scope"))
+	for _, s := range requested {
+		if _, ok := c.supported[s]; !ok {
+			c.mu.Unlock()
+			http.Error(w, "unsupported scope", http.StatusBadRequest)
+			return
+		}
+	}
+	for _, s := range c.requiredScopes {
+		if !slices.Contains(requested, s) {
+			c.mu.Unlock()
+			http.Error(w, "required scope missing", http.StatusBadRequest)
+			return
+		}
+	}
 	code, err := freshCode()
 	if err != nil {
+		c.mu.Unlock()
 		http.Error(w, "generate code", http.StatusInternalServerError)
 		return
 	}
-	c.mu.Lock()
 	c.codes[code] = authorizeCode{
 		challenge:   q.Get("code_challenge"),
 		nonce:       q.Get("nonce"),
-		redirectURI: q.Get("redirect_uri"),
+		redirectURI: redirectRaw,
 		scope:       q.Get("scope"),
 	}
 	c.mu.Unlock()

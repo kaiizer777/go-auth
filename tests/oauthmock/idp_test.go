@@ -18,29 +18,13 @@ const idpTestRedirect = "http://app.example/callback"
 // the single-use code it redirected back with.
 func idpAuthorize(t *testing.T, authorizeURL, clientID string) string {
 	t.Helper()
-	return idpAuthorizeScope(t, authorizeURL, clientID, "identify email")
+	return idpAuthorizeScope(t, authorizeURL, clientID, "openid profile email offline_access")
 }
 
 // idpAuthorizeScope is idpAuthorize with an explicit scope request.
 func idpAuthorizeScope(t *testing.T, authorizeURL, clientID, scope string) string {
 	t.Helper()
-	sum := sha256.Sum256([]byte(idpTestVerifier))
-	q := url.Values{
-		"response_type":         {"code"},
-		"client_id":             {clientID},
-		"redirect_uri":          {idpTestRedirect},
-		"scope":                 {scope},
-		"state":                 {"st"},
-		"code_challenge":        {base64.RawURLEncoding.EncodeToString(sum[:])},
-		"code_challenge_method": {"S256"},
-	}
-	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error {
-		return http.ErrUseLastResponse
-	}}
-	resp, err := client.Get(authorizeURL + "?" + q.Encode())
-	if err != nil {
-		t.Fatalf("authorize: %v", err)
-	}
+	resp := idpAuthorizeRequest(t, authorizeURL, clientID, idpTestRedirect, scope)
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusFound {
 		t.Fatalf("authorize status = %d; want 302", resp.StatusCode)
@@ -54,6 +38,63 @@ func idpAuthorizeScope(t *testing.T, authorizeURL, clientID, scope string) strin
 		t.Fatal("authorize redirect missing code")
 	}
 	return code
+}
+
+// idpAuthorizeRequest issues one authorize request with an explicit redirect
+// and scope, returning the un-followed response so callers can assert the
+// provider's verdict.
+func idpAuthorizeRequest(t *testing.T, authorizeURL, clientID, redirectURI, scope string) *http.Response {
+	t.Helper()
+	sum := sha256.Sum256([]byte(idpTestVerifier))
+	q := url.Values{
+		"response_type":         {"code"},
+		"client_id":             {clientID},
+		"redirect_uri":          {redirectURI},
+		"scope":                 {scope},
+		"state":                 {"st"},
+		"code_challenge":        {base64.RawURLEncoding.EncodeToString(sum[:])},
+		"code_challenge_method": {"S256"},
+	}
+	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}}
+	resp, err := client.Get(authorizeURL + "?" + q.Encode())
+	if err != nil {
+		t.Fatalf("authorize: %v", err)
+	}
+	return resp
+}
+
+func TestIdPRejectsUnregisteredRedirectURI(t *testing.T) {
+	t.Parallel()
+	idp, err := NewMicrosoftIdP()
+	if err != nil {
+		t.Fatalf("NewMicrosoftIdP: %v", err)
+	}
+	t.Cleanup(idp.Close)
+
+	resp := idpAuthorizeRequest(t, idp.Server.URL+"/authorize", idp.ClientID,
+		"http://attacker.example/callback", "openid profile email offline_access")
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("unregistered redirect_uri status = %d; want 400", resp.StatusCode)
+	}
+}
+
+func TestIdPRejectsScopeMissingEmail(t *testing.T) {
+	t.Parallel()
+	idp, err := NewMicrosoftIdP()
+	if err != nil {
+		t.Fatalf("NewMicrosoftIdP: %v", err)
+	}
+	t.Cleanup(idp.Close)
+
+	resp := idpAuthorizeRequest(t, idp.Server.URL+"/authorize", idp.ClientID,
+		idpTestRedirect, "openid profile")
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("scope without email status = %d; want 400", resp.StatusCode)
+	}
 }
 
 func idpPostForm(t *testing.T, endpoint string, form url.Values, header map[string]string) int {
@@ -116,7 +157,7 @@ func TestFacebookIdPRequiresAppSecretProof(t *testing.T) {
 	idp := NewFacebookIdP()
 	t.Cleanup(idp.Close)
 
-	code := idpAuthorize(t, idp.Server.URL+"/"+facebookGraphVersion+"/dialog/oauth", idp.AppID)
+	code := idpAuthorizeScope(t, idp.Server.URL+"/"+facebookGraphVersion+"/dialog/oauth", idp.AppID, "email public_profile")
 	tokenForm := url.Values{
 		"grant_type":    {"authorization_code"},
 		"client_id":     {idp.AppID},
@@ -176,17 +217,17 @@ func TestXIdPRequiresBasicAuthAndNoBodyClientID(t *testing.T) {
 		}
 	}
 
-	if got := idpPostForm(t, tokenURL, form(idpAuthorize(t, idp.Server.URL+"/i/oauth2/authorize", idp.ClientID)), basic); got != http.StatusOK {
+	if got := idpPostForm(t, tokenURL, form(idpAuthorizeScope(t, idp.Server.URL+"/i/oauth2/authorize", idp.ClientID, "users.read")), basic); got != http.StatusOK {
 		t.Fatalf("valid exchange status = %d; want 200", got)
 	}
 
-	withClientID := form(idpAuthorize(t, idp.Server.URL+"/i/oauth2/authorize", idp.ClientID))
+	withClientID := form(idpAuthorizeScope(t, idp.Server.URL+"/i/oauth2/authorize", idp.ClientID, "users.read"))
 	withClientID.Set("client_id", idp.ClientID)
 	if got := idpPostForm(t, tokenURL, withClientID, basic); got != http.StatusBadRequest {
 		t.Fatalf("client_id in body status = %d; want 400", got)
 	}
 
-	noBasic := form(idpAuthorize(t, idp.Server.URL+"/i/oauth2/authorize", idp.ClientID))
+	noBasic := form(idpAuthorizeScope(t, idp.Server.URL+"/i/oauth2/authorize", idp.ClientID, "users.read"))
 	if got := idpPostForm(t, tokenURL, noBasic, nil); got != http.StatusBadRequest {
 		t.Fatalf("missing basic auth status = %d; want 400", got)
 	}
@@ -251,13 +292,13 @@ func TestMicrosoftIdPTokenLegBindsRedirectAndScope(t *testing.T) {
 		}
 	}
 	authorize := func() string {
-		return idpAuthorizeScope(t, idp.Server.URL+"/authorize", idp.ClientID, "openid profile")
+		return idpAuthorizeScope(t, idp.Server.URL+"/authorize", idp.ClientID, "openid profile email")
 	}
 	tokenURL := idp.Server.URL + "/token"
 
 	body := idpPostJSON(t, tokenURL, form(authorize()))
-	if scope, _ := body["scope"].(string); scope != "openid profile" {
-		t.Fatalf("token scope = %q; want the granted %q", body["scope"], "openid profile")
+	if scope, _ := body["scope"].(string); scope != "openid profile email" {
+		t.Fatalf("token scope = %q; want the granted %q", body["scope"], "openid profile email")
 	}
 
 	wrongRedirect := form(authorize())

@@ -30,14 +30,13 @@ type Mock struct {
 	userSrv  *httptest.Server
 	jwksSrv  *httptest.Server
 
-	mu              sync.Mutex
-	gotVerifier     string
-	verifierCalls   int
-	seenCodes       map[string]bool
-	challenges      map[string]struct{}
-	requireVerifier string
-	profile         *oauth.UserInfo
-	rawClaims       map[string]any
+	mu            sync.Mutex
+	gotVerifier   string
+	verifierCalls int
+	seenCodes     map[string]bool
+	challenges    map[string]struct{}
+	profile       *oauth.UserInfo
+	rawClaims     map[string]any
 
 	// SingleUseCodes rejects an auth code on second use (replay tests).
 	SingleUseCodes bool
@@ -83,10 +82,6 @@ func New(id, sub, email string, verified bool) *Mock {
 		// which a real provider also rejects.
 		sum := sha256.Sum256([]byte(verifier))
 		if _, ok := m.challenges[base64.RawURLEncoding.EncodeToString(sum[:])]; !ok {
-			http.Error(w, `{"error":"invalid_grant"}`, http.StatusBadRequest)
-			return
-		}
-		if m.requireVerifier != "" && verifier != m.requireVerifier {
 			http.Error(w, `{"error":"invalid_grant"}`, http.StatusBadRequest)
 			return
 		}
@@ -247,13 +242,6 @@ func (m *Mock) ObservedVerifier() (string, int) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.gotVerifier, m.verifierCalls
-}
-
-// SetRequireVerifier pins the verifier the token server accepts.
-func (m *Mock) SetRequireVerifier(v string) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.requireVerifier = v
 }
 
 // SetRawClaims pins extra claims (e.g. untrusted_tenant) onto the profile
