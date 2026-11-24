@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/kaiizer777/go-auth/config"
 	"github.com/kaiizer777/go-auth/errors"
@@ -31,10 +32,11 @@ func requireProviderError(t *testing.T, err error) {
 
 func TestSupportedProviders(t *testing.T) {
 	t.Parallel()
-	if len(SupportedProviders) != 3 {
-		t.Fatalf("len = %d; want 3", len(SupportedProviders))
+	expected := []string{"google", "github", "apple", "microsoft", "facebook", "discord", "x"}
+	if len(SupportedProviders) != len(expected) {
+		t.Fatalf("len = %d; want %d", len(SupportedProviders), len(expected))
 	}
-	for _, id := range []string{"google", "github", "apple"} {
+	for _, id := range expected {
 		if _, ok := SupportedProviders[id]; !ok {
 			t.Errorf("missing provider %q", id)
 		}
@@ -45,9 +47,9 @@ func TestNewProvider(t *testing.T) {
 	t.Parallel()
 	cfg := config.ProviderConfig{ClientID: "id", ClientSecret: "secret", RedirectURL: "https://app.example.com/cb"}
 
-	t.Run("big 3 resolve with matching IDs", func(t *testing.T) {
+	t.Run("all 7 providers resolve with matching IDs", func(t *testing.T) {
 		t.Parallel()
-		for _, id := range []string{"google", "github", "apple"} {
+		for _, id := range []string{"google", "github", "apple", "microsoft", "facebook", "discord", "x"} {
 			p, err := NewProvider(id, cfg)
 			if err != nil {
 				t.Errorf("NewProvider(%q) = %v", id, err)
@@ -59,9 +61,58 @@ func TestNewProvider(t *testing.T) {
 		}
 	})
 
+	t.Run("microsoft typed overrides thread through", func(t *testing.T) {
+		t.Parallel()
+		typed := &config.OAuthConfig{
+			Microsoft: &config.MicrosoftConfig{
+				Tenant:         "organizations",
+				TrustedTenants: []string{"partner-guid"},
+				JWKSCacheTTL:   2 * time.Hour,
+			},
+		}
+		p, err := NewProvider("microsoft", cfg, typed)
+		if err != nil {
+			t.Fatalf("NewProvider(microsoft) = %v", err)
+		}
+		mp, ok := p.(*MicrosoftProvider)
+		if !ok {
+			t.Fatalf("type = %T; want *MicrosoftProvider", p)
+		}
+		if mp.cfg.Tenant != "organizations" {
+			t.Errorf("Tenant = %q; want organizations", mp.cfg.Tenant)
+		}
+		if len(mp.trustedTenants) != 1 {
+			t.Fatalf("trustedTenants entries = %d; want 1", len(mp.trustedTenants))
+		}
+		if mp.cfg.JWKSCacheTTL != 2*time.Hour {
+			t.Errorf("JWKSCacheTTL = %v; want 2h", mp.cfg.JWKSCacheTTL)
+		}
+		if !strings.Contains(mp.authURL, "/organizations/") {
+			t.Errorf("authURL = %q; want organizations authority", mp.authURL)
+		}
+	})
+
+	t.Run("facebook typed graph version threads through", func(t *testing.T) {
+		t.Parallel()
+		typed := &config.OAuthConfig{
+			Facebook: &config.FacebookConfig{GraphVersion: "v20.0"},
+		}
+		p, err := NewProvider("facebook", cfg, typed)
+		if err != nil {
+			t.Fatalf("NewProvider(facebook) = %v", err)
+		}
+		fp, ok := p.(*FacebookProvider)
+		if !ok {
+			t.Fatalf("type = %T; want *FacebookProvider", p)
+		}
+		if fp.cfg.GraphVersion != "v20.0" {
+			t.Errorf("GraphVersion = %q; want v20.0", fp.cfg.GraphVersion)
+		}
+	})
+
 	t.Run("deferred and unknown reject with 404", func(t *testing.T) {
 		t.Parallel()
-		for _, id := range []string{"discord", "microsoft", "facebook", ""} {
+		for _, id := range []string{"slack", "gitlab", "twitch", "unknown", ""} {
 			p, err := NewProvider(id, cfg)
 			if p != nil {
 				t.Errorf("NewProvider(%q) provider = %v; want nil", id, p)
@@ -81,6 +132,86 @@ func TestNewProvider(t *testing.T) {
 			if appErr.HTTPStatus() != http.StatusNotFound {
 				t.Errorf("NewProvider(%q) status = %d; want 404", id, appErr.HTTPStatus())
 			}
+		}
+	})
+}
+
+func TestNewProviderPropagatesAuthoritySettings(t *testing.T) {
+	t.Parallel()
+
+	t.Run("microsoft tenant, allowlist and jwks ttl reach the adapter", func(t *testing.T) {
+		t.Parallel()
+		p, err := NewProvider("microsoft", config.ProviderConfig{
+			ClientID:       "ms-id",
+			ClientSecret:   "ms-secret",
+			RedirectURL:    "https://app.example.com/cb",
+			Tenant:         "tenant-guid",
+			TrustedTenants: []string{"partner-guid"},
+			JWKSCacheTTL:   2 * time.Hour,
+		})
+		if err != nil {
+			t.Fatalf("NewProvider(microsoft) = %v", err)
+		}
+		ms, ok := p.(*MicrosoftProvider)
+		if !ok {
+			t.Fatalf("provider type = %T; want *MicrosoftProvider", p)
+		}
+		if ms.cfg.Tenant != "tenant-guid" {
+			t.Errorf("cfg.Tenant = %q; want tenant-guid", ms.cfg.Tenant)
+		}
+		if _, ok := ms.trustedTenants["partner-guid"]; !ok {
+			t.Errorf("trustedTenants = %v; want partner-guid", ms.trustedTenants)
+		}
+		if ms.jwksMgr.ttl != 2*time.Hour {
+			t.Errorf("jwks ttl = %v; want 2h", ms.jwksMgr.ttl)
+		}
+		if !strings.Contains(ms.authURL, "/tenant-guid/") {
+			t.Errorf("authURL = %q; want tenant-guid authority", ms.authURL)
+		}
+	})
+
+	t.Run("microsoft empty tenant keeps common and no allowlist", func(t *testing.T) {
+		t.Parallel()
+		p, err := NewProvider("microsoft", config.ProviderConfig{
+			ClientID:     "ms-id",
+			ClientSecret: "ms-secret",
+			RedirectURL:  "https://app.example.com/cb",
+		})
+		if err != nil {
+			t.Fatalf("NewProvider(microsoft) = %v", err)
+		}
+		ms := p.(*MicrosoftProvider)
+		if !strings.Contains(ms.authURL, "/common/") {
+			t.Errorf("authURL = %q; want common authority", ms.authURL)
+		}
+		if len(ms.trustedTenants) != 0 {
+			t.Errorf("trustedTenants = %v; want empty (no allowlist)", ms.trustedTenants)
+		}
+		if ms.jwksMgr.ttl != 24*time.Hour {
+			t.Errorf("jwks ttl = %v; want 24h default", ms.jwksMgr.ttl)
+		}
+	})
+
+	t.Run("facebook graph version reaches the adapter", func(t *testing.T) {
+		t.Parallel()
+		p, err := NewProvider("facebook", config.ProviderConfig{
+			ClientID:     "fb-id",
+			ClientSecret: "fb-secret",
+			RedirectURL:  "https://app.example.com/cb",
+			GraphVersion: "v20.0",
+		})
+		if err != nil {
+			t.Fatalf("NewProvider(facebook) = %v", err)
+		}
+		fb, ok := p.(*FacebookProvider)
+		if !ok {
+			t.Fatalf("provider type = %T; want *FacebookProvider", p)
+		}
+		if fb.cfg.GraphVersion != "v20.0" {
+			t.Errorf("cfg.GraphVersion = %q; want v20.0", fb.cfg.GraphVersion)
+		}
+		if !strings.Contains(fb.authURL, "/v20.0/") {
+			t.Errorf("authURL = %q; want v20.0 graph version", fb.authURL)
 		}
 	})
 }

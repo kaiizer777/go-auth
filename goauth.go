@@ -128,23 +128,28 @@ func NewWithStore(store db.Store, cfg config.Config) (*Auth, error) {
 
 	sessHandler := handler.NewSessionHandlerWithStore(sessionSvc, store, &cfg)
 
-	providers := make(map[string]oauth.Provider)
+	registry := oauth.NewRegistry()
+	enabled := 0
 	for id, pcfg := range cfg.OAuth.Providers {
 		if !pcfg.Enabled {
 			continue
 		}
-		p, err := oauth.NewProvider(id, pcfg)
+		p, err := oauth.NewProvider(id, pcfg, &cfg.OAuth)
 		if err != nil {
 			close(limiterDone)
 			return nil, err
 		}
-		providers[id] = p
+		if err := registry.Register(p); err != nil {
+			close(limiterDone)
+			return nil, err
+		}
+		enabled++
 	}
 	var oauthSvc oauth.Service
 	var oauthOpt handler.Option
-	if len(providers) > 0 {
-		oauthSvc = oauth.NewServiceWithStore(store, sessionSvc, providers, &cfg)
-		oauthOpt = handler.WithOAuthService(oauthSvc, providers)
+	if enabled > 0 {
+		oauthSvc = oauth.NewServiceWithRegistry(store, sessionSvc, registry, &cfg)
+		oauthOpt = handler.WithOAuthRegistry(oauthSvc, registry)
 	}
 
 	var totpSvc totp.Service
@@ -208,6 +213,24 @@ func NewWithStore(store db.Store, cfg config.Config) (*Auth, error) {
 		limiterDone:     limiterDone,
 	}
 	return a, nil
+}
+
+// newOAuthProviders instantiates every enabled entry of the resolved provider
+// config. cfg must have passed Config.Validate, which merges the typed sections
+// into cfg.Providers and applies defaults.
+func newOAuthProviders(cfg config.OAuthConfig) (map[string]oauth.Provider, error) {
+	providers := make(map[string]oauth.Provider, len(cfg.Providers))
+	for id, pcfg := range cfg.Providers {
+		if !pcfg.Enabled {
+			continue
+		}
+		p, err := oauth.NewProvider(id, pcfg)
+		if err != nil {
+			return nil, err
+		}
+		providers[id] = p
+	}
+	return providers, nil
 }
 
 // NewWithDB initializes Auth using an existing GORM database connection.

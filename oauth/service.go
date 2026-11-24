@@ -33,11 +33,50 @@ type Service interface {
 	HandleCallback(ctx context.Context, w http.ResponseWriter, r *http.Request, providerID, code, state string, sessType db.SessionType) (*session.Session, string, string, error)
 }
 
+// RateLimitError wraps an upstream rate limit with its Retry-After duration in seconds.
+type RateLimitError struct {
+	RetryAfter int
+	Err        error
+}
+
+func (e *RateLimitError) Error() string {
+	if e.Err != nil {
+		return e.Err.Error()
+	}
+	return "oauth provider rate limit exceeded"
+}
+
+func (e *RateLimitError) Unwrap() error {
+	if e.Err != nil {
+		return e.Err
+	}
+	return errors.ErrOAuthRateLimitExceeded
+}
+
+// RetryAfterFromError extracts the retry-after duration in seconds if err is or wraps RateLimitError.
+func RetryAfterFromError(err error) (int, bool) {
+	var rle *RateLimitError
+	if stderrors.As(err, &rle) && rle.RetryAfter > 0 {
+		return rle.RetryAfter, true
+	}
+	return 0, false
+}
+
 type service struct {
 	store      db.Store
 	sessionSvc session.Service
+	registry   Registry
 	providers  map[string]Provider
 	cfg        *config.Config
+}
+
+// NewServiceWithRegistry wires the OAuth linking engine using an abstract db.Store and dynamic Registry.
+func NewServiceWithRegistry(store db.Store, sessionSvc session.Service, registry Registry, cfg *config.Config) Service {
+	if cfg == nil {
+		defaultCfg := config.DefaultConfig()
+		cfg = &defaultCfg
+	}
+	return &service{store: store, sessionSvc: sessionSvc, registry: registry, cfg: cfg}
 }
 
 // NewServiceWithStore wires the OAuth linking engine using an abstract db.Store.
@@ -75,11 +114,96 @@ func (s *service) providerFor(providerID string) (Provider, error) {
 	if _, ok := SupportedProviders[providerID]; !ok {
 		return nil, errors.ErrOAuthProviderNotFound
 	}
-	p, ok := s.providers[providerID]
-	if !ok || p == nil {
-		return nil, errors.ErrOAuthProviderNotFound
+	if s.registry != nil {
+		p, err := s.registry.Get(providerID)
+		if err == nil && p != nil {
+			return p, nil
+		}
 	}
-	return p, nil
+	if s.providers != nil {
+		if p, ok := s.providers[providerID]; ok && p != nil {
+			return p, nil
+		}
+	}
+	return nil, errors.ErrOAuthProviderNotFound
+}
+
+// linkQueryParam is the explicit link signal on the initiate URL. A bare
+// login initiation never embeds the ambient session user; only ?link=true
+// resolves the signed-in user into the state payload.
+const linkQueryParam = "link"
+
+// linkIntentRequested reports explicit account-link intent for an initiation.
+// Link is opt-in per login: ambient credentials alone never trigger it.
+func linkIntentRequested(r *http.Request) bool {
+	if r == nil || r.URL == nil {
+		return false
+	}
+	return r.URL.Query().Get(linkQueryParam) == "true"
+}
+
+// resolveLinkUserID resolves the signed-in user for an explicit link
+// initiation. Absent, invalid, or expired sessions yield "" so the flow
+// degrades to plain login; store failures are hard errors so an explicit
+// link never silently becomes a registration.
+func (s *service) resolveLinkUserID(r *http.Request) (string, error) {
+	if s.sessionSvc == nil {
+		return "", errors.New(errors.CodeInternalError, "oauth link requires session service", nil)
+	}
+	var rawID string
+	if r.Header.Get("Authorization") != "" {
+		rawID, _ = session.ReadBearerToken(r)
+	} else {
+		rawID, _ = session.ReadSessionCookie(r, s.cfg)
+	}
+	if rawID != "" {
+		sess, gerr := s.sessionSvc.GetSession(r.Context(), rawID)
+		if gerr != nil {
+			var appErr *errors.Error
+			if errors.As(gerr, &appErr) && appErr.Code() == errors.CodeInternalError {
+				return "", errors.New(errors.CodeInternalError, "failed to resolve session for link", gerr)
+			}
+			return "", nil
+		}
+		if sess != nil && sess.UserID != uuid.Nil {
+			return sess.UserID.String(), nil
+		}
+		return "", nil
+	}
+	if v := r.Context().Value("user_id"); v != nil {
+		switch id := v.(type) {
+		case string:
+			return id, nil
+		case uuid.UUID:
+			if id != uuid.Nil {
+				return id.String(), nil
+			}
+		}
+	}
+	return "", nil
+}
+
+// checkLinkOwnerAlive distinguishes a lapsed session from a vanished owner
+// when a callback carries link intent but no live session resolves. A living
+// owner degrades to a plain login (nil); a missing owner fails closed with
+// ErrOAuthAccountNotLinked and a broken store with a 500, mirroring the
+// active-session branch of linkOrCreate.
+func (s *service) checkLinkOwnerAlive(ctx context.Context, activeUserID string) error {
+	uid, perr := uuid.Parse(activeUserID)
+	if perr != nil {
+		return errors.ErrOAuthAccountNotLinked
+	}
+	owner, uerr := s.store.Users().GetByID(ctx, uid)
+	if uerr != nil {
+		if errors.Is(uerr, gorm.ErrRecordNotFound) || errors.Is(uerr, errors.ErrUserNotFound) {
+			return errors.ErrOAuthAccountNotLinked
+		}
+		return errors.New(errors.CodeInternalError, "failed to load linking user", uerr)
+	}
+	if owner == nil {
+		return errors.ErrOAuthAccountNotLinked
+	}
+	return nil
 }
 
 // InitiateFlow generates PKCE, persists verifier+state in the signed state
@@ -96,15 +220,28 @@ func (s *service) InitiateFlow(w http.ResponseWriter, r *http.Request, providerI
 	if err != nil {
 		return "", err
 	}
+	nonce, err := GenerateNonce()
+	if err != nil {
+		return "", err
+	}
 	redirect := ""
 	logCtx := context.Background()
 	ip, ua := clientIP(r), ""
+	var activeUserID string
 	if r != nil {
 		redirect = r.URL.Query().Get("redirect_url")
 		logCtx = r.Context()
 		ua = r.UserAgent()
+
+		if linkIntentRequested(r) {
+			uid, lerr := s.resolveLinkUserID(r)
+			if lerr != nil {
+				return "", lerr
+			}
+			activeUserID = uid
+		}
 	}
-	state, err := SetStateCookie(w, s.cfg, providerID, pkce.Verifier, redirect)
+	state, err := SetStateCookieWithUserAndNonce(w, s.cfg, providerID, pkce.Verifier, redirect, activeUserID, nonce)
 	if err != nil {
 		return "", err
 	}
@@ -113,6 +250,9 @@ func (s *service) InitiateFlow(w http.ResponseWriter, r *http.Request, providerI
 		"ip", ip,
 		"user_agent", ua,
 	)
+	if _, ok := p.(OIDCProvider); ok {
+		return p.AuthCodeURL(state, pkce.Challenge, NonceOption(nonce)), nil
+	}
 	return p.AuthURL(state, pkce.Challenge), nil
 }
 
@@ -174,14 +314,60 @@ func (s *service) HandleCallback(ctx context.Context, w http.ResponseWriter, r *
 	if info == nil {
 		return fail("email_unverified", errors.ErrOAuthEmailUnverified)
 	}
+	// OIDC replay control: re-verify the ID token against the state-stored
+	// nonce. Providers already verified the signature inside FetchUserInfo;
+	// this second pass binds the token to this login. Empty nonces (states
+	// issued before nonce support, or token-only fallbacks) skip the check.
+	if oidc, ok := p.(OIDCProvider); ok && payload.Nonce != "" && tokens.IDToken != "" {
+		if _, verr := oidc.VerifyIDToken(ctx, tokens.IDToken, payload.Nonce); verr != nil {
+			return fail("idtoken_invalid", verr)
+		}
+	}
 
-	user, linked, created, err := s.linkOrCreate(ctx, providerID, info)
+	activeUserID := payload.UserID
+	if activeUserID != "" {
+		// Never link on the embedded value alone: a planted state cookie
+		// would attach the victim's provider identity to the attacker's
+		// account. Re-resolve the live session and require equality. A
+		// missing session falls back to plain login; a different session
+		// rejects the callback.
+		live, rerr := s.resolveLinkUserID(r)
+		if rerr != nil {
+			return fail("session_failed", rerr)
+		}
+		if live == "" {
+			if activeUserID != "" {
+				// The initiation embedded an explicit link owner but no live
+				// session resolves now. A lapsed session for a living owner
+				// degrades to a plain login; a vanished owner fails closed
+				// instead of minting an email-based login for an owner
+				// nobody selected.
+				if verr := s.checkLinkOwnerAlive(ctx, activeUserID); verr != nil {
+					return fail("link_owner_gone", verr)
+				}
+				activeUserID = ""
+			}
+		} else if live != activeUserID {
+			return fail("link_conflict", errors.ErrOAuthAccountAlreadyLinked)
+		}
+	}
+
+	user, linked, created, err := s.linkOrCreate(ctx, providerID, info, activeUserID)
 	if err != nil {
 		// Gate sentinels map to their historical literal reasons before the
 		// code-derived fallback, which stays the producer of UPPER_SNAKE
 		// reasons such as OAUTH_ACCOUNT_LINK_CONFLICT.
+		if errors.Is(err, errors.ErrOAuthEmailRequired) {
+			return fail("email_required", err)
+		}
 		if errors.Is(err, errors.ErrOAuthEmailUnverified) {
 			return fail("email_unverified", err)
+		}
+		if errors.Is(err, errors.ErrOAuthTenantInvalid) {
+			return fail("tenant_invalid", err)
+		}
+		if errors.Is(err, errors.ErrOAuthAccountLinkConflict) {
+			return fail(string(errors.CodeOAuthAccountLinkConflict), err)
 		}
 		if errors.Is(err, errOAuthProviderIdentityInvalid) {
 			return fail("userinfo_invalid", err)
@@ -296,6 +482,9 @@ const providerFieldMaxLen = 255
 // resolve a local account by email. Order is load-bearing: an unverified
 // identity reports OAUTH_EMAIL_UNVERIFIED before any field-validity rejection.
 func validateProviderIdentity(info *UserInfo) error {
+	if strings.TrimSpace(info.Email) == "" {
+		return errors.ErrOAuthEmailRequired
+	}
 	if !info.EmailVerified {
 		return errors.ErrOAuthEmailUnverified
 	}
@@ -369,7 +558,11 @@ func (s *service) insertLink(ctx context.Context, accountStore db.OAuthAccountSt
 // linkExisting attaches the provider identity to owner. Losing the unique race
 // converges on the winner's row, which reports linked=false.
 func (s *service) linkExisting(ctx context.Context, owner db.User, providerID string, info *UserInfo) (db.User, bool, error) {
-	if err := s.insertLink(ctx, s.store.OAuthAccounts(), owner.ID, providerID, info.ProviderUserID, info.Email); err != nil {
+	email := info.Email
+	if email == "" {
+		email = owner.Email
+	}
+	if err := s.insertLink(ctx, s.store.OAuthAccounts(), owner.ID, providerID, info.ProviderUserID, email); err != nil {
 		if errors.Is(err, errLinkConflict) {
 			user, _, _, rerr := s.relinkExisting(ctx, providerID, info.ProviderUserID)
 			return user, false, rerr
@@ -477,17 +670,70 @@ func (s *service) createUserAndLink(ctx context.Context, providerID string, info
 // whether an oauth_accounts row was inserted and whether the user was created.
 // Concurrent duplicate callbacks converge idempotently: a unique-constraint
 // loss re-reads the winner instead of 500ing.
-func (s *service) linkOrCreate(ctx context.Context, providerID string, info *UserInfo) (db.User, bool, bool, error) {
+func (s *service) linkOrCreate(ctx context.Context, providerID string, info *UserInfo, activeUserID string) (db.User, bool, bool, error) {
+	// 1. Returning user check: if linked by (provider_id, provider_user_id), return owner
 	if user, found, err := s.linkedUser(ctx, providerID, info.ProviderUserID); found || err != nil {
+		if found && activeUserID != "" {
+			if user.ID.String() != activeUserID {
+				return db.User{}, false, false, errors.ErrOAuthAccountAlreadyLinked
+			}
+		}
 		return user, false, false, err
 	}
 
-	// The identity fields become the account key, so validate them before the
-	// email lookup, the link row, or the user row are written.
+	// 2. Microsoft "nOauth" defense: fail closed on untrusted external tenants.
+	// Runs before the active-session branch so a signed-in callback cannot
+	// persist an attacker-tenant identity onto the victim's account, while
+	// identities linked before this guard existed (step 1) keep signing in
+	// instead of being locked out.
+	if isUntrusted, _ := info.RawClaims["untrusted_tenant"].(bool); isUntrusted {
+		return db.User{}, false, false, errors.ErrOAuthTenantInvalid
+	}
+
+	// 3. Active session explicit linking: link provider to currently authenticated session user.
+	// Fail closed: an unresolvable link owner never falls through to registration.
+	if activeUserID != "" {
+		uid, parseErr := uuid.Parse(activeUserID)
+		if parseErr != nil {
+			// A selected user that cannot be resolved must never fall through:
+			// the email path would bind the identity to whoever owns the
+			// provider address (or create a fresh account) instead of the
+			// requested owner.
+			return db.User{}, false, false, errors.ErrOAuthAccountNotLinked
+		}
+		owner, uerr := s.store.Users().GetByID(ctx, uid)
+		if uerr != nil {
+			if errors.Is(uerr, gorm.ErrRecordNotFound) || errors.Is(uerr, errors.ErrUserNotFound) {
+				return db.User{}, false, false, errors.ErrOAuthAccountNotLinked
+			}
+			return db.User{}, false, false, errors.New(errors.CodeInternalError, "failed to load linking user", uerr)
+		}
+		// Store is pluggable: (nil, nil) violates the miss contract but must
+		// fail closed rather than panic on the dereference below.
+		if owner == nil {
+			return db.User{}, false, false, errors.ErrOAuthAccountNotLinked
+		}
+		if info.ProviderUserID == "" || len(info.ProviderUserID) > providerFieldMaxLen {
+			return db.User{}, false, false, errOAuthProviderIdentityInvalid
+		}
+		user, linked, lerr := s.linkExisting(ctx, *owner, providerID, info)
+		if lerr != nil {
+			return db.User{}, false, false, lerr
+		}
+		// Losing the insert race converges on the winning row; handing back a
+		// foreign owner would mint their session for this flow.
+		if user.ID != owner.ID {
+			return db.User{}, false, false, errors.ErrOAuthAccountAlreadyLinked
+		}
+		return user, linked, false, nil
+	}
+
+	// 4. Validate provider identity for unauthenticated registration (requires verified email)
 	if gerr := validateProviderIdentity(info); gerr != nil {
 		return db.User{}, false, false, gerr
 	}
 
+	// 5. Existing local user check by verified email
 	existing, err := s.findUserByEmail(ctx, info.Email)
 	if err == nil {
 		// Pre-hijacking defense: never link onto an unverified local account.

@@ -3,6 +3,7 @@ package oauth
 import (
 	"bytes"
 	"context"
+	stderrors "errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -41,6 +42,10 @@ func (f *stubProvider) ID() string { return f.id }
 
 func (f *stubProvider) AuthURL(state, codeChallenge string) string {
 	return "https://provider.example/auth?state=" + state + "&code_challenge=" + codeChallenge
+}
+
+func (f *stubProvider) AuthCodeURL(state, codeChallenge string, _ ...AuthCodeOption) string {
+	return f.AuthURL(state, codeChallenge)
 }
 
 func (f *stubProvider) ExchangeCode(_ context.Context, code, codeVerifier string) (*TokenResponse, error) {
@@ -173,6 +178,41 @@ func callbackRequest(state string, cookie *http.Cookie) (*httptest.ResponseRecor
 	req := httptest.NewRequest(http.MethodGet, "/auth/oauth/google/callback", nil)
 	req.AddCookie(cookie)
 	return rec, req
+}
+
+// callbackRequestWithSession extends callbackRequest with the live session
+// cookie. The callback re-resolves the signed-in user and only honours the
+// state's link owner on equality, so link tests must present the session.
+func callbackRequestWithSession(state string, cookie *http.Cookie, cfg *config.Config, rawSession string) (*httptest.ResponseRecorder, *http.Request) {
+	rec, req := callbackRequest(state, cookie)
+	req.AddCookie(&http.Cookie{Name: cfg.SessionCookieName, Value: rawSession})
+	return rec, req
+}
+
+// initiateLinked starts a flow for an authenticated user so the state cookie
+// carries activeUserID exactly as a real account-link request does. The
+// ?link=true intent is required: since the hardening gate, ambient sessions
+// alone never embed a link owner.
+func initiateLinked(t *testing.T, svc Service, cfg *config.Config, providerID, rawSession string) (string, *http.Cookie) {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/auth/oauth/"+providerID+"?link=true", nil)
+	req.AddCookie(&http.Cookie{Name: cfg.SessionCookieName, Value: rawSession})
+	authURL, err := svc.InitiateFlow(rec, req, providerID)
+	if err != nil {
+		t.Fatalf("InitiateFlow = %v", err)
+	}
+	u, err := url.Parse(authURL)
+	if err != nil {
+		t.Fatalf("parse authURL: %v", err)
+	}
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == cfg.OAuth.StateCookieName {
+			return u.Query().Get("state"), c
+		}
+	}
+	t.Fatalf("no %q cookie issued", cfg.OAuth.StateCookieName)
+	return "", nil
 }
 
 func countRows(t *testing.T, database *gorm.DB, model any) int64 {
@@ -649,6 +689,295 @@ func TestHandleCallbackLinking(t *testing.T) {
 	})
 }
 
+func TestHandleCallbackActiveSessionLinking(t *testing.T) {
+	// Provider emails in this block all differ from the active user's address:
+	// a shared address would let email matching hide a broken owner lookup.
+	t.Run("vanished owner fails closed instead of linking by provider email", func(t *testing.T) {
+		database, cfg, _, svc := setupServiceTest(t, &UserInfo{
+			ProviderID: "google", ProviderUserID: "sub-orphan",
+			Email: "provider-owner@personal.example", EmailVerified: true,
+		})
+		ctx := context.Background()
+		sessSvc := session.NewService(database, cfg)
+		active := db.User{ID: uuid.New(), Email: "active@work.example", PasswordHash: "hash", EmailVerified: true}
+		other := db.User{ID: uuid.New(), Email: "provider-owner@personal.example", PasswordHash: "hash", EmailVerified: true}
+		for _, u := range []db.User{active, other} {
+			if err := database.Create(&u).Error; err != nil {
+				t.Fatalf("seed user: %v", err)
+			}
+		}
+		_, rawSession, err := sessSvc.CreateSession(ctx, active.ID, active.CredentialVersion, db.SessionTypeCookie, "127.0.0.1", "ua")
+		if err != nil {
+			t.Fatalf("create session: %v", err)
+		}
+		state, stateCookie := initiateLinked(t, svc, cfg, "google", rawSession)
+		// Hard delete between initiate and callback: the linked owner is gone.
+		if err := database.Delete(&db.User{}, "id = ?", active.ID).Error; err != nil {
+			t.Fatalf("delete active user: %v", err)
+		}
+		rec, req := callbackRequestWithSession(state, stateCookie, cfg, rawSession)
+		sess, _, _, err := svc.HandleCallback(ctx, rec, req, "google", "code-1", state, db.SessionTypeCookie)
+		if sess != nil {
+			t.Fatalf("session issued for %v; want none", sess.UserID)
+		}
+		requireCode(t, err, errors.CodeOAuthAccountNotLinked, http.StatusNotFound)
+		// Merge premise (oauth sync): the callback's live-session re-resolution
+		// prunes the dangling pre-created session (missing_user_at_read), so no
+		// session row survives; no session was minted and the provider identity
+		// stayed unlinked.
+		requireIdentityRows(t, database, 1, 0, 0)
+	})
+
+	t.Run("non-uuid active user id fails closed", func(t *testing.T) {
+		database, _, _, rawSvc := setupServiceTest(t, nil)
+		info := &UserInfo{ProviderID: "google", ProviderUserID: "sub-bad-id",
+			Email: "provider-owner@personal.example", EmailVerified: true}
+		_, _, _, err := rawSvc.(*service).linkOrCreate(context.Background(), "google", info, "not-a-uuid")
+		requireCode(t, err, errors.CodeOAuthAccountNotLinked, http.StatusNotFound)
+		requireIdentityRows(t, database, 0, 0, 0)
+	})
+
+	t.Run("store failure stays a domain error", func(t *testing.T) {
+		_, _, _, rawSvc := setupServiceTest(t, nil)
+		base := rawSvc.(*service).store
+		broken := &failingGetByIDStore{
+			Store: base,
+			users: &failingGetByIDUserStore{UserStore: base.Users(), err: stderrors.New("dial tcp: connection refused")},
+		}
+		svc := NewServiceWithStore(broken, nil, nil, serviceTestConfig()).(*service)
+		_, _, _, err := svc.linkOrCreate(context.Background(), "google", verifiedInfo(), uuid.New().String())
+		requireCode(t, err, errors.CodeInternalError, http.StatusInternalServerError)
+	})
+
+	t.Run("nil user from store fails closed", func(t *testing.T) {
+		_, _, _, rawSvc := setupServiceTest(t, nil)
+		base := rawSvc.(*service).store
+		svc := NewServiceWithStore(&wrappedTxStore{
+			Store: base,
+			users: nilUserStore{UserStore: base.Users()},
+		}, nil, nil, serviceTestConfig()).(*service)
+		_, _, _, err := svc.linkOrCreate(context.Background(), "google", verifiedInfo(), uuid.New().String())
+		requireCode(t, err, errors.CodeOAuthAccountNotLinked, http.StatusNotFound)
+	})
+
+	t.Run("provider email differing from the active user links to the active user", func(t *testing.T) {
+		database, cfg, _, svc := setupServiceTest(t, &UserInfo{
+			ProviderID: "google", ProviderUserID: "sub-active",
+			Email: "provider-owner@personal.example", EmailVerified: true,
+		})
+		ctx := context.Background()
+		sessSvc := session.NewService(database, cfg)
+		active := db.User{ID: uuid.New(), Email: "active@work.example", PasswordHash: "hash", EmailVerified: true}
+		if err := database.Create(&active).Error; err != nil {
+			t.Fatalf("seed user: %v", err)
+		}
+		_, rawSession, err := sessSvc.CreateSession(ctx, active.ID, active.CredentialVersion, db.SessionTypeCookie, "127.0.0.1", "ua")
+		if err != nil {
+			t.Fatalf("create session: %v", err)
+		}
+		state, stateCookie := initiateLinked(t, svc, cfg, "google", rawSession)
+		rec, req := callbackRequestWithSession(state, stateCookie, cfg, rawSession)
+		sess, _, _, err := svc.HandleCallback(ctx, rec, req, "google", "code-1", state, db.SessionTypeCookie)
+		if err != nil {
+			t.Fatalf("HandleCallback = %v", err)
+		}
+		if sess.UserID != active.ID {
+			t.Fatalf("session user = %v; want active user %v", sess.UserID, active.ID)
+		}
+		var link db.OAuthAccount
+		if err := database.Where("provider_id = ? AND provider_user_id = ?", "google", "sub-active").First(&link).Error; err != nil {
+			t.Fatalf("load link: %v", err)
+		}
+		if link.UserID != active.ID {
+			t.Fatalf("link owner = %v; want %v", link.UserID, active.ID)
+		}
+	})
+}
+
+// failingGetByIDStore swaps the user store so GetByID can fail like a dead DB link.
+type failingGetByIDStore struct {
+	db.Store
+	users db.UserStore
+}
+
+func (f *failingGetByIDStore) Users() db.UserStore { return f.users }
+
+type failingGetByIDUserStore struct {
+	db.UserStore
+	err error
+}
+
+func (f *failingGetByIDUserStore) GetByID(context.Context, uuid.UUID) (*db.User, error) {
+	return nil, f.err
+}
+
+// nilUserStore returns (nil, nil) for GetByID: Store is a pluggable interface,
+// so a third-party implementation may violate the miss contract.
+type nilUserStore struct{ db.UserStore }
+
+func (nilUserStore) GetByID(context.Context, uuid.UUID) (*db.User, error) { return nil, nil }
+
+// gatedMissLinkStore reports a miss for its first `remaining` GetByProvider
+// probes, holding each caller until release closes. Both concurrent callbacks
+// therefore clear the already-linked branch before either can insert.
+type gatedMissLinkStore struct {
+	db.OAuthAccountStore
+	remaining atomic.Int32
+	conflicts atomic.Int32
+	arrived   chan struct{}
+	release   chan struct{}
+}
+
+func (g *gatedMissLinkStore) GetByProvider(ctx context.Context, providerID, providerUserID string) (*db.OAuthAccount, error) {
+	if g.remaining.Add(-1) < 0 {
+		return g.OAuthAccountStore.GetByProvider(ctx, providerID, providerUserID)
+	}
+	g.arrived <- struct{}{}
+	<-g.release
+	return nil, gorm.ErrRecordNotFound
+}
+
+func (g *gatedMissLinkStore) Create(ctx context.Context, a *db.OAuthAccount) error {
+	err := g.OAuthAccountStore.Create(ctx, a)
+	if isUniqueViolation(err) {
+		g.conflicts.Add(1)
+	}
+	return err
+}
+
+// hideFirstLinkStore hides an existing link from the first GetByProvider probe,
+// so the callback skips the already-linked branch and loses the insert race.
+type hideFirstLinkStore struct {
+	db.OAuthAccountStore
+	hidden bool
+}
+
+func (h *hideFirstLinkStore) GetByProvider(ctx context.Context, providerID, providerUserID string) (*db.OAuthAccount, error) {
+	if h.hidden {
+		h.hidden = false
+		return nil, gorm.ErrRecordNotFound
+	}
+	return h.OAuthAccountStore.GetByProvider(ctx, providerID, providerUserID)
+}
+
+func TestHandleCallbackLinkConflictForeignOwner(t *testing.T) {
+	database, cfg, stub, rawSvc := setupServiceTest(t, &UserInfo{
+		ProviderID: "google", ProviderUserID: "sub-conflict",
+		Email: "provider-owner@personal.example", EmailVerified: true,
+	})
+	ctx := context.Background()
+	sessSvc := session.NewService(database, cfg)
+	active := db.User{ID: uuid.New(), Email: "active@work.example", PasswordHash: "hash", EmailVerified: true}
+	foreign := db.User{ID: uuid.New(), Email: "foreign@personal.example", PasswordHash: "hash", EmailVerified: true}
+	for _, u := range []db.User{active, foreign} {
+		if err := database.Create(&u).Error; err != nil {
+			t.Fatalf("seed user: %v", err)
+		}
+	}
+	won := db.OAuthAccount{ID: uuid.New(), UserID: foreign.ID, ProviderID: "google",
+		ProviderUserID: "sub-conflict", Email: foreign.Email}
+	if err := database.Create(&won).Error; err != nil {
+		t.Fatalf("seed link: %v", err)
+	}
+	_, rawSession, err := sessSvc.CreateSession(ctx, active.ID, active.CredentialVersion, db.SessionTypeCookie, "127.0.0.1", "ua")
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	base := rawSvc.(*service).store
+	svc := NewServiceWithStore(&wrappedTxStore{
+		Store: base,
+		oauth: &hideFirstLinkStore{OAuthAccountStore: base.OAuthAccounts(), hidden: true},
+	}, sessSvc, map[string]Provider{"google": stub}, cfg)
+
+	state, stateCookie := initiateLinked(t, svc, cfg, "google", rawSession)
+	rec, req := callbackRequestWithSession(state, stateCookie, cfg, rawSession)
+	sess, _, _, err := svc.HandleCallback(ctx, rec, req, "google", "code-1", state, db.SessionTypeCookie)
+	if sess != nil {
+		t.Fatalf("session issued for %v; want none for the foreign owner", sess.UserID)
+	}
+	requireCode(t, err, errors.CodeOAuthAccountAlreadyLinked, http.StatusConflict)
+	requireIdentityRows(t, database, 2, 1, 1)
+	var link db.OAuthAccount
+	if err := database.Where("provider_id = ? AND provider_user_id = ?", "google", "sub-conflict").First(&link).Error; err != nil {
+		t.Fatalf("load link: %v", err)
+	}
+	if link.UserID != foreign.ID {
+		t.Fatalf("link owner = %v; want untouched %v", link.UserID, foreign.ID)
+	}
+}
+
+func TestHandleCallbackLinkConflictSameOwnerConverges(t *testing.T) {
+	database, cfg, stub, rawSvc := setupServiceTest(t, &UserInfo{
+		ProviderID: "google", ProviderUserID: "sub-same-owner",
+		Email: "provider-owner@personal.example", EmailVerified: true,
+	})
+	ctx := context.Background()
+	sessSvc := session.NewService(database, cfg)
+	active := db.User{ID: uuid.New(), Email: "active@work.example", PasswordHash: "hash", EmailVerified: true}
+	if err := database.Create(&active).Error; err != nil {
+		t.Fatalf("seed user: %v", err)
+	}
+	_, rawSession, err := sessSvc.CreateSession(ctx, active.ID, active.CredentialVersion, db.SessionTypeCookie, "127.0.0.1", "ua")
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	base := rawSvc.(*service).store
+	gate := &gatedMissLinkStore{
+		OAuthAccountStore: base.OAuthAccounts(),
+		arrived:           make(chan struct{}, 2),
+		release:           make(chan struct{}),
+	}
+	gate.remaining.Store(2)
+	svc := NewServiceWithStore(&wrappedTxStore{Store: base, oauth: gate},
+		sessSvc, map[string]Provider{"google": stub}, cfg)
+
+	states := make([]string, 2)
+	cookies := make([]*http.Cookie, 2)
+	for i := range states {
+		states[i], cookies[i] = initiateLinked(t, svc, cfg, "google", rawSession)
+	}
+	type outcome struct {
+		userID uuid.UUID
+		err    error
+	}
+	results := make([]outcome, len(states))
+	var wg sync.WaitGroup
+	for i := range states {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			rec, req := callbackRequestWithSession(states[i], cookies[i], cfg, rawSession)
+			sess, _, _, err := svc.HandleCallback(req.Context(), rec, req, "google", "code-1", states[i], db.SessionTypeCookie)
+			if sess != nil {
+				results[i].userID = sess.UserID
+			}
+			results[i].err = err
+		}(i)
+	}
+	// Hold both callbacks at their first link probe until both have arrived, so
+	// one insert wins and the other takes the conflict-recovery path.
+	<-gate.arrived
+	<-gate.arrived
+	close(gate.release)
+	wg.Wait()
+	if n := gate.conflicts.Load(); n != 1 {
+		t.Fatalf("unique conflicts = %d; want 1 (loser must take the relink path)", n)
+	}
+
+	for i, r := range results {
+		if r.err != nil {
+			t.Fatalf("callback %d: %v; want same-owner convergence", i, r.err)
+		}
+		if r.userID != active.ID {
+			t.Fatalf("callback %d session user = %v; want %v", i, r.userID, active.ID)
+		}
+	}
+	// One active-user session plus one per callback; both linked to the owner.
+	requireIdentityRows(t, database, 1, 1, 3)
+}
+
 func TestHandleCallbackNilGuards(t *testing.T) {
 	t.Run("nil request tolerated on initiate", func(t *testing.T) {
 		t.Parallel()
@@ -707,7 +1036,7 @@ func TestLinkOrCreateConcurrent(t *testing.T) {
 			wg.Add(1)
 			go func(i int) {
 				defer wg.Done()
-				u, _, _, err := svc.linkOrCreate(context.Background(), "google", info)
+				u, _, _, err := svc.linkOrCreate(context.Background(), "google", info, "")
 				outs[i] = outcome{u, err}
 			}(i)
 		}
@@ -1192,6 +1521,236 @@ func TestService_CreateUserAndLink_RetryIsolation(t *testing.T) {
 		}
 		if !strings.Contains(err.Error(), "disk full during oauth link") {
 			t.Fatalf("expected underlying error 'disk full during oauth link', got: %v", err)
+		}
+	})
+}
+
+func TestOAuthService_X_MissingEmail(t *testing.T) {
+	database := serviceTestDB(t)
+	cfg := serviceTestConfig()
+
+	xInfo := &UserInfo{
+		ProviderID:     "x",
+		ProviderUserID: "x-user-999",
+		Email:          "",
+		EmailVerified:  false,
+		Name:           "X User",
+		AvatarURL:      "https://example.com/avatar.png",
+	}
+
+	stub := &stubProvider{id: "x", info: xInfo}
+	svc := NewService(database, session.NewService(database, cfg),
+		map[string]Provider{"x": stub}, cfg)
+
+	t.Run("unauthenticated registration with missing email fails closed", func(t *testing.T) {
+		state, cookie := mustInitiate(t, svc, cfg, "x")
+		req := httptest.NewRequest(http.MethodGet, "/auth/oauth/x/callback", nil)
+		req.AddCookie(cookie)
+		rec := httptest.NewRecorder()
+
+		_, _, _, err := svc.HandleCallback(context.Background(), rec, req, "x", "test-code", state, db.SessionTypeCookie)
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+		if !errors.Is(err, errors.ErrOAuthEmailRequired) {
+			t.Fatalf("expected ErrOAuthEmailRequired, got %v", err)
+		}
+
+		// Invariant: zero synthetic users or link rows created in database
+		var userCount, linkCount int64
+		if err := database.Model(&db.User{}).Count(&userCount).Error; err != nil {
+			t.Fatalf("count users: %v", err)
+		}
+		if err := database.Model(&db.OAuthAccount{}).Count(&linkCount).Error; err != nil {
+			t.Fatalf("count links: %v", err)
+		}
+		if userCount != 0 {
+			t.Fatalf("expected 0 users created, got %d", userCount)
+		}
+		if linkCount != 0 {
+			t.Fatalf("expected 0 links created, got %d", linkCount)
+		}
+	})
+
+	t.Run("returning user with pre-linked account succeeds without email", func(t *testing.T) {
+		owner := seedLinkedIdentity(t, database, "x", "x-user-999")
+
+		state, cookie := mustInitiate(t, svc, cfg, "x")
+		req := httptest.NewRequest(http.MethodGet, "/auth/oauth/x/callback", nil)
+		req.AddCookie(cookie)
+		rec := httptest.NewRecorder()
+
+		sess, rawID, _, err := svc.HandleCallback(context.Background(), rec, req, "x", "test-code", state, db.SessionTypeCookie)
+		if err != nil {
+			t.Fatalf("unexpected callback error: %v", err)
+		}
+		if sess == nil || rawID == "" {
+			t.Fatal("expected valid session and token")
+		}
+		if sess.UserID != owner.ID {
+			t.Fatalf("sess.UserID = %v; want %v", sess.UserID, owner.ID)
+		}
+	})
+
+	t.Run("active session links provider account without email", func(t *testing.T) {
+		sessSvc := session.NewService(database, cfg)
+		user := db.User{
+			ID:            uuid.New(),
+			Email:         "active-session-user@example.com",
+			EmailVerified: true,
+		}
+		if err := database.Create(&user).Error; err != nil {
+			t.Fatalf("create user: %v", err)
+		}
+
+		sess, rawToken, err := sessSvc.CreateSession(context.Background(), user.ID, 0, db.SessionTypeCookie, "127.0.0.1", "ua")
+		if err != nil {
+			t.Fatalf("create session: %v", err)
+		}
+		if sess == nil || rawToken == "" {
+			t.Fatal("session required")
+		}
+
+		initReq := httptest.NewRequest(http.MethodGet, "/auth/oauth/x?link=true", nil)
+		initReq.AddCookie(&http.Cookie{
+			Name:  cfg.SessionCookieName,
+			Value: rawToken,
+		})
+		initRec := httptest.NewRecorder()
+
+		activeStub := &stubProvider{id: "x", info: &UserInfo{ProviderID: "x", ProviderUserID: "x-active-user-123", Email: ""}}
+		activeSvc := NewService(database, sessSvc, map[string]Provider{"x": activeStub}, cfg)
+
+		authURL, err := activeSvc.InitiateFlow(initRec, initReq, "x")
+		if err != nil {
+			t.Fatalf("initiate flow failed: %v", err)
+		}
+		if authURL == "" {
+			t.Fatal("expected non-empty auth url")
+		}
+
+		var stateCookie *http.Cookie
+		for _, c := range initRec.Result().Cookies() {
+			if c.Name == cfg.OAuth.StateCookieName {
+				stateCookie = c
+				break
+			}
+		}
+		if stateCookie == nil {
+			t.Fatal("state cookie required")
+		}
+
+		// Extract state query param from authURL
+		u, err := url.Parse(authURL)
+		if err != nil {
+			t.Fatalf("parse auth url: %v", err)
+		}
+		state := u.Query().Get("state")
+
+		cbReq := httptest.NewRequest(http.MethodGet, "/auth/oauth/x/callback?code=valid-code&state="+state, nil)
+		cbReq.AddCookie(stateCookie)
+		cbReq.AddCookie(&http.Cookie{Name: cfg.SessionCookieName, Value: rawToken})
+		cbRec := httptest.NewRecorder()
+
+		cbSess, _, _, err := activeSvc.HandleCallback(context.Background(), cbRec, cbReq, "x", "valid-code", state, db.SessionTypeCookie)
+		if err != nil {
+			t.Fatalf("callback failed for active user link: %v", err)
+		}
+		if cbSess.UserID != user.ID {
+			t.Fatalf("expected session user %v, got %v", user.ID, cbSess.UserID)
+		}
+
+		// Verify oauth_accounts link was created
+		var count int64
+		if err := database.Model(&db.OAuthAccount{}).Where("provider_id = ? AND user_id = ?", "x", user.ID).Count(&count).Error; err != nil {
+			t.Fatalf("count links: %v", err)
+		}
+		if count != 1 {
+			t.Fatalf("expected 1 link for user, got %d", count)
+		}
+	})
+
+	t.Run("untrusted tenant token is rejected with ErrOAuthTenantInvalid", func(t *testing.T) {
+		sessSvc := session.NewService(database, cfg)
+		// Mock profile carrying untrusted_tenant claim
+		untrustedInfo := &UserInfo{
+			ProviderID:     "microsoft",
+			ProviderUserID: "ms-untrusted-sub",
+			Email:          "victim@example.com",
+			EmailVerified:  false,
+			Name:           "Untrusted Tenant User",
+			RawClaims: map[string]any{
+				"untrusted_tenant": true,
+			},
+		}
+		mockMS := &stubProvider{
+			id:   "microsoft",
+			info: untrustedInfo,
+		}
+		msSvc := NewService(database, sessSvc, map[string]Provider{"microsoft": mockMS}, cfg)
+
+		state, cookie := mustInitiate(t, msSvc, cfg, "microsoft")
+		req := httptest.NewRequest(http.MethodGet, "/auth/oauth/microsoft/callback", nil)
+		req.AddCookie(cookie)
+		rec := httptest.NewRecorder()
+
+		_, _, _, err := msSvc.HandleCallback(context.Background(), rec, req, "microsoft", "code", state, db.SessionTypeCookie)
+		if !errors.Is(err, errors.ErrOAuthTenantInvalid) {
+			t.Fatalf("expected ErrOAuthTenantInvalid, got %v", err)
+		}
+	})
+}
+
+func TestHandleCallbackActiveSessionUntrustedTenant(t *testing.T) {
+	t.Run("signed-in link with untrusted tenant fails closed", func(t *testing.T) {
+		t.Parallel()
+		database, cfg, _, _ := setupServiceTest(t, verifiedInfo())
+		sessSvc := session.NewService(database, cfg)
+		user := db.User{ID: uuid.New(), Email: "victim@example.com", PasswordHash: "hash", EmailVerified: true}
+		if err := database.Create(&user).Error; err != nil {
+			t.Fatalf("create user: %v", err)
+		}
+		_, rawToken, err := sessSvc.CreateSession(context.Background(), user.ID, 0, db.SessionTypeCookie, "127.0.0.1", "ua")
+		if err != nil {
+			t.Fatalf("create session: %v", err)
+		}
+		untrusted := &stubProvider{id: "microsoft", info: &UserInfo{
+			ProviderID: "microsoft", ProviderUserID: "ms-attacker-sub",
+			Email: "victim@example.com", EmailVerified: true, Name: "Attacker",
+			RawClaims: map[string]any{"untrusted_tenant": true},
+		}}
+		svc := NewService(database, sessSvc, map[string]Provider{"microsoft": untrusted}, cfg)
+
+		initReq := httptest.NewRequest(http.MethodGet, "/auth/oauth/microsoft?link=true", nil)
+		initReq.AddCookie(&http.Cookie{Name: cfg.SessionCookieName, Value: rawToken})
+		initRec := httptest.NewRecorder()
+		authURL, err := svc.InitiateFlow(initRec, initReq, "microsoft")
+		if err != nil {
+			t.Fatalf("initiate flow failed: %v", err)
+		}
+		u, err := url.Parse(authURL)
+		if err != nil {
+			t.Fatalf("parse auth url: %v", err)
+		}
+		state := u.Query().Get("state")
+		var stateCookie *http.Cookie
+		for _, c := range initRec.Result().Cookies() {
+			if c.Name == cfg.OAuth.StateCookieName {
+				stateCookie = c
+			}
+		}
+		if stateCookie == nil {
+			t.Fatal("state cookie required")
+		}
+		cbReq := httptest.NewRequest(http.MethodGet, "/auth/oauth/microsoft/callback", nil)
+		cbReq.AddCookie(stateCookie)
+		cbReq.AddCookie(&http.Cookie{Name: cfg.SessionCookieName, Value: rawToken})
+		_, _, _, err = svc.HandleCallback(context.Background(), httptest.NewRecorder(), cbReq, "microsoft", "code-1", state, db.SessionTypeCookie)
+		if !errors.Is(err, errors.ErrOAuthTenantInvalid) {
+			t.Fatalf("expected ErrOAuthTenantInvalid, got %v", err)
+		}
+		if n := countRows(t, database, &db.OAuthAccount{}); n != 0 {
+			t.Fatalf("oauth_accounts = %d; want 0", n)
 		}
 	})
 }

@@ -37,6 +37,11 @@ func (p *GitHubProvider) ID() string { return "github" }
 
 // AuthURL builds the GitHub authorization URL with PKCE S256 parameters.
 func (p *GitHubProvider) AuthURL(state, codeChallenge string) string {
+	return p.AuthCodeURL(state, codeChallenge)
+}
+
+// AuthCodeURL builds the GitHub authorization URL with options.
+func (p *GitHubProvider) AuthCodeURL(state, codeChallenge string, opts ...AuthCodeOption) string {
 	q := url.Values{}
 	q.Set("client_id", p.cfg.ClientID)
 	q.Set("redirect_uri", p.cfg.RedirectURL)
@@ -44,6 +49,7 @@ func (p *GitHubProvider) AuthURL(state, codeChallenge string) string {
 	q.Set("state", state)
 	q.Set("code_challenge", codeChallenge)
 	q.Set("code_challenge_method", "S256")
+	applyAuthCodeOptions(q, opts)
 	return p.authURL + "?" + q.Encode()
 }
 

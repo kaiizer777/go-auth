@@ -42,6 +42,18 @@ type ProviderConfig struct {
 	TeamID     string // 10-character Apple Developer Team ID
 	KeyID      string // 10-character Apple Developer Key ID
 	PrivateKey string // PEM-encoded PKCS#8 ECDSA private key (.p8 content)
+
+	// Authority settings shared across adapters; currently consumed only by
+	// Microsoft Entra ID. Empty Tenant and non-positive JWKSCacheTTL fall back
+	// to provider defaults ("common" / 24h); empty TrustedTenants means no
+	// allowlist, not deny-all.
+	Tenant         string        `json:"tenant,omitempty"`
+	TrustedTenants []string      `json:"trusted_tenants,omitempty"`
+	JWKSCacheTTL   time.Duration `json:"jwks_cache_ttl,omitempty"`
+
+	// GraphVersion pins the Facebook Graph API version (e.g. "v19.0"); ignored
+	// by every other adapter.
+	GraphVersion string `json:"graph_version,omitempty"`
 }
 
 // LogValue implements slog.LogValuer to ensure ClientSecret and PrivateKey are masked in logs.
@@ -63,6 +75,10 @@ func (p ProviderConfig) LogValue() slog.Value {
 		slog.String("team_id", p.TeamID),
 		slog.String("key_id", p.KeyID),
 		slog.String("private_key", keyMasked),
+		slog.String("tenant", p.Tenant),
+		slog.Any("trusted_tenants", p.TrustedTenants),
+		slog.Duration("jwks_cache_ttl", p.JWKSCacheTTL),
+		slog.String("graph_version", p.GraphVersion),
 	)
 }
 
@@ -77,18 +93,69 @@ func (p ProviderConfig) String() string {
 
 // OAuthConfig groups configurations for all external identity providers.
 type OAuthConfig struct {
-	// Providers maps provider ID ("google", "github", "apple") to provider configuration.
+	// Providers maps provider ID ("google", "github", "apple", "microsoft") to provider configuration.
+	// Validate merges the typed sections below into this map and applies provider
+	// defaults there, so after validation this map is the authoritative source.
 	Providers       map[string]ProviderConfig
-	StateCookieName string        // Default: "oauth_state"
-	StateCookiePath string        // Default: "/" (ensures cookies are sent on /auth/oauth/* and /api/auth/oauth/*)
-	StateTTL        time.Duration // Default: 10 * time.Minute
-	StateSecret     string        // Required when any OAuth provider is enabled; empty fails closed at startup. Min 32 bytes.
-	CallbackBaseURL string        // e.g. "https://api.example.com"
+	Microsoft       *MicrosoftConfig `json:"microsoft,omitempty"`
+	Facebook        *FacebookConfig  `json:"facebook,omitempty"`
+	Discord         *DiscordConfig   `json:"discord,omitempty"`
+	X               *XConfig         `json:"x,omitempty"`
+	StateCookieName string           // Default: "oauth_state"
+	StateCookiePath string           // Default: "/" (ensures cookies are sent on /auth/oauth/* and /api/auth/oauth/*)
+	StateTTL        time.Duration    // Default: 10 * time.Minute
+	StateSecret     string           // Required when any OAuth provider is enabled; empty fails closed at startup. Min 32 bytes.
+	CallbackBaseURL string           // e.g. "https://api.example.com"
 	// StateCookieSameSite is the base SameSite policy for the OAuth state
 	// cookie on GET-redirect flows. Default: Lax. form_post providers (Apple)
 	// always escalate to None+Secure regardless, since browsers withhold Lax
 	// on cross-site POST navigations.
 	StateCookieSameSite http.SameSite
+}
+
+// LogValue implements slog.LogValuer to ensure StateSecret and nested provider secrets are redacted.
+func (o OAuthConfig) LogValue() slog.Value {
+	secretMasked := "[REDACTED]"
+	if o.StateSecret == "" {
+		secretMasked = ""
+	}
+	providerAttrs := make([]slog.Attr, 0, len(o.Providers))
+	for name, provider := range o.Providers {
+		providerAttrs = append(providerAttrs, slog.Any(name, provider.LogValue()))
+	}
+	attrs := []slog.Attr{
+		slog.String("state_secret", secretMasked),
+		slog.String("state_cookie_name", o.StateCookieName),
+		slog.String("state_cookie_path", o.StateCookiePath),
+		slog.Duration("state_ttl", o.StateTTL),
+		slog.String("callback_base_url", o.CallbackBaseURL),
+	}
+	if len(providerAttrs) > 0 {
+		attrs = append(attrs, slog.Attr{Key: "providers", Value: slog.GroupValue(providerAttrs...)})
+	}
+	if o.Microsoft != nil {
+		attrs = append(attrs, slog.Any("microsoft", o.Microsoft.LogValue()))
+	}
+	if o.Facebook != nil {
+		attrs = append(attrs, slog.Any("facebook", o.Facebook.LogValue()))
+	}
+	if o.Discord != nil {
+		attrs = append(attrs, slog.Any("discord", o.Discord.LogValue()))
+	}
+	if o.X != nil {
+		attrs = append(attrs, slog.Any("x", o.X.LogValue()))
+	}
+	return slog.GroupValue(attrs...)
+}
+
+// String implements fmt.Stringer to ensure StateSecret is masked when printed.
+func (o OAuthConfig) String() string {
+	secret := "[REDACTED]"
+	if o.StateSecret == "" {
+		secret = ""
+	}
+	return fmt.Sprintf("OAuthConfig{Providers: %v, Microsoft: %v, Facebook: %v, Discord: %v, X: %v, StateSecret: %s, CallbackBaseURL: %s}",
+		o.Providers, o.Microsoft, o.Facebook, o.Discord, o.X, secret, o.CallbackBaseURL)
 }
 
 // SecurityHeadersConfig groups HTTP security header policies.
@@ -676,10 +743,8 @@ func (c *Config) Validate() error {
 	// verify across replicas and restarts, which a per-process fallback key
 	// cannot do. With no providers enabled OAuth is inert and empty stays valid.
 	if c.OAuth.StateSecret == "" {
-		for _, provider := range c.OAuth.Providers {
-			if provider.Enabled {
-				return errors.ErrOAuthStateSecretRequired
-			}
+		if c.OAuth.anyProviderEnabled() {
+			return errors.ErrOAuthStateSecretRequired
 		}
 	} else if len(c.OAuth.StateSecret) < 32 {
 		return errors.ErrOAuthStateSecretTooShort
@@ -699,7 +764,7 @@ func (c *Config) Validate() error {
 	}
 	for id, provider := range c.OAuth.Providers {
 		switch id {
-		case "google", "github", "apple":
+		case "google", "github", "apple", "microsoft", "discord", "facebook", "x":
 		default:
 			return errors.ErrOAuthProviderUnknown
 		}
@@ -713,7 +778,7 @@ func (c *Config) Validate() error {
 			return errors.ErrOAuthRedirectURLRequired
 		}
 		switch id {
-		case "google", "github":
+		case "google", "github", "microsoft", "discord", "facebook", "x":
 			if provider.ClientSecret == "" {
 				return errors.ErrOAuthClientSecretRequired
 			}
@@ -722,6 +787,100 @@ func (c *Config) Validate() error {
 				(provider.TeamID == "" || provider.KeyID == "" || provider.PrivateKey == "") {
 				return errors.ErrOAuthClientSecretRequired
 			}
+		}
+	}
+
+	if c.OAuth.Microsoft != nil {
+		if c.OAuth.Microsoft.ClientID == "" {
+			return errors.ErrOAuthClientIDRequired
+		}
+		if c.OAuth.Microsoft.ClientSecret == "" {
+			return errors.ErrOAuthClientSecretRequired
+		}
+		if c.OAuth.Microsoft.RedirectURI == "" {
+			return errors.ErrOAuthRedirectURLRequired
+		}
+		// Merge rule: typed defaults materialise only without a map entry for
+		// this provider. A pre-merge "common"/scope/TTL default reads as an
+		// explicit typed value and would otherwise shadow explicit map config.
+		_, msMapEntry := c.OAuth.Providers["microsoft"]
+		tenant := strings.ToLower(strings.TrimSpace(c.OAuth.Microsoft.Tenant))
+		if tenant == "" && !msMapEntry {
+			tenant = "common"
+		}
+		c.OAuth.Microsoft.Tenant = tenant
+		switch tenant {
+		case "", "common", "organizations", "consumers":
+		default:
+			if !isMicrosoftTenantRef(tenant) {
+				return errors.WrapOverride(errors.ErrOAuthTenantInvalid, errors.CodeInvalidConfig, "oauth microsoft tenant is invalid: "+tenant)
+			}
+		}
+		trusted := make([]string, 0, len(c.OAuth.Microsoft.TrustedTenants))
+		for _, t := range c.OAuth.Microsoft.TrustedTenants {
+			if t = strings.ToLower(strings.TrimSpace(t)); t != "" {
+				trusted = append(trusted, t)
+			}
+		}
+		c.OAuth.Microsoft.TrustedTenants = trusted
+		if len(c.OAuth.Microsoft.Scopes) == 0 && !msMapEntry {
+			c.OAuth.Microsoft.Scopes = []string{"openid", "profile", "email", "offline_access"}
+		}
+		if c.OAuth.Microsoft.JWKSCacheTTL == 0 && !msMapEntry {
+			c.OAuth.Microsoft.JWKSCacheTTL = 24 * time.Hour
+		}
+	}
+
+	if c.OAuth.Discord != nil {
+		if c.OAuth.Discord.ClientID == "" {
+			return errors.ErrOAuthClientIDRequired
+		}
+		if c.OAuth.Discord.ClientSecret == "" {
+			return errors.ErrOAuthClientSecretRequired
+		}
+		if c.OAuth.Discord.RedirectURI == "" {
+			return errors.ErrOAuthRedirectURLRequired
+		}
+	}
+
+	if c.OAuth.Facebook != nil {
+		if c.OAuth.Facebook.AppID == "" {
+			return errors.ErrOAuthClientIDRequired
+		}
+		if c.OAuth.Facebook.AppSecret == "" {
+			return errors.ErrOAuthClientSecretRequired
+		}
+		if c.OAuth.Facebook.RedirectURI == "" {
+			return errors.ErrOAuthRedirectURLRequired
+		}
+	}
+
+	if c.OAuth.X != nil {
+		if c.OAuth.X.ClientID == "" {
+			return errors.ErrOAuthClientIDRequired
+		}
+		if c.OAuth.X.ClientSecret == "" {
+			return errors.ErrOAuthClientSecretRequired
+		}
+		if c.OAuth.X.RedirectURI == "" {
+			return errors.ErrOAuthRedirectURLRequired
+		}
+		// Same merge rule as Microsoft above: no pre-merge default when a map
+		// entry carries explicit scopes.
+		_, xMapEntry := c.OAuth.Providers["x"]
+		if len(c.OAuth.X.Scopes) == 0 && !xMapEntry {
+			c.OAuth.X.Scopes = []string{"users.read"}
+		}
+	}
+
+	// Resolve after the per-surface credential checks: defaults are applied once,
+	// to the merged result, so no default can overwrite explicit map or typed
+	// configuration. The graph version only matters on the merged entry, so it is
+	// validated here — one check for both surfaces.
+	c.OAuth.resolveProviders()
+	if fb, ok := c.OAuth.Providers["facebook"]; ok {
+		if err := validateGraphVersion(fb.GraphVersion); err != nil {
+			return err
 		}
 	}
 
@@ -822,6 +981,23 @@ func isToken(s string) bool {
 	return true
 }
 
+// validateGraphVersion accepts an empty value (defaulted after the merge) and
+// requires the "v" prefix with a numeric part of at least 19.0, below which
+// Facebook no longer serves the OAuth dialog.
+func validateGraphVersion(version string) error {
+	if version == "" {
+		return nil
+	}
+	if !strings.HasPrefix(version, "v") {
+		return errors.ErrOAuthGraphVersionInvalid
+	}
+	ver, err := strconv.ParseFloat(strings.TrimPrefix(version, "v"), 64)
+	if err != nil || ver < 19.0 {
+		return errors.ErrOAuthGraphVersionInvalid
+	}
+	return nil
+}
+
 func isCookiePath(s string) bool {
 	if s == "" || s[0] != '/' {
 		return false
@@ -858,7 +1034,15 @@ var (
 	dsnSecretRegex       = regexp.MustCompile(`(?i)\b(password|pass|token|secret|api_key|apikey|sslpassword)\b(\s*=\s*)(?:'(?:\\.|[^'\\])*'|"(?:\\.|[^"\\])*"|\S+)`)
 	userinfoRegex        = regexp.MustCompile(`://([^:]+):([^@]+)@`)
 	mysqlUserinfoRegex   = regexp.MustCompile(`(^|[^\w/])([a-zA-Z0-9_\-\.]+):(.+)@((?:tcp|unix)\([^\)]+\)|[a-zA-Z0-9_\-\.]*\/|$)`)
+	tenantGUIDRegex      = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+	tenantDomainRegex    = regexp.MustCompile(`^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}$`)
 )
+
+// isMicrosoftTenantRef reports whether tenant is a GUID or domain name.
+// Callers must lowercase tenant first; named authorities are handled separately.
+func isMicrosoftTenantRef(tenant string) bool {
+	return tenantGUIDRegex.MatchString(tenant) || tenantDomainRegex.MatchString(tenant)
+}
 
 func isSecretParam(k string) bool {
 	switch strings.ToLower(k) {

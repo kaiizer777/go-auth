@@ -7,6 +7,7 @@ import (
 	stderrors "errors"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -467,6 +468,63 @@ func TestNew_SuccessAndWiring(t *testing.T) {
 	// Verify Close cleans up cleanly
 	if err := a.Close(); err != nil {
 		t.Fatalf("a.Close() unexpected err = %v", err)
+	}
+}
+
+func TestNew_OAuthRegistryWiring(t *testing.T) {
+	sqliteDB, err := gorm.Open(sqlite.Open("file::memory:?cache=shared"), &gorm.Config{
+		DisableAutomaticPing: true,
+	})
+	if err != nil {
+		t.Fatalf("failed to open sqlite db: %v", err)
+	}
+	t.Cleanup(func() {
+		if sqlDB, errDB := sqliteDB.DB(); errDB == nil {
+			_ = sqlDB.Close()
+		}
+	})
+	store := gormstore.New(sqliteDB)
+
+	cfg := config.DefaultConfig()
+	cfg.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+	cfg.BaseURL = "https://auth.example.com"
+	cfg.OAuth.StateSecret = "test-state-secret-at-least-32-bytes!"
+	cfg.OAuth.Providers = map[string]config.ProviderConfig{
+		"microsoft": {
+			ClientID:     "ms-client-id",
+			ClientSecret: "ms-client-secret",
+			RedirectURL:  "https://auth.example.com/auth/oauth/microsoft/callback",
+			Enabled:      true,
+		},
+	}
+	cfg.OAuth.Microsoft = &config.MicrosoftConfig{
+		ClientID:     "ms-client-id",
+		ClientSecret: "ms-client-secret",
+		Tenant:       "organizations",
+		RedirectURI:  "https://auth.example.com/auth/oauth/microsoft/callback",
+	}
+
+	a, err := NewWithStore(store, cfg)
+	if err != nil {
+		t.Fatalf("NewWithStore unexpected err = %v", err)
+	}
+	t.Cleanup(func() { _ = a.Close() })
+	if a.OAuthService() == nil {
+		t.Fatal("expected non-nil OAuth service for enabled provider")
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/auth/oauth/microsoft", nil)
+	authURL, err := a.OAuthService().InitiateFlow(rec, req, "microsoft")
+	if err != nil {
+		t.Fatalf("InitiateFlow(microsoft) unexpected err = %v", err)
+	}
+	if !strings.Contains(authURL, "/organizations/") {
+		t.Errorf("authURL = %q; want organizations authority from typed config", authURL)
+	}
+
+	if _, err := a.OAuthService().InitiateFlow(rec, req, "slack"); err == nil {
+		t.Error("InitiateFlow(slack) expected error, got nil")
 	}
 }
 
