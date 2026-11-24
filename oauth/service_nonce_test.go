@@ -127,6 +127,9 @@ func TestInitiateFlowNonce(t *testing.T) {
 		if err != nil {
 			t.Fatalf("parse authURL: %v", err)
 		}
+		if u.Host != "login.microsoftonline.com" || u.Path != "/common/oauth2/v2.0/authorize" {
+			t.Fatalf("authorize endpoint = %q%s; want tenant /common endpoint", u.Host, u.Path)
+		}
 		urlNonce := u.Query().Get("nonce")
 		if urlNonce == "" {
 			t.Fatalf("authorize URL missing nonce: %q", authURL)
