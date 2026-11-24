@@ -2114,6 +2114,55 @@ func TestMicrosoftProvider_KeyIssuerBinding(t *testing.T) {
 	})
 }
 
+// TestMicrosoftProvider_ConsumersAuthorityBindsTIDToIssuer pins the issuer↔tid
+// binding for the consumers authority: the consumer issuer alone must not admit
+// a token whose tid names an organisation tenant.
+func TestMicrosoftProvider_ConsumersAuthorityBindsTIDToIssuer(t *testing.T) {
+	privKey, nRaw, eRaw := generateTestRSAKey(t)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(JWKDoc{Keys: []JWKKey{{
+			Kty: "RSA", Use: "sig", Kid: "ms-key-1", Alg: "RS256", N: nRaw, E: eRaw,
+		}}})
+	}))
+	defer server.Close()
+
+	p := NewMicrosoftProvider(config.MicrosoftConfig{
+		ClientID:    "client-test-id",
+		Tenant:      "consumers",
+		RedirectURI: "https://example.com/callback",
+	})
+	p.client = server.Client()
+	p.jwksMgr = NewJWKSManager(server.URL, p.client, time.Hour)
+	p.jwksRetriever = p.jwksMgr
+
+	consumerIssuer := "https://login.microsoftonline.com/" + MicrosoftConsumerTenantGUID + "/v2.0"
+	mint := func(tid string) string {
+		return signRS256JWT(t, privKey, "ms-key-1", map[string]any{
+			"iss":   consumerIssuer,
+			"sub":   "sub-1",
+			"aud":   "client-test-id",
+			"exp":   time.Now().Add(10 * time.Minute).Unix(),
+			"email": "user@outlook.com",
+			"tid":   tid,
+		})
+	}
+
+	ctx := context.Background()
+	if _, err := p.VerifyIDToken(ctx, mint(MicrosoftConsumerTenantGUID), ""); err != nil {
+		t.Fatalf("consumer token rejected: %v", err)
+	}
+
+	_, err := p.VerifyIDToken(ctx, mint(otherTenantGUID), "")
+	if err == nil {
+		t.Fatal("consumers authority accepted a token whose tid names another tenant")
+	}
+	var appErr *errors.Error
+	if !errors.As(err, &appErr) || appErr.Code() != errors.CodeOAuthIDTokenInvalid {
+		t.Fatalf("error = %v; want code %q", err, errors.CodeOAuthIDTokenInvalid)
+	}
+}
+
 // TestMicrosoftProvider_StaleAllowlistEntryDoesNotBlockAdmittedTenant pins the
 // scope of per-login domain resolution: an allowlist entry that no longer
 // resolves must not decide the login of a tenant another entry admits. Map

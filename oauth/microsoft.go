@@ -431,6 +431,9 @@ func (p *MicrosoftProvider) verifyIssuer(authority, issuer, tenantID string) err
 		if issuer != expected {
 			return errors.New(errors.CodeOAuthIDTokenInvalid, fmt.Sprintf("invalid issuer %q for consumers authority mode, expected %q", issuer, expected), nil)
 		}
+		if normalizeTenant(tenantID) != MicrosoftConsumerTenantGUID {
+			return errors.New(errors.CodeOAuthIDTokenInvalid, "consumers authority mode requires the consumer tid", nil)
+		}
 	case "organizations":
 		if tenantID == "" || tenantID == MicrosoftConsumerTenantGUID {
 			return errors.New(errors.CodeOAuthIDTokenInvalid, "organizations authority mode rejects consumer accounts or missing tid", nil)
