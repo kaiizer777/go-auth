@@ -507,6 +507,8 @@ func TestMigrations_NoExplicitTransactionWrappers(t *testing.T) {
 		"migrations/000008_create_totp.down.sql",
 		"migrations/000009_add_oauth_account_verified.up.sql",
 		"migrations/000009_add_oauth_account_verified.down.sql",
+		"migrations/000010_resolve_microsoft_oid_links.up.sql",
+		"migrations/000010_resolve_microsoft_oid_links.down.sql",
 	}
 
 	for _, file := range files {
@@ -534,5 +536,27 @@ func TestRunMigrations_ConfiguresStatementTimeout(t *testing.T) {
 	src := string(data)
 	if !strings.Contains(src, "StatementTimeout: defaultMigrationTimeout") {
 		t.Fatal("runMigrations must configure StatementTimeout: defaultMigrationTimeout in pgmigrate.Config")
+	}
+}
+
+func TestMigration000010_DeduplicatesMicrosoftOIDLinks(t *testing.T) {
+	data, err := defaultMigrationsFS.ReadFile("migrations/000010_resolve_microsoft_oid_links.up.sql")
+	if err != nil {
+		t.Fatalf("failed to read migration 10 up: %v", err)
+	}
+	content := string(data)
+	if !strings.Contains(content, "DELETE FROM oauth_accounts") {
+		t.Fatal("migration 10 up must delete duplicate oauth_accounts")
+	}
+	if !strings.Contains(content, "provider_id = 'microsoft'") {
+		t.Fatal("migration 10 up must be scoped to microsoft provider")
+	}
+
+	downData, err := defaultMigrationsFS.ReadFile("migrations/000010_resolve_microsoft_oid_links.down.sql")
+	if err != nil {
+		t.Fatalf("failed to read migration 10 down: %v", err)
+	}
+	if len(downData) == 0 {
+		t.Fatal("migration 10 down file must exist")
 	}
 }

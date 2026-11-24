@@ -222,6 +222,10 @@ func Connect(cfg config.Config) (*MongoStore, error) {
 		_ = client.Disconnect(context.Background())
 		return nil, errors.Wrap(err, errors.CodeDatabaseError, "failed to backfill oauth account verification")
 	}
+	if err := BackfillMicrosoftOIDLinks(idxCtx, database); err != nil {
+		_ = client.Disconnect(context.Background())
+		return nil, errors.Wrap(err, errors.CodeDatabaseError, "failed to backfill microsoft oid links")
+	}
 
 	return New(client, database, cfg.MongoDB.AllowNonTransactionalMongo), nil
 }
@@ -702,6 +706,20 @@ func (s *oauthAccountStore) GetByUserID(ctx context.Context, userID uuid.UUID) (
 		accounts = append(accounts, docs[i].toDomain())
 	}
 	return accounts, nil
+}
+
+func (s *oauthAccountStore) UpdateProviderUserID(ctx context.Context, id uuid.UUID, providerUserID string) error {
+	res, err := s.collection().UpdateOne(s.store.resolveCtx(ctx),
+		bson.M{"_id": id.String()},
+		bson.M{"$set": bson.M{"provider_user_id": providerUserID, "updated_at": time.Now().UTC()}},
+	)
+	if err != nil {
+		return NormalizeMongoError(err)
+	}
+	if res.MatchedCount == 0 {
+		return gorm.ErrRecordNotFound
+	}
+	return nil
 }
 
 func (s *oauthAccountStore) Delete(ctx context.Context, id uuid.UUID) error {

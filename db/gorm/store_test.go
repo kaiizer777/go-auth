@@ -695,12 +695,21 @@ func TestOAuthAccountStore_AllMethods(t *testing.T) {
 		t.Fatalf("GetByUserID got %d items, err=%v", len(list), err)
 	}
 
-	// 4. Delete
+	// 4. UpdateProviderUserID
+	if err := oauth.UpdateProviderUserID(ctx, acc.ID, "gh_456_updated"); err != nil {
+		t.Fatalf("UpdateProviderUserID failed: %v", err)
+	}
+	gotUpdated, err := oauth.GetByProvider(ctx, "github", "gh_456_updated")
+	if err != nil || gotUpdated == nil || gotUpdated.ProviderUserID != "gh_456_updated" {
+		t.Fatalf("expected updated provider_user_id, got %v, err=%v", gotUpdated, err)
+	}
+
+	// 5. Delete
 	if err := oauth.Delete(ctx, acc.ID); err != nil {
 		t.Fatalf("Delete oauth account failed: %v", err)
 	}
 
-	// 5. DeleteByUserID
+	// 6. DeleteByUserID
 	acc2 := &db.OAuthAccount{
 		UserID:         userID,
 		ProviderID:     "google",

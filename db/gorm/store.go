@@ -251,6 +251,14 @@ func (s *oauthAccountStore) GetByUserID(ctx context.Context, userID uuid.UUID) (
 	return accounts, nil
 }
 
+func (s *oauthAccountStore) UpdateProviderUserID(ctx context.Context, id uuid.UUID, providerUserID string) error {
+	err := s.db.WithContext(ctx).Model(&db.OAuthAccount{}).Where("id = ?", id).Update("provider_user_id", providerUserID).Error
+	if err != nil {
+		return db.NormalizeMySQLError(err)
+	}
+	return nil
+}
+
 func (s *oauthAccountStore) Delete(ctx context.Context, id uuid.UUID) error {
 	return s.db.WithContext(ctx).Where("id = ?", id).Delete(&db.OAuthAccount{}).Error
 }

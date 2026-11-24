@@ -87,3 +87,80 @@ func BackfillOAuthAccountVerified(ctx context.Context, database *mongo.Database)
 	)
 	return nil
 }
+
+// microsoftOIDBackfillID is the schema_migrations marker of the data migration
+// that mirrors SQL migration 000010 for MongoDB.
+const microsoftOIDBackfillID = "000010_resolve_microsoft_oid_links"
+
+// BackfillMicrosoftOIDLinks deduplicates pre-switch Microsoft links where both
+// an oid-keyed row and a sub-keyed row exist for the same user, mirroring SQL
+// migration 000010.
+func BackfillMicrosoftOIDLinks(ctx context.Context, database *mongo.Database) error {
+	if database == nil {
+		return nil
+	}
+	markers := database.Collection("schema_migrations")
+	var marker bson.M
+	err := markers.FindOne(ctx, bson.M{"_id": microsoftOIDBackfillID}).Decode(&marker)
+	if err == nil {
+		return nil
+	}
+	if !stderrors.Is(err, mongo.ErrNoDocuments) {
+		return err
+	}
+
+	links := database.Collection("oauth_accounts")
+	pipeline := mongo.Pipeline{
+		{{Key: "$match", Value: bson.M{"provider_id": "microsoft"}}},
+		{{Key: "$sort", Value: bson.M{"created_at": -1}}},
+		{{Key: "$group", Value: bson.M{
+			"_id":   "$user_id",
+			"count": bson.M{"$sum": 1},
+			"docs":  bson.M{"$push": "$_id"},
+		}}},
+		{{Key: "$match", Value: bson.M{"count": bson.M{"$gt": 1}}}},
+	}
+	cursor, err := links.Aggregate(ctx, pipeline)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = cursor.Close(ctx) }()
+
+	var toDelete []string
+	for cursor.Next(ctx) {
+		var res struct {
+			Docs []string `bson:"docs"`
+		}
+		if derr := cursor.Decode(&res); derr != nil {
+			return derr
+		}
+		if len(res.Docs) > 1 {
+			toDelete = append(toDelete, res.Docs[1:]...)
+		}
+	}
+	if cerr := cursor.Err(); cerr != nil {
+		return cerr
+	}
+
+	deleted := int64(0)
+	if len(toDelete) > 0 {
+		dres, derr := links.DeleteMany(ctx, bson.M{"_id": bson.M{"$in": toDelete}})
+		if derr != nil {
+			return derr
+		}
+		deleted = dres.DeletedCount
+	}
+
+	if _, merr := markers.UpdateOne(ctx,
+		bson.M{"_id": microsoftOIDBackfillID},
+		bson.M{"$setOnInsert": bson.M{"applied_at": time.Now().UTC()}},
+		options.UpdateOne().SetUpsert(true),
+	); merr != nil {
+		return merr
+	}
+	slog.InfoContext(ctx, "microsoft_oid_backfill_applied",
+		"migration", microsoftOIDBackfillID,
+		"links_deleted", deleted,
+	)
+	return nil
+}

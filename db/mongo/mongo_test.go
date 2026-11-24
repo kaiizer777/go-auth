@@ -706,6 +706,56 @@ func TestBackfillOAuthAccountVerified(t *testing.T) {
 	}
 }
 
+func TestBackfillMicrosoftOIDLinks(t *testing.T) {
+	uri := os.Getenv("TEST_MONGO_URI")
+	if uri == "" {
+		t.Skip("TEST_MONGO_URI unset; skipping live MongoDB backfill test")
+	}
+	opts := options.Client().ApplyURI(uri)
+	client, err := mongo.Connect(opts)
+	if err != nil {
+		t.Fatalf("mongo.Connect failed: %v", err)
+	}
+	database := client.Database(fmt.Sprintf("goauth_test_ms_backfill_%s", strings.ReplaceAll(uuid.New().String(), "-", "")))
+	t.Cleanup(func() {
+		_ = database.Drop(context.Background())
+		_ = client.Disconnect(context.Background())
+	})
+	ctx := context.Background()
+
+	ownerID := uuid.New().String()
+	links := database.Collection("oauth_accounts")
+	olderOIDLink := uuid.New().String()
+	newerSubLink := uuid.New().String()
+	now := time.Now().UTC()
+	if _, err := links.InsertMany(ctx, []any{
+		bson.M{"_id": olderOIDLink, "user_id": ownerID, "provider_id": "microsoft",
+			"provider_user_id": "oid-guid-123", "email": "ms@example.com", "created_at": now.Add(-10 * time.Minute)},
+		bson.M{"_id": newerSubLink, "user_id": ownerID, "provider_id": "microsoft",
+			"provider_user_id": "sub-pairwise-456", "email": "ms@example.com", "created_at": now},
+	}); err != nil {
+		t.Fatalf("seed links: %v", err)
+	}
+
+	for run := 1; run <= 2; run++ {
+		if err := BackfillMicrosoftOIDLinks(ctx, database); err != nil {
+			t.Fatalf("run %d: %v", run, err)
+		}
+		// The older duplicate OID link should be removed, newer sub link preserved
+		var subDoc OAuthAccountDoc
+		if err := links.FindOne(ctx, bson.M{"_id": newerSubLink}).Decode(&subDoc); err != nil {
+			t.Fatalf("run %d: newer sub link missing: %v", run, err)
+		}
+		var oidDoc OAuthAccountDoc
+		if err := links.FindOne(ctx, bson.M{"_id": olderOIDLink}).Decode(&oidDoc); !errors.Is(err, mongo.ErrNoDocuments) {
+			t.Fatalf("run %d: older oid link must be deleted, err=%v", run, err)
+		}
+	}
+	if n, err := database.Collection("schema_migrations").CountDocuments(ctx, bson.M{"_id": microsoftOIDBackfillID}); err != nil || n != 1 {
+		t.Fatalf("migration marker rows = %d (err %v); want 1", n, err)
+	}
+}
+
 func TestUserStore_Delete_Cascade(t *testing.T) {
 	uri := os.Getenv("TEST_MONGO_URI")
 	if uri == "" {
@@ -929,6 +979,7 @@ func TestMongoStore_CanceledContext_AllMethods(t *testing.T) {
 	assertCanceled("OAuthAccounts.GetByProvider", err)
 	_, err = store.OAuthAccounts().GetByUserID(ctx, uid)
 	assertCanceled("OAuthAccounts.GetByUserID", err)
+	assertCanceled("OAuthAccounts.UpdateProviderUserID", store.OAuthAccounts().UpdateProviderUserID(ctx, acc.ID, "123_upd"))
 	assertCanceled("OAuthAccounts.Delete", store.OAuthAccounts().Delete(ctx, acc.ID))
 	assertCanceled("OAuthAccounts.DeleteByUserID", store.OAuthAccounts().DeleteByUserID(ctx, uid))
 

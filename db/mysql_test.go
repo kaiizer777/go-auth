@@ -57,8 +57,8 @@ func TestMySQLDefaultMigrationsEmbedded(t *testing.T) {
 		current = next
 	}
 
-	if count != 9 {
-		t.Fatalf("expected 9 mysql migration versions, found %d", count)
+	if count != 10 {
+		t.Fatalf("expected 10 mysql migration versions, found %d", count)
 	}
 }
 
@@ -505,5 +505,27 @@ func TestPrepareMySQLMigrationDSN_MultiStatements(t *testing.T) {
 	var appErr *errors.Error
 	if !errors.As(err, &appErr) || appErr.Code() != errors.CodeDatabaseError {
 		t.Fatalf("expected CodeDatabaseError, got: %v", err)
+	}
+}
+
+func TestMySQLMigration000010_DeduplicatesMicrosoftOIDLinks(t *testing.T) {
+	data, err := defaultMigrationsFS.ReadFile("migrations/mysql/000010_resolve_microsoft_oid_links.up.sql")
+	if err != nil {
+		t.Fatalf("failed to read mysql migration 10 up: %v", err)
+	}
+	content := string(data)
+	if !strings.Contains(content, "DELETE a FROM oauth_accounts a") {
+		t.Fatal("mysql migration 10 up must delete duplicate oauth_accounts")
+	}
+	if !strings.Contains(content, "a.provider_id = 'microsoft'") {
+		t.Fatal("mysql migration 10 up must be scoped to microsoft provider")
+	}
+
+	downData, err := defaultMigrationsFS.ReadFile("migrations/mysql/000010_resolve_microsoft_oid_links.down.sql")
+	if err != nil {
+		t.Fatalf("failed to read mysql migration 10 down: %v", err)
+	}
+	if len(downData) == 0 {
+		t.Fatal("mysql migration 10 down file must exist")
 	}
 }
