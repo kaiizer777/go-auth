@@ -257,7 +257,9 @@ func (s *service) InitiateFlow(w http.ResponseWriter, r *http.Request, providerI
 		"user_agent", ua,
 	)
 	if _, ok := p.(OIDCProvider); ok {
-		return p.AuthCodeURL(state, pkce.Challenge, NonceOption(nonce)), nil
+		if ac, ok := p.(AuthCodeURLProvider); ok {
+			return ac.AuthCodeURL(state, pkce.Challenge, NonceOption(nonce)), nil
+		}
 	}
 	return p.AuthURL(state, pkce.Challenge), nil
 }

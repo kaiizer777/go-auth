@@ -88,8 +88,8 @@ type OAuthUser struct {
 type UserInfo = OAuthUser
 
 // Provider defines the standard contract required for any OAuth2 / OIDC identity provider.
-// AuthURL is the option-free shortcut; AuthCodeURL carries provider-specific
-// authorization options such as the OIDC nonce.
+// AuthURL is the option-free authorization URL. Providers that additionally
+// accept per-login options expose AuthCodeURLProvider.
 type Provider interface {
 	// ID returns the canonical provider slug (e.g. "google", "github", "apple", "microsoft").
 	ID() string
@@ -97,14 +97,22 @@ type Provider interface {
 	// AuthURL constructs the provider authorization URL with PKCE challenge, state, and scopes.
 	AuthURL(state, codeChallenge string) string
 
-	// AuthCodeURL constructs the authorization redirect URL with state, PKCE challenge, and options.
-	AuthCodeURL(state, codeChallenge string, opts ...AuthCodeOption) string
-
 	// ExchangeCode exchanges an authorization code and PKCE code verifier for tokens.
 	ExchangeCode(ctx context.Context, code, codeVerifier string) (*OAuthToken, error)
 
 	// FetchUserInfo retrieves and normalizes user profile information using the granted tokens.
 	FetchUserInfo(ctx context.Context, tokens *OAuthToken) (*OAuthUser, error)
+}
+
+// AuthCodeURLProvider is the optional capability for providers that build the
+// authorization redirect with per-login options such as an OIDC nonce. Keeping
+// it out of Provider preserves source compatibility for implementers written
+// against the original contract; callers type-assert before using it.
+// Tenant-scoped providers (Microsoft) pin the tenant in the endpoint when the
+// provider is constructed, so the tenant travels through this same path.
+type AuthCodeURLProvider interface {
+	// AuthCodeURL constructs the authorization redirect URL with state, PKCE challenge, and options.
+	AuthCodeURL(state, codeChallenge string, opts ...AuthCodeOption) string
 }
 
 // OIDCProvider extends Provider for OpenID Connect compliant providers supporting ID token discovery & verification.

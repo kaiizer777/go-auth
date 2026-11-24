@@ -19,7 +19,11 @@ func TestAuthCodeURLReservedParamsGuarded(t *testing.T) {
 		if err != nil {
 			t.Fatalf("NewProvider(%q) = %v", id, err)
 		}
-		raw := p.AuthCodeURL("real-state", "real-challenge",
+		ac, ok := p.(AuthCodeURLProvider)
+		if !ok {
+			t.Fatalf("%s: provider does not implement AuthCodeURLProvider", id)
+		}
+		raw := ac.AuthCodeURL("real-state", "real-challenge",
 			AuthCodeOption{Key: "state", Value: "evil"},
 			AuthCodeOption{Key: "STATE", Value: "evil"},
 			AuthCodeOption{Key: "redirect_uri", Value: "https://evil.example/"},
