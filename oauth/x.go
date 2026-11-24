@@ -141,6 +141,18 @@ func parseXErrorWithHeader(statusCode int, body []byte, header http.Header) erro
 		if problem.Title != "" {
 			return errors.New(errors.CodeOAuthProviderError, "oauth provider request failed", errors.New(errors.CodeOAuthProviderError, "upstream title: "+problem.Title, nil))
 		}
+		// Some failures carry the only diagnostic in the nested error array,
+		// with no top-level title/detail. Keep it server-side on the cause.
+		for _, e := range problem.Errors {
+			detail := e.Message
+			if detail == "" {
+				detail = e.Detail
+			}
+			if detail != "" {
+				return errors.New(errors.CodeOAuthProviderError, "oauth provider request failed",
+					errors.New(errors.CodeOAuthProviderError, "upstream error: "+detail, nil))
+			}
+		}
 	}
 
 	return errors.New(errors.CodeOAuthProviderError, fmt.Sprintf("oauth provider responded with status %d", statusCode), nil)

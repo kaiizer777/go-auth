@@ -183,6 +183,17 @@ func TestXProvider_ExchangeCode(t *testing.T) {
 			})
 			return
 		}
+		if code == "nested-error-code" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"errors": []map[string]any{{
+					"message": "nested upstream diagnostic",
+					"status":  400,
+				}},
+			})
+			return
+		}
 		if code == "server-error" {
 			http.Error(w, "internal server error", http.StatusInternalServerError)
 			return
@@ -313,6 +324,23 @@ func TestXProvider_ExchangeCode(t *testing.T) {
 		}
 		if !strings.Contains(err.Error(), "Value passed for authorization code was invalid") {
 			t.Fatalf("expected the provider text preserved in the cause chain, got %v", err)
+		}
+	})
+
+	t.Run("nested error array keeps provider text out of the message", func(t *testing.T) {
+		_, err := p.ExchangeCode(context.Background(), "nested-error-code", "test-code-verifier")
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+		var appErr *errors.Error
+		if !errors.As(err, &appErr) || appErr.Code() != errors.CodeOAuthProviderError {
+			t.Fatalf("expected CodeOAuthProviderError, got %v", err)
+		}
+		if appErr.Message() != "oauth provider request failed" {
+			t.Fatalf("message = %q; want the generic message", appErr.Message())
+		}
+		if !strings.Contains(err.Error(), "nested upstream diagnostic") {
+			t.Fatalf("expected the nested diagnostic in the cause chain, got %v", err)
 		}
 	})
 
