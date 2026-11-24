@@ -1142,6 +1142,114 @@ func TestMicrosoftProvider_DomainOwnershipAttestation(t *testing.T) {
 	}
 }
 
+func TestMicrosoftProvider_ProviderUserIDConsistency(t *testing.T) {
+	privKey, nRaw, eRaw := generateTestRSAKey(t)
+
+	jwks := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(JWKDoc{Keys: []JWKKey{{
+			Kty: "RSA", Use: "sig", Kid: "ms-key-1", Alg: "RS256", N: nRaw, E: eRaw,
+		}}})
+	}))
+	defer jwks.Close()
+
+	var userinfoClaims atomic.Value
+	userinfo := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(userinfoClaims.Load())
+	}))
+	defer userinfo.Close()
+
+	newProvider := func(t *testing.T) *MicrosoftProvider {
+		t.Helper()
+		p := NewMicrosoftProvider(config.MicrosoftConfig{
+			ClientID:    "client-test-id",
+			Tenant:      "common",
+			RedirectURI: "https://example.com/callback",
+		})
+		p.client = jwks.Client()
+		p.jwksMgr = NewJWKSManager(jwks.URL, p.client, time.Hour)
+		p.jwksRetriever = p.jwksMgr
+		p.userinfoURL = userinfo.URL
+		return p
+	}
+
+	idToken := func(t *testing.T, extra map[string]any) string {
+		t.Helper()
+		claims := map[string]any{
+			"iss": "https://login.microsoftonline.com/tid-1/v2.0",
+			"aud": "client-test-id",
+			"exp": time.Now().Add(10 * time.Minute).Unix(),
+			"tid": "tid-1",
+		}
+		for k, v := range extra {
+			claims[k] = v
+		}
+		return signRS256JWT(t, privKey, "ms-key-1", claims)
+	}
+
+	t.Run("id token", func(t *testing.T) {
+		tests := []struct {
+			name string
+			oid  string
+			sub  string
+			want string
+		}{
+			{name: "oid preferred over sub", oid: "immutable-oid", sub: "app-sub", want: "immutable-oid"},
+			{name: "sub fallback without oid", sub: "app-sub", want: "app-sub"},
+		}
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				claims := map[string]any{"sub": tt.sub}
+				if tt.oid != "" {
+					claims["oid"] = tt.oid
+				}
+				user, err := newProvider(t).FetchUserInfo(context.Background(), &OAuthToken{IDToken: idToken(t, claims)})
+				if err != nil {
+					t.Fatalf("FetchUserInfo = %v", err)
+				}
+				if user.ProviderUserID != tt.want {
+					t.Errorf("ProviderUserID = %q; want %q", user.ProviderUserID, tt.want)
+				}
+			})
+		}
+	})
+
+	t.Run("userinfo", func(t *testing.T) {
+		tests := []struct {
+			name   string
+			claims map[string]any
+			want   string
+		}{
+			{name: "oid preferred over sub", claims: map[string]any{"oid": "immutable-oid", "sub": "app-sub"}, want: "immutable-oid"},
+			{name: "sub fallback without oid", claims: map[string]any{"sub": "app-sub"}, want: "app-sub"},
+			{name: "oid without sub", claims: map[string]any{"oid": "immutable-oid"}, want: "immutable-oid"},
+		}
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				userinfoClaims.Store(tt.claims)
+				user, err := newProvider(t).FetchUserInfo(context.Background(), &OAuthToken{AccessToken: "access-token"})
+				if err != nil {
+					t.Fatalf("FetchUserInfo = %v", err)
+				}
+				if user.ProviderUserID != tt.want {
+					t.Errorf("ProviderUserID = %q; want %q", user.ProviderUserID, tt.want)
+				}
+			})
+		}
+
+		t.Run("rejects missing oid and sub", func(t *testing.T) {
+			userinfoClaims.Store(map[string]any{"email": "user@example.com"})
+			_, err := newProvider(t).FetchUserInfo(context.Background(), &OAuthToken{AccessToken: "access-token"})
+			if err == nil {
+				t.Fatal("expected rejection for userinfo without oid and sub")
+			}
+			var appErr *errors.Error
+			if !errors.As(err, &appErr) || appErr.Code() != errors.CodeOAuthProviderError {
+				t.Fatalf("expected CodeOAuthProviderError, got %v", err)
+			}
+		})
+	})
+}
+
 func TestMicrosoftProvider_KeyIssuerBinding(t *testing.T) {
 	const (
 		tenantA = "tenant-a"

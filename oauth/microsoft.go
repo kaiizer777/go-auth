@@ -24,6 +24,7 @@ type MicrosoftProvider struct {
 	jwksURL        string
 	jwksMgr        *JWKSManager
 	jwksRetriever  JWKSKeyRetriever
+	userinfoURL    string
 	trustedTenants map[string]struct{}
 }
 
@@ -62,6 +63,7 @@ func NewMicrosoftProvider(cfg config.MicrosoftConfig) *MicrosoftProvider {
 		jwksURL:        jwksURL,
 		jwksMgr:        mgr,
 		jwksRetriever:  mgr,
+		userinfoURL:    "https://graph.microsoft.com/oidc/userinfo",
 		trustedTenants: trusted,
 	}
 }
@@ -335,11 +337,7 @@ func (p *MicrosoftProvider) FetchUserInfo(ctx context.Context, token *OAuthToken
 		}
 
 		// ProviderUserID: OID if present, fallback to Subject
-		if claims.OID != "" {
-			user.ProviderUserID = claims.OID
-		} else {
-			user.ProviderUserID = claims.Subject
-		}
+		user.ProviderUserID = providerUserID(claims.OID, claims.Subject)
 
 		// Fallback from admin-mutable UPN never verifies the address.
 		if user.Email == "" && strings.Contains(claims.PreferredUsername, "@") {
@@ -355,15 +353,16 @@ func (p *MicrosoftProvider) FetchUserInfo(ctx context.Context, token *OAuthToken
 		return nil, errors.New(errors.CodeOAuthProviderError, "token has neither id_token nor access_token", nil)
 	}
 
-	userinfoEndpoint := "https://graph.microsoft.com/oidc/userinfo"
+	userinfoEndpoint := p.userinfoURL
 	raw, err := getJSON(ctx, p.client, userinfoEndpoint, token.AccessToken)
 	if err != nil {
 		return nil, err
 	}
 
+	oid, _ := raw["oid"].(string)
 	sub, _ := raw["sub"].(string)
-	if sub == "" {
-		return nil, errors.New(errors.CodeOAuthProviderError, "userinfo missing sub claim", nil)
+	if oid == "" && sub == "" {
+		return nil, errors.New(errors.CodeOAuthProviderError, "userinfo missing both oid and sub claims", nil)
 	}
 
 	email, _ := raw["email"].(string)
@@ -372,13 +371,23 @@ func (p *MicrosoftProvider) FetchUserInfo(ctx context.Context, token *OAuthToken
 
 	return &OAuthUser{
 		ProviderID:     "microsoft",
-		ProviderUserID: sub,
+		ProviderUserID: providerUserID(oid, sub),
 		Email:          strings.ToLower(email),
 		EmailVerified:  false, // Userinfo alone cannot attest nOauth domain ownership
 		Name:           name,
 		AvatarURL:      picture,
 		RawClaims:      raw,
 	}, nil
+}
+
+// providerUserID keys the identity on oid, the immutable directory object id,
+// and falls back to sub only when the token omits oid. Both token paths must
+// resolve the same principal to the same key.
+func providerUserID(oid, sub string) string {
+	if oid != "" {
+		return oid
+	}
+	return sub
 }
 
 type jsonNumber interface {
