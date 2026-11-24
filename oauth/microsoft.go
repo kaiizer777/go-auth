@@ -48,8 +48,8 @@ func NewMicrosoftProvider(cfg config.MicrosoftConfig) *MicrosoftProvider {
 
 	trusted := make(map[string]struct{}, len(cfg.TrustedTenants))
 	for _, t := range cfg.TrustedTenants {
-		if strings.TrimSpace(t) != "" {
-			trusted[strings.TrimSpace(t)] = struct{}{}
+		if t = normalizeTenant(t); t != "" {
+			trusted[t] = struct{}{}
 		}
 	}
 
@@ -66,6 +66,43 @@ func NewMicrosoftProvider(cfg config.MicrosoftConfig) *MicrosoftProvider {
 		userinfoURL:    "https://graph.microsoft.com/oidc/userinfo",
 		trustedTenants: trusted,
 	}
+}
+
+// normalizeTenant canonicalises a tenant GUID or domain for comparison.
+func normalizeTenant(tenant string) string {
+	return strings.ToLower(strings.TrimSuffix(strings.TrimSpace(tenant), "."))
+}
+
+// issuerTenant returns the tenant segment of a Microsoft v2 issuer.
+func issuerTenant(issuer string) string {
+	const prefix = "https://login.microsoftonline.com/"
+	if !strings.HasPrefix(issuer, prefix) {
+		return ""
+	}
+	segment := strings.TrimPrefix(issuer, prefix)
+	if i := strings.IndexByte(segment, '/'); i >= 0 {
+		segment = segment[:i]
+	}
+	return segment
+}
+
+// tenantTrusted reports whether the allowlist accepts the verified tenant.
+// Identifiers compare verbatim and case-insensitively, so entries may be
+// GUIDs or tenant domains; the issuer segment covers domain-form authorities.
+// An empty allowlist keeps multi-tenant mode.
+func (p *MicrosoftProvider) tenantTrusted(tenantID, issuer string) bool {
+	if len(p.trustedTenants) == 0 {
+		return true
+	}
+	for _, id := range []string{tenantID, issuerTenant(issuer)} {
+		if id == "" {
+			continue
+		}
+		if _, ok := p.trustedTenants[normalizeTenant(id)]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 // ID returns the canonical provider slug.
@@ -195,6 +232,15 @@ func (p *MicrosoftProvider) VerifyIDToken(ctx context.Context, rawIDToken, nonce
 
 	// "nOauth" anti-account-takeover defense: compute EmailVerified
 	claims.EmailVerified = p.isEmailVerified(rawClaims, claims.TenantID)
+
+	// The allowlist bounds which external tenants may hold accounts here.
+	// Attestation never overrides it: an unlisted tenant is untrusted even
+	// when it presents xms_edov.
+	if !p.tenantTrusted(claims.TenantID, claims.Issuer) {
+		claims.EmailVerified = false
+		rawClaims["untrusted_tenant"] = true
+	}
+
 	if isUntrusted, _ := rawClaims["untrusted_tenant"].(bool); isUntrusted {
 		claims.UntrustedTenant = true
 	}

@@ -689,6 +689,7 @@ func TestMicrosoftProvider(t *testing.T) {
 	})
 
 	t.Run("nOauth defense - untrusted tenant vs domain ownership attestation", func(t *testing.T) {
+		pMulti := newTestProvider("common", nil)
 		pCommon := newTestProvider("common", []string{"trusted-partner-guid"})
 
 		// 1. Untrusted tenant without xms_edov -> EmailVerified must be FALSE
@@ -701,7 +702,7 @@ func TestMicrosoftProvider(t *testing.T) {
 			"tid":   "untrusted-guid",
 		}
 		tokUntrusted := signRS256JWT(t, privKey, "ms-key-1", claimsUntrusted)
-		cUntrusted, err := pCommon.VerifyIDToken(ctx, tokUntrusted, "")
+		cUntrusted, err := pMulti.VerifyIDToken(ctx, tokUntrusted, "")
 		if err != nil {
 			t.Fatalf("unexpected verification error: %v", err)
 		}
@@ -712,11 +713,9 @@ func TestMicrosoftProvider(t *testing.T) {
 			t.Errorf("untrusted tenant must set UntrustedTenant == true")
 		}
 
-		// 2. Untrusted tenant with xms_edov == '1' -> EmailVerified must be TRUE.
-		// Merge premise (oauth sync): the hardening trust model keeps attestation
-		// as sufficient evidence regardless of the allowlist, because the
-		// allowlist attests tenant identity only — tenant admins can claim
-		// foreign-domain addresses, so the allowlist alone never verifies.
+		// 2. Untrusted tenant with xms_edov == '1' -> EmailVerified must be TRUE
+		// when no allowlist bounds the tenants. The allowlist case is covered by
+		// the tenant-allowlist table below.
 		claimsAttested := map[string]any{
 			"iss":      "https://login.microsoftonline.com/untrusted-guid/v2.0",
 			"sub":      "verified-sub",
@@ -727,7 +726,7 @@ func TestMicrosoftProvider(t *testing.T) {
 			"xms_edov": "1",
 		}
 		tokAttested := signRS256JWT(t, privKey, "ms-key-1", claimsAttested)
-		cAttested, err := pCommon.VerifyIDToken(ctx, tokAttested, "")
+		cAttested, err := pMulti.VerifyIDToken(ctx, tokAttested, "")
 		if err != nil {
 			t.Fatalf("unexpected verification error: %v", err)
 		}
@@ -749,7 +748,7 @@ func TestMicrosoftProvider(t *testing.T) {
 			"xms_edov": true,
 		}
 		tokBool := signRS256JWT(t, privKey, "ms-key-1", claimsBool)
-		cBool, err := pCommon.VerifyIDToken(ctx, tokBool, "")
+		cBool, err := pMulti.VerifyIDToken(ctx, tokBool, "")
 		if err != nil {
 			t.Fatalf("unexpected verification error: %v", err)
 		}
@@ -771,7 +770,7 @@ func TestMicrosoftProvider(t *testing.T) {
 			"xms_edov": 1,
 		}
 		tokNum := signRS256JWT(t, privKey, "ms-key-1", claimsNum)
-		cNum, err := pCommon.VerifyIDToken(ctx, tokNum, "")
+		cNum, err := pMulti.VerifyIDToken(ctx, tokNum, "")
 		if err != nil {
 			t.Fatalf("unexpected verification error: %v", err)
 		}
@@ -793,7 +792,7 @@ func TestMicrosoftProvider(t *testing.T) {
 			"xms_edov": false,
 		}
 		tokFalse := signRS256JWT(t, privKey, "ms-key-1", claimsFalse)
-		cFalse, err := pCommon.VerifyIDToken(ctx, tokFalse, "")
+		cFalse, err := pMulti.VerifyIDToken(ctx, tokFalse, "")
 		if err != nil {
 			t.Fatalf("unexpected verification error: %v", err)
 		}
@@ -1096,14 +1095,14 @@ func TestMicrosoftProvider_DomainOwnershipAttestation(t *testing.T) {
 		{name: "no allowlist string zero", tenant: unlistedTenant, edov: "0", setEdov: true},
 		{name: "no allowlist bool false", tenant: unlistedTenant, edov: false, setEdov: true},
 		{name: "no allowlist missing claim", tenant: unlistedTenant},
-		// Merge premise (oauth sync): the hardening trust model keeps the
-		// allowlist as tenant-identity evidence only, so a listed tenant still
-		// needs domain attestation, while attestation verifies any tenant.
+		// The allowlist bounds tenant trust: listed tenants still need domain
+		// attestation for the email value, and attestation cannot admit an
+		// unlisted tenant.
 		{name: "allowlist listed tenant unattested", trusted: allowlist, tenant: listedTenant},
 		{name: "allowlist listed tenant attested", trusted: allowlist, tenant: listedTenant, edov: "1", setEdov: true, wantVerified: true},
-		{name: "allowlist unlisted tenant string one", trusted: allowlist, tenant: unlistedTenant, edov: "1", setEdov: true, wantVerified: true},
-		{name: "allowlist unlisted tenant string true", trusted: allowlist, tenant: unlistedTenant, edov: "true", setEdov: true, wantVerified: true},
-		{name: "allowlist unlisted tenant bool true", trusted: allowlist, tenant: unlistedTenant, edov: true, setEdov: true, wantVerified: true},
+		{name: "allowlist unlisted tenant string one", trusted: allowlist, tenant: unlistedTenant, edov: "1", setEdov: true},
+		{name: "allowlist unlisted tenant string true", trusted: allowlist, tenant: unlistedTenant, edov: "true", setEdov: true},
+		{name: "allowlist unlisted tenant bool true", trusted: allowlist, tenant: unlistedTenant, edov: true, setEdov: true},
 		{name: "allowlist unlisted tenant string zero", trusted: allowlist, tenant: unlistedTenant, edov: "0", setEdov: true},
 		{name: "allowlist unlisted tenant bool false", trusted: allowlist, tenant: unlistedTenant, edov: false, setEdov: true},
 		{name: "allowlist unlisted tenant missing claim", trusted: allowlist, tenant: unlistedTenant},
@@ -1137,6 +1136,85 @@ func TestMicrosoftProvider_DomainOwnershipAttestation(t *testing.T) {
 			}
 			if tt.wantVerified && c.UntrustedTenant {
 				t.Error("verified tenant carries the untrusted_tenant marker")
+			}
+		})
+	}
+}
+
+func TestMicrosoftProvider_TenantAllowlist(t *testing.T) {
+	privKey, nRaw, eRaw := generateTestRSAKey(t)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(JWKDoc{Keys: []JWKKey{{
+			Kty: "RSA", Use: "sig", Kid: "ms-key-1", Alg: "RS256", N: nRaw, E: eRaw,
+		}}})
+	}))
+	defer server.Close()
+
+	newProvider := func(t *testing.T, tenant string, trusted []string) *MicrosoftProvider {
+		t.Helper()
+		if tenant == "" {
+			tenant = "common"
+		}
+		p := NewMicrosoftProvider(config.MicrosoftConfig{
+			ClientID:       "client-test-id",
+			Tenant:         tenant,
+			TrustedTenants: trusted,
+			RedirectURI:    "https://example.com/callback",
+		})
+		p.client = server.Client()
+		p.jwksMgr = NewJWKSManager(server.URL, p.client, time.Hour)
+		p.jwksRetriever = p.jwksMgr
+		return p
+	}
+
+	tests := []struct {
+		name         string
+		tenantCfg    string
+		trusted      []string
+		tid          string
+		issuer       string
+		wantTrusted  bool
+		wantVerified bool
+	}{
+		{name: "no allowlist accepts any tenant", tid: "tenant-a", wantTrusted: true, wantVerified: true},
+		{name: "listed guid", trusted: []string{"tenant-a"}, tid: "tenant-a", wantTrusted: true, wantVerified: true},
+		{name: "listed guid uppercase entry", trusted: []string{"TENANT-A"}, tid: "tenant-a", wantTrusted: true, wantVerified: true},
+		{name: "listed guid uppercase tid", trusted: []string{"tenant-a"}, tid: "TENANT-A", wantTrusted: true, wantVerified: true},
+		{name: "listed domain", trusted: []string{"contoso.onmicrosoft.com"}, tid: "contoso.onmicrosoft.com", wantTrusted: true, wantVerified: true},
+		{name: "listed domain uppercase entry", trusted: []string{"Contoso.OnMicrosoft.com"}, tid: "contoso.onmicrosoft.com", wantTrusted: true, wantVerified: true},
+		{name: "listed domain authority matches issuer segment", tenantCfg: "contoso.onmicrosoft.com", trusted: []string{"contoso.onmicrosoft.com"}, tid: "tenant-guid", issuer: "https://login.microsoftonline.com/contoso.onmicrosoft.com/v2.0", wantTrusted: true, wantVerified: true},
+		{name: "unlisted tenant rejected despite attestation", trusted: []string{"tenant-a"}, tid: "tenant-b"},
+		{name: "unlisted domain rejected", trusted: []string{"tenant-a"}, tid: "evil.example.com"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := newProvider(t, tt.tenantCfg, tt.trusted)
+			issuer := tt.issuer
+			if issuer == "" {
+				issuer = "https://login.microsoftonline.com/" + tt.tid + "/v2.0"
+			}
+			claims := map[string]any{
+				"iss":      issuer,
+				"sub":      "sub-1",
+				"aud":      "client-test-id",
+				"exp":      time.Now().Add(10 * time.Minute).Unix(),
+				"email":    "user@example.com",
+				"tid":      tt.tid,
+				"xms_edov": "1",
+			}
+			tok := signRS256JWT(t, privKey, "ms-key-1", claims)
+
+			c, err := p.VerifyIDToken(context.Background(), tok, "")
+			if err != nil {
+				t.Fatalf("VerifyIDToken = %v", err)
+			}
+			if c.UntrustedTenant == tt.wantTrusted {
+				t.Errorf("UntrustedTenant = %v; want trusted = %v", c.UntrustedTenant, tt.wantTrusted)
+			}
+			if c.EmailVerified != tt.wantVerified {
+				t.Errorf("EmailVerified = %v; want %v", c.EmailVerified, tt.wantVerified)
 			}
 		})
 	}
