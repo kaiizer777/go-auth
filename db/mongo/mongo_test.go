@@ -178,6 +178,7 @@ func TestDocumentSerialization_RoundTrip(t *testing.T) {
 			ProviderID:     "google",
 			ProviderUserID: "google-uid-123",
 			Email:          "user@example.com",
+			Verified:       true,
 			CreatedAt:      now,
 			UpdatedAt:      now,
 		}
@@ -197,8 +198,38 @@ func TestDocumentSerialization_RoundTrip(t *testing.T) {
 		if roundTripped.ID != acc.ID || roundTripped.UserID != acc.UserID ||
 			roundTripped.ProviderID != acc.ProviderID ||
 			roundTripped.ProviderUserID != acc.ProviderUserID ||
-			roundTripped.Email != acc.Email {
+			roundTripped.Email != acc.Email ||
+			!roundTripped.Verified {
 			t.Fatalf("roundtrip mismatch: got %+v, want %+v", roundTripped, acc)
+		}
+	})
+
+	t.Run("OAuthAccountDoc without verified decodes unverified", func(t *testing.T) {
+		// Documents written before the flag existed carry no verified field;
+		// the missing field must land on the fail-closed zero value.
+		legacy := bson.M{
+			"_id":              uuid.New().String(),
+			"user_id":          uuid.New().String(),
+			"provider_id":      "google",
+			"provider_user_id": "legacy-uid",
+			"email":            "legacy@example.com",
+			"created_at":       now,
+			"updated_at":       now,
+		}
+		data, err := bson.Marshal(legacy)
+		if err != nil {
+			t.Fatalf("bson.Marshal failed: %v", err)
+		}
+
+		var unmarshaled OAuthAccountDoc
+		if err := bson.Unmarshal(data, &unmarshaled); err != nil {
+			t.Fatalf("bson.Unmarshal failed: %v", err)
+		}
+		if unmarshaled.Verified {
+			t.Fatal("missing verified field must decode false")
+		}
+		if got := unmarshaled.toDomain(); got.Verified {
+			t.Fatalf("legacy document decoded Verified=%v; want false", got.Verified)
 		}
 	})
 
