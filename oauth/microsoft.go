@@ -295,9 +295,11 @@ func (p *MicrosoftProvider) isEmailVerified(rawClaims map[string]any, tenantID s
 		tenant = "common"
 	}
 
-	// 1. Single-tenant mode (not common, organizations, or consumers)
+	// 1. Single-tenant mode (not common, organizations, or consumers). The
+	// authority pins one tenant, but verification is inherited only when the
+	// token actually names that tenant; the caller has validated the issuer.
 	if tenant != "common" && tenant != "organizations" && tenant != "consumers" {
-		return true
+		return normalizeTenant(tenantID) == normalizeTenant(tenant)
 	}
 
 	// 2. Personal consumer account (Microsoft verifies email on registration)

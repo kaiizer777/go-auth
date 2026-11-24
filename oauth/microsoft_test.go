@@ -1183,7 +1183,7 @@ func TestMicrosoftProvider_TenantAllowlist(t *testing.T) {
 		{name: "listed guid uppercase tid", trusted: []string{"tenant-a"}, tid: "TENANT-A", wantTrusted: true, wantVerified: true},
 		{name: "listed domain", trusted: []string{"contoso.onmicrosoft.com"}, tid: "contoso.onmicrosoft.com", wantTrusted: true, wantVerified: true},
 		{name: "listed domain uppercase entry", trusted: []string{"Contoso.OnMicrosoft.com"}, tid: "contoso.onmicrosoft.com", wantTrusted: true, wantVerified: true},
-		{name: "listed domain authority matches issuer segment", tenantCfg: "contoso.onmicrosoft.com", trusted: []string{"contoso.onmicrosoft.com"}, tid: "tenant-guid", issuer: "https://login.microsoftonline.com/contoso.onmicrosoft.com/v2.0", wantTrusted: true, wantVerified: true},
+		{name: "listed domain authority matches issuer segment", tenantCfg: "contoso.onmicrosoft.com", trusted: []string{"contoso.onmicrosoft.com"}, tid: "tenant-guid", issuer: "https://login.microsoftonline.com/contoso.onmicrosoft.com/v2.0", wantTrusted: true},
 		{name: "unlisted tenant rejected despite attestation", trusted: []string{"tenant-a"}, tid: "tenant-b"},
 		{name: "unlisted domain rejected", trusted: []string{"tenant-a"}, tid: "evil.example.com"},
 	}
@@ -1212,6 +1212,73 @@ func TestMicrosoftProvider_TenantAllowlist(t *testing.T) {
 			}
 			if c.UntrustedTenant == tt.wantTrusted {
 				t.Errorf("UntrustedTenant = %v; want trusted = %v", c.UntrustedTenant, tt.wantTrusted)
+			}
+			if c.EmailVerified != tt.wantVerified {
+				t.Errorf("EmailVerified = %v; want %v", c.EmailVerified, tt.wantVerified)
+			}
+		})
+	}
+}
+
+func TestMicrosoftProvider_SingleTenantVerification(t *testing.T) {
+	privKey, nRaw, eRaw := generateTestRSAKey(t)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(JWKDoc{Keys: []JWKKey{{
+			Kty: "RSA", Use: "sig", Kid: "ms-key-1", Alg: "RS256", N: nRaw, E: eRaw,
+		}}})
+	}))
+	defer server.Close()
+
+	newProvider := func(t *testing.T, tenant string) *MicrosoftProvider {
+		t.Helper()
+		p := NewMicrosoftProvider(config.MicrosoftConfig{
+			ClientID:    "client-test-id",
+			Tenant:      tenant,
+			RedirectURI: "https://example.com/callback",
+		})
+		p.client = server.Client()
+		p.jwksMgr = NewJWKSManager(server.URL, p.client, time.Hour)
+		p.jwksRetriever = p.jwksMgr
+		return p
+	}
+
+	tests := []struct {
+		name         string
+		tenantCfg    string
+		issuerTenant string
+		tid          string
+		wantErr      bool
+		wantVerified bool
+	}{
+		{name: "matching tid inherits verification", tenantCfg: "contoso-guid", issuerTenant: "contoso-guid", tid: "contoso-guid", wantVerified: true},
+		{name: "matching tid is case insensitive", tenantCfg: "contoso-guid", issuerTenant: "contoso-guid", tid: "CONTOSO-GUID", wantVerified: true},
+		{name: "domain tenant inherits verification", tenantCfg: "contoso.onmicrosoft.com", issuerTenant: "contoso.onmicrosoft.com", tid: "contoso.onmicrosoft.com", wantVerified: true},
+		{name: "foreign tid does not inherit verification", tenantCfg: "contoso-guid", issuerTenant: "contoso-guid", tid: "other-guid"},
+		{name: "foreign issuer rejected", tenantCfg: "contoso-guid", issuerTenant: "other-guid", tid: "contoso-guid", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			claims := map[string]any{
+				"iss":   "https://login.microsoftonline.com/" + tt.issuerTenant + "/v2.0",
+				"sub":   "sub-1",
+				"aud":   "client-test-id",
+				"exp":   time.Now().Add(10 * time.Minute).Unix(),
+				"email": "user@contoso.com",
+				"tid":   tt.tid,
+			}
+			tok := signRS256JWT(t, privKey, "ms-key-1", claims)
+
+			c, err := newProvider(t, tt.tenantCfg).VerifyIDToken(context.Background(), tok, "")
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("expected issuer rejection")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("VerifyIDToken = %v", err)
 			}
 			if c.EmailVerified != tt.wantVerified {
 				t.Errorf("EmailVerified = %v; want %v", c.EmailVerified, tt.wantVerified)
