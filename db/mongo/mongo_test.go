@@ -379,6 +379,7 @@ func TestIndexSpecifications_Completeness(t *testing.T) {
 		name string
 	}{
 		{"users", "uq_users_email"},
+		{"users", "idx_users_email_verified"},
 		{"sessions", "uq_sessions_id_hash"},
 		{"sessions", "idx_sessions_user_id"},
 		{"sessions", "ttl_sessions_expiry"},
@@ -703,6 +704,112 @@ func TestBackfillOAuthAccountVerified(t *testing.T) {
 	}
 	if n, err := database.Collection("schema_migrations").CountDocuments(ctx, bson.M{"_id": oauthVerifiedBackfillID}); err != nil || n != 1 {
 		t.Fatalf("migration marker rows = %d (err %v); want 1", n, err)
+	}
+	if n, err := database.Collection("schema_migrations").CountDocuments(ctx, bson.M{"_id": oauthVerifiedProgressID}); err != nil || n != 0 {
+		t.Fatalf("progress marker rows = %d; want 0 (cleaned up)", n)
+	}
+}
+
+func TestBackfillOAuthAccountVerified_BatchingAndResumability(t *testing.T) {
+	uri := os.Getenv("TEST_MONGO_URI")
+	if uri == "" {
+		t.Skip("TEST_MONGO_URI unset; skipping live MongoDB backfill test")
+	}
+	opts := options.Client().ApplyURI(uri)
+	client, err := mongo.Connect(opts)
+	if err != nil {
+		t.Fatalf("mongo.Connect failed: %v", err)
+	}
+	database := client.Database(fmt.Sprintf("goauth_test_backfill_batch_%s", strings.ReplaceAll(uuid.New().String(), "-", "")))
+	t.Cleanup(func() {
+		_ = database.Drop(context.Background())
+		_ = client.Disconnect(context.Background())
+	})
+	ctx := context.Background()
+
+	oldBatchSize := backfillBatchSize
+	backfillBatchSize = 2
+	defer func() { backfillBatchSize = oldBatchSize }()
+
+	users := database.Collection("users")
+	links := database.Collection("oauth_accounts")
+	markers := database.Collection("schema_migrations")
+
+	owners := []string{"u1", "u2", "u3", "u4", "u5"}
+	var userDocs []any
+	var linkDocs []any
+	for _, id := range owners {
+		userDocs = append(userDocs, bson.M{"_id": id, "email": id + "@example.com", "email_verified": true})
+		linkDocs = append(linkDocs, bson.M{
+			"_id":              "link-" + id,
+			"user_id":          id,
+			"provider_id":      "google",
+			"provider_user_id": "sub-" + id,
+			"email":            id + "@example.com",
+		})
+	}
+	if _, err := users.InsertMany(ctx, userDocs); err != nil {
+		t.Fatalf("seed users: %v", err)
+	}
+	if _, err := links.InsertMany(ctx, linkDocs); err != nil {
+		t.Fatalf("seed links: %v", err)
+	}
+
+	// 1. Simulate a prior truncated run that processed up to u2
+	if _, err := markers.InsertOne(ctx, bson.M{
+		"_id":          oauthVerifiedProgressID,
+		"last_user_id": "u2",
+		"updated_at":   time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("seed progress: %v", err)
+	}
+
+	// Run the backfill - it should resume from u3 onwards
+	if err := BackfillOAuthAccountVerified(ctx, database); err != nil {
+		t.Fatalf("BackfillOAuthAccountVerified resume run failed: %v", err)
+	}
+
+	// Verify all links from u3 to u5 are now verified
+	for _, id := range []string{"u3", "u4", "u5"} {
+		var doc OAuthAccountDoc
+		if err := links.FindOne(ctx, bson.M{"_id": "link-" + id}).Decode(&doc); err != nil {
+			t.Fatalf("find link-%s: %v", id, err)
+		}
+		if !doc.Verified {
+			t.Errorf("expected link-%s to be verified after resume", id)
+		}
+	}
+
+	// Verify completion marker exists
+	var m bson.M
+	if err := markers.FindOne(ctx, bson.M{"_id": oauthVerifiedBackfillID}).Decode(&m); err != nil {
+		t.Fatalf("completion marker not found: %v", err)
+	}
+
+	// Verify progress marker was cleaned up
+	var prog bson.M
+	err = markers.FindOne(ctx, bson.M{"_id": oauthVerifiedProgressID}).Decode(&prog)
+	if !errors.Is(err, mongo.ErrNoDocuments) {
+		t.Fatalf("expected progress marker to be deleted, got err: %v", err)
+	}
+
+	// Verify email_verified index was created
+	cursor, err := users.Indexes().List(ctx)
+	if err != nil {
+		t.Fatalf("list indexes: %v", err)
+	}
+	var foundIndex bool
+	for cursor.Next(ctx) {
+		var idx struct {
+			Name string `bson:"name"`
+		}
+		if err := cursor.Decode(&idx); err == nil && idx.Name == "idx_users_email_verified" {
+			foundIndex = true
+			break
+		}
+	}
+	if !foundIndex {
+		t.Errorf("expected index idx_users_email_verified to be created")
 	}
 }
 
