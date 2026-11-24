@@ -678,6 +678,24 @@ func TestUnverifiedSignupNeverBindsLink(t *testing.T) {
 		}
 		requireIdentityRows(t, database, 1, 0, 0)
 	})
+
+	// The winner's commit may become visible before the losing goroutine reads
+	// the address at all; that ordering must converge exactly like the raced one.
+	t.Run("visible pending row converges without a link", func(t *testing.T) {
+		database, _, _, rawSvc := setupServiceTest(t, nil)
+		pending := db.User{ID: uuid.New(), Email: addr, PasswordHash: "", EmailVerified: false}
+		if err := database.Create(&pending).Error; err != nil {
+			t.Fatalf("seed pending user: %v", err)
+		}
+		got, _, created, err := rawSvc.(*service).linkOrCreate(context.Background(), "google", unverified(), "")
+		if err != nil {
+			t.Fatalf("linkOrCreate over a pending row = %v; want convergence", err)
+		}
+		if got.ID != pending.ID || created {
+			t.Fatalf("converged on %v (created=%v); want %v", got.ID, created, pending.ID)
+		}
+		requireIdentityRows(t, database, 1, 0, 0)
+	})
 }
 
 // TestMergeGateRejectsUnstorableIdentity pins validateProviderIdentity as the

@@ -624,38 +624,55 @@ func (s *service) relinkExisting(ctx context.Context, providerID, providerUserID
 }
 
 // linkRacedUser converges after losing a concurrent user-create race: re-read
-// the winner by normalized email, then decide. An unverified provider claim
-// never merges into the winner; it only converges on the passwordless row that
-// a concurrent unverified signup of the same address just created. The 409 is
-// permanent by design: it mirrors password signup, which refuses an
-// already-registered email instead of taking it over, and no verification-mail
-// or takeover flow exists here, so the address stays blocked until the squatted
-// row is removed out of band.
+// the winner by normalized email, then decide. The 409 is permanent by design:
+// it mirrors password signup, which refuses an already-registered email instead
+// of taking it over, and no verification-mail or takeover flow exists here, so
+// the address stays blocked until the squatted row is removed out of band.
 func (s *service) linkRacedUser(ctx context.Context, providerID string, info *UserInfo) (db.User, bool, bool, error) {
 	existing, err := s.findUserByEmail(ctx, info.Email)
-	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) && !errors.Is(err, errors.ErrUserNotFound) {
+	if err != nil {
+		if !errors.Is(err, gorm.ErrRecordNotFound) && !errors.Is(err, errors.ErrUserNotFound) {
+			return db.User{}, false, false, errors.New(errors.CodeInternalError, "failed to query user", err)
+		}
+		// No winner is visible, so there is nothing to converge on: an unverified
+		// claim stays a hard rejection.
+		if !info.EmailVerified {
+			return db.User{}, false, false, errors.ErrOAuthEmailUnverified
+		}
 		return db.User{}, false, false, errors.New(errors.CodeInternalError, "failed to query user", err)
 	}
-	if !info.EmailVerified {
-		if err == nil && !existing.EmailVerified && existing.PasswordHash == "" {
+	return s.mergeOrConverge(ctx, providerID, existing, info)
+}
+
+// mergeOrConverge decides what an address collision with a live local account
+// may do. An unverified provider claim never merges into an established
+// account; it only converges on the passwordless row an unverified signup of
+// the same address left behind, which grants nothing the claim did not already
+// have. The create-race path and the pre-existing-owner path share this rule so
+// the outcome cannot depend on which goroutine observes the winner's commit
+// first.
+func (s *service) mergeOrConverge(ctx context.Context, providerID string, existing db.User, info *UserInfo) (db.User, bool, bool, error) {
+	if gerr := validateProviderIdentity(info); gerr != nil {
+		if errors.Is(gerr, errors.ErrOAuthEmailUnverified) && isUnclaimedAccount(existing) {
 			return existing, false, false, nil
 		}
-		return db.User{}, false, false, errors.ErrOAuthEmailUnverified
-	}
-	if err != nil {
-		return db.User{}, false, false, errors.New(errors.CodeInternalError, "failed to query user", err)
-	}
-	if gerr := validateProviderIdentity(info); gerr != nil {
 		return db.User{}, false, false, gerr
 	}
+	// Pre-hijacking defense: never link onto an unverified local account.
 	if !existing.EmailVerified {
 		return db.User{}, false, false, errors.ErrOAuthAccountLinkConflict
 	}
-	user, linked, err := s.linkExisting(ctx, existing, providerID, info)
-	if err != nil {
-		return db.User{}, false, false, err
+	user, linked, lerr := s.linkExisting(ctx, existing, providerID, info)
+	if lerr != nil {
+		return db.User{}, false, false, lerr
 	}
 	return user, linked, false, nil
+}
+
+// isUnclaimedAccount reports the row shape an unverified oauth signup leaves:
+// no proven address ownership and no credential to take over.
+func isUnclaimedAccount(u db.User) bool {
+	return !u.EmailVerified && u.PasswordHash == ""
 }
 
 // createUserAndLink creates the user and, only for a provider-verified address,
@@ -779,19 +796,11 @@ func (s *service) linkOrCreate(ctx context.Context, providerID string, info *Use
 	}
 
 	// 5. Existing local user check by email. Merging stays fail-closed through
-	// validateProviderIdentity: an unverified provider claim never resolves to
-	// or attaches to an owner.
+	// mergeOrConverge: an unverified provider claim never resolves to or attaches
+	// to an owner, only converging on the row a concurrent unverified signup left.
 	existing, err := s.findUserByEmail(ctx, info.Email)
 	if err == nil {
-		if gerr := validateProviderIdentity(info); gerr != nil {
-			return db.User{}, false, false, gerr
-		}
-		// Pre-hijacking defense: never link onto an unverified local account.
-		if !existing.EmailVerified {
-			return db.User{}, false, false, errors.ErrOAuthAccountLinkConflict
-		}
-		user, linked, lerr := s.linkExisting(ctx, existing, providerID, info)
-		return user, linked, false, lerr
+		return s.mergeOrConverge(ctx, providerID, existing, info)
 	}
 	if !errors.Is(err, gorm.ErrRecordNotFound) && !errors.Is(err, errors.ErrUserNotFound) {
 		return db.User{}, false, false, errors.New(errors.CodeInternalError, "failed to query user", err)
