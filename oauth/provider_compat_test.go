@@ -34,7 +34,8 @@ func (p *legacyProvider) FetchUserInfo(context.Context, *OAuthToken) (*OAuthUser
 }
 
 // legacyOIDCProvider adds the OIDC capability without AuthCodeURL; the service
-// must fall back to AuthURL rather than require the optional interface.
+// must fall back to AuthURL (appending the nonce) rather than require the
+// optional interface: the callback verifies that nonce for every OIDC provider.
 type legacyOIDCProvider struct {
 	legacyProvider
 }
@@ -48,11 +49,12 @@ func (p *legacyOIDCProvider) VerifyIDToken(context.Context, string, string) (*ID
 func TestInitiateFlowLegacyProvider(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
-		name     string
-		provider Provider
+		name      string
+		provider  Provider
+		wantNonce bool
 	}{
 		{name: "pre-PR provider", provider: &legacyProvider{authURL: "https://legacy.example/authorize"}},
-		{name: "pre-PR OIDC provider", provider: &legacyOIDCProvider{legacyProvider{authURL: "https://legacy.example/authorize"}}},
+		{name: "pre-PR OIDC provider", provider: &legacyOIDCProvider{legacyProvider{authURL: "https://legacy.example/authorize"}}, wantNonce: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -77,8 +79,8 @@ func TestInitiateFlowLegacyProvider(t *testing.T) {
 			if u.Query().Get("state") == "" {
 				t.Fatal("authorize URL missing state")
 			}
-			if got := u.Query().Get("nonce"); got != "" {
-				t.Fatalf("nonce = %q; want empty fallback URL", got)
+			if got := u.Query().Get("nonce"); (got != "") != tt.wantNonce {
+				t.Fatalf("nonce = %q; want set=%v", got, tt.wantNonce)
 			}
 		})
 	}

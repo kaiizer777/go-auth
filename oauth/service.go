@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"github.com/go-sql-driver/mysql"
@@ -257,11 +258,27 @@ func (s *service) InitiateFlow(w http.ResponseWriter, r *http.Request, providerI
 		"user_agent", ua,
 	)
 	if _, ok := p.(OIDCProvider); ok {
-		if ac, ok := p.(AuthCodeURLProvider); ok {
-			return ac.AuthCodeURL(state, pkce.Challenge, NonceOption(nonce)), nil
-		}
+		return oidcAuthURL(p, state, pkce.Challenge, nonce)
 	}
 	return p.AuthURL(state, pkce.Challenge), nil
+}
+
+// oidcAuthURL binds the login nonce into the authorization request. A provider
+// that only implements Provider has no option channel, so the nonce is appended
+// to its authorize URL: the callback verifies the ID-token nonce for every OIDC
+// provider, and a request that never carried one could never satisfy that check.
+func oidcAuthURL(p Provider, state, codeChallenge, nonce string) (string, error) {
+	if ac, ok := p.(AuthCodeURLProvider); ok {
+		return ac.AuthCodeURL(state, codeChallenge, NonceOption(nonce)), nil
+	}
+	u, err := url.Parse(p.AuthURL(state, codeChallenge))
+	if err != nil {
+		return "", errors.New(errors.CodeOAuthProviderError, "oauth provider returned an unusable authorize URL", err)
+	}
+	q := u.Query()
+	q.Set("nonce", nonce)
+	u.RawQuery = q.Encode()
+	return u.String(), nil
 }
 
 // HandleCallback runs the full decision tree: state validation, code exchange,
