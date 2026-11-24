@@ -43,18 +43,11 @@ type facebookOptions struct {
 // FacebookOption customizes the Facebook adapter at construction.
 type FacebookOption func(*facebookOptions)
 
-// FacebookFailClosedEmailVerification is the default policy, kept explicit so a
-// config-driven call site can state it: a returned address reports
-// EmailVerified=false, which keeps the identity on the registration path and
-// out of existing-account merges.
-func FacebookFailClosedEmailVerification() FacebookOption {
-	return func(o *facebookOptions) { o.assertsVerifiedEmail = false }
-}
-
 // FacebookAssertEmailVerified declares that the operator treats the Graph email
 // field as an assertion that Meta verified the address, enabling the
 // existing-account merge for Facebook identities. Do not infer it from a
 // non-empty response: only assert it when app review scopes guarantee it.
+// Without this option the adapter applies no attestation.
 func FacebookAssertEmailVerified() FacebookOption {
 	return func(o *facebookOptions) { o.assertsVerifiedEmail = true }
 }
