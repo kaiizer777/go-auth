@@ -720,6 +720,18 @@ func TestUnverifiedSignupLinkProvenance(t *testing.T) {
 		if err := database.Create(&pending).Error; err != nil {
 			t.Fatalf("seed pending user: %v", err)
 		}
+		// Winning unverified signup committed its oauth link alongside the user
+		winnerLink := db.OAuthAccount{
+			ID:             uuid.New(),
+			UserID:         pending.ID,
+			ProviderID:     "google",
+			ProviderUserID: "sub-unverified-bind",
+			Email:          addr,
+			Verified:       false,
+		}
+		if err := database.Create(&winnerLink).Error; err != nil {
+			t.Fatalf("seed winner link: %v", err)
+		}
 		got, _, created, err := rawSvc.(*service).linkOrCreate(context.Background(), "google", unverified(), "")
 		if err != nil {
 			t.Fatalf("linkOrCreate over a pending row = %v; want convergence", err)
@@ -727,6 +739,27 @@ func TestUnverifiedSignupLinkProvenance(t *testing.T) {
 		if got.ID != pending.ID || created {
 			t.Fatalf("converged on %v (created=%v); want %v", got.ID, created, pending.ID)
 		}
+		requireIdentityRows(t, database, 1, 1, 0)
+	})
+
+	t.Run("unattested email cannot take over pending unclaimed account", func(t *testing.T) {
+		database, cfg, _, svc := setupServiceTest(t, &UserInfo{
+			ProviderID:     "google",
+			ProviderUserID: "attacker-sub-456",
+			Email:          addr,
+			EmailVerified:  false,
+		})
+		pending := db.User{ID: uuid.New(), Email: addr, PasswordHash: "", EmailVerified: false}
+		if err := database.Create(&pending).Error; err != nil {
+			t.Fatalf("seed pending user: %v", err)
+		}
+		state, cookie := mustInitiate(t, svc, cfg, "google")
+		rec, req := callbackRequest(state, cookie)
+		sess, _, _, err := svc.HandleCallback(req.Context(), rec, req, "google", "code-1", state, db.SessionTypeCookie)
+		if sess != nil {
+			t.Fatalf("session minted for %v; want none", sess.UserID)
+		}
+		requireCode(t, err, errors.CodeOAuthEmailUnverified, http.StatusBadRequest)
 		requireIdentityRows(t, database, 1, 0, 0)
 	})
 }
@@ -2173,6 +2206,82 @@ func TestOAuthService_X_MissingEmail(t *testing.T) {
 		}
 		if count != 1 {
 			t.Fatalf("expected 1 link for user, got %d", count)
+		}
+	})
+
+	t.Run("subsequent login with linked subject-only identity succeeds and preserves link", func(t *testing.T) {
+		sessSvc := session.NewService(database, cfg)
+		user := db.User{
+			ID:            uuid.New(),
+			Email:         "active-subseq-user@example.com",
+			EmailVerified: true,
+		}
+		if err := database.Create(&user).Error; err != nil {
+			t.Fatalf("create user: %v", err)
+		}
+
+		_, rawToken, err := sessSvc.CreateSession(context.Background(), user.ID, 0, db.SessionTypeCookie, "127.0.0.1", "ua")
+		if err != nil {
+			t.Fatalf("create session: %v", err)
+		}
+
+		initReq := httptest.NewRequest(http.MethodGet, "/auth/oauth/x?link=true", nil)
+		initReq.AddCookie(&http.Cookie{Name: cfg.SessionCookieName, Value: rawToken})
+		initRec := httptest.NewRecorder()
+
+		stub := &stubProvider{id: "x", info: &UserInfo{ProviderID: "x", ProviderUserID: "x-subseq-user-456", Email: "", EmailVerified: false}}
+		xSvc := NewService(database, sessSvc, map[string]Provider{"x": stub}, cfg)
+
+		authURL, err := xSvc.InitiateFlow(initRec, initReq, "x")
+		if err != nil {
+			t.Fatalf("initiate flow failed: %v", err)
+		}
+		u, _ := url.Parse(authURL)
+		state := u.Query().Get("state")
+
+		var stateCookie *http.Cookie
+		for _, c := range initRec.Result().Cookies() {
+			if c.Name == cfg.OAuth.StateCookieName {
+				stateCookie = c
+				break
+			}
+		}
+
+		// Explicit link
+		cbReq := httptest.NewRequest(http.MethodGet, "/auth/oauth/x/callback?code=valid-code&state="+state, nil)
+		cbReq.AddCookie(stateCookie)
+		cbReq.AddCookie(&http.Cookie{Name: cfg.SessionCookieName, Value: rawToken})
+		cbRec := httptest.NewRecorder()
+
+		cbSess, _, _, err := xSvc.HandleCallback(context.Background(), cbRec, cbReq, "x", "valid-code", state, db.SessionTypeCookie)
+		if err != nil {
+			t.Fatalf("callback failed for active user link: %v", err)
+		}
+		if cbSess.UserID != user.ID {
+			t.Fatalf("expected session user %v, got %v", user.ID, cbSess.UserID)
+		}
+
+		// Subsequent login (unauthenticated, returning user)
+		loginState, loginCookie := mustInitiate(t, xSvc, cfg, "x")
+		loginReq := httptest.NewRequest(http.MethodGet, "/auth/oauth/x/callback", nil)
+		loginReq.AddCookie(loginCookie)
+		loginRec := httptest.NewRecorder()
+
+		loginSess, _, _, err := xSvc.HandleCallback(context.Background(), loginRec, loginReq, "x", "login-code", loginState, db.SessionTypeCookie)
+		if err != nil {
+			t.Fatalf("subsequent login failed: %v; want successful login", err)
+		}
+		if loginSess.UserID != user.ID {
+			t.Fatalf("expected session user %v, got %v", user.ID, loginSess.UserID)
+		}
+
+		// Verify link was not deleted by the unverified-link invalidation rule
+		var link db.OAuthAccount
+		if err := database.Where("provider_id = ? AND provider_user_id = ?", "x", "x-subseq-user-456").First(&link).Error; err != nil {
+			t.Fatalf("expected link to persist, got err: %v", err)
+		}
+		if link.UserID != user.ID {
+			t.Fatalf("expected link user %v, got %v", user.ID, link.UserID)
 		}
 	})
 
