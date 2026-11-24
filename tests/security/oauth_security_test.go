@@ -678,8 +678,15 @@ func TestOAuthSecurity_CallbackFailureReasons(t *testing.T) {
 		wantReason string
 	}{
 		{
-			name:       "email_unverified",
-			mock:       oauthmock.New("google", "sub-reason-unverified", "reason-unverified@example.com", false),
+			name: "email_unverified_merge_gate",
+			mock: oauthmock.New("google", "sub-reason-unverified", "reason-unverified@example.com", false),
+			seed: func(t *testing.T, database *gorm.DB) {
+				t.Helper()
+				local := db.User{ID: uuid.New(), Email: "reason-unverified@example.com", PasswordHash: "hash", EmailVerified: true}
+				if err := database.Create(&local).Error; err != nil {
+					t.Fatalf("seed local: %v", err)
+				}
+			},
 			query:      func(state string) string { return "?code=c&state=" + state },
 			wantStatus: http.StatusBadRequest, wantReason: "email_unverified",
 		},
