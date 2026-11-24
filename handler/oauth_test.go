@@ -220,6 +220,21 @@ func TestOAuthInitiateRoute(t *testing.T) {
 		driveInitiate(t, h, "/auth/oauth/custom-idp")
 	})
 
+	t.Run("attached providers without a service report the wiring bug", func(t *testing.T) {
+		cfg := oauthTestConfig()
+		providers := map[string]oauth.Provider{"google": &stubOAuthProvider{id: "google"}}
+		h := New(nil, cfg, nil, WithOAuthService(nil, providers))
+		req := httptest.NewRequest(http.MethodGet, "/auth/oauth/google", nil)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusInternalServerError {
+			t.Fatalf("status = %d; want 500 (%s)", rec.Code, rec.Body.String())
+		}
+		if code := decodeErrCode(t, rec); code != errors.CodeInternalError {
+			t.Fatalf("code = %s; want INTERNAL_ERROR", code)
+		}
+	})
+
 	t.Run("unknown provider 404s", func(t *testing.T) {
 		_, h := oauthTestEnv(t, &oauth.UserInfo{ProviderID: "google", ProviderUserID: "s", Email: "a@b.c", EmailVerified: true})
 		for _, path := range []string{"/auth/oauth/discord", "/api/auth/oauth/microsoft"} {

@@ -330,7 +330,9 @@ func (h *Handler) registerRoutes() {
 		h.mux.Handle("POST /sessions/rotate", sessionWrap(h.sessHandler.RotateSession))
 	}
 
-	if h.oauthSvc != nil {
+	// An attached provider map or registry without a service still mounts the
+	// routes so the nil-service 500 reports the wiring bug instead of a 404.
+	if h.oauthSvc != nil || h.oauthProviders != nil || h.oauthRegistry != nil {
 		// Mounted RAW outside csrf.Middleware/PreAuthMiddleware: Apple
 		// form_post callbacks carry no CSRF cookie+header, and RFC 6749
 		// state validation in HandleCallback is the CSRF defense.
