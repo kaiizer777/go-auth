@@ -680,6 +680,42 @@ func TestUnverifiedSignupNeverBindsLink(t *testing.T) {
 	})
 }
 
+// TestMergeGateRejectsUnstorableIdentity pins validateProviderIdentity as the
+// live merge gate: no merge may attempt to store an identity the schema cannot
+// hold, and an unverified claim may not pass it at all.
+func TestMergeGateRejectsUnstorableIdentity(t *testing.T) {
+	oversized := func(email string) *UserInfo {
+		return &UserInfo{ProviderID: "google", ProviderUserID: strings.Repeat("s", providerFieldMaxLen+1),
+			Email: email, EmailVerified: true}
+	}
+
+	t.Run("email merge rejects an oversized provider subject", func(t *testing.T) {
+		database, _, _, rawSvc := setupServiceTest(t, nil)
+		existing := db.User{ID: uuid.New(), Email: "gate@example.com", PasswordHash: "hash", EmailVerified: true}
+		if err := database.Create(&existing).Error; err != nil {
+			t.Fatalf("seed user: %v", err)
+		}
+		_, _, _, err := rawSvc.(*service).linkOrCreate(context.Background(), "google", oversized("gate@example.com"), "")
+		requireCode(t, err, errors.CodeOAuthProviderError, http.StatusBadGateway)
+		if n := countRows(t, database, &db.OAuthAccount{}); n != 0 {
+			t.Fatalf("oauth_accounts = %d; want 0", n)
+		}
+	})
+
+	t.Run("raced email merge rejects an oversized provider subject", func(t *testing.T) {
+		database, _, _, rawSvc := setupServiceTest(t, nil)
+		winner := db.User{ID: uuid.New(), Email: "raced-gate@example.com", PasswordHash: "hash", EmailVerified: true}
+		if err := database.Create(&winner).Error; err != nil {
+			t.Fatalf("seed winner: %v", err)
+		}
+		_, _, _, err := rawSvc.(*service).createUserAndLink(context.Background(), "google", oversized("raced-gate@example.com"))
+		requireCode(t, err, errors.CodeOAuthProviderError, http.StatusBadGateway)
+		if n := countRows(t, database, &db.OAuthAccount{}); n != 0 {
+			t.Fatalf("oauth_accounts = %d; want 0", n)
+		}
+	})
+}
+
 func TestHandleCallbackLinking(t *testing.T) {
 	t.Run("verified email links existing verified user without dup", func(t *testing.T) {
 		t.Parallel()

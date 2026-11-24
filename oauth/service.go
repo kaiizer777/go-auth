@@ -110,16 +110,16 @@ func clientIP(r *http.Request) string {
 	return host
 }
 
-// canonicalProviderSlug normalizes a provider slug for lookup. The registry and
-// the static provider map key on the canonical lowercase ID, so callers may
-// address a configured provider with any casing. Callers must also send the
-// returned slug to the store: provider_id is part of the identity key.
-func canonicalProviderSlug(providerID string) string {
+// CanonicalProviderSlug normalizes a provider slug for gating and dispatch. The
+// registry and the static provider map key on the canonical lowercase ID, so a
+// configured provider may be addressed with any casing. The returned slug is
+// what must reach the store: provider_id is part of the identity key.
+func CanonicalProviderSlug(providerID string) string {
 	return strings.ToLower(strings.TrimSpace(providerID))
 }
 
 func (s *service) providerFor(providerID string) (Provider, error) {
-	slug := canonicalProviderSlug(providerID)
+	slug := CanonicalProviderSlug(providerID)
 	if s.registry != nil {
 		if p, err := s.registry.Get(slug); err == nil && p != nil {
 			return p, nil
@@ -217,7 +217,7 @@ func (s *service) InitiateFlow(w http.ResponseWriter, r *http.Request, providerI
 	if w == nil {
 		return "", errors.New(errors.CodeValidationError, "invalid oauth initiate request", nil)
 	}
-	providerID = canonicalProviderSlug(providerID)
+	providerID = CanonicalProviderSlug(providerID)
 	p, err := s.providerFor(providerID)
 	if err != nil {
 		return "", err
@@ -269,7 +269,7 @@ func (s *service) InitiateFlow(w http.ResponseWriter, r *http.Request, providerI
 // provider-verified gate lives inside the link path so an already-linked
 // identity never needs an email (Apple omits it after first consent).
 func (s *service) HandleCallback(ctx context.Context, w http.ResponseWriter, r *http.Request, providerID, code, state string, sessType db.SessionType) (*session.Session, string, string, error) {
-	providerID = canonicalProviderSlug(providerID)
+	providerID = CanonicalProviderSlug(providerID)
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -487,13 +487,12 @@ var errOAuthProviderIdentityInvalid = errors.New(errors.CodeOAuthProviderError, 
 // writes: users.email, oauth_accounts.email and oauth_accounts.provider_user_id.
 const providerFieldMaxLen = 255
 
-// validateProviderIdentity gates the account-merge paths, which are the only
-// ones allowed to resolve an existing local account by email: an address the
-// provider did not verify must never resolve to or attach to an existing
-// account. Fresh registration uses validateProviderIdentityFields instead; the
-// takeover risk is binding an unverified address to an owner, not creating a
-// new account for it. Order is load-bearing: an unverified identity reports
-// OAUTH_EMAIL_UNVERIFIED before any field-validity rejection.
+// validateProviderIdentity gates the account-merge paths: a merge is the only
+// step allowed to attach a provider identity to an existing local account, and
+// an address the provider did not verify must never pass it. Fresh registration
+// validates fields only (validateProviderIdentityFields) and stores no binding.
+// Order is load-bearing: an unverified identity reports OAUTH_EMAIL_UNVERIFIED
+// before any field-validity rejection.
 func validateProviderIdentity(info *UserInfo) error {
 	if strings.TrimSpace(info.Email) == "" {
 		return errors.ErrOAuthEmailRequired
@@ -646,6 +645,9 @@ func (s *service) linkRacedUser(ctx context.Context, providerID string, info *Us
 	if err != nil {
 		return db.User{}, false, false, errors.New(errors.CodeInternalError, "failed to query user", err)
 	}
+	if gerr := validateProviderIdentity(info); gerr != nil {
+		return db.User{}, false, false, gerr
+	}
 	if !existing.EmailVerified {
 		return db.User{}, false, false, errors.ErrOAuthAccountLinkConflict
 	}
@@ -776,12 +778,13 @@ func (s *service) linkOrCreate(ctx context.Context, providerID string, info *Use
 		return db.User{}, false, false, gerr
 	}
 
-	// 5. Existing local user check by email. Merging stays fail-closed: an
-	// unverified provider claim never resolves to or attaches to an owner.
+	// 5. Existing local user check by email. Merging stays fail-closed through
+	// validateProviderIdentity: an unverified provider claim never resolves to
+	// or attaches to an owner.
 	existing, err := s.findUserByEmail(ctx, info.Email)
 	if err == nil {
-		if !info.EmailVerified {
-			return db.User{}, false, false, errors.ErrOAuthEmailUnverified
+		if gerr := validateProviderIdentity(info); gerr != nil {
+			return db.User{}, false, false, gerr
 		}
 		// Pre-hijacking defense: never link onto an unverified local account.
 		if !existing.EmailVerified {
