@@ -121,42 +121,55 @@ func (m *JWKSManager) GetKey(ctx context.Context, kid string) (JWKSKey, error) {
 		return key, nil
 	}
 	if !ok && neg && time.Now().Before(missExp) {
-		return JWKSKey{}, errors.New(errors.CodeOAuthIDTokenInvalid, fmt.Sprintf("signing key with kid %q not found in jwks", kid), nil)
+		return JWKSKey{}, errUnknownKid(kid)
 	}
 
 	// Singleflight deduplication across concurrent cache misses.
-	fetched, err := m.refreshFlight("jwks_refresh", kid, ctx)
-	if err != nil {
+	if _, err := m.refreshFlight("jwks_refresh", kid, ctx); err != nil {
 		return m.staleOrError(kid, err)
 	}
-	// A concurrent commit can supersede this fetch; committed material wins because
-	// generation only proves "someone committed later", not which document is newer.
+	// Only the committed document may authorize a kid. A superseded fetch is
+	// discarded even when it lists the kid: a later flight already published
+	// the current set, and a kid absent from it must not authenticate.
 	if key, ok := m.cachedKey(kid); ok {
-		m.clearMiss(kid)
-		return key, nil
-	}
-	// The superseded document still proves the provider served kid, so it covers
-	// kids the committed cache genuinely lacks.
-	if key, ok := fetched[kid]; ok {
 		m.clearMiss(kid)
 		return key, nil
 	}
 
-	// If missing after joiner flight, refresh under singleflight deduplication to avoid stampedes
-	fetched, err = m.refreshFlight("jwks_rollover_refresh", kid, ctx)
-	if err != nil {
+	// The kid may have rotated in after this flight's fetch, so confirm against
+	// one rollover fetch before recording a miss.
+	if _, err := m.refreshFlight("jwks_rollover_refresh", kid, ctx); err != nil {
+		if key, ok := m.cachedKey(kid); ok {
+			m.clearMiss(kid)
+			return key, nil
+		}
+		// A fresh committed set that lacks the kid is an auth failure, not a
+		// provider outage; only a stale set can be a server-side error.
+		if m.cacheFresh() {
+			m.recordMiss(kid)
+			return JWKSKey{}, errUnknownKid(kid)
+		}
 		return m.staleOrError(kid, err)
 	}
 	if key, ok := m.cachedKey(kid); ok {
-		m.clearMiss(kid)
-		return key, nil
-	}
-	if key, ok := fetched[kid]; ok {
 		m.clearMiss(kid)
 		return key, nil
 	}
 	m.recordMiss(kid)
-	return JWKSKey{}, errors.New(errors.CodeOAuthIDTokenInvalid, fmt.Sprintf("signing key with kid %q not found in jwks", kid), nil)
+	return JWKSKey{}, errUnknownKid(kid)
+}
+
+// errUnknownKid is an authentication failure: the token names a kid the
+// provider's current signing set does not contain.
+func errUnknownKid(kid string) error {
+	return errors.New(errors.CodeOAuthIDTokenInvalid, fmt.Sprintf("signing key with kid %q not found in jwks", kid), nil)
+}
+
+// cacheFresh reports whether the committed key set is still within its TTL.
+func (m *JWKSManager) cacheFresh() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return time.Now().Before(m.expires)
 }
 
 // staleOrError serves the last-known-good key while it is still inside the
@@ -209,6 +222,11 @@ func (m *JWKSManager) recordMiss(kid string) {
 func (m *JWKSManager) cachedKey(kid string) (JWKSKey, bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
+	// Both call sites run right after refreshFlight committed, so a stale entry
+	// cannot be read today; enforcing the bound keeps the invariant local.
+	if !time.Now().Before(m.expires) {
+		return JWKSKey{}, false
+	}
 	key, ok := m.keys[kid]
 	return key, ok
 }

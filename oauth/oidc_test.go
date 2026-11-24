@@ -9,13 +9,16 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	apperrors "github.com/kaiizer777/go-auth/errors"
 )
 
-// Reproduces the rollover lost-update: caller A fetches the post-rollover document
-// while caller B's older fetch commits first, superseding A's generation.
-func TestJWKSManager_SupersededRefreshServesRequestedKid(t *testing.T) {
+// A superseded fetch must not authorize a kid absent from the committed set:
+// caller A fetches the post-rollover document while caller B's older fetch
+// commits first, superseding A's generation.
+func TestJWKSManager_SupersededRefreshRejectsUncommittedKid(t *testing.T) {
 	_, oldN, oldE := generateTestRSAKey(t)
-	newPriv, newN, newE := generateTestRSAKey(t)
+	_, newN, newE := generateTestRSAKey(t)
 
 	oldSet := JWKDoc{Keys: []JWKKey{{
 		Kty: "RSA", Use: "sig", Kid: "kid_old", Alg: "RS256", N: oldN, E: oldE,
@@ -91,11 +94,12 @@ func TestJWKSManager_SupersededRefreshServesRequestedKid(t *testing.T) {
 	release()
 
 	res := <-aDone
-	if res.err != nil {
-		t.Fatalf("superseded refresh lost kid_new: %v", res.err)
+	if res.err == nil {
+		t.Fatal("superseded refresh authorized a kid absent from the committed set")
 	}
-	if res.key.Key.N.Cmp(newPriv.N) != 0 {
-		t.Fatal("returned key is not the rollover key")
+	var appErr *apperrors.Error
+	if !apperrors.As(res.err, &appErr) || appErr.Code() != apperrors.CodeOAuthIDTokenInvalid {
+		t.Fatalf("expected CodeOAuthIDTokenInvalid, got %v", res.err)
 	}
 	if got := requests.Load(); got != 3 {
 		t.Fatalf("jwks requests = %d; want 3", got)
@@ -282,5 +286,57 @@ func TestJWKSManager_SupersededPrimaryFlightPrefersCommittedKey(t *testing.T) {
 	}
 	if got := requests.Load(); got != 3 {
 		t.Fatalf("jwks requests = %d; want 3", got)
+	}
+}
+
+func TestJWKSManager_RolloverRefreshFailureStaysAuthError(t *testing.T) {
+	_, n, e := generateTestRSAKey(t)
+	var requests atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if requests.Add(1) == 1 {
+			_ = json.NewEncoder(w).Encode(JWKDoc{Keys: []JWKKey{
+				{Kty: "RSA", Use: "sig", Kid: "kid-1", Alg: "RS256", N: n, E: e},
+			}})
+			return
+		}
+		http.Error(w, "upstream down", http.StatusBadGateway)
+	}))
+	defer srv.Close()
+
+	mgr := NewJWKSManager(srv.URL, srv.Client(), time.Hour)
+	_, err := mgr.GetKey(context.Background(), "kid-missing")
+	if err == nil {
+		t.Fatal("expected not-found error, got nil")
+	}
+	var appErr *apperrors.Error
+	if !apperrors.As(err, &appErr) || appErr.Code() != apperrors.CodeOAuthIDTokenInvalid {
+		t.Fatalf("expected auth failure CodeOAuthIDTokenInvalid, got %v", err)
+	}
+	if got := requests.Load(); got != 2 {
+		t.Fatalf("jwks requests = %d; want 2", got)
+	}
+}
+
+func TestJWKSManager_CachedKeyRejectsExpiredDocument(t *testing.T) {
+	_, n, e := generateTestRSAKey(t)
+	pub, ok := parseRSAPublicKey(n, e)
+	if !ok {
+		t.Fatal("failed to parse public key")
+	}
+	mgr := NewJWKSManager("http://unused", nil, time.Hour)
+	mgr.mu.Lock()
+	mgr.keys = map[string]JWKSKey{"kid-1": {Key: pub}}
+	mgr.expires = time.Now().Add(time.Minute)
+	mgr.mu.Unlock()
+
+	if _, ok := mgr.cachedKey("kid-1"); !ok {
+		t.Fatal("fresh cached key rejected")
+	}
+
+	mgr.mu.Lock()
+	mgr.expires = time.Now().Add(-time.Second)
+	mgr.mu.Unlock()
+	if _, ok := mgr.cachedKey("kid-1"); ok {
+		t.Fatal("expired cached key accepted")
 	}
 }
