@@ -108,6 +108,9 @@ type Provider interface {
 // authorization redirect with per-login options such as an OIDC nonce. Keeping
 // it out of Provider preserves source compatibility for implementers written
 // against the original contract; callers type-assert before using it.
+// An OIDCProvider without this capability still receives the nonce: the service
+// appends it to the AuthURL result, because the callback verifies every OIDC
+// ID-token nonce.
 // Tenant-scoped providers (Microsoft) pin the tenant in the endpoint when the
 // provider is constructed, so the tenant travels through this same path.
 type AuthCodeURLProvider interface {

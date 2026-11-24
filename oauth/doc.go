@@ -18,6 +18,20 @@
 // without an email, because providers such as Apple only return one on first
 // consent.
 //
+// Link trust: every oauth_accounts row records whether the provider attested the
+// address it carries. An unverified link may sign in the account it was created
+// on, and only while that account still holds no proven credential; once a
+// password signup or reset claims the address the link is deleted and refuses.
+// Unverified links never merge, recover, or resolve an account by email, and
+// ?link=true cannot persist an unattested address.
+//
+// Provider compatibility: Provider is unchanged and AuthCodeURLProvider is still
+// optional. An OIDCProvider that does not implement it now receives the login
+// nonce as a "nonce" query parameter on the URL returned by AuthURL, because the
+// callback verifies the ID-token nonce for every OIDC provider. Adapters either
+// tolerate the extra parameter (the OAuth 2.0 authorize endpoint ignores unknown
+// parameters) or implement AuthCodeURL to control where the nonce is placed.
+//
 // The consumed-state record is process-local. A multi-replica deployment needs
 // sticky routing per in-flight login or an external store; otherwise two
 // replicas each accept the same state token once.
