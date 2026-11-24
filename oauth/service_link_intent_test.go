@@ -113,7 +113,11 @@ func TestInitiateFlowLinkIntent(t *testing.T) {
 }
 
 func TestLinkOrCreateFailClosed(t *testing.T) {
-	t.Run("unparsable link user is 500 with zero writes", func(t *testing.T) {
+	// Merge premise (oauth sync): an unresolvable link owner maps to the
+	// domain-level OAUTH_ACCOUNT_NOT_LINKED (404), not a 500: nothing is
+	// broken server-side, the selected owner just cannot be confirmed.
+	// Genuine store failures stay 500 ("store failure stays a domain error").
+	t.Run("unparsable link user fails closed with zero writes", func(t *testing.T) {
 		t.Parallel()
 		database, _, _, svc := setupServiceTest(t, verifiedInfo())
 		inner, ok := svc.(*service)
@@ -121,11 +125,11 @@ func TestLinkOrCreateFailClosed(t *testing.T) {
 			t.Fatal("NewService did not return *service")
 		}
 		_, _, _, err := inner.linkOrCreate(context.Background(), "google", verifiedInfo(), "not-a-uuid")
-		requireCode(t, err, errors.CodeInternalError, http.StatusInternalServerError)
+		requireCode(t, err, errors.CodeOAuthAccountNotLinked, http.StatusNotFound)
 		requireIdentityRows(t, database, 0, 0, 0)
 	})
 
-	t.Run("missing link owner is 500 with zero writes", func(t *testing.T) {
+	t.Run("missing link owner fails closed with zero writes", func(t *testing.T) {
 		t.Parallel()
 		database, _, _, svc := setupServiceTest(t, verifiedInfo())
 		inner, ok := svc.(*service)
@@ -133,7 +137,7 @@ func TestLinkOrCreateFailClosed(t *testing.T) {
 			t.Fatal("NewService did not return *service")
 		}
 		_, _, _, err := inner.linkOrCreate(context.Background(), "google", verifiedInfo(), uuid.New().String())
-		requireCode(t, err, errors.CodeInternalError, http.StatusInternalServerError)
+		requireCode(t, err, errors.CodeOAuthAccountNotLinked, http.StatusNotFound)
 		requireIdentityRows(t, database, 0, 0, 0)
 	})
 }

@@ -2,6 +2,7 @@ package config
 
 import (
 	"bytes"
+	"encoding/json"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -515,6 +516,30 @@ func TestConfigValidate_OAuth(t *testing.T) {
 			wantErr: nil,
 		},
 		{
+			name: "facebook map graph version missing v prefix rejected",
+			mutate: func(c *Config) {
+				c.OAuth.Providers = enabled("facebook", ProviderConfig{
+					ClientID:     "fb-app-id",
+					ClientSecret: "fb-app-secret",
+					RedirectURL:  "https://example.com/callback",
+					GraphVersion: "18.0",
+				})
+			},
+			wantErr: errors.ErrOAuthGraphVersionInvalid,
+		},
+		{
+			name: "facebook map graph version below 19 rejected",
+			mutate: func(c *Config) {
+				c.OAuth.Providers = enabled("facebook", ProviderConfig{
+					ClientID:     "fb-app-id",
+					ClientSecret: "fb-app-secret",
+					RedirectURL:  "https://example.com/callback",
+					GraphVersion: "v18.0",
+				})
+			},
+			wantErr: errors.ErrOAuthGraphVersionInvalid,
+		},
+		{
 			name: "facebook missing state secret rejected",
 			mutate: func(c *Config) {
 				c.OAuth.StateSecret = ""
@@ -656,6 +681,26 @@ func TestConfigValidate_MicrosoftTenantNormalisation(t *testing.T) {
 		if cfg.OAuth.Microsoft.TrustedTenants[i] != want[i] {
 			t.Errorf("TrustedTenants[%d] = %q; want %q", i, cfg.OAuth.Microsoft.TrustedTenants[i], want[i])
 		}
+	}
+}
+
+func TestProviderConfigJSONTags(t *testing.T) {
+	var p ProviderConfig
+	raw := `{"client_id":"id","tenant":"tenant-guid","trusted_tenants":["partner-guid"],"jwks_cache_ttl":3600000000000,"graph_version":"v20.0"}`
+	if err := json.Unmarshal([]byte(raw), &p); err != nil {
+		t.Fatalf("unmarshal ProviderConfig: %v", err)
+	}
+	if p.Tenant != "tenant-guid" {
+		t.Errorf("Tenant = %q; want tenant-guid", p.Tenant)
+	}
+	if len(p.TrustedTenants) != 1 || p.TrustedTenants[0] != "partner-guid" {
+		t.Errorf("TrustedTenants = %v; want [partner-guid]", p.TrustedTenants)
+	}
+	if p.JWKSCacheTTL != time.Hour {
+		t.Errorf("JWKSCacheTTL = %v; want 1h", p.JWKSCacheTTL)
+	}
+	if p.GraphVersion != "v20.0" {
+		t.Errorf("GraphVersion = %q; want v20.0", p.GraphVersion)
 	}
 }
 
@@ -917,6 +962,13 @@ func TestProviderConfigLogValue(t *testing.T) {
 		if len(cfg.OAuth.X.Scopes) != 1 || cfg.OAuth.X.Scopes[0] != "users.read" {
 			t.Fatalf("Scopes = %v; want [users.read]", cfg.OAuth.X.Scopes)
 		}
+		// Merge premise (oauth sync): the typed X default is least-privilege
+		// [users.read] and wins the resolveProviders merge, so the merged map
+		// entry carries it rather than the broader remote default.
+		scopes := cfg.OAuth.Providers["x"].Scopes
+		if len(scopes) != 1 || scopes[0] != "users.read" {
+			t.Fatalf("Scopes = %v; want [users.read]", scopes)
+		}
 	})
 
 	t.Run("XConfig masks client secret in LogValue and String", func(t *testing.T) {
@@ -963,6 +1015,217 @@ func TestProviderConfigLogValue(t *testing.T) {
 		str := o.String()
 		if strings.Contains(str, "x-secret-leak-test") {
 			t.Fatalf("String() leaked x secret")
+		}
+	})
+}
+
+// A JSON handler resolves LogValuer only on slog.Attr values, so assertions on
+// slog.Value.String() cannot catch an unredacted map element.
+func TestOAuthConfigLogValueJSONRedaction(t *testing.T) {
+	o := OAuthConfig{
+		StateSecret: "state-secret-serialized-leak",
+		Providers: map[string]ProviderConfig{
+			"google": {
+				ClientID:     "google-client-id",
+				ClientSecret: "google-client-secret-leak",
+				RedirectURL:  "https://example.com/callback",
+				Scopes:       []string{"openid", "email"},
+				Enabled:      true,
+			},
+			"apple": {
+				ClientID:   "apple-client-id",
+				TeamID:     "TEAM123456",
+				KeyID:      "KEY1234567",
+				PrivateKey: "-----BEGIN PRIVATE KEY-----\napple-p8-leak\n-----END PRIVATE KEY-----",
+				Enabled:    true,
+			},
+			"secretless": {ClientID: "public-client"},
+		},
+	}
+
+	var buf bytes.Buffer
+	slog.New(slog.NewJSONHandler(&buf, nil)).Info("oauth config", "oauth", o)
+
+	line := buf.String()
+	for _, leaked := range []string{"state-secret-serialized-leak", "google-client-secret-leak", "apple-p8-leak"} {
+		if strings.Contains(line, leaked) {
+			t.Fatalf("serialized log line leaked %q: %s", leaked, line)
+		}
+	}
+
+	var entry map[string]any
+	if err := json.Unmarshal(buf.Bytes(), &entry); err != nil {
+		t.Fatalf("log line is not valid json: %v", err)
+	}
+	oauth, ok := entry["oauth"].(map[string]any)
+	if !ok {
+		t.Fatalf("oauth group missing from log line: %s", line)
+	}
+	providers, ok := oauth["providers"].(map[string]any)
+	if !ok {
+		t.Fatalf("providers group missing from log line: %s", line)
+	}
+	google, ok := providers["google"].(map[string]any)
+	if !ok {
+		t.Fatalf("google provider missing from log line: %s", line)
+	}
+	if google["client_secret"] != "[REDACTED]" {
+		t.Fatalf("google client_secret = %v; want [REDACTED]", google["client_secret"])
+	}
+	apple, ok := providers["apple"].(map[string]any)
+	if !ok {
+		t.Fatalf("apple provider missing from log line: %s", line)
+	}
+	if apple["private_key"] != "[REDACTED]" {
+		t.Fatalf("apple private_key = %v; want [REDACTED]", apple["private_key"])
+	}
+	secretless, ok := providers["secretless"].(map[string]any)
+	if !ok {
+		t.Fatalf("secretless provider missing from log line: %s", line)
+	}
+	if secretless["client_secret"] != "" {
+		t.Fatalf("secretless client_secret = %v; want empty", secretless["client_secret"])
+	}
+}
+
+func TestOAuthConfigLogValueEmptyProviders(t *testing.T) {
+	var buf bytes.Buffer
+	slog.New(slog.NewJSONHandler(&buf, nil)).Info("oauth config", "oauth", OAuthConfig{})
+
+	var entry map[string]any
+	if err := json.Unmarshal(buf.Bytes(), &entry); err != nil {
+		t.Fatalf("log line is not valid json: %v", err)
+	}
+	oauth, ok := entry["oauth"].(map[string]any)
+	if !ok {
+		t.Fatalf("oauth group missing from log line: %s", buf.String())
+	}
+	if raw, present := oauth["providers"]; present {
+		if _, isObject := raw.(map[string]any); !isObject {
+			t.Fatalf("providers = %v; want a group object", raw)
+		}
+	}
+}
+
+func TestOAuthConfig_ResolvesProvidersAfterDefaults(t *testing.T) {
+	msMap := func(tenant string) map[string]ProviderConfig {
+		return map[string]ProviderConfig{"microsoft": {
+			ClientID:     "map-id",
+			ClientSecret: "map-secret",
+			RedirectURL:  "https://example.com/cb",
+			Enabled:      true,
+			Tenant:       tenant,
+		}}
+	}
+	msTyped := func(tenant string) *MicrosoftConfig {
+		return &MicrosoftConfig{
+			ClientID:     "typed-id",
+			ClientSecret: "typed-secret",
+			RedirectURI:  "https://example.com/cb",
+			Tenant:       tenant,
+		}
+	}
+
+	t.Run("map tenant survives defaults", func(t *testing.T) {
+		cfg := validOAuthBase()
+		cfg.OAuth.Providers = msMap("corp-guid")
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("Validate = %v", err)
+		}
+		p := cfg.OAuth.Providers["microsoft"]
+		if p.Tenant != "corp-guid" {
+			t.Errorf("Tenant = %q; want corp-guid", p.Tenant)
+		}
+		if len(p.Scopes) != 4 {
+			t.Errorf("Scopes = %v; want defaults", p.Scopes)
+		}
+		if p.JWKSCacheTTL != 24*time.Hour {
+			t.Errorf("JWKSCacheTTL = %v; want 24h", p.JWKSCacheTTL)
+		}
+	})
+
+	// Merge premise (oauth sync): fixtures use realistic tenant GUIDs because
+	// Validate enforces the tenant gate (fail closed on non-GUID/domain refs).
+	t.Run("typed tenant wins over map tenant", func(t *testing.T) {
+		cfg := validOAuthBase()
+		cfg.OAuth.Providers = msMap("map-guid")
+		cfg.OAuth.Microsoft = msTyped("22222222-2222-2222-2222-222222222222")
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("Validate = %v", err)
+		}
+		if got := cfg.OAuth.Providers["microsoft"].Tenant; got != "22222222-2222-2222-2222-222222222222" {
+			t.Errorf("Tenant = %q; want typed guid", got)
+		}
+	})
+
+	t.Run("typed tenant wins when map omits it", func(t *testing.T) {
+		cfg := validOAuthBase()
+		cfg.OAuth.Providers = map[string]ProviderConfig{"microsoft": {
+			ClientID:     "map-id",
+			ClientSecret: "map-secret",
+			RedirectURL:  "https://example.com/cb",
+			Enabled:      true,
+		}}
+		cfg.OAuth.Microsoft = msTyped("22222222-2222-2222-2222-222222222222")
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("Validate = %v", err)
+		}
+		if got := cfg.OAuth.Providers["microsoft"].Tenant; got != "22222222-2222-2222-2222-222222222222" {
+			t.Errorf("Tenant = %q; want typed guid", got)
+		}
+	})
+
+	t.Run("common remains reachable when nothing configures a tenant", func(t *testing.T) {
+		cfg := validOAuthBase()
+		cfg.OAuth.Microsoft = msTyped("")
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("Validate = %v", err)
+		}
+		if got := cfg.OAuth.Providers["microsoft"].Tenant; got != "common" {
+			t.Errorf("Tenant = %q; want common", got)
+		}
+	})
+
+	t.Run("typed provider registers without a map entry", func(t *testing.T) {
+		cfg := validOAuthBase()
+		cfg.OAuth.Microsoft = msTyped("")
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("Validate = %v", err)
+		}
+		if !cfg.OAuth.Providers["microsoft"].Enabled {
+			t.Error("merged microsoft entry is disabled; want enabled")
+		}
+	})
+
+	t.Run("explicit map enabled false disables a typed provider", func(t *testing.T) {
+		off := false
+		cfg := validOAuthBase()
+		cfg.OAuth.Providers = msMap("corp-guid")
+		entry := cfg.OAuth.Providers["microsoft"]
+		entry.Enabled = off
+		cfg.OAuth.Providers["microsoft"] = entry
+		cfg.OAuth.Microsoft = msTyped("")
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("Validate = %v", err)
+		}
+		if cfg.OAuth.Providers["microsoft"].Enabled {
+			t.Error("merged microsoft entry is enabled; want disabled")
+		}
+	})
+
+	t.Run("explicit typed enabled false disables the provider", func(t *testing.T) {
+		off := false
+		cfg := validOAuthBase()
+		cfg.OAuth.StateSecret = ""
+		cfg.OAuth.Providers = msMap("corp-guid")
+		typed := msTyped("")
+		typed.Enabled = &off
+		cfg.OAuth.Microsoft = typed
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("Validate = %v; want nil (disabled provider needs no state secret)", err)
+		}
+		if cfg.OAuth.Providers["microsoft"].Enabled {
+			t.Error("merged microsoft entry is enabled; want disabled")
 		}
 	})
 }

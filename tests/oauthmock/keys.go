@@ -34,6 +34,15 @@ func BuildJWK(kid, nRaw, eRaw string) map[string]any {
 	}
 }
 
+// BuildJWKWithIssuer builds a JSON Web Key map that advertises the issuer/tenant it is scoped to.
+func BuildJWKWithIssuer(kid, nRaw, eRaw, issuer string) map[string]any {
+	jwk := BuildJWK(kid, nRaw, eRaw)
+	if issuer != "" {
+		jwk["issuer"] = issuer
+	}
+	return jwk
+}
+
 // SignRS256JWT signs claims using RS256 and the provided private key and kid.
 func SignRS256JWT(privKey *rsa.PrivateKey, kid string, claims map[string]any) (string, error) {
 	headerBytes, err := json.Marshal(map[string]string{

@@ -183,12 +183,17 @@ func NewProvider(id string, cfg config.ProviderConfig, oCfg ...*config.OAuthConf
 }
 
 // mergeMicrosoftConfig overlays typed Microsoft overrides on generic identity fields.
+// Generic tenant, allowlist, and JWKS TTL survive a missing typed section so
+// map-only callers (2-arg NewProvider) keep working after the merge.
 func mergeMicrosoftConfig(cfg config.ProviderConfig, typed *config.OAuthConfig) config.MicrosoftConfig {
 	merged := config.MicrosoftConfig{
-		ClientID:     cfg.ClientID,
-		ClientSecret: cfg.ClientSecret,
-		RedirectURI:  cfg.RedirectURL,
-		Scopes:       cfg.Scopes,
+		ClientID:       cfg.ClientID,
+		ClientSecret:   cfg.ClientSecret,
+		RedirectURI:    cfg.RedirectURL,
+		Scopes:         cfg.Scopes,
+		Tenant:         cfg.Tenant,
+		TrustedTenants: cfg.TrustedTenants,
+		JWKSCacheTTL:   cfg.JWKSCacheTTL,
 	}
 	if typed == nil || typed.Microsoft == nil {
 		return merged
@@ -219,12 +224,15 @@ func mergeMicrosoftConfig(cfg config.ProviderConfig, typed *config.OAuthConfig) 
 }
 
 // mergeFacebookConfig overlays typed Facebook overrides on generic identity fields.
+// The generic graph version survives a missing typed section for the same
+// reason as mergeMicrosoftConfig above.
 func mergeFacebookConfig(cfg config.ProviderConfig, typed *config.OAuthConfig) config.FacebookConfig {
 	merged := config.FacebookConfig{
-		AppID:       cfg.ClientID,
-		AppSecret:   cfg.ClientSecret,
-		RedirectURI: cfg.RedirectURL,
-		Scopes:      cfg.Scopes,
+		AppID:        cfg.ClientID,
+		AppSecret:    cfg.ClientSecret,
+		RedirectURI:  cfg.RedirectURL,
+		Scopes:       cfg.Scopes,
+		GraphVersion: cfg.GraphVersion,
 	}
 	if typed == nil || typed.Facebook == nil {
 		return merged

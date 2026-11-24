@@ -215,6 +215,24 @@ func NewWithStore(store db.Store, cfg config.Config) (*Auth, error) {
 	return a, nil
 }
 
+// newOAuthProviders instantiates every enabled entry of the resolved provider
+// config. cfg must have passed Config.Validate, which merges the typed sections
+// into cfg.Providers and applies defaults.
+func newOAuthProviders(cfg config.OAuthConfig) (map[string]oauth.Provider, error) {
+	providers := make(map[string]oauth.Provider, len(cfg.Providers))
+	for id, pcfg := range cfg.Providers {
+		if !pcfg.Enabled {
+			continue
+		}
+		p, err := oauth.NewProvider(id, pcfg)
+		if err != nil {
+			return nil, err
+		}
+		providers[id] = p
+	}
+	return providers, nil
+}
+
 // NewWithDB initializes Auth using an existing GORM database connection.
 func NewWithDB(database *gorm.DB, cfg config.Config) (*Auth, error) {
 	adapter := gormstore.New(database)

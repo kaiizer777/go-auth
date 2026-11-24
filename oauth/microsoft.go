@@ -264,7 +264,9 @@ func (p *MicrosoftProvider) isEmailVerified(rawClaims map[string]any, tenantID s
 			return true
 		}
 	case string:
-		if strings.TrimSpace(edov) == "1" {
+		// "true" is accepted alongside "1": both encodings are MS-signed, so
+		// this only affects availability, never the trust model below.
+		if trimmed := strings.TrimSpace(edov); trimmed == "1" || trimmed == "true" {
 			return true
 		}
 	case float64:
@@ -321,6 +323,9 @@ func (p *MicrosoftProvider) FetchUserInfo(ctx context.Context, token *OAuthToken
 		}
 		if claims.UntrustedTenant {
 			user.RawClaims["untrusted_tenant"] = true
+		}
+		if claims.PreferredUsername != "" {
+			user.RawClaims["preferred_username"] = claims.PreferredUsername
 		}
 
 		// ProviderUserID: OID if present, fallback to Subject

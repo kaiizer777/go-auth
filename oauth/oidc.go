@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -47,13 +48,14 @@ type OIDCDiscovery struct {
 
 // JWKKey represents a single RSA JSON Web Key.
 type JWKKey struct {
-	Kty string   `json:"kty"`
-	Use string   `json:"use"`
-	Kid string   `json:"kid"`
-	Alg string   `json:"alg"`
-	N   string   `json:"n"`
-	E   string   `json:"e"`
-	X5c []string `json:"x5c,omitempty"`
+	Kty    string   `json:"kty"`
+	Use    string   `json:"use"`
+	Kid    string   `json:"kid"`
+	Alg    string   `json:"alg"`
+	N      string   `json:"n"`
+	E      string   `json:"e"`
+	Issuer string   `json:"issuer,omitempty"` // optional issuer/tenant scope advertised per key
+	X5c    []string `json:"x5c,omitempty"`
 }
 
 // JWKDoc represents a JSON Web Key Set document.
@@ -61,9 +63,15 @@ type JWKDoc struct {
 	Keys []JWKKey `json:"keys"`
 }
 
-// JWKSKeyRetriever retrieves an RSA public key by kid.
+// JWKSKey is a signing key together with the issuer scope advertised by its JWKS entry.
+type JWKSKey struct {
+	Key    *rsa.PublicKey
+	Issuer string
+}
+
+// JWKSKeyRetriever retrieves a signing key and its issuer scope by kid.
 type JWKSKeyRetriever interface {
-	GetKey(ctx context.Context, kid string) (*rsa.PublicKey, error)
+	GetKey(ctx context.Context, kid string) (JWKSKey, error)
 }
 
 // JWKSManager manages dynamic caching, singleflight deduplication, and rollover refresh for JWKS.
@@ -73,7 +81,7 @@ type JWKSManager struct {
 	ttl     time.Duration
 
 	mu      sync.RWMutex
-	keys    map[string]*rsa.PublicKey
+	keys    map[string]JWKSKey
 	expires time.Time
 	gen     uint64
 	sf      singleflight.Group
@@ -95,15 +103,15 @@ func NewJWKSManager(jwksURL string, client *http.Client, ttl time.Duration) *JWK
 		jwksURL: jwksURL,
 		client:  client,
 		ttl:     ttl,
-		keys:    make(map[string]*rsa.PublicKey),
+		keys:    make(map[string]JWKSKey),
 		misses:  make(map[string]time.Time),
 	}
 }
 
-// GetKey retrieves the RSA public key for kid, refreshing if missing or expired.
+// GetKey retrieves the signing key for kid, refreshing if missing or expired.
 // A failed refresh serves last-known-good keys within jwksStaleGracePeriod;
 // kids confirmed missing are negatively cached for unknownKidCooldown.
-func (m *JWKSManager) GetKey(ctx context.Context, kid string) (*rsa.PublicKey, error) {
+func (m *JWKSManager) GetKey(ctx context.Context, kid string) (JWKSKey, error) {
 	m.mu.RLock()
 	key, ok := m.keys[kid]
 	fresh := time.Now().Before(m.expires)
@@ -113,11 +121,102 @@ func (m *JWKSManager) GetKey(ctx context.Context, kid string) (*rsa.PublicKey, e
 		return key, nil
 	}
 	if !ok && neg && time.Now().Before(missExp) {
-		return nil, errors.New(errors.CodeOAuthIDTokenInvalid, fmt.Sprintf("signing key with kid %q not found in jwks", kid), nil)
+		return JWKSKey{}, errors.New(errors.CodeOAuthIDTokenInvalid, fmt.Sprintf("signing key with kid %q not found in jwks", kid), nil)
 	}
 
-	// Single flight collapses concurrent misses into one upstream fetch.
-	_, err, _ := m.sf.Do("jwks_fetch", func() (any, error) {
+	// Singleflight deduplication across concurrent cache misses.
+	fetched, err := m.refreshFlight("jwks_refresh", kid, ctx)
+	if err != nil {
+		return m.staleOrError(kid, err)
+	}
+	// A concurrent commit can supersede this fetch; committed material wins because
+	// generation only proves "someone committed later", not which document is newer.
+	if key, ok := m.cachedKey(kid); ok {
+		m.clearMiss(kid)
+		return key, nil
+	}
+	// The superseded document still proves the provider served kid, so it covers
+	// kids the committed cache genuinely lacks.
+	if key, ok := fetched[kid]; ok {
+		m.clearMiss(kid)
+		return key, nil
+	}
+
+	// If missing after joiner flight, refresh under singleflight deduplication to avoid stampedes
+	fetched, err = m.refreshFlight("jwks_rollover_refresh", kid, ctx)
+	if err != nil {
+		return m.staleOrError(kid, err)
+	}
+	if key, ok := m.cachedKey(kid); ok {
+		m.clearMiss(kid)
+		return key, nil
+	}
+	if key, ok := fetched[kid]; ok {
+		m.clearMiss(kid)
+		return key, nil
+	}
+	m.recordMiss(kid)
+	return JWKSKey{}, errors.New(errors.CodeOAuthIDTokenInvalid, fmt.Sprintf("signing key with kid %q not found in jwks", kid), nil)
+}
+
+// staleOrError serves the last-known-good key while it is still inside the
+// stale grace period, so a transient JWKS outage degrades to older keys
+// instead of locking out every login. Beyond the grace period the refresh
+// error is returned.
+func (m *JWKSManager) staleOrError(kid string, refreshErr error) (JWKSKey, error) {
+	m.mu.RLock()
+	key, ok := m.keys[kid]
+	expired := m.expires
+	m.mu.RUnlock()
+	if ok && time.Now().Before(expired.Add(jwksStaleGracePeriod)) {
+		return key, nil
+	}
+	return JWKSKey{}, refreshErr
+}
+
+// clearMiss drops a negative-cache entry once the kid resolves again.
+func (m *JWKSManager) clearMiss(kid string) {
+	m.mu.Lock()
+	delete(m.misses, kid)
+	m.mu.Unlock()
+}
+
+// recordMiss negatively caches a kid confirmed missing after a full refresh
+// cycle, so repeated lookups for attacker-controlled kids do not each cost
+// two upstream fetches. The map is bounded and expired entries are swept,
+// because unknown kids must not grow it without limit.
+func (m *JWKSManager) recordMiss(kid string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.misses == nil {
+		m.misses = make(map[string]time.Time)
+	}
+	now := time.Now()
+	for k, exp := range m.misses {
+		if !now.Before(exp) {
+			delete(m.misses, k)
+		}
+	}
+	if len(m.misses) >= unknownKidMaxNegEntries {
+		for k := range m.misses {
+			delete(m.misses, k)
+			break
+		}
+	}
+	m.misses[kid] = now.Add(unknownKidCooldown)
+}
+
+func (m *JWKSManager) cachedKey(kid string) (JWKSKey, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	key, ok := m.keys[kid]
+	return key, ok
+}
+
+// refreshFlight runs one deduplicated refresh unless the key is already cached and fresh.
+// The fetched set is returned even when another flight committed first.
+func (m *JWKSManager) refreshFlight(name, kid string, ctx context.Context) (map[string]JWKSKey, error) {
+	v, err, _ := m.sf.Do(name, func() (any, error) {
 		m.mu.RLock()
 		_, ok := m.keys[kid]
 		fresh := time.Now().Before(m.expires)
@@ -125,48 +224,16 @@ func (m *JWKSManager) GetKey(ctx context.Context, kid string) (*rsa.PublicKey, e
 		if ok && fresh {
 			return nil, nil
 		}
-		return nil, m.refresh(ctx)
+		return m.refresh(ctx)
 	})
-	if err == nil {
-		m.mu.Lock()
-		key, ok := m.keys[kid]
-		if ok {
-			delete(m.misses, kid)
-			m.mu.Unlock()
-			return key, nil
-		}
-		if m.misses == nil {
-			m.misses = make(map[string]time.Time)
-		}
-		now := time.Now()
-		for k, exp := range m.misses {
-			if !now.Before(exp) {
-				delete(m.misses, k)
-			}
-		}
-		if len(m.misses) >= unknownKidMaxNegEntries {
-			for k := range m.misses {
-				delete(m.misses, k)
-				break
-			}
-		}
-		m.misses[kid] = now.Add(unknownKidCooldown)
-		m.mu.Unlock()
-		return nil, errors.New(errors.CodeOAuthIDTokenInvalid, fmt.Sprintf("signing key with kid %q not found in jwks", kid), nil)
+	if err != nil {
+		return nil, err
 	}
-
-	refreshErr := err
-	m.mu.RLock()
-	key, ok = m.keys[kid]
-	expired := m.expires
-	m.mu.RUnlock()
-	if ok && time.Now().Before(expired.Add(jwksStaleGracePeriod)) {
-		return key, nil
-	}
-	return nil, refreshErr
+	fetched, _ := v.(map[string]JWKSKey)
+	return fetched, nil
 }
 
-func (m *JWKSManager) refresh(ctx context.Context) error {
+func (m *JWKSManager) refresh(ctx context.Context) (map[string]JWKSKey, error) {
 	m.mu.RLock()
 	startGen := m.gen
 	m.mu.RUnlock()
@@ -176,27 +243,27 @@ func (m *JWKSManager) refresh(ctx context.Context) error {
 
 	req, err := http.NewRequestWithContext(fetchCtx, http.MethodGet, m.jwksURL, nil)
 	if err != nil {
-		return errors.New(errors.CodeOAuthProviderError, "oauth jwks request failed", err)
+		return nil, errors.New(errors.CodeOAuthProviderError, "oauth jwks request failed", err)
 	}
 	req.Header.Set("Accept", "application/json")
 
 	resp, err := m.client.Do(req)
 	if err != nil {
-		return errors.New(errors.CodeOAuthProviderError, "oauth jwks fetch failed", err)
+		return nil, errors.New(errors.CodeOAuthProviderError, "oauth jwks fetch failed", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, oauthBodyLimit))
-		return errors.New(errors.CodeOAuthProviderError, fmt.Sprintf("oauth provider jwks responded with status %d", resp.StatusCode), nil)
+		return nil, errors.New(errors.CodeOAuthProviderError, fmt.Sprintf("oauth provider jwks responded with status %d", resp.StatusCode), nil)
 	}
 
 	var doc JWKDoc
 	if err := json.NewDecoder(io.LimitReader(resp.Body, oauthBodyLimit)).Decode(&doc); err != nil {
-		return errors.New(errors.CodeOAuthProviderError, "oauth provider returned invalid jwks response", err)
+		return nil, errors.New(errors.CodeOAuthProviderError, "oauth provider returned invalid jwks response", err)
 	}
 
-	parsedKeys := make(map[string]*rsa.PublicKey, len(doc.Keys))
+	parsedKeys := make(map[string]JWKSKey, len(doc.Keys))
 	for _, k := range doc.Keys {
 		if k.Kid == "" {
 			continue
@@ -206,26 +273,28 @@ func (m *JWKSManager) refresh(ctx context.Context) error {
 		}
 		pubKey, ok := parseRSAPublicKey(k.N, k.E)
 		if ok {
-			parsedKeys[k.Kid] = pubKey
+			parsedKeys[k.Kid] = JWKSKey{Key: pubKey, Issuer: k.Issuer}
 		}
 	}
 
 	if len(parsedKeys) == 0 {
-		return errors.New(errors.CodeOAuthProviderError, "oauth provider returned jwks with no valid rsa keys", nil)
+		return nil, errors.New(errors.CodeOAuthProviderError, "oauth provider returned jwks with no valid rsa keys", nil)
 	}
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.gen != startGen {
-		return nil
+	// gen flags that another flight committed since the snapshot. It is not an
+	// ordering guarantee, so a superseded response is never written over the cache;
+	// the caller that fetched it decides whether it satisfies its own request.
+	if m.gen == startGen {
+		m.keys = parsedKeys
+		m.expires = time.Now().Add(m.ttl)
+		m.gen++
+		for kid := range parsedKeys {
+			delete(m.misses, kid)
+		}
 	}
-	m.keys = parsedKeys
-	m.expires = time.Now().Add(m.ttl)
-	m.gen++
-	for kid := range parsedKeys {
-		delete(m.misses, kid)
-	}
-	return nil
+	return parsedKeys, nil
 }
 
 // parseRSAPublicKey converts base64url-encoded modulus (n) and exponent (e) to *rsa.PublicKey.
@@ -360,6 +429,9 @@ func VerifyRS256JWT(ctx context.Context, rawJWT string, keyRetriever JWKSKeyRetr
 	if err != nil {
 		return nil, err
 	}
+	if pubKey.Key == nil {
+		return nil, errors.New(errors.CodeOAuthIDTokenInvalid, fmt.Sprintf("signing key with kid %q has no key material", header.Kid), nil)
+	}
 
 	sigBytes, err := base64.RawURLEncoding.DecodeString(parts[2])
 	if err != nil {
@@ -367,7 +439,7 @@ func VerifyRS256JWT(ctx context.Context, rawJWT string, keyRetriever JWKSKeyRetr
 	}
 
 	digest := sha256.Sum256([]byte(parts[0] + "." + parts[1]))
-	if err := rsa.VerifyPKCS1v15(pubKey, crypto.SHA256, digest[:], sigBytes); err != nil {
+	if err := rsa.VerifyPKCS1v15(pubKey.Key, crypto.SHA256, digest[:], sigBytes); err != nil {
 		return nil, errors.New(errors.CodeOAuthIDTokenInvalid, "jwt signature verification failed", err)
 	}
 
@@ -381,5 +453,46 @@ func VerifyRS256JWT(ctx context.Context, rawJWT string, keyRetriever JWKSKeyRetr
 		return nil, errors.New(errors.CodeOAuthIDTokenInvalid, "invalid jwt payload json", err)
 	}
 
+	if err := verifyKeyIssuer(pubKey, claims); err != nil {
+		return nil, err
+	}
+
 	return claims, nil
+}
+
+// issuerTenantPlaceholder matches Microsoft's templated per-key issuer, e.g. "{tenantid}".
+var issuerTenantPlaceholder = regexp.MustCompile(`(?i)\{tenantid\}`)
+
+// verifyKeyIssuer enforces the key↔issuer binding advertised by the JWKS document.
+// It runs only after the signature verified, so the token's iss is authenticated.
+//
+// Comparison rule:
+//  1. An empty key issuer means the document does not scope the key: accept.
+//  2. A templated key issuer resolves "{tenantid}" with the token's tid claim. Any
+//     placeholder that stays unresolved cannot be evaluated, so the binding is
+//     skipped rather than guessed — a template must not cause false rejections.
+//  3. A concrete key issuer must equal the token's iss exactly; an absent iss on a
+//     concrete-issuer key is rejected, never silently accepted.
+func verifyKeyIssuer(key JWKSKey, claims map[string]any) error {
+	if key.Issuer == "" {
+		return nil
+	}
+
+	expected := key.Issuer
+	if strings.Contains(expected, "{") {
+		tid, _ := claims["tid"].(string)
+		if tid == "" {
+			return nil
+		}
+		expected = issuerTenantPlaceholder.ReplaceAllString(expected, tid)
+		if strings.Contains(expected, "{") {
+			return nil
+		}
+	}
+
+	iss, _ := claims["iss"].(string)
+	if iss != expected {
+		return errors.New(errors.CodeOAuthIDTokenInvalid, fmt.Sprintf("id_token issuer %q does not match signing key issuer %q", iss, expected), nil)
+	}
+	return nil
 }

@@ -3,6 +3,7 @@ package oauth
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -12,6 +13,12 @@ import (
 	"github.com/kaiizer777/go-auth/config"
 	"github.com/kaiizer777/go-auth/errors"
 )
+
+type failingTransport func(*http.Request) (*http.Response, error)
+
+func (f failingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
 
 func TestFacebookProvider_AuthCodeURL(t *testing.T) {
 	t.Parallel()
@@ -480,6 +487,45 @@ func TestFacebookProvider_FetchUserInfo(t *testing.T) {
 			t.Errorf("error exposes appsecret_proof: %q", msg)
 		}
 	})
+}
+
+func TestFacebookProvider_FetchUserInfo_RedactsTransportErrors(t *testing.T) {
+	t.Parallel()
+
+	const (
+		accessToken = "fb-user-access-token-secret"
+		appSecret   = "fb-app-secret-never-log"
+	)
+	proof := GenerateAppSecretProof(accessToken, appSecret)
+
+	p := NewFacebookProvider(config.FacebookConfig{
+		AppID:        "fb-app",
+		AppSecret:    appSecret,
+		RedirectURI:  "https://myapp.com/callback",
+		GraphVersion: "v19.0",
+	})
+	// net/http surfaces RoundTripper failures as *url.Error carrying the full request URL.
+	p.client = &http.Client{Transport: failingTransport(func(req *http.Request) (*http.Response, error) {
+		return nil, &url.Error{Op: req.Method, URL: req.URL.String(), Err: io.ErrUnexpectedEOF}
+	})}
+
+	_, err := p.FetchUserInfo(context.Background(), &OAuthToken{AccessToken: accessToken})
+	if err == nil {
+		t.Fatal("expected transport error, got nil")
+	}
+	for _, leaked := range []string{accessToken, proof, "access_token", "appsecret_proof"} {
+		if strings.Contains(err.Error(), leaked) {
+			t.Fatalf("transport error leaked %q: %s", leaked, err.Error())
+		}
+	}
+
+	var appErr *errors.Error
+	if !errors.As(err, &appErr) || appErr.Code() != errors.CodeOAuthProviderError {
+		t.Fatalf("expected CodeOAuthProviderError, got %v", err)
+	}
+	if appErr.Message() != "oauth userinfo request failed" {
+		t.Fatalf("message = %q; want oauth userinfo request failed", appErr.Message())
+	}
 }
 
 func TestFacebookProvider_RegistryIntegration(t *testing.T) {

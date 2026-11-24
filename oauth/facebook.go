@@ -183,7 +183,7 @@ func (p *FacebookProvider) FetchUserInfo(ctx context.Context, tokens *OAuthToken
 
 	raw, err := executeJSON[map[string]any](req, p.client, "oauth userinfo request failed")
 	if err != nil {
-		return nil, err
+		return nil, redactUserInfoError(err)
 	}
 
 	id, _ := raw["id"].(string)
@@ -218,4 +218,26 @@ func (p *FacebookProvider) FetchUserInfo(ctx context.Context, tokens *OAuthToken
 		AvatarURL:      avatarURL,
 		RawClaims:      raw,
 	}, nil
+}
+
+// redactUserInfoError drops the cause of transport failures: the /me query string
+// carries the user access token and the app-secret-derived proof.
+func redactUserInfoError(err error) error {
+	var urlErr *url.Error
+	if !errors.As(err, &urlErr) {
+		return err
+	}
+
+	code := errors.CodeOAuthProviderError
+	message := "oauth userinfo request failed"
+	var appErr *errors.Error
+	if errors.As(err, &appErr) {
+		if appErr.Code() != "" {
+			code = appErr.Code()
+		}
+		if appErr.Message() != "" {
+			message = appErr.Message()
+		}
+	}
+	return errors.New(code, message, nil)
 }
