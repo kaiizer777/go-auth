@@ -429,7 +429,7 @@ func (p *MicrosoftProvider) verifyIssuer(authority, issuer, tenantID string) err
 	case "consumers":
 		expected := fmt.Sprintf("https://login.microsoftonline.com/%s/v2.0", MicrosoftConsumerTenantGUID)
 		if issuer != expected {
-			return errors.New(errors.CodeOAuthIDTokenInvalid, fmt.Sprintf("invalid issuer %q for consumers authority mode, expected %q", issuer, expected), nil)
+			return issuerRejection(errors.CodeOAuthIDTokenInvalid, "id_token issuer does not match the consumers authority", issuer, expected)
 		}
 		if normalizeTenant(tenantID) != MicrosoftConsumerTenantGUID {
 			return errors.New(errors.CodeOAuthIDTokenInvalid, "consumers authority mode requires the consumer tid", nil)
@@ -440,7 +440,7 @@ func (p *MicrosoftProvider) verifyIssuer(authority, issuer, tenantID string) err
 		}
 		expected := fmt.Sprintf("https://login.microsoftonline.com/%s/v2.0", tenantID)
 		if issuer != expected {
-			return errors.New(errors.CodeOAuthIDTokenInvalid, fmt.Sprintf("invalid issuer %q for organizations mode, expected %q", issuer, expected), nil)
+			return issuerRejection(errors.CodeOAuthIDTokenInvalid, "id_token issuer does not match the organizations authority", issuer, expected)
 		}
 	case "common":
 		if tenantID == "" {
@@ -448,17 +448,25 @@ func (p *MicrosoftProvider) verifyIssuer(authority, issuer, tenantID string) err
 		}
 		expected := fmt.Sprintf("https://login.microsoftonline.com/%s/v2.0", tenantID)
 		if issuer != expected {
-			return errors.New(errors.CodeOAuthIDTokenInvalid, fmt.Sprintf("invalid issuer %q for common mode, expected %q", issuer, expected), nil)
+			return issuerRejection(errors.CodeOAuthIDTokenInvalid, "id_token issuer does not match the token tenant", issuer, expected)
 		}
 	default:
 		// Specific tenant, already resolved to the GUID form Microsoft emits.
 		expected := fmt.Sprintf("https://login.microsoftonline.com/%s/v2.0", authority)
 		if issuer != expected {
-			return errors.New(errors.CodeOAuthTenantInvalid, fmt.Sprintf("invalid issuer %q for specific tenant %q, expected %q", issuer, p.cfg.Tenant, expected), nil)
+			return issuerRejection(errors.CodeOAuthTenantInvalid, "id_token issuer does not match the configured tenant", issuer, expected)
 		}
 	}
 
 	return nil
+}
+
+// issuerRejection builds the client-facing issuer rejection with a generic
+// message: the token's issuer and the authority expected for it are server-side
+// facts and ride the cause, which only reaches server-side logs.
+func issuerRejection(code errors.Code, message, issuer, expected string) error {
+	return errors.New(code, message,
+		errors.New(code, fmt.Sprintf("issuer %q does not match expected %q", issuer, expected), nil))
 }
 
 // isEmailVerified implements Microsoft's "nOauth" anti-takeover verification gate.

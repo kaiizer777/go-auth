@@ -2163,6 +2163,94 @@ func TestMicrosoftProvider_ConsumersAuthorityBindsTIDToIssuer(t *testing.T) {
 	}
 }
 
+// TestMicrosoftProvider_IssuerRejectionKeepsTenantOutOfClientMessage pins the
+// disclosure boundary: the token's issuer and the tenant the authority expects
+// are server-side facts and stay in the cause, never in the client message.
+func TestMicrosoftProvider_IssuerRejectionKeepsTenantOutOfClientMessage(t *testing.T) {
+	privKey, nRaw, eRaw := generateTestRSAKey(t)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(JWKDoc{Keys: []JWKKey{{
+			Kty: "RSA", Use: "sig", Kid: "ms-key-1", Alg: "RS256", N: nRaw, E: eRaw,
+		}}})
+	}))
+	defer server.Close()
+
+	const foreignIssuer = "https://login.microsoftonline.com/" + otherTenantGUID + "/v2.0"
+
+	tests := []struct {
+		name string
+		// authority configured on the adapter.
+		tenant string
+		// the token's tid and iss, which disagree with the authority.
+		tid string
+		iss string
+		// values that would identify the token's or the configured tenant.
+		secrets []string
+		code    errors.Code
+	}{
+		{
+			name: "consumers authority", tenant: "consumers", tid: otherTenantGUID, iss: foreignIssuer,
+			secrets: []string{foreignIssuer, otherTenantGUID},
+			code:    errors.CodeOAuthIDTokenInvalid,
+		},
+		{
+			name: "organizations authority", tenant: "organizations", tid: contosoTenantGUID, iss: foreignIssuer,
+			secrets: []string{foreignIssuer, contosoTenantGUID},
+			code:    errors.CodeOAuthIDTokenInvalid,
+		},
+		{
+			name: "common authority", tenant: "common", tid: contosoTenantGUID, iss: foreignIssuer,
+			secrets: []string{foreignIssuer, contosoTenantGUID},
+			code:    errors.CodeOAuthIDTokenInvalid,
+		},
+		{
+			name: "specific tenant", tenant: contosoTenantGUID, tid: otherTenantGUID, iss: foreignIssuer,
+			secrets: []string{foreignIssuer, otherTenantGUID, contosoTenantGUID},
+			code:    errors.CodeOAuthTenantInvalid,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := NewMicrosoftProvider(config.MicrosoftConfig{
+				ClientID:    "client-test-id",
+				Tenant:      tt.tenant,
+				RedirectURI: "https://example.com/callback",
+			})
+			p.client = server.Client()
+			p.jwksMgr = NewJWKSManager(server.URL, p.client, time.Hour)
+			p.jwksRetriever = p.jwksMgr
+
+			tok := signRS256JWT(t, privKey, "ms-key-1", map[string]any{
+				"iss":   tt.iss,
+				"sub":   "sub-1",
+				"aud":   "client-test-id",
+				"exp":   time.Now().Add(10 * time.Minute).Unix(),
+				"email": "user@example.com",
+				"tid":   tt.tid,
+			})
+
+			_, err := p.VerifyIDToken(context.Background(), tok, "")
+			if err == nil {
+				t.Fatal("expected an issuer rejection, got nil")
+			}
+			var appErr *errors.Error
+			if !errors.As(err, &appErr) || appErr.Code() != tt.code {
+				t.Fatalf("error = %v; want code %q", err, tt.code)
+			}
+			for _, secret := range tt.secrets {
+				if strings.Contains(appErr.Message(), secret) {
+					t.Errorf("message = %q; it discloses %q", appErr.Message(), secret)
+				}
+			}
+			if !strings.Contains(err.Error(), tt.iss) {
+				t.Errorf("error = %v; want the issuer kept in the cause chain", err)
+			}
+		})
+	}
+}
+
 // TestMicrosoftProvider_StaleAllowlistEntryDoesNotBlockAdmittedTenant pins the
 // scope of per-login domain resolution: an allowlist entry that no longer
 // resolves must not decide the login of a tenant another entry admits. Map
