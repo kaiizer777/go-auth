@@ -3,7 +3,6 @@ package oauth
 import (
 	"fmt"
 	"slices"
-	"strings"
 	"sync"
 
 	"github.com/kaiizer777/go-auth/errors"
@@ -14,7 +13,8 @@ type Registry interface {
 	// Register associates a provider with the registry using its canonical ID.
 	Register(provider Provider) error
 
-	// Get retrieves a registered provider by its unique slug.
+	// Get retrieves a registered provider by slug, ignoring case and
+	// surrounding whitespace.
 	Get(providerID string) (Provider, error)
 
 	// List returns a slice of all registered provider IDs.
@@ -37,22 +37,23 @@ func (r *providerRegistry) Register(p Provider) error {
 	if p == nil {
 		return errors.New(errors.CodeInvalidConfig, "cannot register nil oauth provider", nil)
 	}
-	if strings.TrimSpace(p.ID()) == "" {
+	id := canonicalProviderSlug(p.ID())
+	if id == "" {
 		return errors.New(errors.CodeInvalidConfig, "cannot register provider with empty id", nil)
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if _, exists := r.providers[p.ID()]; exists {
-		return errors.New(errors.CodeInvalidConfig, fmt.Sprintf("oauth provider %q already registered", p.ID()), nil)
+	if _, exists := r.providers[id]; exists {
+		return errors.New(errors.CodeInvalidConfig, fmt.Sprintf("oauth provider %q already registered", id), nil)
 	}
-	r.providers[p.ID()] = p
+	r.providers[id] = p
 	return nil
 }
 
 func (r *providerRegistry) Get(providerID string) (Provider, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	p, ok := r.providers[providerID]
+	p, ok := r.providers[canonicalProviderSlug(providerID)]
 	if !ok {
 		return nil, errors.New(errors.CodeOAuthProviderNotFound, "unsupported or unconfigured oauth provider: "+providerID, nil)
 	}

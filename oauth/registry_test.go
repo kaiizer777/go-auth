@@ -145,6 +145,45 @@ func TestProviderRegistry(t *testing.T) {
 		}
 	})
 
+	t.Run("canonicalizes mixed-case ids on register and get", func(t *testing.T) {
+		reg := NewRegistry()
+		if err := reg.Register(&dummyProvider{id: "  GitHub "}); err != nil {
+			t.Fatalf("unexpected register error: %v", err)
+		}
+		for _, lookup := range []string{"github", "GitHub", "  GITHUB  "} {
+			got, err := reg.Get(lookup)
+			if err != nil {
+				t.Fatalf("Get(%q) = %v; want the registered provider", lookup, err)
+			}
+			if got.ID() != "  GitHub " {
+				t.Fatalf("Get(%q).ID() = %q; want the registered provider", lookup, got.ID())
+			}
+		}
+		if list := reg.List(); len(list) != 1 || list[0] != "github" {
+			t.Fatalf("List() = %v; want [github]", list)
+		}
+	})
+
+	t.Run("rejects ids that collide after canonicalization", func(t *testing.T) {
+		reg := NewRegistry()
+		first := &dummyProvider{id: "GitHub"}
+		if err := reg.Register(first); err != nil {
+			t.Fatalf("unexpected error registering first provider: %v", err)
+		}
+		err := reg.Register(&dummyProvider{id: "github"})
+		if err == nil {
+			t.Fatal("expected error on canonical duplicate, got nil")
+		}
+		var appErr *errors.Error
+		if !errors.As(err, &appErr) || appErr.Code() != errors.CodeInvalidConfig {
+			t.Fatalf("expected CodeInvalidConfig, got %v", err)
+		}
+		got, err := reg.Get("github")
+		if err != nil || got != first {
+			t.Fatalf("Get(github) = %v, err = %v; want the first registration kept", got, err)
+		}
+	})
+
 	t.Run("service wires dynamic registry lookup", func(t *testing.T) {
 		reg := NewRegistry()
 		_ = reg.Register(&dummyProvider{id: "google"})
