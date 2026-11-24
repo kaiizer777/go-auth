@@ -2101,8 +2101,21 @@ func TestMicrosoftProvider_KeyIssuerBinding(t *testing.T) {
 
 	t.Run("key scoped to a foreign tenant is rejected", func(t *testing.T) {
 		p := serve(t, "https://login.microsoftonline.com/"+tenantB+"/v2.0")
-		if _, err := p.VerifyIDToken(ctx, rawJWT, ""); err == nil {
+		_, err := p.VerifyIDToken(ctx, rawJWT, "")
+		if err == nil {
 			t.Fatal("token verified with a key scoped to another tenant")
+		}
+		var appErr *errors.Error
+		if !errors.As(err, &appErr) {
+			t.Fatalf("error = %v; want an *errors.Error", err)
+		}
+		for _, secret := range []string{tenantA, tenantB} {
+			if strings.Contains(appErr.Message(), secret) {
+				t.Errorf("message = %q; it discloses %q", appErr.Message(), secret)
+			}
+		}
+		if !strings.Contains(err.Error(), tenantB) {
+			t.Errorf("error = %v; want the signing key issuer kept in the cause", err)
 		}
 	})
 
@@ -2161,6 +2174,66 @@ func TestMicrosoftProvider_ConsumersAuthorityBindsTIDToIssuer(t *testing.T) {
 	if !errors.As(err, &appErr) || appErr.Code() != errors.CodeOAuthIDTokenInvalid {
 		t.Fatalf("error = %v; want code %q", err, errors.CodeOAuthIDTokenInvalid)
 	}
+}
+
+// TestMicrosoftProvider_ConsumerTIDMatchingIsCaseInsensitive pins both consumer
+// tenant comparisons to the normalized tid: an upper-case spelling of the
+// consumer GUID must still attest under common and stay rejected under
+// organizations.
+func TestMicrosoftProvider_ConsumerTIDMatchingIsCaseInsensitive(t *testing.T) {
+	privKey, nRaw, eRaw := generateTestRSAKey(t)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(JWKDoc{Keys: []JWKKey{{
+			Kty: "RSA", Use: "sig", Kid: "ms-key-1", Alg: "RS256", N: nRaw, E: eRaw,
+		}}})
+	}))
+	defer server.Close()
+
+	newProvider := func(tenant string) *MicrosoftProvider {
+		p := NewMicrosoftProvider(config.MicrosoftConfig{
+			ClientID:    "client-test-id",
+			Tenant:      tenant,
+			RedirectURI: "https://example.com/callback",
+		})
+		p.client = server.Client()
+		p.jwksMgr = NewJWKSManager(server.URL, p.client, time.Hour)
+		p.jwksRetriever = p.jwksMgr
+		return p
+	}
+
+	upperTID := strings.ToUpper(MicrosoftConsumerTenantGUID)
+	tok := signRS256JWT(t, privKey, "ms-key-1", map[string]any{
+		"iss":   "https://login.microsoftonline.com/" + upperTID + "/v2.0",
+		"sub":   "sub-1",
+		"aud":   "client-test-id",
+		"exp":   time.Now().Add(10 * time.Minute).Unix(),
+		"email": "user@outlook.com",
+		"tid":   upperTID,
+	})
+
+	ctx := context.Background()
+
+	t.Run("common authority attests the consumer tid", func(t *testing.T) {
+		c, err := newProvider("common").VerifyIDToken(ctx, tok, "")
+		if err != nil {
+			t.Fatalf("VerifyIDToken = %v", err)
+		}
+		if !c.EmailVerified {
+			t.Error("EmailVerified = false; a consumer tid is attested regardless of its case")
+		}
+	})
+
+	t.Run("organizations authority rejects a consumer account", func(t *testing.T) {
+		_, err := newProvider("organizations").VerifyIDToken(ctx, tok, "")
+		if err == nil {
+			t.Fatal("organizations authority admitted a consumer account")
+		}
+		var appErr *errors.Error
+		if !errors.As(err, &appErr) || appErr.Code() != errors.CodeOAuthIDTokenInvalid {
+			t.Fatalf("error = %v; want code %q", err, errors.CodeOAuthIDTokenInvalid)
+		}
+	})
 }
 
 // TestMicrosoftProvider_IssuerRejectionKeepsTenantOutOfClientMessage pins the
@@ -2282,18 +2355,6 @@ func TestMicrosoftProvider_StaleAllowlistEntryDoesNotBlockAdmittedTenant(t *test
 	defer server.Close()
 	serverURL = server.URL
 
-	p := NewMicrosoftProvider(config.MicrosoftConfig{
-		ClientID: "client-test-id",
-		Tenant:   "common",
-		// The stale entry sorts after the one authorising the token, and a
-		// permuted insertion order must not matter either.
-		TrustedTenants: []string{"stale.onmicrosoft.com", "contoso.onmicrosoft.com"},
-		RedirectURI:    "https://example.com/callback",
-	}, WithEndpoints(EndpointOverride{DiscoveryURL: server.URL}))
-	p.client = server.Client()
-	p.jwksMgr = NewJWKSManager(server.URL+"/keys", p.client, time.Hour)
-	p.jwksRetriever = p.jwksMgr
-
 	tok := signRS256JWT(t, privKey, "ms-key-1", map[string]any{
 		"iss":   "https://login.microsoftonline.com/" + contosoTenantGUID + "/v2.0",
 		"sub":   "sub-1",
@@ -2303,13 +2364,37 @@ func TestMicrosoftProvider_StaleAllowlistEntryDoesNotBlockAdmittedTenant(t *test
 		"tid":   contosoTenantGUID,
 	})
 
-	for i := 0; i < 20; i++ {
-		c, err := p.VerifyIDToken(context.Background(), tok, "")
-		if err != nil {
-			t.Fatalf("run %d: VerifyIDToken = %v; a stale sibling entry must not fail an admitted tenant's login", i, err)
-		}
-		if c.UntrustedTenant {
-			t.Fatalf("run %d: UntrustedTenant = true; a resolvable domain entry admits this tenant", i)
-		}
+	// The failure of a stale entry may only be held back once that entry has
+	// been walked, so the stale domain is placed at both ends of the sorted
+	// walk: first covers the held-back path, last covers early admission.
+	tests := []struct {
+		name    string
+		trusted []string
+	}{
+		{name: "stale entry sorts first", trusted: []string{"aaa-stale.onmicrosoft.com", "contoso.onmicrosoft.com"}},
+		{name: "stale entry sorts last", trusted: []string{"contoso.onmicrosoft.com", "zzz-stale.onmicrosoft.com"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := NewMicrosoftProvider(config.MicrosoftConfig{
+				ClientID:       "client-test-id",
+				Tenant:         "common",
+				TrustedTenants: tt.trusted,
+				RedirectURI:    "https://example.com/callback",
+			}, WithEndpoints(EndpointOverride{DiscoveryURL: server.URL}))
+			p.client = server.Client()
+			p.jwksMgr = NewJWKSManager(server.URL+"/keys", p.client, time.Hour)
+			p.jwksRetriever = p.jwksMgr
+
+			for i := 0; i < 20; i++ {
+				c, err := p.VerifyIDToken(context.Background(), tok, "")
+				if err != nil {
+					t.Fatalf("run %d: VerifyIDToken = %v; a stale sibling entry must not fail an admitted tenant's login", i, err)
+				}
+				if c.UntrustedTenant {
+					t.Fatalf("run %d: UntrustedTenant = true; a resolvable domain entry admits this tenant", i)
+				}
+			}
+		})
 	}
 }

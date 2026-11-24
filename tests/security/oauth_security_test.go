@@ -226,12 +226,14 @@ func TestOAuthSecurity_LocalUnverifiedLinkConflict(t *testing.T) {
 	}
 }
 
-// argon2MemoryFloor is half the heap one Argon2id derivation allocates at the
-// given memory cost (Argon2 allocates one KiB per unit). TotalAlloc is
-// monotonic, so the bound tracks the configured parameters and cannot flake
-// under load the way a wall-clock ratio does.
+// argon2MemoryFloor is the smallest allocation one Argon2id derivation at the
+// given memory cost can produce: Argon2 allocates one KiB block per unit, so the
+// exact footprint is memoryKiB*1024 and the floor keeps only 10% headroom for the
+// allocations the surrounding login path adds. TotalAlloc is monotonic, so a
+// loaded runner can only push the measurement up, never below the floor, while a
+// dummy hash run at half the configured memory lands near 0.5x and stays visible.
 func argon2MemoryFloor(memoryKiB uint32) uint64 {
-	return uint64(memoryKiB) * 1024 / 2
+	return uint64(memoryKiB) * 1024 * 9 / 10
 }
 
 // allocDelta reports bytes allocated by fn, so a memory-hard derivation that

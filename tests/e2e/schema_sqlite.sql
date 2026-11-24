@@ -7,6 +7,11 @@
 -- branch, so these files cannot be executed by glebarez/sqlite. This file is the
 -- single sqlite DDL source for this suite; 000009's oauth_accounts.verified is
 -- mirrored here and the Postgres e2e journey exercises the real migration.
+--
+-- Drift here is silent on its own: a column missing from this file makes
+-- SELECT * decode it as a zero value instead of failing, so
+-- TestE2E_SQLiteSchemaMatchesModels compares each table's column set with
+-- db/models.go.
 
 CREATE TABLE IF NOT EXISTS users (
     id TEXT PRIMARY KEY,

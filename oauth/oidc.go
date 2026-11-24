@@ -521,7 +521,7 @@ func verifyKeyIssuer(key JWKSKey, claims map[string]any) error {
 
 	iss, _ := claims["iss"].(string)
 	if iss != expected {
-		return errors.New(errors.CodeOAuthIDTokenInvalid, fmt.Sprintf("id_token issuer %q does not match signing key issuer %q", iss, expected), nil)
+		return issuerRejection(errors.CodeOAuthIDTokenInvalid, "id_token issuer does not match the signing key issuer", iss, expected)
 	}
 	return nil
 }

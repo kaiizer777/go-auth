@@ -435,7 +435,7 @@ func (p *MicrosoftProvider) verifyIssuer(authority, issuer, tenantID string) err
 			return errors.New(errors.CodeOAuthIDTokenInvalid, "consumers authority mode requires the consumer tid", nil)
 		}
 	case "organizations":
-		if tenantID == "" || tenantID == MicrosoftConsumerTenantGUID {
+		if tid := normalizeTenant(tenantID); tid == "" || tid == MicrosoftConsumerTenantGUID {
 			return errors.New(errors.CodeOAuthIDTokenInvalid, "organizations authority mode rejects consumer accounts or missing tid", nil)
 		}
 		expected := fmt.Sprintf("https://login.microsoftonline.com/%s/v2.0", tenantID)
@@ -480,7 +480,7 @@ func (p *MicrosoftProvider) isEmailVerified(authority string, rawClaims map[stri
 	}
 
 	// 2. Personal consumer account (Microsoft verifies email on registration)
-	if authority == "consumers" || tenantID == MicrosoftConsumerTenantGUID {
+	if authority == "consumers" || normalizeTenant(tenantID) == MicrosoftConsumerTenantGUID {
 		return true
 	}
 
