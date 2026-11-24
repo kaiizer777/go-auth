@@ -246,12 +246,12 @@ func (m *JWKSManager) refreshFlight(name, kid string, ctx context.Context) error
 		if ok && fresh {
 			return nil, nil
 		}
-		return m.refresh(ctx)
+		return nil, m.refresh(ctx)
 	})
 	return err
 }
 
-func (m *JWKSManager) refresh(ctx context.Context) (map[string]JWKSKey, error) {
+func (m *JWKSManager) refresh(ctx context.Context) error {
 	m.mu.RLock()
 	startGen := m.gen
 	m.mu.RUnlock()
@@ -261,24 +261,24 @@ func (m *JWKSManager) refresh(ctx context.Context) (map[string]JWKSKey, error) {
 
 	req, err := http.NewRequestWithContext(fetchCtx, http.MethodGet, m.jwksURL, nil)
 	if err != nil {
-		return nil, errors.New(errors.CodeOAuthProviderError, "oauth jwks request failed", err)
+		return errors.New(errors.CodeOAuthProviderError, "oauth jwks request failed", err)
 	}
 	req.Header.Set("Accept", "application/json")
 
 	resp, err := m.client.Do(req)
 	if err != nil {
-		return nil, errors.New(errors.CodeOAuthProviderError, "oauth jwks fetch failed", err)
+		return errors.New(errors.CodeOAuthProviderError, "oauth jwks fetch failed", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, oauthBodyLimit))
-		return nil, errors.New(errors.CodeOAuthProviderError, fmt.Sprintf("oauth provider jwks responded with status %d", resp.StatusCode), nil)
+		return errors.New(errors.CodeOAuthProviderError, fmt.Sprintf("oauth provider jwks responded with status %d", resp.StatusCode), nil)
 	}
 
 	var doc JWKDoc
 	if err := json.NewDecoder(io.LimitReader(resp.Body, oauthBodyLimit)).Decode(&doc); err != nil {
-		return nil, errors.New(errors.CodeOAuthProviderError, "oauth provider returned invalid jwks response", err)
+		return errors.New(errors.CodeOAuthProviderError, "oauth provider returned invalid jwks response", err)
 	}
 
 	parsedKeys := make(map[string]JWKSKey, len(doc.Keys))
@@ -296,7 +296,7 @@ func (m *JWKSManager) refresh(ctx context.Context) (map[string]JWKSKey, error) {
 	}
 
 	if len(parsedKeys) == 0 {
-		return nil, errors.New(errors.CodeOAuthProviderError, "oauth provider returned jwks with no valid rsa keys", nil)
+		return errors.New(errors.CodeOAuthProviderError, "oauth provider returned jwks with no valid rsa keys", nil)
 	}
 
 	m.mu.Lock()
@@ -312,7 +312,7 @@ func (m *JWKSManager) refresh(ctx context.Context) (map[string]JWKSKey, error) {
 			delete(m.misses, kid)
 		}
 	}
-	return parsedKeys, nil
+	return nil
 }
 
 // parseRSAPublicKey converts base64url-encoded modulus (n) and exponent (e) to *rsa.PublicKey.
@@ -338,6 +338,16 @@ func parseRSAPublicKey(nRaw, eRaw string) (*rsa.PublicKey, bool) {
 	return &rsa.PublicKey{N: n, E: int(e.Int64())}, true
 }
 
+// discoveryStatusError carries the upstream status so a caller can tell a
+// misconfigured authority (404) from a provider outage (5xx).
+type discoveryStatusError struct {
+	status int
+}
+
+func (e *discoveryStatusError) Error() string {
+	return fmt.Sprintf("oidc discovery endpoint responded with status %d", e.status)
+}
+
 // FetchOIDCDiscovery fetches and parses the OpenID Connect discovery document.
 func FetchOIDCDiscovery(ctx context.Context, client *http.Client, discoveryURL string) (*OIDCDiscovery, error) {
 	if client == nil {
@@ -360,7 +370,8 @@ func FetchOIDCDiscovery(ctx context.Context, client *http.Client, discoveryURL s
 
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, oauthBodyLimit))
-		return nil, errors.New(errors.CodeOAuthProviderError, fmt.Sprintf("oidc discovery endpoint responded with status %d", resp.StatusCode), nil)
+		return nil, errors.New(errors.CodeOAuthProviderError, "oidc discovery request failed",
+			&discoveryStatusError{status: resp.StatusCode})
 	}
 
 	var disc OIDCDiscovery
