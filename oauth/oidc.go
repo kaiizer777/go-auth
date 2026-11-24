@@ -125,7 +125,7 @@ func (m *JWKSManager) GetKey(ctx context.Context, kid string) (JWKSKey, error) {
 	}
 
 	// Singleflight deduplication across concurrent cache misses.
-	if _, err := m.refreshFlight("jwks_refresh", kid, ctx); err != nil {
+	if err := m.refreshFlight("jwks_refresh", kid, ctx); err != nil {
 		return m.resolveRefreshFailure(kid, err)
 	}
 	// Only the committed document may authorize a kid. A superseded fetch is
@@ -138,7 +138,7 @@ func (m *JWKSManager) GetKey(ctx context.Context, kid string) (JWKSKey, error) {
 
 	// The kid may have rotated in after this flight's fetch, so confirm against
 	// one rollover fetch before recording a miss.
-	if _, err := m.refreshFlight("jwks_rollover_refresh", kid, ctx); err != nil {
+	if err := m.refreshFlight("jwks_rollover_refresh", kid, ctx); err != nil {
 		return m.resolveRefreshFailure(kid, err)
 	}
 	if key, ok := m.cachedKey(kid); ok {
@@ -237,9 +237,8 @@ func (m *JWKSManager) cachedKey(kid string) (JWKSKey, bool) {
 }
 
 // refreshFlight runs one deduplicated refresh unless the key is already cached and fresh.
-// The fetched set is returned even when another flight committed first.
-func (m *JWKSManager) refreshFlight(name, kid string, ctx context.Context) (map[string]JWKSKey, error) {
-	v, err, _ := m.sf.Do(name, func() (any, error) {
+func (m *JWKSManager) refreshFlight(name, kid string, ctx context.Context) error {
+	_, err, _ := m.sf.Do(name, func() (any, error) {
 		m.mu.RLock()
 		_, ok := m.keys[kid]
 		fresh := time.Now().Before(m.expires)
@@ -249,11 +248,7 @@ func (m *JWKSManager) refreshFlight(name, kid string, ctx context.Context) (map[
 		}
 		return m.refresh(ctx)
 	})
-	if err != nil {
-		return nil, err
-	}
-	fetched, _ := v.(map[string]JWKSKey)
-	return fetched, nil
+	return err
 }
 
 func (m *JWKSManager) refresh(ctx context.Context) (map[string]JWKSKey, error) {
