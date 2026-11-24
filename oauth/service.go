@@ -654,10 +654,13 @@ func (s *service) attachLink(ctx context.Context, ownerID uuid.UUID, providerID 
 		}
 		owner = *locked
 		email := info.Email
+		verified := info.EmailVerified
 		if email == "" {
-			email = owner.Email
+			// Subject-only identity (e.g. Apple, X) explicitly attached by
+			// an authenticated owner carries no email and is trusted.
+			verified = true
 		}
-		if ierr := s.insertLink(ctx, txStore.OAuthAccounts(), owner.ID, providerID, info.ProviderUserID, email, info.EmailVerified); ierr != nil {
+		if ierr := s.insertLink(ctx, txStore.OAuthAccounts(), owner.ID, providerID, info.ProviderUserID, email, verified); ierr != nil {
 			return ierr
 		}
 		linked = true
@@ -726,15 +729,22 @@ func (s *service) linkRacedUser(ctx context.Context, providerID string, info *Us
 
 // mergeOrConverge decides what an address collision with a live local account
 // may do. An unverified provider claim never merges into an established
-// account; it only converges on the passwordless row an unverified signup of
-// the same address left behind, which grants nothing the claim did not already
-// have. The create-race path and the pre-existing-owner path share this rule so
-// the outcome cannot depend on which goroutine observes the winner's commit
-// first.
+// account and never resolves an account by email alone. It may only converge
+// on an existing row if the provider identity (provider_id + provider_user_id)
+// already matches that row, ensuring an unattested email cannot take over an
+// unclaimed account. The create-race path and the pre-existing-owner path share
+// this rule so the outcome cannot depend on which goroutine observes the winner's
+// commit first.
 func (s *service) mergeOrConverge(ctx context.Context, providerID string, existing db.User, info *UserInfo) (db.User, bool, bool, error) {
 	if gerr := validateProviderIdentity(info); gerr != nil {
 		if errors.Is(gerr, errors.ErrOAuthEmailUnverified) && holdsNoCredential(existing) {
-			return existing, false, false, nil
+			link, found, err := s.findLink(ctx, providerID, info.ProviderUserID)
+			if err != nil {
+				return db.User{}, false, false, errors.New(errors.CodeInternalError, "failed to query oauth account", err)
+			}
+			if found && link.UserID == existing.ID {
+				return existing, false, false, nil
+			}
 		}
 		return db.User{}, false, false, gerr
 	}
@@ -841,7 +851,8 @@ func (s *service) linkOrCreate(ctx context.Context, providerID string, info *Use
 	// unverified link signs in only the account it was created on, and only
 	// while that owner is unclaimed: once a verification or password reset
 	// proves the address locally, the link is spent and is deleted here rather
-	// than allowed to outlive its trust.
+	// than allowed to outlive its trust. Subject-only identities carry no email
+	// and are immune to unverified-link invalidation.
 	user, link, found, err := s.linkedUser(ctx, providerID, info.ProviderUserID)
 	if err != nil {
 		return db.User{}, false, false, err
@@ -850,7 +861,7 @@ func (s *service) linkOrCreate(ctx context.Context, providerID string, info *Use
 		if activeUserID != "" && user.ID.String() != activeUserID {
 			return db.User{}, false, false, errors.ErrOAuthAccountAlreadyLinked
 		}
-		if !link.Verified && isClaimedAccount(user) {
+		if !link.Verified && link.Email != "" && isClaimedAccount(user) {
 			s.invalidateLink(ctx, link)
 			return db.User{}, false, false, errors.ErrOAuthEmailUnverified
 		}
