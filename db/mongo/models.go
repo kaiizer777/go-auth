@@ -203,12 +203,15 @@ func (d *PasswordResetTokenDoc) toDomain() *db.PasswordResetToken {
 }
 
 // OAuthAccountDoc represents a federated identity document in the "oauth_accounts" collection.
+// A document written before the verified flag existed decodes as false: missing
+// fields land on the Go zero value, which is the fail-closed default.
 type OAuthAccountDoc struct {
 	ID             string    `bson:"_id"`
 	UserID         string    `bson:"user_id"`
 	ProviderID     string    `bson:"provider_id"`
 	ProviderUserID string    `bson:"provider_user_id"`
 	Email          string    `bson:"email"`
+	Verified       bool      `bson:"verified"`
 	CreatedAt      time.Time `bson:"created_at"`
 	UpdatedAt      time.Time `bson:"updated_at"`
 }
@@ -238,6 +241,7 @@ func oauthAccountDocFromDomain(o *db.OAuthAccount) *OAuthAccountDoc {
 		ProviderID:     o.ProviderID,
 		ProviderUserID: o.ProviderUserID,
 		Email:          o.Email,
+		Verified:       o.Verified,
 		CreatedAt:      createdAt,
 		UpdatedAt:      updatedAt,
 	}
@@ -255,6 +259,7 @@ func (d *OAuthAccountDoc) toDomain() *db.OAuthAccount {
 		ProviderID:     d.ProviderID,
 		ProviderUserID: d.ProviderUserID,
 		Email:          d.Email,
+		Verified:       d.Verified,
 		CreatedAt:      d.CreatedAt.UTC(),
 		UpdatedAt:      d.UpdatedAt.UTC(),
 	}
