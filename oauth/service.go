@@ -625,17 +625,24 @@ func (s *service) relinkExisting(ctx context.Context, providerID, providerUserID
 }
 
 // linkRacedUser converges after losing a concurrent user-create race: re-read
-// the winner by normalized email, keep the pre-hijack gate, then link. An
-// unverified provider claim never merges into the winner. The 409 is permanent
-// by design: it mirrors password signup, which refuses an already-registered
-// email instead of taking it over, and no verification-mail or takeover flow
-// exists here, so the address stays blocked until the squatted row is removed
-// out of band.
+// the winner by normalized email, then decide. An unverified provider claim
+// never merges into the winner; it only converges on the passwordless row that
+// a concurrent unverified signup of the same address just created. The 409 is
+// permanent by design: it mirrors password signup, which refuses an
+// already-registered email instead of taking it over, and no verification-mail
+// or takeover flow exists here, so the address stays blocked until the squatted
+// row is removed out of band.
 func (s *service) linkRacedUser(ctx context.Context, providerID string, info *UserInfo) (db.User, bool, bool, error) {
+	existing, err := s.findUserByEmail(ctx, info.Email)
+	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) && !errors.Is(err, errors.ErrUserNotFound) {
+		return db.User{}, false, false, errors.New(errors.CodeInternalError, "failed to query user", err)
+	}
 	if !info.EmailVerified {
+		if err == nil && !existing.EmailVerified && existing.PasswordHash == "" {
+			return existing, false, false, nil
+		}
 		return db.User{}, false, false, errors.ErrOAuthEmailUnverified
 	}
-	existing, err := s.findUserByEmail(ctx, info.Email)
 	if err != nil {
 		return db.User{}, false, false, errors.New(errors.CodeInternalError, "failed to query user", err)
 	}
@@ -649,11 +656,15 @@ func (s *service) linkRacedUser(ctx context.Context, providerID string, info *Us
 	return user, linked, false, nil
 }
 
-// createUserAndLink creates the verified passwordless user and its link row in
-// one transaction. Separate inserts would let a cancel land between them
-// (verified user, no link) or a lost link race orphan the loser's user. Session
-// creation stays post-commit: cookie issuance cannot roll back. Unique
-// conflicts roll the transaction back before converging on the winner.
+// createUserAndLink creates the user and, only for a provider-verified address,
+// its oauth_accounts row in one transaction. An unverified claim creates the
+// user without a link: a durable binding minted for an unproven address would
+// be inherited by whoever later proves ownership of it, and the link is instead
+// minted by the next callback after verification. Separate inserts would let a
+// cancel land between them (verified user, no link) or a lost link race orphan
+// the loser's user. Session creation stays post-commit: cookie issuance cannot
+// roll back. Unique conflicts roll the transaction back before converging on
+// the winner.
 func (s *service) createUserAndLink(ctx context.Context, providerID string, info *UserInfo) (db.User, bool, bool, error) {
 	user := db.User{
 		ID:            uuid.New(),
@@ -673,6 +684,9 @@ func (s *service) createUserAndLink(ctx context.Context, providerID string, info
 				isUniqueViolation(err)
 			return err
 		}
+		if !info.EmailVerified {
+			return nil
+		}
 		op = "failed to link oauth account"
 		if err := s.insertLink(ctx, txStore.OAuthAccounts(), user.ID, providerID, info.ProviderUserID, info.Email); err != nil {
 			linkConflict = errors.Is(err, errLinkConflict)
@@ -689,7 +703,7 @@ func (s *service) createUserAndLink(ctx context.Context, providerID string, info
 		}
 		return db.User{}, false, false, errors.New(errors.CodeInternalError, op, txErr)
 	}
-	return user, true, true, nil
+	return user, info.EmailVerified, true, nil
 }
 
 // linkOrCreate executes the linking decision tree. Returns the user plus
@@ -755,8 +769,9 @@ func (s *service) linkOrCreate(ctx context.Context, providerID string, info *Use
 	}
 
 	// 4. Validate the identity fields for unauthenticated registration. A
-	// present-but-unverified address may register: binding it to an existing
-	// account (step 5) is the takeover risk, not creating its own account.
+	// present-but-unverified address may register its own account, but the
+	// unproven claim is not bound to it: createUserAndLink mints the link only
+	// once the address is verified.
 	if gerr := validateProviderIdentityFields(info); gerr != nil {
 		return db.User{}, false, false, gerr
 	}

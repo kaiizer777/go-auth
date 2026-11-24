@@ -20,9 +20,11 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 
+	"github.com/kaiizer777/go-auth/auth"
 	"github.com/kaiizer777/go-auth/config"
 	"github.com/kaiizer777/go-auth/db"
 	gormstore "github.com/kaiizer777/go-auth/db/gorm"
+	"github.com/kaiizer777/go-auth/email"
 	"github.com/kaiizer777/go-auth/errors"
 	"github.com/kaiizer777/go-auth/session"
 )
@@ -130,6 +132,12 @@ func serviceTestDB(t *testing.T) *gorm.DB {
 		credential_version INTEGER NOT NULL DEFAULT 0,
 		last_active_at DATETIME NOT NULL,
 		absolute_expires_at DATETIME NOT NULL,
+		created_at DATETIME
+	);
+	CREATE TABLE IF NOT EXISTS verification_tokens (
+		token_hash BLOB PRIMARY KEY,
+		user_id TEXT NOT NULL,
+		expires_at DATETIME NOT NULL,
 		created_at DATETIME
 	);
 	`
@@ -486,7 +494,8 @@ func TestHandleCallbackEmailGate(t *testing.T) {
 		if user.EmailVerified {
 			t.Fatal("unverified provider email minted a verified local user")
 		}
-		requireIdentityRows(t, database, 1, 1, 1)
+		// No link: an unproven address must not leave a binding behind.
+		requireIdentityRows(t, database, 1, 0, 1)
 	})
 
 	t.Run("nil userinfo keeps the 400", func(t *testing.T) {
@@ -569,6 +578,105 @@ func TestHandleCallbackEmailGate(t *testing.T) {
 		_, _, _, err := svc.HandleCallback(req.Context(), rec, req, "google", "code-1", state, db.SessionTypeCookie)
 		requireCode(t, err, errors.CodeOAuthProviderError, http.StatusBadGateway)
 		requireIdentityRows(t, database, 0, 0, 0)
+	})
+}
+
+// TestUnverifiedSignupNeverBindsLink pins the invariant that a provider email
+// the provider did not verify never leaves a durable account binding behind:
+// the link is minted only after the address is proven, so whoever later proves
+// ownership of the address never inherits a provider identity someone else
+// attached to it.
+func TestUnverifiedSignupNeverBindsLink(t *testing.T) {
+	const addr = "victim@example.com"
+	unverified := func() *UserInfo {
+		return &UserInfo{ProviderID: "google", ProviderUserID: "sub-unverified-bind", Email: addr}
+	}
+	// passwordSignup runs the real recovery signup, which binds the caller's
+	// password to the pending row and drops its sessions.
+	passwordSignup := func(t *testing.T, database *gorm.DB, cfg *config.Config) {
+		t.Helper()
+		authSvc, err := auth.New(*cfg, database, email.Hooks{})
+		if err != nil {
+			t.Fatalf("auth.New: %v", err)
+		}
+		if _, _, err := authSvc.Signup(context.Background(), db.SignupRequest{
+			Email: addr, Password: "CorrectHorseBattery9!",
+		}); err != nil {
+			t.Fatalf("password signup: %v", err)
+		}
+	}
+	callback := func(t *testing.T, svc Service, cfg *config.Config) (*session.Session, error) {
+		t.Helper()
+		state, cookie := mustInitiate(t, svc, cfg, "google")
+		rec, req := callbackRequest(state, cookie)
+		sess, _, _, err := svc.HandleCallback(req.Context(), rec, req, "google", "code-1", state, db.SessionTypeCookie)
+		return sess, err
+	}
+
+	t.Run("oauth then password never inherits the provider link", func(t *testing.T) {
+		database, cfg, _, svc := setupServiceTest(t, unverified())
+		first, err := callback(t, svc, cfg)
+		if err != nil {
+			t.Fatalf("unverified oauth signup = %v", err)
+		}
+		if n := countRows(t, database, &db.OAuthAccount{}); n != 0 {
+			t.Errorf("oauth_accounts = %d; want 0 for an unverified address", n)
+		}
+		passwordSignup(t, database, cfg)
+		var owner db.User
+		if err := database.Where("id = ?", first.UserID).First(&owner).Error; err != nil {
+			t.Fatalf("load owner: %v", err)
+		}
+		if owner.PasswordHash == "" {
+			t.Fatal("password signup did not take ownership of the pending row")
+		}
+		sess, err := callback(t, svc, cfg)
+		if sess != nil {
+			t.Fatalf("session minted for %v after the password takeover", sess.UserID)
+		}
+		requireCode(t, err, errors.CodeOAuthEmailUnverified, http.StatusBadRequest)
+		requireIdentityRows(t, database, 1, 0, 0)
+	})
+
+	t.Run("password then oauth never binds", func(t *testing.T) {
+		database, cfg, _, svc := setupServiceTest(t, unverified())
+		passwordSignup(t, database, cfg)
+		sess, err := callback(t, svc, cfg)
+		if sess != nil {
+			t.Fatalf("session minted for %v; want none", sess.UserID)
+		}
+		requireCode(t, err, errors.CodeOAuthEmailUnverified, http.StatusBadRequest)
+		requireIdentityRows(t, database, 1, 0, 0)
+	})
+
+	t.Run("concurrent unverified signups converge without a link", func(t *testing.T) {
+		database, _, _, rawSvc := setupServiceTest(t, nil)
+		svc := rawSvc.(*service)
+		info := unverified()
+		type outcome struct {
+			user db.User
+			err  error
+		}
+		outs := make([]outcome, 2)
+		var wg sync.WaitGroup
+		for i := range outs {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				u, _, _, err := svc.linkOrCreate(context.Background(), "google", info, "")
+				outs[i] = outcome{user: u, err: err}
+			}(i)
+		}
+		wg.Wait()
+		for i, o := range outs {
+			if o.err != nil {
+				t.Fatalf("goroutine %d: %v; want convergence", i, o.err)
+			}
+		}
+		if outs[0].user.ID != outs[1].user.ID {
+			t.Fatalf("converged users differ: %v vs %v", outs[0].user.ID, outs[1].user.ID)
+		}
+		requireIdentityRows(t, database, 1, 0, 0)
 	})
 }
 
