@@ -148,6 +148,10 @@ func linkIntentRequested(r *http.Request) bool {
 	return r.URL.Query().Get(linkQueryParam) == "true"
 }
 
+// ctxUserIDKey types the context slot carrying the signed-in user for a link
+// initiation; a bare string key would collide with any other package's.
+type ctxUserIDKey struct{}
+
 // resolveLinkUserID resolves the signed-in user for an explicit link
 // initiation. Absent, invalid, or expired sessions yield "" so the flow
 // degrades to plain login; store failures are hard errors so an explicit
@@ -176,7 +180,7 @@ func (s *service) resolveLinkUserID(r *http.Request) (string, error) {
 		}
 		return "", nil
 	}
-	if v := r.Context().Value("user_id"); v != nil {
+	if v := r.Context().Value(ctxUserIDKey{}); v != nil {
 		switch id := v.(type) {
 		case string:
 			return id, nil

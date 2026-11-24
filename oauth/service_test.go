@@ -257,6 +257,15 @@ func requireCode(t *testing.T, err error, want errors.Code, status int) {
 	}
 }
 
+// writeFixture writes an upstream fixture body, failing the test when the
+// response can no longer be written.
+func writeFixture(t *testing.T, w http.ResponseWriter, format string, args ...any) {
+	t.Helper()
+	if _, err := fmt.Fprintf(w, format, args...); err != nil {
+		t.Errorf("write fixture: %v", err)
+	}
+}
+
 func verifiedInfo() *UserInfo {
 	return &UserInfo{ProviderID: "google", ProviderUserID: "sub-123", Email: "jane@example.com", EmailVerified: true}
 }
@@ -2265,7 +2274,7 @@ func TestFacebookFirstSignup(t *testing.T) {
 				http.Error(w, "bad form", http.StatusBadRequest)
 				return
 			}
-			fmt.Fprintf(w, `{"access_token":%q,"token_type":"bearer"}`, "token-"+r.PostFormValue("code"))
+			writeFixture(t, w, `{"access_token":%q,"token_type":"bearer"}`, "token-"+r.PostFormValue("code"))
 		case "/debug_token":
 			if err := r.ParseForm(); err != nil {
 				http.Error(w, "bad form", http.StatusBadRequest)
@@ -2275,13 +2284,13 @@ func TestFacebookFirstSignup(t *testing.T) {
 				http.Error(w, "missing input_token", http.StatusBadRequest)
 				return
 			}
-			fmt.Fprintf(w, `{"data":{"app_id":%q,"is_valid":true}}`, appID)
+			writeFixture(t, w, `{"data":{"app_id":%q,"is_valid":true}}`, appID)
 		case "/me":
 			switch strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ") {
 			case "token-code-with-email":
-				fmt.Fprint(w, `{"id":"fb-1001","name":"Alice","email":"alice@fb-test.com"}`)
+				writeFixture(t, w, `{"id":"fb-1001","name":"Alice","email":"alice@fb-test.com"}`)
 			case "token-code-without-email":
-				fmt.Fprint(w, `{"id":"fb-1002","name":"Bob"}`)
+				writeFixture(t, w, `{"id":"fb-1002","name":"Bob"}`)
 			default:
 				http.Error(w, "unauthorized", http.StatusUnauthorized)
 			}
@@ -2445,7 +2454,7 @@ func TestResolveLinkUserID(t *testing.T) {
 	}
 	contextRequest := func(v any) *http.Request {
 		req := httptest.NewRequest(http.MethodGet, "/auth/oauth/google?link=true", nil)
-		return req.WithContext(context.WithValue(context.Background(), "user_id", v))
+		return req.WithContext(context.WithValue(context.Background(), ctxUserIDKey{}, v))
 	}
 
 	t.Run("store failure stays a 500", func(t *testing.T) {

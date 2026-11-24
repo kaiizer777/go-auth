@@ -50,7 +50,7 @@ func (p *nonceProvider) VerifyIDToken(_ context.Context, rawIDToken, nonce strin
 type nonceOptionProvider struct{ *nonceProvider }
 
 func (p *nonceOptionProvider) AuthCodeURL(state, codeChallenge string, opts ...AuthCodeOption) string {
-	u, err := url.Parse(p.nonceProvider.AuthURL(state, codeChallenge))
+	u, err := url.Parse(p.AuthURL(state, codeChallenge))
 	if err != nil {
 		return ""
 	}
