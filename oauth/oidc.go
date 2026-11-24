@@ -222,8 +222,8 @@ func (m *JWKSManager) recordMiss(kid string) {
 func (m *JWKSManager) cachedKey(kid string) (JWKSKey, bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	// Both call sites run right after refreshFlight committed, so a stale entry
-	// cannot be read today; enforcing the bound keeps the invariant local.
+	// Call sites run after a refreshFlight, so a stale entry is not expected
+	// today; enforcing the bound keeps the freshness invariant local to the read.
 	if !time.Now().Before(m.expires) {
 		return JWKSKey{}, false
 	}
