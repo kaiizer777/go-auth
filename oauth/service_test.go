@@ -979,6 +979,140 @@ func TestHandleCallbackActiveSessionLinking(t *testing.T) {
 	})
 }
 
+// TestExplicitLinkRequiresClaimedOwner pins the pre-hijack gate on the explicit
+// ?link=true path: anyone who registered an address can hold a session on its
+// still-unclaimed row, so a verified provider identity may attach only after the
+// user has claimed the account with a password or a verified address.
+func TestExplicitLinkRequiresClaimedOwner(t *testing.T) {
+	linkInfo := func() *UserInfo {
+		return &UserInfo{ProviderID: "google", ProviderUserID: "sub-link-gate",
+			Email: "provider-owner@personal.example", EmailVerified: true}
+	}
+	linkAttempt := func(t *testing.T, svc Service, cfg *config.Config, rawSession string) (*session.Session, error) {
+		t.Helper()
+		state, cookie := initiateLinked(t, svc, cfg, "google", rawSession)
+		rec, req := callbackRequestWithSession(state, cookie, cfg, rawSession)
+		sess, _, _, err := svc.HandleCallback(req.Context(), rec, req, "google", "code-1", state, db.SessionTypeCookie)
+		return sess, err
+	}
+	seedUnclaimed := func(t *testing.T, database *gorm.DB, cfg *config.Config) (db.User, string) {
+		t.Helper()
+		owner := db.User{ID: uuid.New(), Email: "unclaimed@work.example"}
+		if err := database.Create(&owner).Error; err != nil {
+			t.Fatalf("seed owner: %v", err)
+		}
+		_, rawSession, err := session.NewService(database, cfg).
+			CreateSession(context.Background(), owner.ID, owner.CredentialVersion, db.SessionTypeCookie, "127.0.0.1", "ua")
+		if err != nil {
+			t.Fatalf("create session: %v", err)
+		}
+		return owner, rawSession
+	}
+
+	t.Run("unclaimed owner rejects the link", func(t *testing.T) {
+		database, cfg, _, svc := setupServiceTest(t, linkInfo())
+		_, rawSession := seedUnclaimed(t, database, cfg)
+
+		sess, err := linkAttempt(t, svc, cfg, rawSession)
+		if sess != nil {
+			t.Fatalf("session minted for %v; want the link rejected", sess.UserID)
+		}
+		requireCode(t, err, errors.CodeOAuthAccountLinkConflict, http.StatusConflict)
+		requireIdentityRows(t, database, 1, 0, 1)
+	})
+
+	t.Run("owner claims with a password then links", func(t *testing.T) {
+		database, cfg, _, svc := setupServiceTest(t, linkInfo())
+		owner, _ := seedUnclaimed(t, database, cfg)
+		signupPassword(t, database, cfg, owner.Email, "CorrectHorseBattery9!")
+
+		var claimed db.User
+		if err := database.Where("id = ?", owner.ID).First(&claimed).Error; err != nil {
+			t.Fatalf("load claimed owner: %v", err)
+		}
+		if claimed.PasswordHash == "" {
+			t.Fatal("password signup did not claim the account")
+		}
+		_, rawSession, err := session.NewService(database, cfg).
+			CreateSession(context.Background(), claimed.ID, claimed.CredentialVersion, db.SessionTypeCookie, "127.0.0.1", "ua")
+		if err != nil {
+			t.Fatalf("create session: %v", err)
+		}
+
+		sess, err := linkAttempt(t, svc, cfg, rawSession)
+		if err != nil {
+			t.Fatalf("link after claim = %v; want success", err)
+		}
+		if sess.UserID != claimed.ID {
+			t.Fatalf("session user = %v; want %v", sess.UserID, claimed.ID)
+		}
+		var link db.OAuthAccount
+		if err := database.Where("provider_id = ? AND provider_user_id = ?", "google", "sub-link-gate").First(&link).Error; err != nil {
+			t.Fatalf("load link: %v", err)
+		}
+		if link.UserID != claimed.ID || !link.Verified {
+			t.Fatalf("link = (%v, verified=%v); want (%v, verified)", link.UserID, link.Verified, claimed.ID)
+		}
+	})
+
+	// The full pre-hijack chain: an unverified provider signup mints a session on
+	// the victim's unclaimed row, the explicit link that would survive the later
+	// password claim is refused, and the one link that does exist is spent by the
+	// claim.
+	t.Run("rejected pre-claim link leaves nothing to mint after the password claim", func(t *testing.T) {
+		database := serviceTestDB(t)
+		cfg := serviceTestConfig()
+		const addr = "victim@example.test"
+		google := &stubProvider{id: "google", info: &UserInfo{
+			ProviderID: "google", ProviderUserID: "sub-victim-unverified", Email: addr,
+		}}
+		github := &stubProvider{id: "github", info: &UserInfo{
+			ProviderID: "github", ProviderUserID: "sub-attacker-verified",
+			Email: "attacker@example.test", EmailVerified: true,
+		}}
+		sessSvc := session.NewService(database, cfg)
+		svc := NewService(database, sessSvc, map[string]Provider{"google": google, "github": github}, cfg)
+
+		attacker, err := loginViaGoogle(t, svc, cfg)
+		if err != nil {
+			t.Fatalf("unverified signup = %v", err)
+		}
+		var pending db.User
+		if err := database.Where("id = ?", attacker.UserID).First(&pending).Error; err != nil {
+			t.Fatalf("load pending owner: %v", err)
+		}
+		_, rawSession, err := sessSvc.CreateSession(context.Background(), pending.ID,
+			pending.CredentialVersion, db.SessionTypeCookie, "127.0.0.1", "ua")
+		if err != nil {
+			t.Fatalf("create session: %v", err)
+		}
+
+		state, cookie := initiateLinked(t, svc, cfg, "github", rawSession)
+		rec, req := callbackRequestWithSession(state, cookie, cfg, rawSession)
+		sess, _, _, err := svc.HandleCallback(req.Context(), rec, req, "github", "code-1", state, db.SessionTypeCookie)
+		if sess != nil {
+			t.Fatalf("session minted for %v through the explicit link", sess.UserID)
+		}
+		requireCode(t, err, errors.CodeOAuthAccountLinkConflict, http.StatusConflict)
+		requireIdentityRows(t, database, 1, 1, 2)
+		var link db.OAuthAccount
+		if err := database.First(&link).Error; err != nil {
+			t.Fatalf("load link: %v", err)
+		}
+		if link.Verified {
+			t.Fatal("the refused link must not have been persisted as verified")
+		}
+
+		signupPassword(t, database, cfg, addr, "CorrectHorseBattery9!")
+		sess, err = loginViaGoogle(t, svc, cfg)
+		if sess != nil {
+			t.Fatalf("session minted for %v after the password claim", sess.UserID)
+		}
+		requireCode(t, err, errors.CodeOAuthEmailUnverified, http.StatusBadRequest)
+		requireIdentityRows(t, database, 1, 0, 0)
+	})
+}
+
 // failingGetByIDStore swaps the user store so GetByID can fail like a dead DB link.
 type failingGetByIDStore struct {
 	db.Store

@@ -846,6 +846,13 @@ func (s *service) linkOrCreate(ctx context.Context, providerID string, info *Use
 		if verr := validateLinkTarget(info); verr != nil {
 			return db.User{}, false, false, verr
 		}
+		// Pre-hijacking defense, mirroring mergeOrConverge: an unclaimed row
+		// (no password, no local verification) is reachable by whoever
+		// registered its address, and a link attached here would outlive the
+		// claim that takes the account back. The user must claim it first.
+		if isUnclaimedAccount(*owner) {
+			return db.User{}, false, false, errors.ErrOAuthAccountLinkConflict
+		}
 		user, linked, lerr := s.linkExisting(ctx, *owner, providerID, info)
 		if lerr != nil {
 			return db.User{}, false, false, lerr
