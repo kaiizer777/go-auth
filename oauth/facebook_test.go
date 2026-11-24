@@ -381,15 +381,15 @@ func TestFacebookProvider_FetchUserInfo(t *testing.T) {
 	})
 	p.userInfoURL = ts.URL
 
-	pClosed := NewFacebookProvider(config.FacebookConfig{
+	pAsserted := NewFacebookProvider(config.FacebookConfig{
 		AppID:        "fb-test-app",
 		AppSecret:    "fb-test-secret",
 		RedirectURI:  "https://myapp.com/callback",
 		GraphVersion: "v19.0",
-	}, FacebookFailClosedEmailVerification())
-	pClosed.userInfoURL = ts.URL
+	}, FacebookAssertEmailVerified())
+	pAsserted.userInfoURL = ts.URL
 
-	t.Run("full profile email reports verified by default", func(t *testing.T) {
+	t.Run("full profile email stays unverified by default", func(t *testing.T) {
 		tok := &OAuthToken{AccessToken: "token-full-profile"}
 		user, err := p.FetchUserInfo(context.Background(), tok)
 		if err != nil {
@@ -408,10 +408,10 @@ func TestFacebookProvider_FetchUserInfo(t *testing.T) {
 		if user.Email != "alice@fb-test.com" {
 			t.Errorf("Email = %q; want alice@fb-test.com", user.Email)
 		}
-		// Graph exposes the primary address only when the email permission is
-		// granted and the address is confirmed, so the default trusts it.
-		if !user.EmailVerified {
-			t.Error("EmailVerified = false; want true for a Graph-returned address")
+		// Meta documents no attestation for the Graph email field, so a
+		// present address must not unlock the existing-account merge.
+		if user.EmailVerified {
+			t.Error("EmailVerified = true; Graph email is not a documented attestation")
 		}
 		expectedAvatar := "https://platform-lookaside.fbsbx.com/profile.jpg"
 		if user.AvatarURL != expectedAvatar {
@@ -419,16 +419,16 @@ func TestFacebookProvider_FetchUserInfo(t *testing.T) {
 		}
 	})
 
-	t.Run("fail-closed option reports a present email as unverified", func(t *testing.T) {
-		user, err := pClosed.FetchUserInfo(context.Background(), &OAuthToken{AccessToken: "token-full-profile"})
+	t.Run("operator assertion reports a present email as verified", func(t *testing.T) {
+		user, err := pAsserted.FetchUserInfo(context.Background(), &OAuthToken{AccessToken: "token-full-profile"})
 		if err != nil {
 			t.Fatalf("FetchUserInfo failed: %v", err)
 		}
 		if user.Email != "alice@fb-test.com" {
 			t.Errorf("Email = %q; want the address kept for display", user.Email)
 		}
-		if user.EmailVerified {
-			t.Error("EmailVerified = true; want false under fail-closed trust")
+		if !user.EmailVerified {
+			t.Error("EmailVerified = false; want true under an explicit operator assertion")
 		}
 	})
 

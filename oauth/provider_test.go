@@ -204,14 +204,14 @@ func TestNewProviderFacebookEmailVerificationGate(t *testing.T) {
 		}
 	})
 
-	t.Run("default config trusts the Graph email and allows the merge", func(t *testing.T) {
+	t.Run("default config reports the Graph email unverified", func(t *testing.T) {
 		t.Parallel()
 		user := fetch(t, false)
-		if !user.EmailVerified {
-			t.Fatal("EmailVerified = false; want true with the default trust")
+		if user.EmailVerified {
+			t.Fatal("EmailVerified = true; a non-empty Graph email is not an attested claim")
 		}
-		if err := validateProviderIdentity(user); err != nil {
-			t.Fatalf("validateProviderIdentity = %v; want nil", err)
+		if err := validateProviderIdentity(user); !errors.Is(err, errors.ErrOAuthEmailUnverified) {
+			t.Fatalf("validateProviderIdentity = %v; want ErrOAuthEmailUnverified", err)
 		}
 	})
 }

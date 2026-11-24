@@ -10,6 +10,8 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/sync/singleflight"
+
 	"github.com/kaiizer777/go-auth/config"
 	"github.com/kaiizer777/go-auth/errors"
 )
@@ -18,6 +20,15 @@ import (
 const MicrosoftConsumerTenantGUID = "9188040d-6c67-4c5b-b112-36a304b66dad"
 
 const microsoftDiscoveryBaseURL = "https://login.microsoftonline.com"
+
+const (
+	// tenantResolutionTimeout bounds one tenant-discovery lookup: a slow or dead
+	// endpoint fails the login that triggered it instead of stalling the next.
+	tenantResolutionTimeout = 5 * time.Second
+	// tenantResolutionCooldown negatively caches a failed lookup so a broken
+	// domain fails fast rather than paying the timeout on every login.
+	tenantResolutionCooldown = 30 * time.Second
+)
 
 // MicrosoftProvider implements OAuth 2.0 and OIDC authentication for Microsoft Entra ID (Azure AD).
 type MicrosoftProvider struct {
@@ -31,12 +42,22 @@ type MicrosoftProvider struct {
 	userinfoURL    string
 	trustedTenants map[string]struct{}
 
-	// discoveryBaseURL roots domain→tenant-GUID lookups; tests point it at a
-	// loopback server. resolveMu guards the caches below.
+	// discoveryBaseURL roots domain→tenant-GUID lookups. resolveMu guards the
+	// caches below and is never held across I/O: lookups run inside
+	// resolveFlight so concurrent logins for one domain share a request.
 	discoveryBaseURL string
+	resolveTimeout   time.Duration
 	resolveMu        sync.Mutex
-	tenantGUID       string
-	resolvedTrusted  map[string]string
+	resolveFlight    singleflight.Group
+	resolvedGUIDs    map[string]string
+	resolveFailures  map[string]resolutionFailure
+}
+
+// resolutionFailure is a negatively cached lookup failure and the time its
+// cooldown expires.
+type resolutionFailure struct {
+	retryAt time.Time
+	err     error
 }
 
 // NewMicrosoftProvider constructs a Microsoft Entra ID adapter.
@@ -58,6 +79,7 @@ func NewMicrosoftProvider(cfg config.MicrosoftConfig, opts ...EndpointOption) *M
 		TokenURL:     fmt.Sprintf("https://login.microsoftonline.com/%s/oauth2/v2.0/token", tenant),
 		JWKSURL:      fmt.Sprintf("https://login.microsoftonline.com/%s/discovery/v2.0/keys", tenant),
 		UserInfoURL:  "https://graph.microsoft.com/oidc/userinfo",
+		DiscoveryURL: microsoftDiscoveryBaseURL,
 	}, opts)
 
 	trusted := make(map[string]struct{}, len(cfg.TrustedTenants))
@@ -79,7 +101,10 @@ func NewMicrosoftProvider(cfg config.MicrosoftConfig, opts ...EndpointOption) *M
 		jwksRetriever:    mgr,
 		userinfoURL:      ep.UserInfoURL,
 		trustedTenants:   trusted,
-		discoveryBaseURL: microsoftDiscoveryBaseURL,
+		discoveryBaseURL: ep.DiscoveryURL,
+		resolveTimeout:   tenantResolutionTimeout,
+		resolvedGUIDs:    make(map[string]string),
+		resolveFailures:  make(map[string]resolutionFailure),
 	}
 }
 
@@ -111,8 +136,7 @@ func issuerTenant(issuer string) string {
 // tenantAuthority resolves the configured authority to the tenant GUID form
 // Microsoft emits in iss and tid. Entra tokens always name the tenant GUID,
 // even when the authority was configured as a domain, so a domain is looked up
-// through its v2 discovery issuer once and cached. Resolution failures are
-// returned and never cached, so a transient outage does not brick logins.
+// through its v2 discovery issuer once and cached.
 func (p *MicrosoftProvider) tenantAuthority(ctx context.Context) (string, error) {
 	authority := normalizeTenant(p.cfg.Tenant)
 	if authority == "" {
@@ -121,20 +145,55 @@ func (p *MicrosoftProvider) tenantAuthority(ctx context.Context) (string, error)
 	if !isTenantDomain(authority) {
 		return authority, nil
 	}
+	return p.resolveDomain(ctx, authority)
+}
+
+// resolveDomain maps a domain-form tenant or allowlist entry to the GUID
+// Microsoft emits in iss and tid. Concurrent lookups for one domain share a
+// single discovery request, successes are cached for the process lifetime, and
+// failures are negatively cached for tenantResolutionCooldown so a broken
+// domain fails fast instead of paying the timeout on every login.
+func (p *MicrosoftProvider) resolveDomain(ctx context.Context, domain string) (string, error) {
 	p.resolveMu.Lock()
-	defer p.resolveMu.Unlock()
-	if p.tenantGUID != "" {
-		return p.tenantGUID, nil
+	if guid, ok := p.resolvedGUIDs[domain]; ok {
+		p.resolveMu.Unlock()
+		return guid, nil
 	}
-	guid, err := p.fetchTenantGUID(ctx, authority)
+	if failure, ok := p.resolveFailures[domain]; ok {
+		if time.Now().Before(failure.retryAt) {
+			p.resolveMu.Unlock()
+			return "", failure.err
+		}
+		delete(p.resolveFailures, domain)
+	}
+	p.resolveMu.Unlock()
+
+	v, err, _ := p.resolveFlight.Do(domain, func() (any, error) {
+		// Detach from the triggering request so a canceled login does not fail
+		// the logins that joined this flight; the bound still caps the lookup.
+		lookupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), p.resolveTimeout)
+		defer cancel()
+		guid, ferr := p.fetchTenantGUID(lookupCtx, domain)
+		p.resolveMu.Lock()
+		defer p.resolveMu.Unlock()
+		if ferr != nil {
+			p.resolveFailures[domain] = resolutionFailure{retryAt: time.Now().Add(tenantResolutionCooldown), err: ferr}
+			return nil, ferr
+		}
+		p.resolvedGUIDs[domain] = guid
+		return guid, nil
+	})
 	if err != nil {
 		return "", err
 	}
-	p.tenantGUID = guid
+	guid, _ := v.(string)
 	return guid, nil
 }
 
 // fetchTenantGUID reads the tenant GUID from a domain's v2 discovery issuer.
+// A failure here is an operator configuration defect, not an upstream outage:
+// the configured domain is the only input and it never becomes resolvable by
+// retrying the same URL pattern.
 func (p *MicrosoftProvider) fetchTenantGUID(ctx context.Context, domain string) (string, error) {
 	base := strings.TrimSuffix(p.discoveryBaseURL, "/")
 	if base == "" {
@@ -143,32 +202,17 @@ func (p *MicrosoftProvider) fetchTenantGUID(ctx context.Context, domain string) 
 	discoveryURL := fmt.Sprintf("%s/%s/v2.0/.well-known/openid-configuration", base, domain)
 	doc, err := FetchOIDCDiscovery(ctx, p.client, discoveryURL)
 	if err != nil {
-		return "", errors.New(errors.CodeOAuthProviderError,
+		return "", errors.New(errors.CodeInvalidConfig,
 			fmt.Sprintf("microsoft tenant domain %q could not be resolved to a tenant id", domain), err)
 	}
 	guid := normalizeTenant(issuerTenant(doc.Issuer))
 	if !tenantGUIDPattern.MatchString(guid) {
-		return "", errors.New(errors.CodeOAuthProviderError,
-			fmt.Sprintf("microsoft tenant domain %q resolved to non-GUID issuer %q", domain, doc.Issuer), nil)
+		// The issuer is server-controlled: keep it in the cause, never in the
+		// client-visible message.
+		return "", errors.New(errors.CodeInvalidConfig,
+			fmt.Sprintf("microsoft tenant domain %q did not resolve to a tenant id", domain),
+			errors.New(errors.CodeInvalidConfig, "issuer "+doc.Issuer+" is not a tenant GUID", nil))
 	}
-	return guid, nil
-}
-
-// resolveTrustedDomain resolves and caches a domain-form allowlist entry.
-func (p *MicrosoftProvider) resolveTrustedDomain(ctx context.Context, domain string) (string, error) {
-	p.resolveMu.Lock()
-	defer p.resolveMu.Unlock()
-	if guid, ok := p.resolvedTrusted[domain]; ok {
-		return guid, nil
-	}
-	guid, err := p.fetchTenantGUID(ctx, domain)
-	if err != nil {
-		return "", err
-	}
-	if p.resolvedTrusted == nil {
-		p.resolvedTrusted = make(map[string]string)
-	}
-	p.resolvedTrusted[domain] = guid
 	return guid, nil
 }
 
@@ -195,7 +239,7 @@ func (p *MicrosoftProvider) tenantTrusted(ctx context.Context, tenantID, issuer 
 		if !isTenantDomain(entry) {
 			continue
 		}
-		guid, err := p.resolveTrustedDomain(ctx, entry)
+		guid, err := p.resolveDomain(ctx, entry)
 		if err != nil {
 			return false, err
 		}
@@ -488,8 +532,8 @@ func (p *MicrosoftProvider) FetchUserInfo(ctx context.Context, token *OAuthToken
 			user.RawClaims["preferred_username"] = claims.PreferredUsername
 		}
 
-		// ProviderUserID: OID if present, fallback to Subject
-		user.ProviderUserID = providerUserID(claims.OID, claims.Subject)
+		// ProviderUserID: sub is the key both token paths share, oid the fallback
+		user.ProviderUserID = identityKey(claims.Subject, claims.OID)
 
 		// Fallback from admin-mutable UPN never verifies the address.
 		if user.Email == "" && strings.Contains(claims.PreferredUsername, "@") {
@@ -506,36 +550,32 @@ func (p *MicrosoftProvider) FetchUserInfo(ctx context.Context, token *OAuthToken
 	}
 
 	userinfoEndpoint := p.userinfoURL
+	// /oidc/userinfo carries no tenant and no signed issuer, so an authority
+	// narrower than common or an allowlist cannot be enforced on this path.
+	// Fail closed with a configuration error instead of trusting the token.
+	if p.tenantScoped() {
+		return nil, errors.New(errors.CodeInvalidConfig,
+			"microsoft userinfo cannot validate the token tenant without a verified id_token", nil)
+	}
+
 	raw, err := getJSON(ctx, p.client, userinfoEndpoint, token.AccessToken)
 	if err != nil {
 		return nil, err
 	}
 
-	oid, _ := raw["oid"].(string)
 	sub, _ := raw["sub"].(string)
-	if oid == "" && sub == "" {
-		return nil, errors.New(errors.CodeOAuthProviderError, "userinfo missing both oid and sub claims", nil)
+	oid, _ := raw["oid"].(string)
+	if sub == "" && oid == "" {
+		return nil, errors.New(errors.CodeOAuthProviderError, "userinfo returned no subject identifier", nil)
 	}
 
 	email, _ := raw["email"].(string)
 	name, _ := raw["name"].(string)
 	picture, _ := raw["picture"].(string)
 
-	// The userinfo response carries no signed issuer, so only the tenant claim
-	// can be evaluated here; an allowlist miss fails closed on the same marker
-	// the ID-token path sets.
-	tid, _ := raw["tid"].(string)
-	trusted, err := p.tenantTrusted(ctx, tid, "")
-	if err != nil {
-		return nil, err
-	}
-	if !trusted {
-		raw["untrusted_tenant"] = true
-	}
-
 	return &OAuthUser{
 		ProviderID:     "microsoft",
-		ProviderUserID: providerUserID(oid, sub),
+		ProviderUserID: identityKey(sub, oid),
 		Email:          strings.ToLower(email),
 		EmailVerified:  false, // Userinfo alone cannot attest nOauth domain ownership
 		Name:           name,
@@ -544,14 +584,25 @@ func (p *MicrosoftProvider) FetchUserInfo(ctx context.Context, token *OAuthToken
 	}, nil
 }
 
-// providerUserID keys the identity on oid, the immutable directory object id,
-// and falls back to sub only when the token omits oid. Both token paths must
-// resolve the same principal to the same key.
-func providerUserID(oid, sub string) string {
-	if oid != "" {
-		return oid
+// tenantScoped reports whether the deployment constrains tenants beyond
+// Microsoft's multi-tenant "common" authority.
+func (p *MicrosoftProvider) tenantScoped() bool {
+	if len(p.trustedTenants) > 0 {
+		return true
 	}
-	return sub
+	authority := normalizeTenant(p.cfg.Tenant)
+	return authority != "" && authority != "common"
+}
+
+// identityKey keys the principal on sub, the claim both the id_token and
+// /oidc/userinfo return, and falls back to oid only when sub is absent. Keying
+// on oid first splits one principal into two provider_user_id values: the
+// userinfo payload never carries oid.
+func identityKey(sub, oid string) string {
+	if sub != "" {
+		return sub
+	}
+	return oid
 }
 
 type jsonNumber interface {

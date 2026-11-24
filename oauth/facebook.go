@@ -18,44 +18,51 @@ import (
 
 // FacebookProvider implements OAuth 2.0 authentication for Meta Facebook Graph API v19.0+.
 type FacebookProvider struct {
-	cfg             config.FacebookConfig
-	client          *http.Client
-	authURL         string
-	tokenURL        string
-	debugURL        string
-	userInfoURL     string
-	trustGraphEmail bool
+	cfg    config.FacebookConfig
+	client *http.Client
+
+	authURL     string
+	tokenURL    string
+	debugURL    string
+	userInfoURL string
+
+	// assertsVerifiedEmail is an operator assertion that the Graph email field
+	// is provider-attested. Meta documents no such guarantee, so it defaults to
+	// false and only then may an address unlock the existing-account merge.
+	assertsVerifiedEmail bool
 }
 
 var _ Provider = (*FacebookProvider)(nil)
 
-// FacebookOption customizes the Facebook adapter at construction.
-type FacebookOption func(*FacebookProvider)
-
-// FacebookFailClosedEmailVerification stops trusting the Graph email field: a
-// returned address then reports EmailVerified=false, which keeps the identity
-// on the registration/returning-login path and out of existing-account merges.
-func FacebookFailClosedEmailVerification() FacebookOption {
-	return func(p *FacebookProvider) { p.trustGraphEmail = false }
+// facebookOptions is the constructor state Facebook options mutate.
+type facebookOptions struct {
+	endpoints            EndpointOverride
+	assertsVerifiedEmail bool
 }
 
-// FacebookEndpoints applies non-empty endpoint overrides. It is the FacebookOption
-// form of WithEndpoints, which the other adapters take directly.
+// FacebookOption customizes the Facebook adapter at construction.
+type FacebookOption func(*facebookOptions)
+
+// FacebookFailClosedEmailVerification is the default policy, kept explicit so a
+// config-driven call site can state it: a returned address reports
+// EmailVerified=false, which keeps the identity on the registration path and
+// out of existing-account merges.
+func FacebookFailClosedEmailVerification() FacebookOption {
+	return func(o *facebookOptions) { o.assertsVerifiedEmail = false }
+}
+
+// FacebookAssertEmailVerified declares that the operator treats the Graph email
+// field as an assertion that Meta verified the address, enabling the
+// existing-account merge for Facebook identities. Do not infer it from a
+// non-empty response: only assert it when app review scopes guarantee it.
+func FacebookAssertEmailVerified() FacebookOption {
+	return func(o *facebookOptions) { o.assertsVerifiedEmail = true }
+}
+
+// FacebookEndpoints applies non-empty endpoint overrides through the shared
+// merge, so the adapter accepts the same fields as the others.
 func FacebookEndpoints(o EndpointOverride) FacebookOption {
-	return func(p *FacebookProvider) {
-		if o.AuthorizeURL != "" {
-			p.authURL = o.AuthorizeURL
-		}
-		if o.TokenURL != "" {
-			p.tokenURL = o.TokenURL
-		}
-		if o.UserInfoURL != "" {
-			p.userInfoURL = o.UserInfoURL
-		}
-		if o.DebugURL != "" {
-			p.debugURL = o.DebugURL
-		}
-	}
+	return func(opts *facebookOptions) { applyEndpoints(&opts.endpoints, o) }
 }
 
 // NewFacebookProvider constructs a new Facebook Graph API provider adapter.
@@ -68,21 +75,26 @@ func NewFacebookProvider(cfg config.FacebookConfig, opts ...FacebookOption) *Fac
 		cfg.Scopes = []string{"email", "public_profile"}
 	}
 
-	p := &FacebookProvider{
-		cfg:             cfg,
-		client:          newHTTPClient(),
-		authURL:         fmt.Sprintf("https://www.facebook.com/%s/dialog/oauth", version),
-		tokenURL:        fmt.Sprintf("https://graph.facebook.com/%s/oauth/access_token", version),
-		debugURL:        "https://graph.facebook.com/debug_token",
-		userInfoURL:     fmt.Sprintf("https://graph.facebook.com/%s/me", version),
-		trustGraphEmail: true,
-	}
+	fo := facebookOptions{endpoints: EndpointOverride{
+		AuthorizeURL: fmt.Sprintf("https://www.facebook.com/%s/dialog/oauth", version),
+		TokenURL:     fmt.Sprintf("https://graph.facebook.com/%s/oauth/access_token", version),
+		UserInfoURL:  fmt.Sprintf("https://graph.facebook.com/%s/me", version),
+		DebugURL:     "https://graph.facebook.com/debug_token",
+	}}
 	for _, opt := range opts {
 		if opt != nil {
-			opt(p)
+			opt(&fo)
 		}
 	}
-	return p
+	return &FacebookProvider{
+		cfg:                  cfg,
+		client:               newHTTPClient(),
+		authURL:              fo.endpoints.AuthorizeURL,
+		tokenURL:             fo.endpoints.TokenURL,
+		userInfoURL:          fo.endpoints.UserInfoURL,
+		debugURL:             fo.endpoints.DebugURL,
+		assertsVerifiedEmail: fo.assertsVerifiedEmail,
+	}
 }
 
 // ID returns the canonical provider slug.
@@ -232,11 +244,12 @@ func (p *FacebookProvider) FetchUserInfo(ctx context.Context, tokens *OAuthToken
 	email, _ := raw["email"].(string)
 	email = strings.TrimSpace(email)
 
-	// Graph only returns a primary address confirmed on the account when the
-	// email permission is granted, so a present address is the provider's
-	// ownership assertion. Operators who cannot rely on that opt out with
-	// FacebookFailClosedEmailVerification.
-	emailVerified := p.trustGraphEmail && email != ""
+	// Graph returns a primary address when the email permission is granted, but
+	// Meta documents no attestation for it: a non-empty email is therefore not
+	// proof of ownership and stays unverified unless the operator asserts the
+	// attestation explicitly. Unverified identities may register but can never
+	// merge into an existing account.
+	emailVerified := p.assertsVerifiedEmail && email != ""
 
 	var avatarURL string
 	if picMap, ok := raw["picture"].(map[string]any); ok {

@@ -135,17 +135,20 @@ func (i *MicrosoftIdP) keys(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, map[string]any{"keys": []any{BuildJWK(i.kid, i.n, i.e)}})
 }
 
+// userinfo returns the documented Microsoft Graph /oidc/userinfo shape: no
+// oid, no tid. The ID token carries those; this endpoint does not.
 func (i *MicrosoftIdP) userinfo(w http.ResponseWriter, r *http.Request) {
 	if bearerToken(r) != msAccessToken {
 		http.Error(w, "invalid access token", http.StatusUnauthorized)
 		return
 	}
 	writeJSON(w, map[string]any{
-		"sub":   i.Subject,
-		"oid":   i.OID,
-		"tid":   i.TenantID,
-		"email": i.Email,
-		"name":  i.Name,
+		"sub":         i.Subject,
+		"name":        i.Name,
+		"family_name": "MSTestUser",
+		"given_name":  "IDP",
+		"email":       i.Email,
+		"picture":     "",
 	})
 }
 

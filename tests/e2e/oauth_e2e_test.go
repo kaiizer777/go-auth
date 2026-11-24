@@ -248,6 +248,7 @@ func TestE2E_FullBrowserOAuthJourneys(t *testing.T) {
 		defer idp.Close()
 		idp.TenantID = tenant
 		idp.OID = "ms-user-oid-1"
+		idp.Subject = "ms-user-sub-1"
 		idp.Email = "corp-user@example.com"
 
 		provider := oauth.NewMicrosoftProvider(config.MicrosoftConfig{
@@ -261,11 +262,12 @@ func TestE2E_FullBrowserOAuthJourneys(t *testing.T) {
 			t.Fatalf("register microsoft adapter: %v", err)
 		}
 
-		// Fails if the adapter stops verifying the id_token signature, keying
-		// the identity on oid, or trusting the attestation for this tenant.
+		// Fails if the adapter stops verifying the id_token signature, keys
+		// the identity on oid instead of sub, or trusts the attestation for
+		// this tenant.
 		info := probeIdentity(t, provider)
-		if info.ProviderUserID != "ms-user-oid-1" {
-			t.Fatalf("adapter ProviderUserID = %q; want %q", info.ProviderUserID, "ms-user-oid-1")
+		if info.ProviderUserID != "ms-user-sub-1" {
+			t.Fatalf("adapter ProviderUserID = %q; want %q", info.ProviderUserID, "ms-user-sub-1")
 		}
 		if !info.EmailVerified {
 			t.Fatal("adapter EmailVerified = false for a verified-tenant id_token")
@@ -319,8 +321,8 @@ func TestE2E_FullBrowserOAuthJourneys(t *testing.T) {
 		if err := dbConn.Where("provider_id = ? AND user_id = ?", "microsoft", user.ID).First(&link).Error; err != nil {
 			t.Fatalf("link record not found: %v", err)
 		}
-		if link.ProviderUserID != "ms-user-oid-1" {
-			t.Fatalf("link provider_user_id = %q; want %q", link.ProviderUserID, "ms-user-oid-1")
+		if link.ProviderUserID != "ms-user-sub-1" {
+			t.Fatalf("link provider_user_id = %q; want %q", link.ProviderUserID, "ms-user-sub-1")
 		}
 	})
 
@@ -335,6 +337,7 @@ func TestE2E_FullBrowserOAuthJourneys(t *testing.T) {
 		defer msIdP.Close()
 		msIdP.TenantID = oauth.MicrosoftConsumerTenantGUID
 		msIdP.OID = "ms-user-oid-2"
+		msIdP.Subject = "ms-user-sub-2"
 		msIdP.Email = "existing-user@example.com"
 
 		msProvider := oauth.NewMicrosoftProvider(config.MicrosoftConfig{
@@ -399,8 +402,8 @@ func TestE2E_FullBrowserOAuthJourneys(t *testing.T) {
 		for _, l := range links {
 			gotKeys[l.ProviderID] = l.ProviderUserID
 		}
-		if gotKeys["microsoft"] != "ms-user-oid-2" {
-			t.Fatalf("microsoft link provider_user_id = %q; want %q", gotKeys["microsoft"], "ms-user-oid-2")
+		if gotKeys["microsoft"] != "ms-user-sub-2" {
+			t.Fatalf("microsoft link provider_user_id = %q; want %q", gotKeys["microsoft"], "ms-user-sub-2")
 		}
 		if gotKeys["discord"] != "discord-snowflake-888" {
 			t.Fatalf("discord link provider_user_id = %q; want %q", gotKeys["discord"], "discord-snowflake-888")
@@ -482,7 +485,7 @@ func TestE2E_FullBrowserOAuthJourneys(t *testing.T) {
 		}
 	})
 
-	// 4. Journey 4: Facebook first-time signup with a provider-confirmed email
+	// 4. Journey 4: Facebook first-time signup with a provider-supplied email
 	t.Run("journey 4: facebook login", func(t *testing.T) {
 		h, dbConn, pReg, cfg := setupOAuthE2EStack(t)
 
@@ -501,14 +504,14 @@ func TestE2E_FullBrowserOAuthJourneys(t *testing.T) {
 		}
 
 		// Fails if the adapter stops validating the token via /debug_token,
-		// stops sending appsecret_proof to /me, or reverts to reporting every
-		// Graph email as unverified.
+		// stops sending appsecret_proof to /me, or claims the Graph address is
+		// attested when Meta documents no such guarantee.
 		info := probeIdentity(t, provider)
 		if info.ProviderUserID != "fb-app-scoped-uid-444" {
 			t.Fatalf("adapter ProviderUserID = %q; want %q", info.ProviderUserID, "fb-app-scoped-uid-444")
 		}
-		if info.Email != "fb-user@example.com" || !info.EmailVerified {
-			t.Fatalf("adapter identity = %q verified=%v; want fb-user@example.com and verified", info.Email, info.EmailVerified)
+		if info.Email != "fb-user@example.com" || info.EmailVerified {
+			t.Fatalf("adapter identity = %q verified=%v; want fb-user@example.com and unverified", info.Email, info.EmailVerified)
 		}
 
 		authorizeURL, cookies := initiateOAuth(t, h, "facebook", "")
@@ -524,15 +527,12 @@ func TestE2E_FullBrowserOAuthJourneys(t *testing.T) {
 		if err := dbConn.Where("email = ?", "fb-user@example.com").First(&user).Error; err != nil {
 			t.Fatalf("user record not found: %v", err)
 		}
-		if !user.EmailVerified {
-			t.Fatal("first-time Facebook signup must create a verified user for a provider-confirmed email")
+		if user.EmailVerified {
+			t.Fatal("an unverified Graph email must not create a verified user")
 		}
-		var link db.OAuthAccount
-		if err := dbConn.Where("provider_id = ? AND user_id = ?", "facebook", user.ID).First(&link).Error; err != nil {
-			t.Fatalf("facebook link record not found: %v", err)
-		}
-		if link.ProviderUserID != "fb-app-scoped-uid-444" {
-			t.Fatalf("link provider_user_id = %q; want %q", link.ProviderUserID, "fb-app-scoped-uid-444")
+		var linkCount int64
+		if err := dbConn.Model(&db.OAuthAccount{}).Where("provider_id = ?", "facebook").Count(&linkCount).Error; err != nil || linkCount != 0 {
+			t.Fatalf("expected no durable facebook link for an unproven address, got count=%d err=%v", linkCount, err)
 		}
 
 		var sessCount int64
@@ -554,7 +554,7 @@ func TestE2E_FullBrowserOAuthJourneys(t *testing.T) {
 			AppID:       idp.AppID,
 			AppSecret:   idp.AppSecret,
 			RedirectURI: cfg.BaseURL + "/auth/oauth/facebook/callback",
-		}, oauth.FacebookEndpoints(facebookEndpoints(idp)), oauth.FacebookFailClosedEmailVerification())
+		}, oauth.FacebookEndpoints(facebookEndpoints(idp)))
 		if err := (*pReg).Register(provider); err != nil {
 			t.Fatalf("register facebook adapter: %v", err)
 		}
@@ -569,9 +569,8 @@ func TestE2E_FullBrowserOAuthJourneys(t *testing.T) {
 			t.Fatalf("seed user: %v", err)
 		}
 
-		// Fails if the fail-closed option stops suppressing EmailVerified while
-		// the Graph address is still non-empty: the gate below must see the
-		// false the adapter actually produced.
+		// Fails if the adapter starts treating the Graph address as attested by
+		// default: the merge gate below must see the false the adapter produces.
 		info := probeIdentity(t, provider)
 		if info.Email != "squatted@example.com" || info.EmailVerified {
 			t.Fatalf("adapter identity = %q verified=%v; want non-empty unverified email", info.Email, info.EmailVerified)
@@ -614,6 +613,7 @@ func TestE2E_FullBrowserOAuthJourneys(t *testing.T) {
 		defer idp.Close()
 		idp.TenantID = attackerTenant
 		idp.OID = "ms-attacker-oid-666"
+		idp.Subject = "ms-attacker-sub-666"
 		idp.Email = "victim@example.com"
 		idp.EDov = "1" // domain attestation must not override the allowlist
 
@@ -646,8 +646,8 @@ func TestE2E_FullBrowserOAuthJourneys(t *testing.T) {
 		if untrusted, _ := info.RawClaims["untrusted_tenant"].(bool); !untrusted {
 			t.Fatalf("adapter RawClaims[untrusted_tenant] = %v; want true", info.RawClaims["untrusted_tenant"])
 		}
-		if info.ProviderUserID != "ms-attacker-oid-666" {
-			t.Fatalf("adapter ProviderUserID = %q; want %q", info.ProviderUserID, "ms-attacker-oid-666")
+		if info.ProviderUserID != "ms-attacker-sub-666" {
+			t.Fatalf("adapter ProviderUserID = %q; want %q", info.ProviderUserID, "ms-attacker-sub-666")
 		}
 
 		authorizeURL, cookies := initiateOAuth(t, h, "microsoft", "")

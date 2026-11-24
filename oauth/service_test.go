@@ -2007,7 +2007,7 @@ func TestFacebookFirstSignup(t *testing.T) {
 			map[string]Provider{"facebook": p}, cfg)
 	}
 
-	t.Run("first signup with a Graph email succeeds", func(t *testing.T) {
+	t.Run("first signup with an unverified Graph email registers an unverified user", func(t *testing.T) {
 		database, cfg, svc := newService(t)
 		state, cookie := mustInitiate(t, svc, cfg, "facebook")
 		rec, req := callbackRequest(state, cookie)
@@ -2019,10 +2019,11 @@ func TestFacebookFirstSignup(t *testing.T) {
 		if err := database.Where("id = ?", sess.UserID).First(&user).Error; err != nil {
 			t.Fatalf("load user: %v", err)
 		}
-		if user.Email != "alice@fb-test.com" || !user.EmailVerified {
-			t.Fatalf("user email=%q verified=%v; want alice@fb-test.com/true", user.Email, user.EmailVerified)
+		if user.Email != "alice@fb-test.com" || user.EmailVerified {
+			t.Fatalf("user email=%q verified=%v; want alice@fb-test.com/false", user.Email, user.EmailVerified)
 		}
-		requireIdentityRows(t, database, 1, 1, 1)
+		// No durable binding is minted for a claim the provider did not attest.
+		requireIdentityRows(t, database, 1, 0, 1)
 	})
 
 	t.Run("first signup without a Graph email is rejected", func(t *testing.T) {
