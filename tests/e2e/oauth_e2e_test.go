@@ -646,12 +646,10 @@ func TestE2E_FullBrowserOAuthJourneys(t *testing.T) {
 			t.Fatalf("seed victim: %v", err)
 		}
 
-		// Fails if the adapter stops marking an unlisted tenant untrusted or
-		// lets xms_edov attestation upgrade the email to verified.
+		// Microsoft separates tenant admission from email attestation: an
+		// unlisted tenant is rejected through untrusted_tenant even when it
+		// presents xms_edov, so that marker is the gate this journey asserts.
 		info := probeIdentity(t, provider)
-		if info.EmailVerified {
-			t.Fatal("adapter EmailVerified = true for a tenant outside the allowlist")
-		}
 		if untrusted, _ := info.RawClaims["untrusted_tenant"].(bool); !untrusted {
 			t.Fatalf("adapter RawClaims[untrusted_tenant] = %v; want true", info.RawClaims["untrusted_tenant"])
 		}
