@@ -20,11 +20,28 @@ import (
 // IdPs below emulate each provider's HTTP surface (authorize, token, userinfo,
 // JWKS) so tests can drive the real adapter instead of a Provider stub: point
 // the adapter at Server with oauth.WithEndpoints. The authorize leg validates
-// the adapter's PKCE S256 request and the token leg redeems the code once
-// against that challenge, so a broken authorize URL or a dropped verifier
-// fails the journey rather than passing through a mock.
+// the adapter's PKCE S256 request and records the redirect_uri and scope it
+// issued; the token leg redeems the code once against that challenge and
+// rejects a token request that does not replay both, so a broken authorize URL,
+// a dropped verifier, or a mismatched redirect fails the journey rather than
+// passing through a mock.
 
 const msAccessToken = "ms-idp-access-token"
+
+// msForeignTenant is the tenant a bad-issuer token names; it is never the
+// tenant the adapter under test is configured for.
+const msForeignTenant = "99999999-9999-9999-9999-999999999999"
+
+// IDTokenFault corrupts one aspect of a minted id_token so a test can prove the
+// adapter rejects it. The zero value mints a valid token.
+type IDTokenFault string
+
+const (
+	FaultNone         IDTokenFault = ""
+	FaultBadIssuer    IDTokenFault = "bad_issuer"
+	FaultBadAudience  IDTokenFault = "bad_audience"
+	FaultBadSignature IDTokenFault = "bad_signature"
+)
 
 // MicrosoftIdP emulates Entra ID authorize, token, JWKS, and userinfo.
 type MicrosoftIdP struct {
@@ -37,9 +54,17 @@ type MicrosoftIdP struct {
 	Subject      string
 	Email        string
 	Name         string
-	// EDov is the xms_edov domain-ownership attestation; "1" marks the
-	// address domain as verified by the tenant.
-	EDov string
+	// OmitIDToken drops id_token from the token response, forcing the adapter
+	// onto its /userinfo fallback.
+	OmitIDToken bool
+	// Fault breaks one id_token property. At most one aspect is corrupted so
+	// the rejection is attributable to it.
+	Fault IDTokenFault
+
+	// edov is the xms_edov domain-ownership attestation claim. Tokens are
+	// unattested by default: an attested default would hide the difference
+	// between tenant admission and address attestation.
+	edov string
 
 	codes *authorizeCodes
 	priv  *rsa.PrivateKey
@@ -47,6 +72,10 @@ type MicrosoftIdP struct {
 	n     string
 	e     string
 }
+
+// AttestDomain opts the IdP into the xms_edov attestation, which is what the
+// adapter treats as proof that the tenant owns the address domain.
+func (i *MicrosoftIdP) AttestDomain() { i.edov = "1" }
 
 // NewMicrosoftIdP starts a Microsoft-shaped IdP with consumer-safe defaults.
 func NewMicrosoftIdP() (*MicrosoftIdP, error) {
@@ -62,7 +91,6 @@ func NewMicrosoftIdP() (*MicrosoftIdP, error) {
 		Subject:      "ms-idp-sub-1",
 		Email:        "ms-user@example.com",
 		Name:         "Microsoft IDP User",
-		EDov:         "1",
 		codes:        newAuthorizeCodes(),
 		priv:         priv,
 		kid:          "ms-idp-key-1",
@@ -94,14 +122,22 @@ func (i *MicrosoftIdP) token(w http.ResponseWriter, r *http.Request) {
 		writeOAuthError(w, "invalid_client")
 		return
 	}
-	ac, ok := i.codes.redeem(r.PostForm.Get("code"), r.PostForm.Get("code_verifier"))
+	ac, ok := i.codes.complete(r.PostForm)
 	if !ok {
 		writeOAuthError(w, "invalid_grant")
 		return
 	}
+	issuer := fmt.Sprintf("https://login.microsoftonline.com/%s/v2.0", i.TenantID)
+	if i.Fault == FaultBadIssuer {
+		issuer = fmt.Sprintf("https://login.microsoftonline.com/%s/v2.0", msForeignTenant)
+	}
+	audience := i.ClientID
+	if i.Fault == FaultBadAudience {
+		audience = "ms-idp-other-client-id"
+	}
 	claims := map[string]any{
-		"iss":                fmt.Sprintf("https://login.microsoftonline.com/%s/v2.0", i.TenantID),
-		"aud":                i.ClientID,
+		"iss":                issuer,
+		"aud":                audience,
 		"sub":                i.Subject,
 		"oid":                i.OID,
 		"tid":                i.TenantID,
@@ -111,8 +147,8 @@ func (i *MicrosoftIdP) token(w http.ResponseWriter, r *http.Request) {
 		"exp":                time.Now().Add(time.Hour).Unix(),
 		"iat":                time.Now().Unix(),
 	}
-	if i.EDov != "" {
-		claims["xms_edov"] = i.EDov
+	if i.edov != "" {
+		claims["xms_edov"] = i.edov
 	}
 	if ac.nonce != "" {
 		claims["nonce"] = ac.nonce
@@ -122,13 +158,43 @@ func (i *MicrosoftIdP) token(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "sign id_token", http.StatusInternalServerError)
 		return
 	}
-	writeJSON(w, map[string]any{
+	if i.Fault == FaultBadSignature {
+		if idToken, err = corruptSignature(idToken); err != nil {
+			http.Error(w, "corrupt id_token signature", http.StatusInternalServerError)
+			return
+		}
+	}
+	resp := map[string]any{
 		"token_type":    "Bearer",
 		"access_token":  msAccessToken,
-		"id_token":      idToken,
 		"expires_in":    3600,
 		"refresh_token": "ms-idp-refresh-token",
-	})
+	}
+	if !i.OmitIDToken {
+		resp["id_token"] = idToken
+	}
+	if ac.scope != "" {
+		resp["scope"] = ac.scope
+	}
+	writeJSON(w, resp)
+}
+
+// corruptSignature flips one signature byte. The header and claims stay intact,
+// so signature verification is the only check that can reject the token.
+func corruptSignature(token string) (string, error) {
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return "", fmt.Errorf("malformed jwt with %d parts", len(parts))
+	}
+	sig, err := base64.RawURLEncoding.DecodeString(parts[2])
+	if err != nil {
+		return "", fmt.Errorf("decode jwt signature: %w", err)
+	}
+	if len(sig) == 0 {
+		return "", fmt.Errorf("jwt signature is empty")
+	}
+	sig[0] ^= 0xff
+	return parts[0] + "." + parts[1] + "." + base64.RawURLEncoding.EncodeToString(sig), nil
 }
 
 func (i *MicrosoftIdP) keys(w http.ResponseWriter, _ *http.Request) {
@@ -154,6 +220,13 @@ func (i *MicrosoftIdP) userinfo(w http.ResponseWriter, r *http.Request) {
 
 const facebookGraphVersion = "v19.0"
 
+// DebugToken is the /debug_token verdict. The zero AppID reports this app's own
+// ID; naming another app is how the confused-deputy rejection is exercised.
+type DebugToken struct {
+	AppID   string
+	IsValid bool
+}
+
 // FacebookIdP emulates the Graph authorize, token, debug_token, and /me surface.
 type FacebookIdP struct {
 	Server *httptest.Server
@@ -164,6 +237,9 @@ type FacebookIdP struct {
 	Email     string
 	Name      string
 	AvatarURL string
+	// Debug shapes the /debug_token verdict. The adapter must reject a token
+	// that /debug_token does not attribute to its own app.
+	Debug DebugToken
 
 	codes *authorizeCodes
 }
@@ -177,6 +253,7 @@ func NewFacebookIdP() *FacebookIdP {
 		Email:     "fb-user@example.com",
 		Name:      "Facebook IDP User",
 		AvatarURL: "https://cdn.example.com/fb-avatar.png",
+		Debug:     DebugToken{IsValid: true},
 		codes:     newAuthorizeCodes(),
 	}
 	mux := http.NewServeMux()
@@ -204,7 +281,7 @@ func (i *FacebookIdP) token(w http.ResponseWriter, r *http.Request) {
 		writeOAuthError(w, "invalid_client")
 		return
 	}
-	if _, ok := i.codes.redeem(r.PostForm.Get("code"), r.PostForm.Get("code_verifier")); !ok {
+	if _, ok := i.codes.complete(r.PostForm); !ok {
 		writeOAuthError(w, "invalid_grant")
 		return
 	}
@@ -229,10 +306,14 @@ func (i *FacebookIdP) debugToken(w http.ResponseWriter, r *http.Request) {
 		writeOAuthError(w, "invalid_token")
 		return
 	}
+	appID := i.Debug.AppID
+	if appID == "" {
+		appID = i.AppID
+	}
 	writeJSON(w, map[string]any{"data": map[string]any{
-		"app_id":   i.AppID,
+		"app_id":   appID,
 		"type":     "USER",
-		"is_valid": true,
+		"is_valid": i.Debug.IsValid,
 		"user_id":  i.UserID,
 	}})
 }
@@ -318,17 +399,17 @@ func (i *DiscordIdP) token(w http.ResponseWriter, r *http.Request) {
 		writeOAuthError(w, "invalid_client")
 		return
 	}
-	if _, ok := i.codes.redeem(r.PostForm.Get("code"), r.PostForm.Get("code_verifier")); !ok {
+	ac, ok := i.codes.complete(r.PostForm)
+	if !ok {
 		writeOAuthError(w, "invalid_grant")
 		return
 	}
-	writeJSON(w, map[string]any{
+	writeJSON(w, grantedScope(map[string]any{
 		"access_token":  i.accessToken(),
 		"token_type":    "Bearer",
 		"expires_in":    604800,
 		"refresh_token": "discord-idp-refresh-token",
-		"scope":         "identify email",
-	})
+	}, ac))
 }
 
 func (i *DiscordIdP) me(w http.ResponseWriter, r *http.Request) {
@@ -398,17 +479,17 @@ func (i *XIdP) token(w http.ResponseWriter, r *http.Request) {
 		writeOAuthError(w, "invalid_client")
 		return
 	}
-	if _, ok := i.codes.redeem(r.PostForm.Get("code"), r.PostForm.Get("code_verifier")); !ok {
+	ac, ok := i.codes.complete(r.PostForm)
+	if !ok {
 		writeOAuthError(w, "invalid_grant")
 		return
 	}
-	writeJSON(w, map[string]any{
+	writeJSON(w, grantedScope(map[string]any{
 		"token_type":    "bearer",
 		"access_token":  i.accessToken(),
 		"expires_in":    7200,
 		"refresh_token": "x-idp-refresh-token",
-		"scope":         "users.read",
-	})
+	}, ac))
 }
 
 func (i *XIdP) me(w http.ResponseWriter, r *http.Request) {
@@ -425,10 +506,13 @@ func (i *XIdP) me(w http.ResponseWriter, r *http.Request) {
 	}})
 }
 
-// authorizeCode is the PKCE challenge and OIDC nonce bound to an issued code.
+// authorizeCode is the PKCE challenge and OIDC nonce bound to an issued code,
+// plus the redirect_uri and scope the authorize leg granted.
 type authorizeCode struct {
-	challenge string
-	nonce     string
+	challenge   string
+	nonce       string
+	redirectURI string
+	scope       string
 }
 
 // authorizeCodes issues single-use authorization codes bound to the PKCE
@@ -465,7 +549,12 @@ func (c *authorizeCodes) authorize(w http.ResponseWriter, r *http.Request, clien
 		return
 	}
 	c.mu.Lock()
-	c.codes[code] = authorizeCode{challenge: q.Get("code_challenge"), nonce: q.Get("nonce")}
+	c.codes[code] = authorizeCode{
+		challenge:   q.Get("code_challenge"),
+		nonce:       q.Get("nonce"),
+		redirectURI: q.Get("redirect_uri"),
+		scope:       q.Get("scope"),
+	}
 	c.mu.Unlock()
 
 	vals := redirect.Query()
@@ -489,6 +578,33 @@ func (c *authorizeCodes) redeem(code, verifier string) (authorizeCode, bool) {
 		return authorizeCode{}, false
 	}
 	return ac, true
+}
+
+// complete redeems code and enforces that the token request replays what the
+// authorize leg issued. RFC 6749 §4.1.3 binds both: redirect_uri must match the
+// authorize request, and a scope, when the client repeats it, must not differ
+// from what was granted.
+func (c *authorizeCodes) complete(form url.Values) (authorizeCode, bool) {
+	ac, ok := c.redeem(form.Get("code"), form.Get("code_verifier"))
+	if !ok {
+		return authorizeCode{}, false
+	}
+	if form.Get("redirect_uri") != ac.redirectURI {
+		return authorizeCode{}, false
+	}
+	if scope := form.Get("scope"); scope != "" && scope != ac.scope {
+		return authorizeCode{}, false
+	}
+	return ac, true
+}
+
+// grantedScope reports the scope the authorize leg actually issued instead of
+// echoing a scope the client never asked for.
+func grantedScope(payload map[string]any, ac authorizeCode) map[string]any {
+	if ac.scope != "" {
+		payload["scope"] = ac.scope
+	}
+	return payload
 }
 
 func freshCode() (string, error) {

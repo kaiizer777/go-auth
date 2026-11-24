@@ -3,6 +3,7 @@ package oauthmock
 import (
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/json"
 	"net/http"
 	"net/url"
 	"strings"
@@ -11,15 +12,24 @@ import (
 
 const idpTestVerifier = "idp-test-verifier-0123456789-0123456789-abcdef"
 
+const idpTestRedirect = "http://app.example/callback"
+
 // idpAuthorize plays the browser against an IdP authorize endpoint and returns
 // the single-use code it redirected back with.
 func idpAuthorize(t *testing.T, authorizeURL, clientID string) string {
+	t.Helper()
+	return idpAuthorizeScope(t, authorizeURL, clientID, "identify email")
+}
+
+// idpAuthorizeScope is idpAuthorize with an explicit scope request.
+func idpAuthorizeScope(t *testing.T, authorizeURL, clientID, scope string) string {
 	t.Helper()
 	sum := sha256.Sum256([]byte(idpTestVerifier))
 	q := url.Values{
 		"response_type":         {"code"},
 		"client_id":             {clientID},
-		"redirect_uri":          {"http://app.example/callback"},
+		"redirect_uri":          {idpTestRedirect},
+		"scope":                 {scope},
 		"state":                 {"st"},
 		"code_challenge":        {base64.RawURLEncoding.EncodeToString(sum[:])},
 		"code_challenge_method": {"S256"},
@@ -79,6 +89,7 @@ func TestMicrosoftIdPRejectsBadVerifierAndSecret(t *testing.T) {
 			"client_id":     {idp.ClientID},
 			"client_secret": {idp.ClientSecret},
 			"code":          {code},
+			"redirect_uri":  {idpTestRedirect},
 			"code_verifier": {idpTestVerifier},
 		}
 	}
@@ -111,6 +122,7 @@ func TestFacebookIdPRequiresAppSecretProof(t *testing.T) {
 		"client_id":     {idp.AppID},
 		"client_secret": {idp.AppSecret},
 		"code":          {code},
+		"redirect_uri":  {idpTestRedirect},
 		"code_verifier": {idpTestVerifier},
 	}
 	if got := idpPostForm(t, idp.Server.URL+"/"+facebookGraphVersion+"/oauth/access_token", tokenForm, nil); got != http.StatusOK {
@@ -159,6 +171,7 @@ func TestXIdPRequiresBasicAuthAndNoBodyClientID(t *testing.T) {
 		return url.Values{
 			"grant_type":    {"authorization_code"},
 			"code":          {code},
+			"redirect_uri":  {idpTestRedirect},
 			"code_verifier": {idpTestVerifier},
 		}
 	}
@@ -196,5 +209,227 @@ func TestDiscordIdPRejectsWrongBearer(t *testing.T) {
 	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("wrong bearer status = %d; want 400", resp.StatusCode)
+	}
+}
+
+// idpPostJSON posts a form and decodes the JSON body.
+func idpPostJSON(t *testing.T, endpoint string, form url.Values) map[string]any {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPost, endpoint, strings.NewReader(form.Encode()))
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("post %s: %v", endpoint, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	var body map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode %s response: %v", endpoint, err)
+	}
+	return body
+}
+
+func TestMicrosoftIdPTokenLegBindsRedirectAndScope(t *testing.T) {
+	t.Parallel()
+	idp, err := NewMicrosoftIdP()
+	if err != nil {
+		t.Fatalf("NewMicrosoftIdP: %v", err)
+	}
+	t.Cleanup(idp.Close)
+
+	form := func(code string) url.Values {
+		return url.Values{
+			"grant_type":    {"authorization_code"},
+			"client_id":     {idp.ClientID},
+			"client_secret": {idp.ClientSecret},
+			"code":          {code},
+			"redirect_uri":  {idpTestRedirect},
+			"code_verifier": {idpTestVerifier},
+		}
+	}
+	authorize := func() string {
+		return idpAuthorizeScope(t, idp.Server.URL+"/authorize", idp.ClientID, "openid profile")
+	}
+	tokenURL := idp.Server.URL + "/token"
+
+	body := idpPostJSON(t, tokenURL, form(authorize()))
+	if scope, _ := body["scope"].(string); scope != "openid profile" {
+		t.Fatalf("token scope = %q; want the granted %q", body["scope"], "openid profile")
+	}
+
+	wrongRedirect := form(authorize())
+	wrongRedirect.Set("redirect_uri", "http://attacker.example/callback")
+	if got := idpPostForm(t, tokenURL, wrongRedirect, nil); got != http.StatusBadRequest {
+		t.Fatalf("mismatched redirect_uri status = %d; want 400", got)
+	}
+
+	wrongScope := form(authorize())
+	wrongScope.Set("scope", "openid profile offline_access")
+	if got := idpPostForm(t, tokenURL, wrongScope, nil); got != http.StatusBadRequest {
+		t.Fatalf("mismatched scope status = %d; want 400", got)
+	}
+}
+
+func TestMicrosoftIdPTokenResponseKnobs(t *testing.T) {
+	t.Parallel()
+
+	claims := func(t *testing.T, idp *MicrosoftIdP) map[string]any {
+		t.Helper()
+		code := idpAuthorize(t, idp.Server.URL+"/authorize", idp.ClientID)
+		body := idpPostJSON(t, idp.Server.URL+"/token", url.Values{
+			"grant_type":    {"authorization_code"},
+			"client_id":     {idp.ClientID},
+			"client_secret": {idp.ClientSecret},
+			"code":          {code},
+			"redirect_uri":  {idpTestRedirect},
+			"code_verifier": {idpTestVerifier},
+		})
+		raw, _ := body["id_token"].(string)
+		parts := strings.Split(raw, ".")
+		if len(parts) != 3 {
+			t.Fatalf("id_token = %q; want three jwt parts", raw)
+		}
+		payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+		if err != nil {
+			t.Fatalf("decode id_token claims: %v", err)
+		}
+		var got map[string]any
+		if err := json.Unmarshal(payload, &got); err != nil {
+			t.Fatalf("unmarshal id_token claims: %v", err)
+		}
+		return got
+	}
+
+	t.Run("unattested by default, attested on opt-in", func(t *testing.T) {
+		idp, err := NewMicrosoftIdP()
+		if err != nil {
+			t.Fatalf("NewMicrosoftIdP: %v", err)
+		}
+		t.Cleanup(idp.Close)
+
+		if _, ok := claims(t, idp)["xms_edov"]; ok {
+			t.Fatal("default token must not carry xms_edov")
+		}
+		idp.AttestDomain()
+		if edov, _ := claims(t, idp)["xms_edov"].(string); edov != "1" {
+			t.Fatalf("xms_edov = %q; want %q after AttestDomain", edov, "1")
+		}
+	})
+
+	t.Run("omit id_token", func(t *testing.T) {
+		idp, err := NewMicrosoftIdP()
+		if err != nil {
+			t.Fatalf("NewMicrosoftIdP: %v", err)
+		}
+		t.Cleanup(idp.Close)
+		idp.OmitIDToken = true
+
+		body := idpPostJSON(t, idp.Server.URL+"/token", url.Values{
+			"grant_type":    {"authorization_code"},
+			"client_id":     {idp.ClientID},
+			"client_secret": {idp.ClientSecret},
+			"code":          {idpAuthorize(t, idp.Server.URL+"/authorize", idp.ClientID)},
+			"redirect_uri":  {idpTestRedirect},
+			"code_verifier": {idpTestVerifier},
+		})
+		if _, ok := body["id_token"]; ok {
+			t.Fatal("OmitIDToken must drop id_token from the token response")
+		}
+		if at, _ := body["access_token"].(string); at != msAccessToken {
+			t.Fatalf("access_token = %q; want %q", at, msAccessToken)
+		}
+	})
+
+	for _, tc := range []struct {
+		fault IDTokenFault
+		check func(t *testing.T, claims map[string]any)
+	}{
+		{
+			fault: FaultBadIssuer,
+			check: func(t *testing.T, c map[string]any) {
+				t.Helper()
+				if got, _ := c["iss"].(string); !strings.Contains(got, msForeignTenant) {
+					t.Fatalf("iss = %q; want the foreign tenant %q", got, msForeignTenant)
+				}
+			},
+		},
+		{
+			fault: FaultBadAudience,
+			check: func(t *testing.T, c map[string]any) {
+				t.Helper()
+				if got, _ := c["aud"].(string); got == "ms-idp-client-id" {
+					t.Fatal("aud must not name the configured client under FaultBadAudience")
+				}
+			},
+		},
+	} {
+		t.Run(string(tc.fault), func(t *testing.T) {
+			idp, err := NewMicrosoftIdP()
+			if err != nil {
+				t.Fatalf("NewMicrosoftIdP: %v", err)
+			}
+			t.Cleanup(idp.Close)
+			idp.Fault = tc.fault
+
+			tc.check(t, claims(t, idp))
+		})
+	}
+
+	t.Run("bad signature", func(t *testing.T) {
+		idp, err := NewMicrosoftIdP()
+		if err != nil {
+			t.Fatalf("NewMicrosoftIdP: %v", err)
+		}
+		t.Cleanup(idp.Close)
+		idp.Fault = FaultBadSignature
+
+		token, err := corruptSignature("a.b.c2ln")
+		if err != nil {
+			t.Fatalf("corruptSignature: %v", err)
+		}
+		if token == "a.b.c2ln" {
+			t.Fatal("corruptSignature returned the input unchanged")
+		}
+		if claims(t, idp)["sub"] != idp.Subject {
+			t.Fatal("FaultBadSignature must keep the claims intact")
+		}
+	})
+}
+
+func TestFacebookIdPDebugTokenVerdict(t *testing.T) {
+	t.Parallel()
+	idp := NewFacebookIdP()
+	t.Cleanup(idp.Close)
+
+	debugForm := func() url.Values {
+		appToken := idp.AppID + "|" + idp.AppSecret
+		return url.Values{
+			"input_token":     {idp.userToken()},
+			"access_token":    {appToken},
+			"appsecret_proof": {hmacHex(idp.AppSecret, appToken)},
+		}
+	}
+	verdict := func(t *testing.T) map[string]any {
+		t.Helper()
+		data, _ := idpPostJSON(t, idp.Server.URL+"/debug_token", debugForm())["data"].(map[string]any)
+		if data == nil {
+			t.Fatal("debug_token response missing data")
+		}
+		return data
+	}
+
+	if data := verdict(t); data["app_id"] != idp.AppID || data["is_valid"] != true {
+		t.Fatalf("default verdict = %v; want app_id %q and is_valid true", data, idp.AppID)
+	}
+	idp.Debug.AppID = "fb-other-app-id"
+	if data := verdict(t); data["app_id"] != "fb-other-app-id" {
+		t.Fatalf("app_id = %v; want the configured foreign app", data["app_id"])
+	}
+	idp.Debug.IsValid = false
+	if data := verdict(t); data["is_valid"] != false {
+		t.Fatalf("is_valid = %v; want false", data["is_valid"])
 	}
 }
