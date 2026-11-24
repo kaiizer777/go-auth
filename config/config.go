@@ -829,41 +829,10 @@ func (c *Config) validate() error {
 			provider.Tenant = tenant
 		}
 		normalizedProviders[id] = provider
-		if !provider.Enabled {
-			continue
-		}
-		if provider.ClientID == "" {
-			return errors.ErrOAuthClientIDRequired
-		}
-		if provider.RedirectURL == "" {
-			return errors.ErrOAuthRedirectURLRequired
-		}
-		switch id {
-		case "google", "github", "microsoft", "discord", "facebook", "x":
-			if provider.ClientSecret == "" {
-				return errors.ErrOAuthClientSecretRequired
-			}
-		case "apple":
-			if provider.ClientSecret == "" &&
-				(provider.TeamID == "" || provider.KeyID == "" || provider.PrivateKey == "") {
-				return errors.ErrOAuthClientSecretRequired
-			}
-		}
 	}
 	c.OAuth.Providers = normalizedProviders
 
 	if c.OAuth.Microsoft != nil {
-		if providerEnabled(c.OAuth.Microsoft.Enabled) {
-			if c.OAuth.Microsoft.ClientID == "" {
-				return errors.ErrOAuthClientIDRequired
-			}
-			if c.OAuth.Microsoft.ClientSecret == "" {
-				return errors.ErrOAuthClientSecretRequired
-			}
-			if c.OAuth.Microsoft.RedirectURI == "" {
-				return errors.ErrOAuthRedirectURLRequired
-			}
-		}
 		// Merge rule: typed defaults materialise only without a map entry for
 		// this provider. A pre-merge "common"/scope/TTL default reads as an
 		// explicit typed value and would otherwise shadow explicit map config.
@@ -892,46 +861,7 @@ func (c *Config) validate() error {
 		}
 	}
 
-	if c.OAuth.Discord != nil {
-		if providerEnabled(c.OAuth.Discord.Enabled) {
-			if c.OAuth.Discord.ClientID == "" {
-				return errors.ErrOAuthClientIDRequired
-			}
-			if c.OAuth.Discord.ClientSecret == "" {
-				return errors.ErrOAuthClientSecretRequired
-			}
-			if c.OAuth.Discord.RedirectURI == "" {
-				return errors.ErrOAuthRedirectURLRequired
-			}
-		}
-	}
-
-	if c.OAuth.Facebook != nil {
-		if providerEnabled(c.OAuth.Facebook.Enabled) {
-			if c.OAuth.Facebook.AppID == "" {
-				return errors.ErrOAuthClientIDRequired
-			}
-			if c.OAuth.Facebook.AppSecret == "" {
-				return errors.ErrOAuthClientSecretRequired
-			}
-			if c.OAuth.Facebook.RedirectURI == "" {
-				return errors.ErrOAuthRedirectURLRequired
-			}
-		}
-	}
-
 	if c.OAuth.X != nil {
-		if providerEnabled(c.OAuth.X.Enabled) {
-			if c.OAuth.X.ClientID == "" {
-				return errors.ErrOAuthClientIDRequired
-			}
-			if c.OAuth.X.ClientSecret == "" {
-				return errors.ErrOAuthClientSecretRequired
-			}
-			if c.OAuth.X.RedirectURI == "" {
-				return errors.ErrOAuthRedirectURLRequired
-			}
-		}
 		// Same merge rule as Microsoft above: no pre-merge default when a map
 		// entry carries explicit scopes.
 		_, xMapEntry := c.OAuth.Providers["x"]
@@ -940,14 +870,36 @@ func (c *Config) validate() error {
 		}
 	}
 
-	// Resolve after the per-surface credential checks: defaults are applied once,
-	// to the merged result, so no default can overwrite explicit map or typed
-	// configuration. The graph version only matters on the merged entry, so it is
-	// validated here — one check for both surfaces.
+	// Resolve folds typed sections into Providers and defaults merged entries.
 	c.OAuth.resolveProviders()
-	if fb, ok := c.OAuth.Providers["facebook"]; ok {
-		if err := validateGraphVersion(fb.GraphVersion); err != nil {
-			return err
+
+	// Validate credentials on the resolved providers. Every check routes through
+	// the resolved enabled state (resolveEnabled).
+	for id, provider := range c.OAuth.Providers {
+		if !provider.Enabled {
+			continue
+		}
+		if provider.ClientID == "" {
+			return errors.ErrOAuthClientIDRequired
+		}
+		switch id {
+		case "google", "github", "microsoft", "discord", "facebook", "x":
+			if provider.ClientSecret == "" {
+				return errors.ErrOAuthClientSecretRequired
+			}
+		case "apple":
+			if provider.ClientSecret == "" &&
+				(provider.TeamID == "" || provider.KeyID == "" || provider.PrivateKey == "") {
+				return errors.ErrOAuthClientSecretRequired
+			}
+		}
+		if provider.RedirectURL == "" {
+			return errors.ErrOAuthRedirectURLRequired
+		}
+		if id == "facebook" {
+			if err := validateGraphVersion(provider.GraphVersion); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -1109,12 +1061,6 @@ var (
 // Callers must lowercase tenant first; named authorities are handled separately.
 func isMicrosoftTenantRef(tenant string) bool {
 	return tenantGUIDRegex.MatchString(tenant) || tenantDomainRegex.MatchString(tenant)
-}
-
-// providerEnabled reports whether a typed provider section registers.
-// The tri-state switch treats an absent value as enabled.
-func providerEnabled(enabled *bool) bool {
-	return enabled == nil || *enabled
 }
 
 // normalizeMicrosoftTenant lowercases and trims tenant, then rejects anything
