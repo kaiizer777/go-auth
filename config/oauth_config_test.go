@@ -763,6 +763,60 @@ func TestConfigValidate_MapMicrosoftTenantNormalisation(t *testing.T) {
 	}
 }
 
+func TestConfigValidate_TenantValidationParity(t *testing.T) {
+	tests := []struct {
+		name    string
+		tenant  string
+		want    string
+		wantErr *errors.Error
+	}{
+		{name: "named authority", tenant: " Common ", want: "common"},
+		{name: "uppercase guid", tenant: "  9188040D-6C67-4C5B-B112-36A304B66DAD  ", want: "9188040d-6c67-4c5b-b112-36a304b66dad"},
+		{name: "mixed-case domain", tenant: "Contoso.OnMicrosoft.com", want: "contoso.onmicrosoft.com"},
+		{name: "empty", tenant: "", want: "common"},
+		{name: "garbage", tenant: "not a tenant!!", wantErr: errors.ErrOAuthTenantInvalid},
+		{name: "single label", tenant: "mytenant", wantErr: errors.ErrOAuthTenantInvalid},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mapCfg := validOAuthBase()
+			mapCfg.OAuth.Providers = map[string]ProviderConfig{"microsoft": {
+				ClientID:     "map-id",
+				ClientSecret: "map-secret",
+				RedirectURL:  "https://example.com/cb",
+				Enabled:      true,
+				Tenant:       tt.tenant,
+			}}
+			mapErr := mapCfg.Validate()
+
+			typedCfg := validOAuthBase()
+			typedCfg.OAuth.Microsoft = &MicrosoftConfig{
+				ClientID:     "typed-id",
+				ClientSecret: "typed-secret",
+				RedirectURI:  "https://example.com/cb",
+				Tenant:       tt.tenant,
+			}
+			typedErr := typedCfg.Validate()
+
+			if tt.wantErr != nil {
+				if !errors.Is(mapErr, tt.wantErr) || !errors.Is(typedErr, tt.wantErr) {
+					t.Fatalf("map err = %v, typed err = %v; want both %v", mapErr, typedErr, tt.wantErr)
+				}
+				return
+			}
+			if mapErr != nil || typedErr != nil {
+				t.Fatalf("map err = %v, typed err = %v; want nil", mapErr, typedErr)
+			}
+			mapTenant := mapCfg.OAuth.Providers["microsoft"].Tenant
+			typedTenant := typedCfg.OAuth.Providers["microsoft"].Tenant
+			if mapTenant != tt.want || typedTenant != tt.want {
+				t.Errorf("map Tenant = %q, typed Tenant = %q; want %q", mapTenant, typedTenant, tt.want)
+			}
+		})
+	}
+}
+
 func TestConfigValidate_NormalizesProviderMapWithoutMutatingInput(t *testing.T) {
 	input := map[string]ProviderConfig{
 		"google": {
