@@ -191,6 +191,51 @@ func TestMySQLMigration000008_DownRefusesOnTotpSecrets(t *testing.T) {
 	}
 }
 
+func TestMySQLMigration000009_AddsVerifiedFlag(t *testing.T) {
+	data, err := defaultMigrationsFS.ReadFile("migrations/mysql/000009_add_oauth_account_verified.up.sql")
+	if err != nil {
+		t.Fatalf("failed to read mysql migration 9 up: %v", err)
+	}
+	content := string(data)
+
+	alterIdx := strings.Index(content, "ALTER TABLE oauth_accounts ADD COLUMN verified TINYINT(1) NOT NULL DEFAULT 0")
+	if alterIdx == -1 {
+		t.Fatal("mysql migration 9 up must add oauth_accounts.verified as TINYINT(1) NOT NULL DEFAULT 0")
+	}
+	backfillIdx := strings.Index(content, "UPDATE oauth_accounts SET verified = 1")
+	if backfillIdx == -1 {
+		t.Fatal("mysql migration 9 up must backfill verified from the owning account")
+	}
+	if alterIdx > backfillIdx {
+		t.Errorf("mysql migration 9 column add (idx %d) must precede the backfill (idx %d)", alterIdx, backfillIdx)
+	}
+	backfill := content[backfillIdx:]
+	if semi := strings.Index(backfill, ";"); semi != -1 {
+		backfill = backfill[:semi]
+	}
+	if !strings.Contains(backfill, "users.email_verified = 1") {
+		t.Errorf("mysql migration 9 backfill must gate trust on users.email_verified: %q", backfill)
+	}
+	if !strings.Contains(backfill, "users.id = oauth_accounts.user_id") {
+		t.Errorf("mysql migration 9 backfill must correlate the link to its owning user: %q", backfill)
+	}
+
+	downData, err := defaultMigrationsFS.ReadFile("migrations/mysql/000009_add_oauth_account_verified.down.sql")
+	if err != nil {
+		t.Fatalf("failed to read mysql migration 9 down: %v", err)
+	}
+	downContent := string(downData)
+	if !strings.Contains(downContent, "ALTER TABLE oauth_accounts DROP COLUMN verified") {
+		t.Error("mysql migration 9 down must drop the verified column")
+	}
+	if strings.Contains(strings.ToUpper(downContent), "DROP TABLE") {
+		t.Error("mysql migration 9 down must drop only the column, never the links table")
+	}
+	if strings.Contains(downContent, "loses no identity data") {
+		t.Error("mysql migration 9 down must not claim the rollback is lossless")
+	}
+}
+
 func TestMySQLMigration000002_SessionTimestampIndexes(t *testing.T) {
 	data, err := defaultMigrationsFS.ReadFile("migrations/mysql/000002_create_sessions.up.sql")
 	if err != nil {
