@@ -219,7 +219,7 @@ func TestOIDC_DiscoveryAndJWKS(t *testing.T) {
 	})
 }
 
-func TestJWKSManager_UnknownKidSingleFetch(t *testing.T) {
+func TestJWKSManager_UnknownKidRepeatUsesNegativeCache(t *testing.T) {
 	_, nRaw, eRaw := generateTestRSAKey(t)
 	var jwksRequests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -239,8 +239,8 @@ func TestJWKSManager_UnknownKidSingleFetch(t *testing.T) {
 	if _, err := mgr.GetKey(ctx, "unknown-kid"); err == nil {
 		t.Fatal("expected not-found error for unknown kid, got nil")
 	}
-	// Merge premise (oauth sync): the first miss costs one fetch per flight
-	// (refresh + rollover re-check); the negative cache makes the repeat free.
+	// A first miss costs the primary fetch plus the rollover re-check that
+	// confirms a rotation; the negative cache makes the repeat free.
 	if got := jwksRequests.Load(); got != 2 {
 		t.Fatalf("sequential unknown-kid lookups cost %d fetches, want 2", got)
 	}
@@ -266,8 +266,8 @@ func TestJWKSManager_UnknownKidPerKidCooldown(t *testing.T) {
 	ctx := context.Background()
 	mgr := NewJWKSManager(server.URL, server.Client(), time.Hour)
 
-	// Merge premise (oauth sync): each first miss costs one fetch per flight
-	// (refresh + rollover re-check); repeats ride the per-kid negative cache.
+	// Each first miss costs the primary fetch plus the rollover re-check;
+	// repeats ride the per-kid negative cache.
 	if _, err := mgr.GetKey(ctx, "unknown-a"); err == nil {
 		t.Fatal("expected not-found for unknown-a, got nil")
 	}
@@ -302,6 +302,49 @@ func TestJWKSManager_UnknownKidPerKidCooldown(t *testing.T) {
 	}
 	if got := jwksRequests.Load(); got != 5 {
 		t.Fatalf("repeat unknown-a cost %d fetches, want 5", got)
+	}
+}
+
+func TestJWKSManager_RefreshFailureOnFreshSetStaysAuthError(t *testing.T) {
+	_, nRaw, eRaw := generateTestRSAKey(t)
+	var fail atomic.Bool
+	var jwksRequests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		jwksRequests.Add(1)
+		if fail.Load() {
+			http.Error(w, "upstream down", http.StatusBadGateway)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(JWKDoc{Keys: []JWKKey{
+			{Kty: "RSA", Use: "sig", Kid: "key-1", Alg: "RS256", N: nRaw, E: eRaw},
+		}})
+	}))
+	defer server.Close()
+
+	ctx := context.Background()
+	mgr := NewJWKSManager(server.URL, server.Client(), time.Hour)
+	if _, err := mgr.GetKey(ctx, "key-1"); err != nil {
+		t.Fatalf("warm fetch failed: %v", err)
+	}
+	fail.Store(true)
+
+	// The committed set is fresh, so a failed fetch cannot explain the kid away:
+	// an unknown kid is an auth failure, never a provider 502.
+	_, err := mgr.GetKey(ctx, "unknown-kid")
+	if err == nil {
+		t.Fatal("expected auth failure for unknown kid, got nil")
+	}
+	var appErr *errors.Error
+	if !errors.As(err, &appErr) || appErr.Code() != errors.CodeOAuthIDTokenInvalid {
+		t.Fatalf("expected CodeOAuthIDTokenInvalid against a fresh set, got %v", err)
+	}
+
+	before := jwksRequests.Load()
+	if _, err := mgr.GetKey(ctx, "unknown-kid"); err == nil {
+		t.Fatal("expected auth failure for cached miss, got nil")
+	}
+	if got := jwksRequests.Load(); got != before {
+		t.Fatalf("recorded miss cost %d fetches, want 0", got-before)
 	}
 }
 

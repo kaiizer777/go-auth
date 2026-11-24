@@ -126,7 +126,7 @@ func (m *JWKSManager) GetKey(ctx context.Context, kid string) (JWKSKey, error) {
 
 	// Singleflight deduplication across concurrent cache misses.
 	if _, err := m.refreshFlight("jwks_refresh", kid, ctx); err != nil {
-		return m.staleOrError(kid, err)
+		return m.resolveRefreshFailure(kid, err)
 	}
 	// Only the committed document may authorize a kid. A superseded fetch is
 	// discarded even when it lists the kid: a later flight already published
@@ -139,17 +139,7 @@ func (m *JWKSManager) GetKey(ctx context.Context, kid string) (JWKSKey, error) {
 	// The kid may have rotated in after this flight's fetch, so confirm against
 	// one rollover fetch before recording a miss.
 	if _, err := m.refreshFlight("jwks_rollover_refresh", kid, ctx); err != nil {
-		if key, ok := m.cachedKey(kid); ok {
-			m.clearMiss(kid)
-			return key, nil
-		}
-		// A fresh committed set that lacks the kid is an auth failure, not a
-		// provider outage; only a stale set can be a server-side error.
-		if m.cacheFresh() {
-			m.recordMiss(kid)
-			return JWKSKey{}, errUnknownKid(kid)
-		}
-		return m.staleOrError(kid, err)
+		return m.resolveRefreshFailure(kid, err)
 	}
 	if key, ok := m.cachedKey(kid); ok {
 		m.clearMiss(kid)
@@ -170,6 +160,21 @@ func (m *JWKSManager) cacheFresh() bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return time.Now().Before(m.expires)
+}
+
+// resolveRefreshFailure classifies a failed flight. The committed set decides the
+// outcome: a fresh set that lacks the kid is an auth failure, not a provider
+// outage, so only a stale set may surface the refresh error.
+func (m *JWKSManager) resolveRefreshFailure(kid string, refreshErr error) (JWKSKey, error) {
+	if key, ok := m.cachedKey(kid); ok {
+		m.clearMiss(kid)
+		return key, nil
+	}
+	if m.cacheFresh() {
+		m.recordMiss(kid)
+		return JWKSKey{}, errUnknownKid(kid)
+	}
+	return m.staleOrError(kid, refreshErr)
 }
 
 // staleOrError serves the last-known-good key while it is still inside the
