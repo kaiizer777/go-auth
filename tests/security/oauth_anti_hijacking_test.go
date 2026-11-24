@@ -20,7 +20,6 @@ import (
 
 	"github.com/kaiizer777/go-auth/auth"
 	"github.com/kaiizer777/go-auth/config"
-	"github.com/kaiizer777/go-auth/crypto"
 	"github.com/kaiizer777/go-auth/db"
 	gormstore "github.com/kaiizer777/go-auth/db/gorm"
 	"github.com/kaiizer777/go-auth/errors"
@@ -449,8 +448,9 @@ func TestSecurity_StateCookieTamperingAndReplay(t *testing.T) {
 	}
 }
 
-func TestSecurity_AntiEnumerationDummyHashTimingParity(t *testing.T) {
-	t.Parallel()
+func TestSecurity_AntiEnumerationDummyHashCost(t *testing.T) {
+	// Not parallel: TotalAlloc is process-wide, and a parallel Argon2id pass
+	// would mask a skipped dummy hash in the measured window.
 	database, _ := setupAntiHijackingDB(t)
 	cfg := config.DefaultConfig()
 	cfg.DatabaseURL = "postgres://postgres:postgres@localhost:5432/testdb"
@@ -462,33 +462,25 @@ func TestSecurity_AntiEnumerationDummyHashTimingParity(t *testing.T) {
 	}
 
 	// Attempt password login with an email that has no user row, so the
-	// lookup-miss branch burns the dummy Argon2id hash (401 invariant).
-	start := time.Now()
-	_, err = authSvc.Login(context.Background(), db.LoginRequest{
-		Email:    "no-such-user@example.com",
-		Password: "AttemptedPassword#123",
+	// lookup-miss branch must burn the configured dummy Argon2id work.
+	var loginErr error
+	alloc := allocDelta(func() {
+		_, loginErr = authSvc.Login(context.Background(), db.LoginRequest{
+			Email:    "no-such-user@example.com",
+			Password: "AttemptedPassword#123",
+		})
 	})
-	elapsed := time.Since(start)
 
-	if err == nil {
+	if loginErr == nil {
 		t.Fatal("expected login to fail for unknown email, got nil")
 	}
-	if !errors.Is(err, errors.ErrInvalidCredentials) {
-		t.Fatalf("expected ErrInvalidCredentials, got %v", err)
+	if !errors.Is(loginErr, errors.ErrInvalidCredentials) {
+		t.Fatalf("expected ErrInvalidCredentials, got %v", loginErr)
 	}
 
-	// Measure dummy hash time directly to verify parity
-	dummyHash, err := crypto.GenerateDummyHash(crypto.DefaultHashParams())
-	if err != nil {
-		t.Fatalf("GenerateDummyHash failed: %v", err)
-	}
-	dummyStart := time.Now()
-	_, _ = crypto.VerifyPassword("AttemptedPassword#123", dummyHash)
-	dummyElapsed := time.Since(dummyStart)
-
-	// Elapsed login time should be at least within 50% of the Argon2id computation
-	if elapsed < (dummyElapsed / 2) {
-		t.Fatalf("timing discrepancy: login elapsed %v, dummy hash took %v (indicates bypass of Argon2id)", elapsed, dummyElapsed)
+	floor := argon2MemoryFloor(cfg.Argon2.Memory)
+	if alloc < floor {
+		t.Fatalf("unknown-email login allocated %d bytes; want >= %d (Argon2id m=%d KiB did not run)", alloc, floor, cfg.Argon2.Memory)
 	}
 }
 

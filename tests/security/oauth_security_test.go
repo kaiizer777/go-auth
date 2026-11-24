@@ -10,7 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"sort"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -226,12 +226,25 @@ func TestOAuthSecurity_LocalUnverifiedLinkConflict(t *testing.T) {
 	}
 }
 
-// minimumPasswordHashCost is a floor no Argon2id verification can beat with the
-// configured 64 MiB / 3-pass parameters; it exists to catch a skipped hash, not
-// to measure one.
-const minimumPasswordHashCost = 5 * time.Millisecond
+// argon2MemoryFloor is half the heap one Argon2id derivation allocates at the
+// given memory cost (Argon2 allocates one KiB per unit). TotalAlloc is
+// monotonic, so the bound tracks the configured parameters and cannot flake
+// under load the way a wall-clock ratio does.
+func argon2MemoryFloor(memoryKiB uint32) uint64 {
+	return uint64(memoryKiB) * 1024 / 2
+}
 
-func TestOAuthSecurity_OAuthOnlyLoginDummyTiming(t *testing.T) {
+// allocDelta reports bytes allocated by fn, so a memory-hard derivation that
+// did not run is visible without measuring elapsed time.
+func allocDelta(fn func()) uint64 {
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	fn()
+	runtime.ReadMemStats(&after)
+	return after.TotalAlloc - before.TotalAlloc
+}
+
+func TestOAuthSecurity_OAuthOnlyLoginDummyHashCost(t *testing.T) {
 	m := oauthmock.New("google", "sub-timing", "timing@example.com", true)
 	h, database, cfg := setupOAuthSecurityApp(t, map[string]*oauthmock.Mock{"google": m})
 
@@ -253,7 +266,7 @@ func TestOAuthSecurity_OAuthOnlyLoginDummyTiming(t *testing.T) {
 
 	signupViaService(t, database, cfg, "normal@example.com", "NormalPass123!")
 
-	login := func(email, password string) (int, string, time.Duration) {
+	login := func(email, password string) (int, string, uint64) {
 		csrfRec := httptest.NewRecorder()
 		h.ServeHTTP(csrfRec, httptest.NewRequest(http.MethodGet, "/auth/csrf", nil))
 		var tok struct {
@@ -273,27 +286,19 @@ func TestOAuthSecurity_OAuthOnlyLoginDummyTiming(t *testing.T) {
 		r.Header.Set("Content-Type", "application/json")
 		r.AddCookie(jar)
 		r.Header.Set(cfg.CSRFHeaderName, tok.CSRFToken)
-		start := time.Now()
-		out := httptest.NewRecorder()
-		h.ServeHTTP(out, r)
-		return out.Code, out.Body.String(), time.Since(start)
+		var code int
+		var respBody string
+		alloc := allocDelta(func() {
+			out := httptest.NewRecorder()
+			h.ServeHTTP(out, r)
+			code, respBody = out.Code, out.Body.String()
+		})
+		return code, respBody, alloc
 	}
 
-	const rounds = 5
-	timeLogin := func(email string) (time.Duration, int, string) {
-		var ds []time.Duration
-		var code int
-		var body string
-		for range rounds {
-			c, b, d := login(email, "WrongPass000!")
-			ds, code, body = append(ds, d), c, b
-		}
-		sort.Slice(ds, func(i, j int) bool { return ds[i] < ds[j] })
-		return ds[len(ds)/2], code, body
-	}
-	oauthMed, oauthCode, oauthBody := timeLogin("timing@example.com")
-	normalMed, normalCode, normalBody := timeLogin("normal@example.com")
-	ghostMed, ghostCode, ghostBody := timeLogin("ghost@example.com")
+	oauthCode, oauthBody, oauthAlloc := login("timing@example.com", "WrongPass000!")
+	normalCode, normalBody, normalAlloc := login("normal@example.com", "WrongPass000!")
+	ghostCode, ghostBody, ghostAlloc := login("ghost@example.com", "WrongPass000!")
 
 	for name, code := range map[string]int{"oauth-only": oauthCode, "normal": normalCode, "ghost": ghostCode} {
 		if code != http.StatusUnauthorized {
@@ -303,12 +308,10 @@ func TestOAuthSecurity_OAuthOnlyLoginDummyTiming(t *testing.T) {
 	if oauthBody != ghostBody || normalBody != ghostBody {
 		t.Fatal("login bodies must be identical across oauth-only, normal, and missing users")
 	}
-	// The dummy work is asserted as a one-sided floor: an Argon2id verification
-	// cannot finish faster than this, and a loaded runner only adds wall-clock,
-	// so the bound cannot flake. Comparing medians across identities would.
-	for name, med := range map[string]time.Duration{"oauth-only": oauthMed, "normal": normalMed, "ghost": ghostMed} {
-		if med < minimumPasswordHashCost {
-			t.Fatalf("%s median %v below %v; Argon2id verification did not run", name, med, minimumPasswordHashCost)
+	floor := argon2MemoryFloor(cfg.Argon2.Memory)
+	for name, alloc := range map[string]uint64{"oauth-only": oauthAlloc, "normal": normalAlloc, "ghost": ghostAlloc} {
+		if alloc < floor {
+			t.Fatalf("%s login allocated %d bytes; want >= %d (Argon2id m=%d KiB did not run)", name, alloc, floor, cfg.Argon2.Memory)
 		}
 	}
 }
