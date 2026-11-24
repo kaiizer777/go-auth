@@ -624,24 +624,52 @@ func (s *service) insertLink(ctx context.Context, accountStore db.OAuthAccountSt
 	return nil
 }
 
-// linkExisting attaches the provider identity to owner. Losing the unique race
-// converges on the winner's row, which reports linked=false.
-func (s *service) linkExisting(ctx context.Context, owner db.User, providerID string, info *UserInfo) (db.User, bool, error) {
-	email := info.Email
-	if email == "" {
-		email = owner.Email
-	}
-	if err := s.insertLink(ctx, s.store.OAuthAccounts(), owner.ID, providerID, info.ProviderUserID, email, info.EmailVerified); err != nil {
+// attachLink attaches the provider identity to ownerID in one transaction: the
+// owner is re-read under a row lock, the claim gate is evaluated on that locked
+// row, and the link insert commits inside the same transaction. A concurrent
+// claim or revocation therefore either lands before the gate (and is honoured)
+// or blocks until the insert commits; it can no longer slip between a stale read
+// and the write. Losing the unique race converges on the winner's row, which
+// reports linked=false.
+func (s *service) attachLink(ctx context.Context, ownerID uuid.UUID, providerID string, info *UserInfo) (db.User, bool, error) {
+	var owner db.User
+	linked := false
+	err := s.store.Transaction(ctx, func(txStore db.Store) error {
+		locked, lerr := txStore.Users().GetByIDForUpdate(ctx, ownerID)
+		if lerr != nil {
+			if errors.Is(lerr, gorm.ErrRecordNotFound) || errors.Is(lerr, errors.ErrUserNotFound) {
+				return errors.ErrOAuthAccountNotLinked
+			}
+			return errors.New(errors.CodeInternalError, "failed to load linking user", lerr)
+		}
+		if locked == nil {
+			return errors.ErrOAuthAccountNotLinked
+		}
+		if !isClaimedAccount(*locked) {
+			return errors.ErrOAuthAccountLinkConflict
+		}
+		owner = *locked
+		email := info.Email
+		if email == "" {
+			email = owner.Email
+		}
+		if ierr := s.insertLink(ctx, txStore.OAuthAccounts(), owner.ID, providerID, info.ProviderUserID, email, info.EmailVerified); ierr != nil {
+			return ierr
+		}
+		linked = true
+		return nil
+	})
+	if err != nil {
 		if errors.Is(err, errLinkConflict) {
 			user, _, _, rerr := s.relinkExisting(ctx, providerID, info.ProviderUserID)
 			return user, false, rerr
 		}
-		if errors.Is(err, errors.ErrUserNotFound) || errors.Is(err, gorm.ErrRecordNotFound) {
-			return db.User{}, false, errors.ErrUserNotFound
+		if errors.Is(err, errors.ErrOAuthAccountNotLinked) || errors.Is(err, errors.ErrOAuthAccountLinkConflict) {
+			return db.User{}, false, err
 		}
 		return db.User{}, false, errors.New(errors.CodeInternalError, "failed to link oauth account", err)
 	}
-	return owner, true, nil
+	return owner, linked, nil
 }
 
 // linkedUser resolves the owner and row of an existing provider link.
@@ -701,16 +729,16 @@ func (s *service) linkRacedUser(ctx context.Context, providerID string, info *Us
 // first.
 func (s *service) mergeOrConverge(ctx context.Context, providerID string, existing db.User, info *UserInfo) (db.User, bool, bool, error) {
 	if gerr := validateProviderIdentity(info); gerr != nil {
-		if errors.Is(gerr, errors.ErrOAuthEmailUnverified) && isUnclaimedAccount(existing) {
+		if errors.Is(gerr, errors.ErrOAuthEmailUnverified) && holdsNoCredential(existing) {
 			return existing, false, false, nil
 		}
 		return db.User{}, false, false, gerr
 	}
-	// Pre-hijacking defense: never link onto an unverified local account.
-	if !existing.EmailVerified {
-		return db.User{}, false, false, errors.ErrOAuthAccountLinkConflict
-	}
-	user, linked, lerr := s.linkExisting(ctx, existing, providerID, info)
+	// Pre-hijacking defense: an attested provider identity attaches only to an
+	// owner with local proof of the address. The check runs on the row-locked
+	// owner inside attachLink, so a claim or revocation that lands mid-flight is
+	// observed rather than overwritten.
+	user, linked, lerr := s.attachLink(ctx, existing.ID, providerID, info)
 	if lerr != nil {
 		return db.User{}, false, false, lerr
 	}
@@ -722,10 +750,21 @@ func (s *service) mergeOrConverge(ctx context.Context, providerID string, existi
 	return user, linked, false, nil
 }
 
-// isUnclaimedAccount reports the row shape that owns no proven credential: no
-// verified address and no password to take over. An unverified link is usable
-// only while its owner is still this shape.
-func isUnclaimedAccount(u db.User) bool {
+// isClaimedAccount reports whether the owner holds local proof of address
+// ownership. users.email_verified is set only by a flow that delivered a secret
+// to the mailbox (verification) or consumed one from it (password reset). A
+// password alone is not proof: anyone can set one on an unverified address, so
+// it must never authorize attaching a provider identity to that account.
+func isClaimedAccount(u db.User) bool {
+	return u.EmailVerified
+}
+
+// holdsNoCredential reports the weaker state an unverified provider claim may
+// converge on: no proven address and no password. It is deliberately stricter
+// than !isClaimedAccount, because converging mints a session on the existing row
+// instead of attaching a link, and a row that already carries a caller-set
+// password belongs to whoever set it.
+func holdsNoCredential(u db.User) bool {
 	return !u.EmailVerified && u.PasswordHash == ""
 }
 
@@ -746,11 +785,11 @@ func (s *service) invalidateLink(ctx context.Context, link db.OAuthAccount) {
 // createUserAndLink creates the user and its oauth_accounts row in one
 // transaction. The row records whether the provider attested the address:
 // verified rows may merge, recover, and resolve by email; unverified rows only
-// sign in the account they were created on, and only until a password or local
-// verification claims it. Separate inserts would let a cancel land between them
-// (verified user, no link) or a lost link race orphan the loser's user. Session
-// creation stays post-commit: cookie issuance cannot roll back. Unique conflicts
-// roll the transaction back before converging on the winner.
+// sign in the account they were created on, and only while that account carries
+// no local proof of the address. Separate inserts would let a cancel land
+// between them (verified user, no link) or a lost link race orphan the loser's
+// user. Session creation stays post-commit: cookie issuance cannot roll back.
+// Unique conflicts roll the transaction back before converging on the winner.
 func (s *service) createUserAndLink(ctx context.Context, providerID string, info *UserInfo) (db.User, bool, bool, error) {
 	user := db.User{
 		ID:            uuid.New(),
@@ -796,9 +835,9 @@ func (s *service) createUserAndLink(ctx context.Context, providerID string, info
 func (s *service) linkOrCreate(ctx context.Context, providerID string, info *UserInfo, activeUserID string) (db.User, bool, bool, error) {
 	// 1. Returning user check: the provider identity resolves its owner. An
 	// unverified link signs in only the account it was created on, and only
-	// while that account holds no proven credential: once a password signup or
-	// local verification claims the address, the link is spent and is deleted
-	// here rather than allowed to outlive its trust.
+	// while that owner is unclaimed: once a verification or password reset
+	// proves the address locally, the link is spent and is deleted here rather
+	// than allowed to outlive its trust.
 	user, link, found, err := s.linkedUser(ctx, providerID, info.ProviderUserID)
 	if err != nil {
 		return db.User{}, false, false, err
@@ -807,7 +846,7 @@ func (s *service) linkOrCreate(ctx context.Context, providerID string, info *Use
 		if activeUserID != "" && user.ID.String() != activeUserID {
 			return db.User{}, false, false, errors.ErrOAuthAccountAlreadyLinked
 		}
-		if !link.Verified && !isUnclaimedAccount(user) {
+		if !link.Verified && isClaimedAccount(user) {
 			s.invalidateLink(ctx, link)
 			return db.User{}, false, false, errors.ErrOAuthEmailUnverified
 		}
@@ -852,14 +891,13 @@ func (s *service) linkOrCreate(ctx context.Context, providerID string, info *Use
 		if verr := validateLinkTarget(info); verr != nil {
 			return db.User{}, false, false, verr
 		}
-		// Pre-hijacking defense, mirroring mergeOrConverge: an unclaimed row
-		// (no password, no local verification) is reachable by whoever
-		// registered its address, and a link attached here would outlive the
-		// claim that takes the account back. The user must claim it first.
-		if isUnclaimedAccount(*owner) {
-			return db.User{}, false, false, errors.ErrOAuthAccountLinkConflict
-		}
-		user, linked, lerr := s.linkExisting(ctx, *owner, providerID, info)
+		// Pre-hijacking defense, mirroring mergeOrConverge: only an owner with
+		// local proof of the address may take a provider identity, and the gate
+		// plus the insert are one transactional decision on the row-locked owner.
+		// A password does not count as proof: a squatter can set one on an
+		// address they do not own, and the link would outlive the owner's
+		// recovery. The user must verify or reset first.
+		user, linked, lerr := s.attachLink(ctx, owner.ID, providerID, info)
 		if lerr != nil {
 			return db.User{}, false, false, lerr
 		}

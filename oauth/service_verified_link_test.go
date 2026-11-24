@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"gorm.io/gorm"
@@ -36,6 +37,106 @@ func signupPassword(t *testing.T, database *gorm.DB, cfg *config.Config, addr, p
 	}
 	if _, _, err := authSvc.Signup(context.Background(), db.SignupRequest{Email: addr, Password: password}); err != nil {
 		t.Fatalf("password signup: %v", err)
+	}
+}
+
+// signupPasswordVerified runs the real password signup for addr, captures the
+// verification token it dispatches, and consumes it: the flow that turns a
+// caller-supplied password into a locally proven address.
+func signupPasswordVerified(t *testing.T, database *gorm.DB, cfg *config.Config, addr, password string) {
+	t.Helper()
+	tokens := make(chan string, 1)
+	authSvc, err := auth.New(*cfg, database, email.Hooks{
+		SendVerificationEmail: func(_ context.Context, recipient, token string) error {
+			if recipient == addr {
+				select {
+				case tokens <- token:
+				default:
+				}
+			}
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("auth.New: %v", err)
+	}
+	ctx := context.Background()
+	if _, _, err := authSvc.Signup(ctx, db.SignupRequest{Email: addr, Password: password}); err != nil {
+		t.Fatalf("password signup: %v", err)
+	}
+	select {
+	case raw := <-tokens:
+		if _, err := authSvc.VerifyEmail(ctx, db.VerifyEmailRequest{Token: raw}); err != nil {
+			t.Fatalf("VerifyEmail: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the verification email")
+	}
+}
+
+// TestPasswordSquatCannotAttachLink is the squat chain end to end: an attacker
+// binds a password to an address it does not own, the explicit ?link=true attach
+// is refused because a caller-set password is not proof, and the owner's reset
+// leaves no attacker link behind.
+func TestPasswordSquatCannotAttachLink(t *testing.T) {
+	const addr = "squatted@example.test"
+	database, cfg, _, svc := setupServiceTest(t, &UserInfo{
+		ProviderID: "google", ProviderUserID: "sub-squat",
+		Email: addr, EmailVerified: true,
+	})
+	ctx := context.Background()
+
+	signupPassword(t, database, cfg, addr, "CorrectHorseBattery9!")
+	var squatter db.User
+	if err := database.Where("email = ?", addr).First(&squatter).Error; err != nil {
+		t.Fatalf("load squatted account: %v", err)
+	}
+	if squatter.EmailVerified || squatter.PasswordHash == "" {
+		t.Fatalf("squatted account verified=%v hasPassword=%v; want an unverified password row",
+			squatter.EmailVerified, squatter.PasswordHash != "")
+	}
+	_, rawSession, err := session.NewService(database, cfg).
+		CreateSession(ctx, squatter.ID, squatter.CredentialVersion, db.SessionTypeCookie, "127.0.0.1", "ua")
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	state, cookie := initiateLinked(t, svc, cfg, "google", rawSession)
+	rec, req := callbackRequestWithSession(state, cookie, cfg, rawSession)
+	sess, _, _, err := svc.HandleCallback(ctx, rec, req, "google", "code-1", state, db.SessionTypeCookie)
+	if sess != nil {
+		t.Fatalf("session minted for %v; the squat must not authorize the link", sess.UserID)
+	}
+	requireCode(t, err, errors.CodeOAuthAccountLinkConflict, http.StatusConflict)
+	requireIdentityRows(t, database, 1, 0, 1)
+
+	// A link planted by the pre-hardening ?link=true path would be sitting on the
+	// squatted row unverified; the owner's reset must remove it instead of
+	// leaving it to mint sessions.
+	planted := db.OAuthAccount{ID: uuid.New(), UserID: squatter.ID, ProviderID: "github",
+		ProviderUserID: "sub-planted", Email: addr}
+	if err := database.Create(&planted).Error; err != nil {
+		t.Fatalf("seed planted link: %v", err)
+	}
+	authSvc, err := auth.New(*cfg, database, email.Hooks{})
+	if err != nil {
+		t.Fatalf("auth.New: %v", err)
+	}
+	rawToken, err := authSvc.RequestPasswordReset(ctx, db.PasswordResetRequest{Email: addr})
+	if err != nil {
+		t.Fatalf("RequestPasswordReset: %v", err)
+	}
+	owner, err := authSvc.ResetPassword(ctx, db.PasswordResetConfirmRequest{
+		Token: rawToken, NewPassword: "OwnerPassword#2026!",
+	})
+	if err != nil {
+		t.Fatalf("ResetPassword: %v", err)
+	}
+	if !owner.EmailVerified {
+		t.Fatal("reset must mark the recovered address verified")
+	}
+	if n := countRows(t, database, &db.OAuthAccount{}); n != 0 {
+		t.Fatalf("oauth_accounts = %d; want 0 (the attacker's links must be purged)", n)
 	}
 }
 
@@ -96,10 +197,10 @@ func TestUnverifiedLinkAuthenticatesItsOwner(t *testing.T) {
 }
 
 // TestUnverifiedLinkTakeoverDefense pins the invariant that makes the trust
-// flag safe: an unverified link signs in only the account it was created on,
-// and only while that account has no proven credential. A password signup or
-// reset claims the address, so the link is spent and can never grant access to
-// the account afterwards.
+// flag safe: an unverified link signs in only the account it was created on, and
+// only while that owner is unclaimed. Local proof of the address — a consumed
+// verification token or a consumed password reset token — claims it, so the link
+// is spent and can never grant access to the account afterwards.
 func TestUnverifiedLinkTakeoverDefense(t *testing.T) {
 	const addr = "victim@example.test"
 	unverified := func() *UserInfo {
@@ -112,7 +213,12 @@ func TestUnverifiedLinkTakeoverDefense(t *testing.T) {
 		}
 	}
 
-	t.Run("password signup invalidates the unverified link", func(t *testing.T) {
+	// A password signup over an existing unverified row proves nothing: the
+	// caller never demonstrated it reads the mailbox, and the same request is
+	// the squat itself. Purging there would let any unauthenticated squatter
+	// destroy the owner's pending link, so the link survives until the owner
+	// proves the address.
+	t.Run("password-only signup leaves the link usable", func(t *testing.T) {
 		database, cfg, _, svc := setupServiceTest(t, unverified())
 		first, err := loginViaGoogle(t, svc, cfg)
 		if err != nil {
@@ -120,23 +226,38 @@ func TestUnverifiedLinkTakeoverDefense(t *testing.T) {
 		}
 		signupPassword(t, database, cfg, addr, "CorrectHorseBattery9!")
 
-		sess, err := loginViaGoogle(t, svc, cfg)
-		if sess != nil {
-			t.Fatalf("session minted for %v after the password takeover", sess.UserID)
-		}
-		requireCode(t, err, errors.CodeOAuthEmailUnverified, http.StatusBadRequest)
-		requireLinkGone(t, database)
-
 		var owner db.User
 		if err := database.Where("id = ?", first.UserID).First(&owner).Error; err != nil {
 			t.Fatalf("load owner: %v", err)
 		}
-		if owner.PasswordHash == "" {
-			t.Fatal("password signup did not bind a password to the pending row")
+		if owner.EmailVerified {
+			t.Fatal("password signup must not mark the address verified")
 		}
+		if _, err := loginViaGoogle(t, svc, cfg); err != nil {
+			t.Fatalf("unverified login after a password-only signup = %v; want the owner's link to keep working", err)
+		}
+		requireIdentityRows(t, database, 1, 1, 1)
 	})
 
-	t.Run("password reset invalidates the unverified link", func(t *testing.T) {
+	t.Run("verification claims the address and purges the link", func(t *testing.T) {
+		database, cfg, _, svc := setupServiceTest(t, unverified())
+		if _, err := loginViaGoogle(t, svc, cfg); err != nil {
+			t.Fatalf("unverified login = %v", err)
+		}
+		signupPasswordVerified(t, database, cfg, addr, "CorrectHorseBattery9!")
+		// The verification token came from the mailbox, so the account is claimed
+		// and the unverified link is gone before its next callback.
+		requireLinkGone(t, database)
+
+		sess, err := loginViaGoogle(t, svc, cfg)
+		if sess != nil {
+			t.Fatalf("session minted for %v after verification claimed the address", sess.UserID)
+		}
+		requireCode(t, err, errors.CodeOAuthEmailUnverified, http.StatusBadRequest)
+		requireLinkGone(t, database)
+	})
+
+	t.Run("password reset claims the address and purges the link", func(t *testing.T) {
 		database, cfg, _, svc := setupServiceTest(t, unverified())
 		if _, err := loginViaGoogle(t, svc, cfg); err != nil {
 			t.Fatalf("unverified login = %v", err)
@@ -149,11 +270,16 @@ func TestUnverifiedLinkTakeoverDefense(t *testing.T) {
 		if err != nil {
 			t.Fatalf("RequestPasswordReset: %v", err)
 		}
-		if _, err := authSvc.ResetPassword(context.Background(), db.PasswordResetConfirmRequest{
+		resetUser, err := authSvc.ResetPassword(context.Background(), db.PasswordResetConfirmRequest{
 			Token: rawToken, NewPassword: "CorrectHorseBattery9!",
-		}); err != nil {
+		})
+		if err != nil {
 			t.Fatalf("ResetPassword: %v", err)
 		}
+		if !resetUser.EmailVerified {
+			t.Fatal("password reset must mark the address verified")
+		}
+		requireLinkGone(t, database)
 
 		sess, err := loginViaGoogle(t, svc, cfg)
 		if sess != nil {

@@ -204,7 +204,9 @@ func (d *PasswordResetTokenDoc) toDomain() *db.PasswordResetToken {
 
 // OAuthAccountDoc represents a federated identity document in the "oauth_accounts" collection.
 // A document written before the verified flag existed decodes as false: missing
-// fields land on the Go zero value, which is the fail-closed default.
+// fields land on the Go zero value, which is the fail-closed default. Startup
+// re-derives the flag from the owning user (BackfillOAuthAccountVerified), so a
+// legacy link on a locally verified account keeps signing in.
 type OAuthAccountDoc struct {
 	ID             string    `bson:"_id"`
 	UserID         string    `bson:"user_id"`

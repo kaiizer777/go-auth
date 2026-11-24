@@ -164,7 +164,8 @@ func isStandaloneTransactionError(err error) bool {
 }
 
 // Connect establishes a connection to MongoDB, validates connectivity via ping,
-// and idempotently provisions native indexes.
+// and idempotently provisions native indexes and the oauth_accounts.verified
+// data backfill.
 func Connect(cfg config.Config) (*MongoStore, error) {
 	opts := options.Client().ApplyURI(cfg.DatabaseURL)
 
@@ -216,6 +217,10 @@ func Connect(cfg config.Config) (*MongoStore, error) {
 	if err := EnsureIndexes(idxCtx, database); err != nil {
 		_ = client.Disconnect(context.Background())
 		return nil, errors.Wrap(err, errors.CodeDatabaseError, "failed to provision mongodb indexes")
+	}
+	if err := BackfillOAuthAccountVerified(idxCtx, database); err != nil {
+		_ = client.Disconnect(context.Background())
+		return nil, errors.Wrap(err, errors.CodeDatabaseError, "failed to backfill oauth account verification")
 	}
 
 	return New(client, database, cfg.MongoDB.AllowNonTransactionalMongo), nil

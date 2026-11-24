@@ -81,6 +81,17 @@ func setupTestDB(t testing.TB) *gorm.DB {
 		absolute_expires_at DATETIME NOT NULL,
 		created_at DATETIME
 	);
+	CREATE TABLE IF NOT EXISTS oauth_accounts (
+		id TEXT PRIMARY KEY,
+		user_id TEXT NOT NULL,
+		provider_id VARCHAR(50) NOT NULL,
+		provider_user_id VARCHAR(255) NOT NULL,
+		email VARCHAR(255) NOT NULL,
+		verified INTEGER NOT NULL DEFAULT 0,
+		created_at DATETIME,
+		updated_at DATETIME,
+		CONSTRAINT uq_oauth_accounts_provider_uid UNIQUE (provider_id, provider_user_id)
+	);
 	`
 	if err := database.Exec(ddl).Error; err != nil {
 		t.Fatalf("failed to create schema: %v", err)

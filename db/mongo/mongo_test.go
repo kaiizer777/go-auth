@@ -640,6 +640,72 @@ func TestMongoStore_ResolveCtx_DynamicBinding(t *testing.T) {
 	}
 }
 
+// TestBackfillOAuthAccountVerified pins the MongoDB mirror of SQL migration
+// 000009: a legacy document written without the flag is promoted only for a
+// locally verified owner, an unverified owner keeps the fail-closed default, and
+// the run is idempotent and marked.
+func TestBackfillOAuthAccountVerified(t *testing.T) {
+	uri := os.Getenv("TEST_MONGO_URI")
+	if uri == "" {
+		t.Skip("TEST_MONGO_URI unset; skipping live MongoDB backfill test")
+	}
+	opts := options.Client().ApplyURI(uri)
+	client, err := mongo.Connect(opts)
+	if err != nil {
+		t.Fatalf("mongo.Connect failed: %v", err)
+	}
+	database := client.Database(fmt.Sprintf("goauth_test_backfill_%s", strings.ReplaceAll(uuid.New().String(), "-", "")))
+	t.Cleanup(func() {
+		_ = database.Drop(context.Background())
+		_ = client.Disconnect(context.Background())
+	})
+	ctx := context.Background()
+
+	verifiedOwner, unverifiedOwner := uuid.New(), uuid.New()
+	users := database.Collection("users")
+	if _, err := users.InsertMany(ctx, []any{
+		bson.M{"_id": verifiedOwner.String(), "email": "verified@example.com", "email_verified": true},
+		bson.M{"_id": unverifiedOwner.String(), "email": "unverified@example.com", "email_verified": false},
+	}); err != nil {
+		t.Fatalf("seed users: %v", err)
+	}
+	links := database.Collection("oauth_accounts")
+	legacyVerified, legacyUnverified := uuid.New().String(), uuid.New().String()
+	if _, err := links.InsertMany(ctx, []any{
+		// Legacy documents carry no verified field at all.
+		bson.M{"_id": legacyVerified, "user_id": verifiedOwner.String(), "provider_id": "google",
+			"provider_user_id": "sub-legacy-verified", "email": "verified@example.com"},
+		bson.M{"_id": legacyUnverified, "user_id": unverifiedOwner.String(), "provider_id": "google",
+			"provider_user_id": "sub-legacy-unverified", "email": "unverified@example.com"},
+	}); err != nil {
+		t.Fatalf("seed links: %v", err)
+	}
+
+	readVerified := func(t *testing.T, id string) bool {
+		t.Helper()
+		var doc OAuthAccountDoc
+		if err := links.FindOne(ctx, bson.M{"_id": id}).Decode(&doc); err != nil {
+			t.Fatalf("load link %s: %v", id, err)
+		}
+		return doc.Verified
+	}
+
+	for run := 1; run <= 2; run++ {
+		if err := BackfillOAuthAccountVerified(ctx, database); err != nil {
+			t.Fatalf("run %d: %v", run, err)
+		}
+		if !readVerified(t, legacyVerified) {
+			t.Fatalf("run %d: link on a verified owner stayed unverified", run)
+		}
+		if readVerified(t, legacyUnverified) {
+			t.Fatalf("run %d: link on an unverified owner must stay unverified", run)
+		}
+	}
+	if n, err := database.Collection("schema_migrations").CountDocuments(ctx, bson.M{"_id": oauthVerifiedBackfillID}); err != nil || n != 1 {
+		t.Fatalf("migration marker rows = %d (err %v); want 1", n, err)
+	}
+}
+
 func TestUserStore_Delete_Cascade(t *testing.T) {
 	uri := os.Getenv("TEST_MONGO_URI")
 	if uri == "" {

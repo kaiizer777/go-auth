@@ -998,9 +998,9 @@ func TestE2E_FullBrowserOAuthJourneys(t *testing.T) {
 		}
 	})
 
-	// 13. Journey 13: an unverified link survives repeated logins until a
-	// password signup claims the address
-	t.Run("journey 13: unverified link is severed by a password signup", func(t *testing.T) {
+	// 13. Journey 13: an unverified link survives repeated logins and a
+	// password-only signup, and is severed once the owner proves the mailbox
+	t.Run("journey 13: unverified link is severed by a password reset", func(t *testing.T) {
 		h, dbConn, pReg, cfg := setupOAuthE2EStack(t, func(c *config.Config) {
 			c.DisableAsyncEmailDispatch = true
 		})
@@ -1045,14 +1045,35 @@ func TestE2E_FullBrowserOAuthJourneys(t *testing.T) {
 			t.Fatal("an unverified provider address must not verify the account")
 		}
 
-		// Fails if the takeover rule is dropped: the signup binds a password to
-		// the pending row, so the unverified link must never sign in again.
+		// A password signup over the pending row proves nothing: the caller never
+		// demonstrated it reads the mailbox, and the same request is the squat.
+		// The link therefore keeps signing in until the address is proven.
 		authSvc, err := auth.New(cfg, dbConn, cfg.EmailHooks)
 		if err != nil {
 			t.Fatalf("auth.New: %v", err)
 		}
 		if _, _, err := authSvc.Signup(context.Background(), db.SignupRequest{Email: addr, Password: "CorrectHorseBattery9!"}); err != nil {
 			t.Fatalf("password signup: %v", err)
+		}
+		if rec := login(); rec.Code != http.StatusFound {
+			t.Fatalf("login after a password-only signup = %d (%s); want 302", rec.Code, rec.Body.String())
+		}
+
+		// The reset token is delivered to the mailbox, so consuming it proves the
+		// address: the account is claimed and the unverified link is deleted.
+		resetToken, err := authSvc.RequestPasswordReset(context.Background(), db.PasswordResetRequest{Email: addr})
+		if err != nil {
+			t.Fatalf("RequestPasswordReset: %v", err)
+		}
+		if _, err := authSvc.ResetPassword(context.Background(), db.PasswordResetConfirmRequest{
+			Token: resetToken, NewPassword: "OwnerPassword#2026!",
+		}); err != nil {
+			t.Fatalf("ResetPassword: %v", err)
+		}
+
+		var linkCount int64
+		if err := dbConn.Model(&db.OAuthAccount{}).Where("user_id = ?", user.ID).Count(&linkCount).Error; err != nil || linkCount != 0 {
+			t.Fatalf("expected the spent link to be deleted, got count=%d err=%v", linkCount, err)
 		}
 
 		rec := login()
@@ -1061,10 +1082,6 @@ func TestE2E_FullBrowserOAuthJourneys(t *testing.T) {
 		}
 		assertErrorCode(t, rec, "OAUTH_EMAIL_UNVERIFIED")
 
-		var linkCount int64
-		if err := dbConn.Model(&db.OAuthAccount{}).Where("user_id = ?", user.ID).Count(&linkCount).Error; err != nil || linkCount != 0 {
-			t.Fatalf("expected the spent link to be deleted, got count=%d err=%v", linkCount, err)
-		}
 		var sessCount int64
 		if err := dbConn.Model(&db.Session{}).Where("user_id = ?", user.ID).Count(&sessCount).Error; err != nil || sessCount != 0 {
 			t.Fatalf("expected no live session after the rejected login, got count=%d err=%v", sessCount, err)
@@ -1073,8 +1090,9 @@ func TestE2E_FullBrowserOAuthJourneys(t *testing.T) {
 		if err := dbConn.Where("id = ?", user.ID).First(&claimed).Error; err != nil {
 			t.Fatalf("reload claimed user: %v", err)
 		}
-		if claimed.PasswordHash == "" {
-			t.Fatal("password signup did not bind a password to the pending row")
+		if !claimed.EmailVerified || claimed.PasswordHash == "" {
+			t.Fatalf("recovered account verified=%v hasPassword=%v; want a proven address with a password",
+				claimed.EmailVerified, claimed.PasswordHash != "")
 		}
 	})
 }

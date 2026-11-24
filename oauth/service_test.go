@@ -597,8 +597,10 @@ func TestHandleCallbackEmailGate(t *testing.T) {
 }
 
 // TestUnverifiedSignupLinkProvenance pins what an unverified provider claim
-// leaves behind: a link row marked unverified that signs in its own account and
-// dies the moment a password claims the address it named.
+// leaves behind: a link row marked unverified that signs in its own account, and
+// keeps doing so through a password-only recovery signup, because a caller-set
+// password proves nothing about the address. Only local proof (verification or
+// password reset) spends it.
 func TestUnverifiedSignupLinkProvenance(t *testing.T) {
 	const addr = "victim@example.com"
 	unverified := func() *UserInfo {
@@ -626,7 +628,7 @@ func TestUnverifiedSignupLinkProvenance(t *testing.T) {
 		return sess, err
 	}
 
-	t.Run("oauth signup persists an unverified link that dies on password takeover", func(t *testing.T) {
+	t.Run("unverified link outlives a password-only recovery signup", func(t *testing.T) {
 		database, cfg, _, svc := setupServiceTest(t, unverified())
 		first, err := callback(t, svc, cfg)
 		if err != nil {
@@ -645,14 +647,19 @@ func TestUnverifiedSignupLinkProvenance(t *testing.T) {
 			t.Fatalf("load owner: %v", err)
 		}
 		if owner.PasswordHash == "" {
-			t.Fatal("password signup did not take ownership of the pending row")
+			t.Fatal("password signup did not bind a password to the pending row")
+		}
+		if owner.EmailVerified {
+			t.Fatal("password signup must not prove the address")
 		}
 		sess, err := callback(t, svc, cfg)
-		if sess != nil {
-			t.Fatalf("session minted for %v after the password takeover", sess.UserID)
+		if err != nil {
+			t.Fatalf("login through the unverified link = %v; want the owner's own link to keep working", err)
 		}
-		requireCode(t, err, errors.CodeOAuthEmailUnverified, http.StatusBadRequest)
-		requireIdentityRows(t, database, 1, 0, 0)
+		if sess.UserID != first.UserID {
+			t.Fatalf("session user = %v; want the link owner %v", sess.UserID, first.UserID)
+		}
+		requireIdentityRows(t, database, 1, 1, 1)
 	})
 
 	t.Run("password then oauth never binds", func(t *testing.T) {
@@ -982,7 +989,8 @@ func TestHandleCallbackActiveSessionLinking(t *testing.T) {
 // TestExplicitLinkRequiresClaimedOwner pins the pre-hijack gate on the explicit
 // ?link=true path: anyone who registered an address can hold a session on its
 // still-unclaimed row, so a verified provider identity may attach only after the
-// user has claimed the account with a password or a verified address.
+// user has proved the address locally with an email verification or a password
+// reset. A password is caller-set and therefore never proof.
 func TestExplicitLinkRequiresClaimedOwner(t *testing.T) {
 	linkInfo := func() *UserInfo {
 		return &UserInfo{ProviderID: "google", ProviderUserID: "sub-link-gate",
@@ -1021,7 +1029,7 @@ func TestExplicitLinkRequiresClaimedOwner(t *testing.T) {
 		requireIdentityRows(t, database, 1, 0, 1)
 	})
 
-	t.Run("owner claims with a password then links", func(t *testing.T) {
+	t.Run("password alone does not authorize the link", func(t *testing.T) {
 		database, cfg, _, svc := setupServiceTest(t, linkInfo())
 		owner, _ := seedUnclaimed(t, database, cfg)
 		signupPassword(t, database, cfg, owner.Email, "CorrectHorseBattery9!")
@@ -1031,7 +1039,10 @@ func TestExplicitLinkRequiresClaimedOwner(t *testing.T) {
 			t.Fatalf("load claimed owner: %v", err)
 		}
 		if claimed.PasswordHash == "" {
-			t.Fatal("password signup did not claim the account")
+			t.Fatal("password signup did not bind a password")
+		}
+		if claimed.EmailVerified {
+			t.Fatal("password signup must not mark the address verified")
 		}
 		_, rawSession, err := session.NewService(database, cfg).
 			CreateSession(context.Background(), claimed.ID, claimed.CredentialVersion, db.SessionTypeCookie, "127.0.0.1", "ua")
@@ -1040,26 +1051,47 @@ func TestExplicitLinkRequiresClaimedOwner(t *testing.T) {
 		}
 
 		sess, err := linkAttempt(t, svc, cfg, rawSession)
-		if err != nil {
-			t.Fatalf("link after claim = %v; want success", err)
+		if sess != nil {
+			t.Fatalf("session minted for %v; a caller-set password must not authorize the link", sess.UserID)
 		}
-		if sess.UserID != claimed.ID {
-			t.Fatalf("session user = %v; want %v", sess.UserID, claimed.ID)
+		requireCode(t, err, errors.CodeOAuthAccountLinkConflict, http.StatusConflict)
+		requireIdentityRows(t, database, 1, 0, 1)
+	})
+
+	t.Run("locally verified owner links", func(t *testing.T) {
+		database, cfg, _, svc := setupServiceTest(t, linkInfo())
+		owner := db.User{ID: uuid.New(), Email: "verified-owner@example.com", EmailVerified: true}
+		if err := database.Create(&owner).Error; err != nil {
+			t.Fatalf("seed owner: %v", err)
+		}
+		_, rawSession, err := session.NewService(database, cfg).
+			CreateSession(context.Background(), owner.ID, owner.CredentialVersion, db.SessionTypeCookie, "127.0.0.1", "ua")
+		if err != nil {
+			t.Fatalf("create session: %v", err)
+		}
+
+		sess, err := linkAttempt(t, svc, cfg, rawSession)
+		if err != nil {
+			t.Fatalf("link for a verified owner = %v; want success", err)
+		}
+		if sess.UserID != owner.ID {
+			t.Fatalf("session user = %v; want %v", sess.UserID, owner.ID)
 		}
 		var link db.OAuthAccount
 		if err := database.Where("provider_id = ? AND provider_user_id = ?", "google", "sub-link-gate").First(&link).Error; err != nil {
 			t.Fatalf("load link: %v", err)
 		}
-		if link.UserID != claimed.ID || !link.Verified {
-			t.Fatalf("link = (%v, verified=%v); want (%v, verified)", link.UserID, link.Verified, claimed.ID)
+		if link.UserID != owner.ID || !link.Verified {
+			t.Fatalf("link = (%v, verified=%v); want (%v, verified)", link.UserID, link.Verified, owner.ID)
 		}
 	})
 
 	// The full pre-hijack chain: an unverified provider signup mints a session on
-	// the victim's unclaimed row, the explicit link that would survive the later
-	// password claim is refused, and the one link that does exist is spent by the
-	// claim.
-	t.Run("rejected pre-claim link leaves nothing to mint after the password claim", func(t *testing.T) {
+	// the victim's unclaimed row, and the explicit link that would have survived
+	// the later claim is refused, so the refused identity never gets a row. The
+	// owner's own unverified link then dies at the address proof (covered by
+	// TestUnverifiedLinkTakeoverDefense).
+	t.Run("rejected pre-claim link persists nothing for the refused identity", func(t *testing.T) {
 		database := serviceTestDB(t)
 		cfg := serviceTestConfig()
 		const addr = "victim@example.test"
@@ -1099,17 +1131,19 @@ func TestExplicitLinkRequiresClaimedOwner(t *testing.T) {
 		if err := database.First(&link).Error; err != nil {
 			t.Fatalf("load link: %v", err)
 		}
-		if link.Verified {
-			t.Fatal("the refused link must not have been persisted as verified")
+		if link.ProviderUserID != "sub-victim-unverified" || link.Verified {
+			t.Fatalf("surviving link = (%q, verified=%v); want the owner's own unverified google link",
+				link.ProviderUserID, link.Verified)
 		}
-
-		signupPassword(t, database, cfg, addr, "CorrectHorseBattery9!")
-		sess, err = loginViaGoogle(t, svc, cfg)
-		if sess != nil {
-			t.Fatalf("session minted for %v after the password claim", sess.UserID)
+		var refused int64
+		if err := database.Model(&db.OAuthAccount{}).
+			Where("provider_id = ? AND provider_user_id = ?", "github", "sub-attacker-verified").
+			Count(&refused).Error; err != nil {
+			t.Fatalf("count refused link: %v", err)
 		}
-		requireCode(t, err, errors.CodeOAuthEmailUnverified, http.StatusBadRequest)
-		requireIdentityRows(t, database, 1, 0, 0)
+		if refused != 0 {
+			t.Fatalf("refused identity rows = %d; want 0", refused)
+		}
 	})
 }
 
@@ -1158,30 +1192,54 @@ type nilUserStore struct{ db.UserStore }
 
 func (nilUserStore) GetByID(context.Context, uuid.UUID) (*db.User, error) { return nil, nil }
 
-// gatedMissLinkStore reports a miss for its first `remaining` GetByProvider
-// probes, holding each caller until release closes. Both concurrent callbacks
-// therefore clear the already-linked branch before either can insert.
-type gatedMissLinkStore struct {
-	db.OAuthAccountStore
+// linkGate is the state shared by every gated store view: the service reads
+// through the root store and through the transaction it opens, and both must
+// agree on the rendezvous and on which probes report a miss.
+type linkGate struct {
 	remaining atomic.Int32
 	conflicts atomic.Int32
 	arrived   chan struct{}
 	release   chan struct{}
 }
 
+// gatedStore rebinds the gate to whichever store view is current, so the
+// transaction-scoped insert is the one that observes the unique violation.
+type gatedStore struct {
+	db.Store
+	gate *linkGate
+}
+
+func (s *gatedStore) OAuthAccounts() db.OAuthAccountStore {
+	return &gatedMissLinkStore{OAuthAccountStore: s.Store.OAuthAccounts(), gate: s.gate}
+}
+
+func (s *gatedStore) Transaction(ctx context.Context, fn func(db.Store) error) error {
+	return s.Store.Transaction(ctx, func(tx db.Store) error {
+		return fn(&gatedStore{Store: tx, gate: s.gate})
+	})
+}
+
+// gatedMissLinkStore reports a miss for its first `remaining` GetByProvider
+// probes, holding each caller until release closes. Both concurrent callbacks
+// therefore clear the already-linked branch before either can insert.
+type gatedMissLinkStore struct {
+	db.OAuthAccountStore
+	gate *linkGate
+}
+
 func (g *gatedMissLinkStore) GetByProvider(ctx context.Context, providerID, providerUserID string) (*db.OAuthAccount, error) {
-	if g.remaining.Add(-1) < 0 {
+	if g.gate.remaining.Add(-1) < 0 {
 		return g.OAuthAccountStore.GetByProvider(ctx, providerID, providerUserID)
 	}
-	g.arrived <- struct{}{}
-	<-g.release
+	g.gate.arrived <- struct{}{}
+	<-g.gate.release
 	return nil, gorm.ErrRecordNotFound
 }
 
 func (g *gatedMissLinkStore) Create(ctx context.Context, a *db.OAuthAccount) error {
 	err := g.OAuthAccountStore.Create(ctx, a)
 	if isUniqueViolation(err) {
-		g.conflicts.Add(1)
+		g.gate.conflicts.Add(1)
 	}
 	return err
 }
@@ -1265,13 +1323,12 @@ func TestHandleCallbackLinkConflictSameOwnerConverges(t *testing.T) {
 	}
 
 	base := rawSvc.(*service).store
-	gate := &gatedMissLinkStore{
-		OAuthAccountStore: base.OAuthAccounts(),
-		arrived:           make(chan struct{}, 2),
-		release:           make(chan struct{}),
+	gate := &linkGate{
+		arrived: make(chan struct{}, 2),
+		release: make(chan struct{}),
 	}
 	gate.remaining.Store(2)
-	svc := NewServiceWithStore(&wrappedTxStore{Store: base, oauth: gate},
+	svc := NewServiceWithStore(&gatedStore{Store: base, gate: gate},
 		sessSvc, map[string]Provider{"google": stub}, cfg)
 
 	states := make([]string, 2)
@@ -1317,6 +1374,77 @@ func TestHandleCallbackLinkConflictSameOwnerConverges(t *testing.T) {
 	}
 	// One active-user session plus one per callback; both linked to the owner.
 	requireIdentityRows(t, database, 1, 1, 3)
+}
+
+// staleOwnerStore hides a revocation that lands after the caller's first read:
+// Users().GetByID returns the verified snapshot the gate would have used, while
+// the locking read observes the current (unverified) row. Transaction rebinds
+// the snapshot to the tx store, so only GetByID is overridden and every other
+// user read, GetByIDForUpdate included, stays on the transaction's connection.
+type staleOwnerStore struct {
+	db.Store
+	stale *db.User
+}
+
+func (s *staleOwnerStore) Users() db.UserStore {
+	return &staleOwnerUserStore{UserStore: s.Store.Users(), stale: s.stale}
+}
+
+func (s *staleOwnerStore) Transaction(ctx context.Context, fn func(db.Store) error) error {
+	return s.Store.Transaction(ctx, func(tx db.Store) error {
+		return fn(&wrappedTxStore{Store: tx, users: &staleOwnerUserStore{UserStore: tx.Users(), stale: s.stale}})
+	})
+}
+
+type staleOwnerUserStore struct {
+	db.UserStore
+	stale *db.User
+}
+
+func (s *staleOwnerUserStore) GetByID(ctx context.Context, id uuid.UUID) (*db.User, error) {
+	if s.stale != nil && s.stale.ID == id {
+		return s.stale, nil
+	}
+	return s.UserStore.GetByID(ctx, id)
+}
+
+// TestExplicitLinkGateReadsLockedOwnerState pins that the claim decision is made
+// on the row-locked owner, not on an earlier read: a revocation that lands
+// between the callback's owner load and the insert must be observed, so the
+// link cannot be committed onto an account that is no longer claimed.
+func TestExplicitLinkGateReadsLockedOwnerState(t *testing.T) {
+	database, cfg, stub, rawSvc := setupServiceTest(t, &UserInfo{
+		ProviderID: "google", ProviderUserID: "sub-locked-gate",
+		Email: "provider-owner@personal.example", EmailVerified: true,
+	})
+	owner := db.User{ID: uuid.New(), Email: "owner@work.example", EmailVerified: true}
+	if err := database.Create(&owner).Error; err != nil {
+		t.Fatalf("seed owner: %v", err)
+	}
+	_, rawSession, err := session.NewService(database, cfg).
+		CreateSession(context.Background(), owner.ID, owner.CredentialVersion, db.SessionTypeCookie, "127.0.0.1", "ua")
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	// The verified snapshot the callback would have gated on, and the revoked row
+	// a concurrent writer commits before the insert.
+	stale := owner
+	if err := database.Model(&db.User{}).Where("id = ?", owner.ID).Update("email_verified", false).Error; err != nil {
+		t.Fatalf("revoke verification: %v", err)
+	}
+
+	base := rawSvc.(*service).store
+	svc := NewServiceWithStore(&staleOwnerStore{Store: base, stale: &stale},
+		session.NewService(database, cfg), map[string]Provider{"google": stub}, cfg)
+
+	state, cookie := initiateLinked(t, svc, cfg, "google", rawSession)
+	rec, req := callbackRequestWithSession(state, cookie, cfg, rawSession)
+	sess, _, _, err := svc.HandleCallback(context.Background(), rec, req, "google", "code-1", state, db.SessionTypeCookie)
+	if sess != nil {
+		t.Fatalf("session minted for %v; the revoked claim must reject the link", sess.UserID)
+	}
+	requireCode(t, err, errors.CodeOAuthAccountLinkConflict, http.StatusConflict)
+	requireIdentityRows(t, database, 1, 0, 1)
 }
 
 func TestHandleCallbackNilGuards(t *testing.T) {

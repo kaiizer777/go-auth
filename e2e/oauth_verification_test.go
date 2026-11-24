@@ -114,6 +114,29 @@ func TestOAuthVerification_UnverifiedLinkSeveredByPasswordSignup(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("password signup: %v", err)
 	}
+	// A password signup over the pending row proves nothing: the request never
+	// demonstrated it reads the mailbox, and the same call is the squat. The
+	// link therefore keeps signing in until the address is proven.
+	if resp := login(); resp.StatusCode != http.StatusFound {
+		t.Fatalf("login after a password-only signup = %d; want 302", resp.StatusCode)
+	}
+
+	// The reset token is delivered to the mailbox, so consuming it proves the
+	// address: the account is claimed and the unverified link is deleted.
+	resetToken, err := authSvc.RequestPasswordReset(context.Background(), db.PasswordResetRequest{Email: "pending-pg@example.com"})
+	if err != nil {
+		t.Fatalf("RequestPasswordReset: %v", err)
+	}
+	if _, err := authSvc.ResetPassword(context.Background(), db.PasswordResetConfirmRequest{
+		Token: resetToken, NewPassword: "OwnerPassword#2026!",
+	}); err != nil {
+		t.Fatalf("ResetPassword: %v", err)
+	}
+
+	var linkCount int64
+	if err := database.Model(&db.OAuthAccount{}).Where("user_id = ?", user.ID).Count(&linkCount).Error; err != nil || linkCount != 0 {
+		t.Fatalf("expected the spent link to be deleted, got count=%d err=%v", linkCount, err)
+	}
 
 	resp := login()
 	if resp.StatusCode != http.StatusBadRequest {
@@ -123,16 +146,13 @@ func TestOAuthVerification_UnverifiedLinkSeveredByPasswordSignup(t *testing.T) {
 		t.Fatalf("error code = %q; want OAUTH_EMAIL_UNVERIFIED", code)
 	}
 
-	var linkCount int64
-	if err := database.Model(&db.OAuthAccount{}).Where("user_id = ?", user.ID).Count(&linkCount).Error; err != nil || linkCount != 0 {
-		t.Fatalf("expected the spent link to be deleted, got count=%d err=%v", linkCount, err)
-	}
 	var claimed db.User
 	if err := database.Where("id = ?", user.ID).First(&claimed).Error; err != nil {
 		t.Fatalf("reload claimed user: %v", err)
 	}
-	if claimed.PasswordHash == "" {
-		t.Fatal("password signup did not bind a password to the pending row")
+	if !claimed.EmailVerified || claimed.PasswordHash == "" {
+		t.Fatalf("recovered account verified=%v hasPassword=%v; want a proven address with a password",
+			claimed.EmailVerified, claimed.PasswordHash != "")
 	}
 }
 
