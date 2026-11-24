@@ -1,4 +1,6 @@
--- 000009 down drops the trust flag, not the links. Re-applying the up file
--- restores the column as 0 for every row, which is the same fail-closed state
--- the up backfill produced, so this rollback loses no identity data.
+-- 000009 down drops the trust flag, not the links. The flag is not restorable:
+-- re-applying the up file re-derives it from users.email_verified, so a link the
+-- provider attested on an account without a locally verified email comes back
+-- 0 and its next callback rejects and deletes it. A down/up cycle therefore
+-- loses the trust state of those links; only link rows survive it.
 ALTER TABLE oauth_accounts DROP COLUMN verified;
