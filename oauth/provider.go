@@ -370,7 +370,14 @@ func postTokenForm(ctx context.Context, client *http.Client, endpoint, form stri
 		return nil, err
 	}
 	if msg, _ := raw["error"].(string); msg != "" {
-		return nil, errors.New(errors.CodeOAuthProviderError, "oauth token exchange failed", nil)
+		// Upstream text never becomes the caller-facing message, so it rides
+		// the cause for server-side logs.
+		detail := "upstream error: " + msg
+		if desc, _ := raw["error_description"].(string); desc != "" {
+			detail += ": " + desc
+		}
+		return nil, errors.New(errors.CodeOAuthProviderError, "oauth token exchange failed",
+			errors.New(errors.CodeOAuthProviderError, detail, nil))
 	}
 	return tokenFromRaw(raw), nil
 }

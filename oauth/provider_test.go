@@ -413,3 +413,66 @@ func TestProviderHTTPHelpers(t *testing.T) {
 		mustProviderMessage(t, err, "oauth provider returned invalid response")
 	})
 }
+
+// TestPostTokenFormKeepsProviderErrorOutOfMessage pins the same boundary the X
+// adapter keeps: a token response carrying an OAuth error is reported to the
+// client generically, with error and error_description preserved in the cause
+// for server-side logs.
+func TestPostTokenFormKeepsProviderErrorOutOfMessage(t *testing.T) {
+	t.Parallel()
+
+	const genericMessage = "oauth token exchange failed"
+
+	exchange := func(t *testing.T, body string) (*TokenResponse, error) {
+		t.Helper()
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = io.WriteString(w, body)
+		}))
+		t.Cleanup(srv.Close)
+		return postTokenForm(context.Background(), srv.Client(), srv.URL, "grant_type=authorization_code")
+	}
+
+	tests := []struct {
+		name    string
+		body    string
+		details []string
+	}{
+		{
+			name:    "error and description",
+			body:    `{"error":"invalid_grant","error_description":"AADSTS70008: the refresh token has expired"}`,
+			details: []string{"invalid_grant", "AADSTS70008: the refresh token has expired"},
+		},
+		{
+			name:    "error code alone",
+			body:    `{"error":"invalid_client"}`,
+			details: []string{"invalid_client"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			tok, err := exchange(t, tt.body)
+			if tok != nil {
+				t.Fatalf("token = %v; want nil for a provider error body", tok)
+			}
+			requireProviderError(t, err)
+
+			var appErr *errors.Error
+			if !errors.As(err, &appErr) {
+				t.Fatalf("error type = %T; want *errors.Error", err)
+			}
+			if got := appErr.Message(); got != genericMessage {
+				t.Fatalf("message = %q; want %q", got, genericMessage)
+			}
+			for _, detail := range tt.details {
+				if strings.Contains(appErr.Message(), detail) {
+					t.Errorf("message = %q; the provider detail %q must not be client-visible", appErr.Message(), detail)
+				}
+				if !strings.Contains(err.Error(), detail) {
+					t.Errorf("error = %v; want %q kept in the cause chain", err, detail)
+				}
+			}
+		})
+	}
+}
