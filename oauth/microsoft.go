@@ -182,12 +182,16 @@ func (p *MicrosoftProvider) tenantTrusted(ctx context.Context, tenantID, issuer 
 		return true, nil
 	}
 	ids := []string{normalizeTenant(tenantID), normalizeTenant(issuerTenant(issuer))}
+	// Direct matches settle without touching discovery, so a broken domain
+	// entry cannot fail a login the token's own GUID already authorises.
 	for entry := range p.trustedTenants {
 		for _, id := range ids {
 			if id != "" && entry == id {
 				return true, nil
 			}
 		}
+	}
+	for entry := range p.trustedTenants {
 		if !isTenantDomain(entry) {
 			continue
 		}
