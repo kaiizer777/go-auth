@@ -1338,6 +1338,55 @@ func TestMicrosoftProvider_UserInfoTenantGate(t *testing.T) {
 	}
 }
 
+func TestMicrosoftProvider_FetchUserInfoCarriesRawClaims(t *testing.T) {
+	privKey, nRaw, eRaw := generateTestRSAKey(t)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(JWKDoc{Keys: []JWKKey{{
+			Kty: "RSA", Use: "sig", Kid: "ms-key-1", Alg: "RS256", N: nRaw, E: eRaw,
+		}}})
+	}))
+	defer server.Close()
+
+	p := NewMicrosoftProvider(config.MicrosoftConfig{
+		ClientID:       "client-test-id",
+		Tenant:         "common",
+		TrustedTenants: []string{"tenant-a"},
+		RedirectURI:    "https://example.com/callback",
+	})
+	p.client = server.Client()
+	p.jwksMgr = NewJWKSManager(server.URL, p.client, time.Hour)
+	p.jwksRetriever = p.jwksMgr
+
+	claims := map[string]any{
+		"iss":   "https://login.microsoftonline.com/tenant-b/v2.0",
+		"sub":   "sub-1",
+		"oid":   "immutable-oid",
+		"aud":   "client-test-id",
+		"exp":   time.Now().Add(10 * time.Minute).Unix(),
+		"email": "user@example.com",
+		"tid":   "tenant-b",
+	}
+	tok := signRS256JWT(t, privKey, "ms-key-1", claims)
+
+	user, err := p.FetchUserInfo(context.Background(), &OAuthToken{IDToken: tok})
+	if err != nil {
+		t.Fatalf("FetchUserInfo = %v", err)
+	}
+	if untrusted, _ := user.RawClaims["untrusted_tenant"].(bool); !untrusted {
+		t.Fatal("identity claims dropped the untrusted_tenant marker")
+	}
+	if user.ProviderUserID != "immutable-oid" {
+		t.Errorf("ProviderUserID = %q; want immutable-oid", user.ProviderUserID)
+	}
+	if got := user.RawClaims["oid"]; got != "immutable-oid" {
+		t.Errorf("RawClaims[oid] = %v; want immutable-oid", got)
+	}
+	if got := user.RawClaims["tid"]; got != "tenant-b" {
+		t.Errorf("RawClaims[tid] = %v; want tenant-b", got)
+	}
+}
+
 func TestMicrosoftProvider_ProviderUserIDConsistency(t *testing.T) {
 	privKey, nRaw, eRaw := generateTestRSAKey(t)
 
