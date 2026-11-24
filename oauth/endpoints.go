@@ -2,8 +2,14 @@ package oauth
 
 // EndpointOverride replaces the provider endpoints an adapter talks to. An
 // empty field keeps the adapter's production endpoint, so the zero value is a
-// no-op. Tests point an adapter at a loopback IdP through this option; nothing
-// else changes the adapter's identity, verification, or trust decisions.
+// no-op. Tests point an adapter at a loopback IdP through this option.
+//
+// It is not trust-neutral. Overriding JWKSURL replaces the key set that signs
+// every id_token the adapter accepts, and DiscoveryURL re-roots domain→tenant
+// resolution, so anything that can reach these options can dictate identities.
+// No config field feeds them and no production call site applies them (only
+// WithEndpoints/FacebookEndpoints, all of which are test call sites), which is
+// why the seam is safe to keep: it is unreachable from the public config path.
 type EndpointOverride struct {
 	AuthorizeURL string
 	TokenURL     string
