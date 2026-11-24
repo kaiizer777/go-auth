@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -223,35 +224,61 @@ func (p *MicrosoftProvider) fetchTenantGUID(ctx context.Context, domain string) 
 // tenantTrusted reports whether the allowlist accepts the verified tenant.
 // Entries may be GUIDs or domains; a domain entry is resolved to its GUID so
 // it matches the GUID the token actually carries. An empty allowlist keeps
-// multi-tenant mode. An unresolvable domain entry fails closed and surfaces
-// the resolution error instead of silently rejecting the tenant.
+// multi-tenant mode.
+//
+// Entries are walked in sorted order, so the outcome never depends on map
+// iteration order. Only a domain entry can require discovery, and a resolution
+// failure is held back instead of failing the login: a stale entry that is not
+// the token's authority must not decide a login another entry already admits.
+// When no entry admits the tenant, the first failure still fails closed rather
+// than silently marking the tenant untrusted.
 func (p *MicrosoftProvider) tenantTrusted(ctx context.Context, tenantID, issuer string) (bool, error) {
 	if len(p.trustedTenants) == 0 {
 		return true, nil
 	}
 	ids := []string{normalizeTenant(tenantID), normalizeTenant(issuerTenant(issuer))}
+	matches := func(candidate string) bool {
+		for _, id := range ids {
+			if id != "" && candidate == id {
+				return true
+			}
+		}
+		return false
+	}
+
+	entries := make([]string, 0, len(p.trustedTenants))
+	for entry := range p.trustedTenants {
+		entries = append(entries, entry)
+	}
+	slices.Sort(entries)
+
 	// Direct matches settle without touching discovery, so a broken domain
 	// entry cannot fail a login the token's own GUID already authorises.
-	for entry := range p.trustedTenants {
-		for _, id := range ids {
-			if id != "" && entry == id {
-				return true, nil
-			}
+	var domains []string
+	for _, entry := range entries {
+		if matches(entry) {
+			return true, nil
+		}
+		if isTenantDomain(entry) {
+			domains = append(domains, entry)
 		}
 	}
-	for entry := range p.trustedTenants {
-		if !isTenantDomain(entry) {
+
+	var resolveErr error
+	for _, domain := range domains {
+		guid, err := p.resolveDomain(ctx, domain)
+		if err != nil {
+			if resolveErr == nil {
+				resolveErr = err
+			}
 			continue
 		}
-		guid, err := p.resolveDomain(ctx, entry)
-		if err != nil {
-			return false, err
+		if matches(guid) {
+			return true, nil
 		}
-		for _, id := range ids {
-			if id != "" && id == guid {
-				return true, nil
-			}
-		}
+	}
+	if resolveErr != nil {
+		return false, resolveErr
 	}
 	return false, nil
 }

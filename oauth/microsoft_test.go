@@ -2073,3 +2073,66 @@ func TestMicrosoftProvider_KeyIssuerBinding(t *testing.T) {
 		}
 	})
 }
+
+// TestMicrosoftProvider_StaleAllowlistEntryDoesNotBlockAdmittedTenant pins the
+// scope of per-login domain resolution: an allowlist entry that no longer
+// resolves must not decide the login of a tenant another entry admits. Map
+// iteration order previously picked which entry was resolved first, so the same
+// login succeeded or failed run to run.
+func TestMicrosoftProvider_StaleAllowlistEntryDoesNotBlockAdmittedTenant(t *testing.T) {
+	privKey, nRaw, eRaw := generateTestRSAKey(t)
+
+	var serverURL string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		const suffix = "/v2.0/.well-known/openid-configuration"
+		if domain, ok := strings.CutSuffix(r.URL.Path, suffix); ok {
+			if strings.TrimPrefix(domain, "/") != "contoso.onmicrosoft.com" {
+				http.NotFound(w, r)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(OIDCDiscovery{
+				Issuer:                serverURL + "/" + contosoTenantGUID + "/v2.0",
+				AuthorizationEndpoint: serverURL + "/authorize",
+				TokenEndpoint:         serverURL + "/token",
+				JWKSURI:               serverURL + "/keys",
+			})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(JWKDoc{Keys: []JWKKey{{
+			Kty: "RSA", Use: "sig", Kid: "ms-key-1", Alg: "RS256", N: nRaw, E: eRaw,
+		}}})
+	}))
+	defer server.Close()
+	serverURL = server.URL
+
+	p := NewMicrosoftProvider(config.MicrosoftConfig{
+		ClientID: "client-test-id",
+		Tenant:   "common",
+		// The stale entry sorts after the one authorising the token, and a
+		// permuted insertion order must not matter either.
+		TrustedTenants: []string{"stale.onmicrosoft.com", "contoso.onmicrosoft.com"},
+		RedirectURI:    "https://example.com/callback",
+	}, WithEndpoints(EndpointOverride{DiscoveryURL: server.URL}))
+	p.client = server.Client()
+	p.jwksMgr = NewJWKSManager(server.URL+"/keys", p.client, time.Hour)
+	p.jwksRetriever = p.jwksMgr
+
+	tok := signRS256JWT(t, privKey, "ms-key-1", map[string]any{
+		"iss":   "https://login.microsoftonline.com/" + contosoTenantGUID + "/v2.0",
+		"sub":   "sub-1",
+		"aud":   "client-test-id",
+		"exp":   time.Now().Add(10 * time.Minute).Unix(),
+		"email": "user@contoso.com",
+		"tid":   contosoTenantGUID,
+	})
+
+	for i := 0; i < 20; i++ {
+		c, err := p.VerifyIDToken(context.Background(), tok, "")
+		if err != nil {
+			t.Fatalf("run %d: VerifyIDToken = %v; a stale sibling entry must not fail an admitted tenant's login", i, err)
+		}
+		if c.UntrustedTenant {
+			t.Fatalf("run %d: UntrustedTenant = true; a resolvable domain entry admits this tenant", i)
+		}
+	}
+}
