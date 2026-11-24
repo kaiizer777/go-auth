@@ -1923,3 +1923,100 @@ func TestProviderLookupCanonicalSlug(t *testing.T) {
 	}
 	requireIdentityRows(t, database, 1, 1, 2)
 }
+
+// TestCallbackStateReplayAcrossSessions pins the state-to-session binding: a
+// completed state value can never be replayed against another live session.
+func TestCallbackStateReplayAcrossSessions(t *testing.T) {
+	database, cfg, _, svc := setupServiceTest(t, &UserInfo{
+		ProviderID: "google", ProviderUserID: "sub-replay-state",
+		Email: "replay-state@example.com", EmailVerified: true,
+	})
+	sessSvc := session.NewService(database, cfg)
+	seedSession := func(t *testing.T, email string) string {
+		t.Helper()
+		user := db.User{ID: uuid.New(), Email: email, PasswordHash: "hash", EmailVerified: true}
+		if err := database.Create(&user).Error; err != nil {
+			t.Fatalf("seed user: %v", err)
+		}
+		_, raw, err := sessSvc.CreateSession(context.Background(), user.ID, 0, db.SessionTypeCookie, "127.0.0.1", "ua")
+		if err != nil {
+			t.Fatalf("create session: %v", err)
+		}
+		return raw
+	}
+	tokA := seedSession(t, "replay-a@example.com")
+	tokB := seedSession(t, "replay-b@example.com")
+
+	state, cookie := initiateLinked(t, svc, cfg, "google", tokA)
+	rec, req := callbackRequestWithSession(state, cookie, cfg, tokA)
+	if _, _, _, err := svc.HandleCallback(req.Context(), rec, req, "google", "code-1", state, db.SessionTypeCookie); err != nil {
+		t.Fatalf("first callback = %v", err)
+	}
+
+	rec, req = callbackRequestWithSession(state, cookie, cfg, tokB)
+	_, _, _, err := svc.HandleCallback(req.Context(), rec, req, "google", "code-1", state, db.SessionTypeCookie)
+	requireCode(t, err, errors.CodeOAuthStateInvalid, http.StatusForbidden)
+	requireIdentityRows(t, database, 2, 1, 3)
+}
+
+// TestResolveLinkUserID pins the guards that keep a broken session store loud
+// and an absent context owner from becoming a link target.
+func TestResolveLinkUserID(t *testing.T) {
+	cfg := serviceTestConfig()
+	newSvc := func(sessSvc session.Service) *service {
+		return NewServiceWithStore(nil, sessSvc, nil, cfg).(*service)
+	}
+	sessionRequest := func() *http.Request {
+		req := httptest.NewRequest(http.MethodGet, "/auth/oauth/google?link=true", nil)
+		req.AddCookie(&http.Cookie{Name: cfg.SessionCookieName, Value: "0123456789abcdef0123456789abcdef"})
+		return req
+	}
+	contextRequest := func(v any) *http.Request {
+		req := httptest.NewRequest(http.MethodGet, "/auth/oauth/google?link=true", nil)
+		return req.WithContext(context.WithValue(context.Background(), "user_id", v))
+	}
+
+	t.Run("store failure stays a 500", func(t *testing.T) {
+		svc := newSvc(&failGetSessionSvc{err: errors.New(errors.CodeInternalError, "db down", nil)})
+		_, err := svc.resolveLinkUserID(sessionRequest())
+		requireCode(t, err, errors.CodeInternalError, http.StatusInternalServerError)
+	})
+
+	t.Run("lapsed session degrades to login", func(t *testing.T) {
+		svc := newSvc(&failGetSessionSvc{err: errors.ErrSessionInvalid})
+		uid, err := svc.resolveLinkUserID(sessionRequest())
+		if err != nil || uid != "" {
+			t.Fatalf("resolveLinkUserID = %q, %v; want empty owner and nil error", uid, err)
+		}
+	})
+
+	t.Run("missing session service fails closed", func(t *testing.T) {
+		_, err := newSvc(nil).resolveLinkUserID(sessionRequest())
+		requireCode(t, err, errors.CodeInternalError, http.StatusInternalServerError)
+	})
+
+	t.Run("nil uuid context owner degrades to login", func(t *testing.T) {
+		svc := newSvc(&failGetSessionSvc{err: errors.ErrSessionInvalid})
+		uid, err := svc.resolveLinkUserID(contextRequest(uuid.Nil))
+		if err != nil || uid != "" {
+			t.Fatalf("resolveLinkUserID(nil uuid) = %q, %v; want empty owner and nil error", uid, err)
+		}
+	})
+
+	t.Run("valid uuid context owner resolves", func(t *testing.T) {
+		want := uuid.New()
+		svc := newSvc(&failGetSessionSvc{err: errors.ErrSessionInvalid})
+		uid, err := svc.resolveLinkUserID(contextRequest(want))
+		if err != nil || uid != want.String() {
+			t.Fatalf("resolveLinkUserID = %q, %v; want %q", uid, err, want)
+		}
+	})
+
+	t.Run("empty context owner degrades to login", func(t *testing.T) {
+		svc := newSvc(&failGetSessionSvc{err: errors.ErrSessionInvalid})
+		uid, err := svc.resolveLinkUserID(contextRequest(""))
+		if err != nil || uid != "" {
+			t.Fatalf("resolveLinkUserID(empty) = %q, %v; want empty owner and nil error", uid, err)
+		}
+	})
+}
