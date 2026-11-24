@@ -191,7 +191,10 @@ func (p *XProvider) ExchangeCode(ctx context.Context, code, codeVerifier string)
 		return nil, errors.New(errors.CodeOAuthProviderError, "oauth provider returned invalid response", err)
 	}
 	if msg, _ := raw["error"].(string); msg != "" {
-		return nil, errors.New(errors.CodeOAuthProviderError, "oauth token exchange failed: "+msg, nil)
+		// Same invariant as parseXErrorWithHeader: upstream text never becomes
+		// the caller-facing message, so it rides the cause for server-side logs.
+		return nil, errors.New(errors.CodeOAuthProviderError, "oauth token exchange failed",
+			errors.New(errors.CodeOAuthProviderError, "upstream error: "+msg, nil))
 	}
 
 	return tokenFromRaw(raw), nil
