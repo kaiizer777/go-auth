@@ -191,9 +191,9 @@ func (p *MicrosoftProvider) resolveDomain(ctx context.Context, domain string) (s
 }
 
 // fetchTenantGUID reads the tenant GUID from a domain's v2 discovery issuer.
-// A failure here is an operator configuration defect, not an upstream outage:
-// the configured domain is the only input and it never becomes resolvable by
-// retrying the same URL pattern.
+// A 404 means the configured domain names no usable authority, so that is an
+// operator configuration defect. Transport failures and 5xx stay operational:
+// a transient outage must not be reported as bad configuration.
 func (p *MicrosoftProvider) fetchTenantGUID(ctx context.Context, domain string) (string, error) {
 	base := strings.TrimSuffix(p.discoveryBaseURL, "/")
 	if base == "" {
@@ -202,8 +202,12 @@ func (p *MicrosoftProvider) fetchTenantGUID(ctx context.Context, domain string) 
 	discoveryURL := fmt.Sprintf("%s/%s/v2.0/.well-known/openid-configuration", base, domain)
 	doc, err := FetchOIDCDiscovery(ctx, p.client, discoveryURL)
 	if err != nil {
-		return "", errors.New(errors.CodeInvalidConfig,
-			fmt.Sprintf("microsoft tenant domain %q could not be resolved to a tenant id", domain), err)
+		var statusErr *discoveryStatusError
+		if errors.As(err, &statusErr) && statusErr.status == http.StatusNotFound {
+			return "", errors.New(errors.CodeInvalidConfig,
+				fmt.Sprintf("microsoft tenant domain %q could not be resolved to a tenant id", domain), err)
+		}
+		return "", err
 	}
 	guid := normalizeTenant(issuerTenant(doc.Issuer))
 	if !tenantGUIDPattern.MatchString(guid) {
@@ -382,24 +386,19 @@ func (p *MicrosoftProvider) VerifyIDToken(ctx context.Context, rawIDToken, nonce
 		return nil, err
 	}
 
-	// "nOauth" anti-account-takeover defense: compute EmailVerified
+	// "nOauth" anti-account-takeover defense: EmailVerified reflects only
+	// whether the provider attested the address, never tenant admission.
 	claims.EmailVerified = p.isEmailVerified(authority, rawClaims, claims.TenantID)
 
 	// The allowlist bounds which external tenants may hold accounts here.
 	// Attestation never overrides it: an unlisted tenant is untrusted even
-	// when it presents xms_edov.
+	// when it presents xms_edov. Admission and attestation are independent, so
+	// an admitted tenant without attestation stays a valid unverified identity.
 	trusted, err := p.tenantTrusted(ctx, claims.TenantID, claims.Issuer)
 	if err != nil {
 		return nil, err
 	}
-	if !trusted {
-		claims.EmailVerified = false
-		rawClaims["untrusted_tenant"] = true
-	}
-
-	if isUntrusted, _ := rawClaims["untrusted_tenant"].(bool); isUntrusted {
-		claims.UntrustedTenant = true
-	}
+	claims.UntrustedTenant = !trusted
 
 	return claims, nil
 }
@@ -491,10 +490,6 @@ func (p *MicrosoftProvider) isEmailVerified(authority string, rawClaims map[stri
 		}
 	}
 
-	// Untrusted external tenant without domain verification: fail closed
-	if rawClaims != nil {
-		rawClaims["untrusted_tenant"] = true
-	}
 	return false
 }
 
@@ -549,7 +544,6 @@ func (p *MicrosoftProvider) FetchUserInfo(ctx context.Context, token *OAuthToken
 		return nil, errors.New(errors.CodeOAuthProviderError, "token has neither id_token nor access_token", nil)
 	}
 
-	userinfoEndpoint := p.userinfoURL
 	// /oidc/userinfo carries no tenant and no signed issuer, so an authority
 	// narrower than common or an allowlist cannot be enforced on this path.
 	// Fail closed with a configuration error instead of trusting the token.
@@ -558,6 +552,7 @@ func (p *MicrosoftProvider) FetchUserInfo(ctx context.Context, token *OAuthToken
 			"microsoft userinfo cannot validate the token tenant without a verified id_token", nil)
 	}
 
+	userinfoEndpoint := p.userinfoURL
 	raw, err := getJSON(ctx, p.client, userinfoEndpoint, token.AccessToken)
 	if err != nil {
 		return nil, err

@@ -732,11 +732,11 @@ func TestMicrosoftProvider(t *testing.T) {
 		}
 	})
 
-	t.Run("nOauth defense - untrusted tenant vs domain ownership attestation", func(t *testing.T) {
+	t.Run("tenant admission and email attestation are independent", func(t *testing.T) {
 		pMulti := newTestProvider("common", nil)
 		pCommon := newTestProvider("common", []string{"trusted-partner-guid"})
 
-		// 1. Untrusted tenant without xms_edov -> EmailVerified must be FALSE
+		// 1. Admitted tenant without xms_edov -> unverified identity, not untrusted.
 		claimsUntrusted := map[string]any{
 			"iss":   "https://login.microsoftonline.com/untrusted-guid/v2.0",
 			"sub":   "attacker-sub",
@@ -751,13 +751,13 @@ func TestMicrosoftProvider(t *testing.T) {
 			t.Fatalf("unexpected verification error: %v", err)
 		}
 		if cUntrusted.EmailVerified {
-			t.Errorf("nOauth vulnerability: untrusted tenant should have EmailVerified == false")
+			t.Errorf("nOauth vulnerability: unattested address should have EmailVerified == false")
 		}
-		if !cUntrusted.UntrustedTenant {
-			t.Errorf("untrusted tenant must set UntrustedTenant == true")
+		if cUntrusted.UntrustedTenant {
+			t.Errorf("tenant admitted by an empty allowlist must not be marked untrusted")
 		}
 
-		// 2. Untrusted tenant with xms_edov == '1' -> EmailVerified must be TRUE
+		// 2. Attested address with xms_edov == '1' -> EmailVerified must be TRUE
 		// when no allowlist bounds the tenants. The allowlist case is covered by
 		// the tenant-allowlist table below.
 		claimsAttested := map[string]any{
@@ -843,8 +843,8 @@ func TestMicrosoftProvider(t *testing.T) {
 		if cFalse.EmailVerified {
 			t.Errorf("expected EmailVerified == false when xms_edov is bool false")
 		}
-		if !cFalse.UntrustedTenant {
-			t.Errorf("denied attestation must set UntrustedTenant == true")
+		if cFalse.UntrustedTenant {
+			t.Errorf("denied attestation alone must not mark an admitted tenant untrusted")
 		}
 
 		// 3. Whitelist alone never verifies the email value.
@@ -864,8 +864,8 @@ func TestMicrosoftProvider(t *testing.T) {
 		if cTrusted.EmailVerified {
 			t.Errorf("whitelist alone must leave EmailVerified == false")
 		}
-		if !cTrusted.UntrustedTenant {
-			t.Errorf("whitelist alone must set UntrustedTenant == true")
+		if cTrusted.UntrustedTenant {
+			t.Errorf("allowlisted tenant without attestation must remain admitted")
 		}
 
 		// 3b. Whitelist + attestation verifies.
@@ -888,6 +888,25 @@ func TestMicrosoftProvider(t *testing.T) {
 		}
 		if cTrustedAttested.UntrustedTenant {
 			t.Errorf("attested whitelisted tenant must leave UntrustedTenant == false")
+		}
+
+		// 4. Admission is the only thing that marks a tenant untrusted.
+		claimsForeign := map[string]any{
+			"iss":      "https://login.microsoftonline.com/untrusted-guid/v2.0",
+			"sub":      "foreign-sub",
+			"aud":      "client-test-id",
+			"exp":      time.Now().Add(10 * time.Minute).Unix(),
+			"email":    "user@foreign-corp.com",
+			"tid":      "untrusted-guid",
+			"xms_edov": true,
+		}
+		tokForeign := signRS256JWT(t, privKey, "ms-key-1", claimsForeign)
+		cForeign, err := pCommon.VerifyIDToken(ctx, tokForeign, "")
+		if err != nil {
+			t.Fatalf("unexpected verification error: %v", err)
+		}
+		if !cForeign.UntrustedTenant {
+			t.Errorf("tenant missing from the allowlist must be marked untrusted")
 		}
 	})
 
@@ -1126,12 +1145,13 @@ func TestMicrosoftProvider_DomainOwnershipAttestation(t *testing.T) {
 	allowlist := []string{listedTenant}
 
 	tests := []struct {
-		name         string
-		trusted      []string
-		tenant       string
-		edov         any
-		setEdov      bool
-		wantVerified bool
+		name          string
+		trusted       []string
+		tenant        string
+		edov          any
+		setEdov       bool
+		wantVerified  bool
+		wantUntrusted bool
 	}{
 		{name: "no allowlist string one", tenant: unlistedTenant, edov: "1", setEdov: true, wantVerified: true},
 		{name: "no allowlist string true", tenant: unlistedTenant, edov: "true", setEdov: true, wantVerified: true},
@@ -1139,17 +1159,16 @@ func TestMicrosoftProvider_DomainOwnershipAttestation(t *testing.T) {
 		{name: "no allowlist string zero", tenant: unlistedTenant, edov: "0", setEdov: true},
 		{name: "no allowlist bool false", tenant: unlistedTenant, edov: false, setEdov: true},
 		{name: "no allowlist missing claim", tenant: unlistedTenant},
-		// The allowlist bounds tenant trust: listed tenants still need domain
-		// attestation for the email value, and attestation cannot admit an
-		// unlisted tenant.
+		// The allowlist bounds tenant admission; domain attestation
+		// independently decides whether the email is verified.
 		{name: "allowlist listed tenant unattested", trusted: allowlist, tenant: listedTenant},
 		{name: "allowlist listed tenant attested", trusted: allowlist, tenant: listedTenant, edov: "1", setEdov: true, wantVerified: true},
-		{name: "allowlist unlisted tenant string one", trusted: allowlist, tenant: unlistedTenant, edov: "1", setEdov: true},
-		{name: "allowlist unlisted tenant string true", trusted: allowlist, tenant: unlistedTenant, edov: "true", setEdov: true},
-		{name: "allowlist unlisted tenant bool true", trusted: allowlist, tenant: unlistedTenant, edov: true, setEdov: true},
-		{name: "allowlist unlisted tenant string zero", trusted: allowlist, tenant: unlistedTenant, edov: "0", setEdov: true},
-		{name: "allowlist unlisted tenant bool false", trusted: allowlist, tenant: unlistedTenant, edov: false, setEdov: true},
-		{name: "allowlist unlisted tenant missing claim", trusted: allowlist, tenant: unlistedTenant},
+		{name: "allowlist unlisted tenant string one", trusted: allowlist, tenant: unlistedTenant, edov: "1", setEdov: true, wantVerified: true, wantUntrusted: true},
+		{name: "allowlist unlisted tenant string true", trusted: allowlist, tenant: unlistedTenant, edov: "true", setEdov: true, wantVerified: true, wantUntrusted: true},
+		{name: "allowlist unlisted tenant bool true", trusted: allowlist, tenant: unlistedTenant, edov: true, setEdov: true, wantVerified: true, wantUntrusted: true},
+		{name: "allowlist unlisted tenant string zero", trusted: allowlist, tenant: unlistedTenant, edov: "0", setEdov: true, wantUntrusted: true},
+		{name: "allowlist unlisted tenant bool false", trusted: allowlist, tenant: unlistedTenant, edov: false, setEdov: true, wantUntrusted: true},
+		{name: "allowlist unlisted tenant missing claim", trusted: allowlist, tenant: unlistedTenant, wantUntrusted: true},
 	}
 
 	for _, tt := range tests {
@@ -1175,11 +1194,8 @@ func TestMicrosoftProvider_DomainOwnershipAttestation(t *testing.T) {
 			if c.EmailVerified != tt.wantVerified {
 				t.Fatalf("EmailVerified = %v; want %v", c.EmailVerified, tt.wantVerified)
 			}
-			if !tt.wantVerified && !c.UntrustedTenant {
-				t.Error("rejected tenant is missing the untrusted_tenant marker")
-			}
-			if tt.wantVerified && c.UntrustedTenant {
-				t.Error("verified tenant carries the untrusted_tenant marker")
+			if c.UntrustedTenant != tt.wantUntrusted {
+				t.Errorf("UntrustedTenant = %v; want %v", c.UntrustedTenant, tt.wantUntrusted)
 			}
 		})
 	}
@@ -1254,9 +1270,9 @@ func TestMicrosoftProvider_TenantAllowlist(t *testing.T) {
 		{name: "listed domain resolves to guid", trusted: []string{"contoso.onmicrosoft.com"}, tid: contosoTenantGUID, wantTrusted: true, wantVerified: true},
 		{name: "listed domain uppercase entry", trusted: []string{"Contoso.OnMicrosoft.com"}, tid: contosoTenantGUID, wantTrusted: true, wantVerified: true},
 		{name: "domain tenant and domain allowlist", tenantCfg: "contoso.onmicrosoft.com", trusted: []string{"contoso.onmicrosoft.com"}, tid: contosoTenantGUID, wantTrusted: true, wantVerified: true},
-		{name: "allowlist domain does not match", trusted: []string{"contoso.onmicrosoft.com"}, tid: otherTenantGUID},
-		{name: "unlisted tenant rejected despite attestation", trusted: []string{"tenant-a"}, tid: "tenant-b"},
-		{name: "unlisted domain rejected", trusted: []string{"tenant-a"}, tid: "evil.example.com"},
+		{name: "allowlist domain does not match", trusted: []string{"contoso.onmicrosoft.com"}, tid: otherTenantGUID, wantVerified: true},
+		{name: "unlisted tenant rejected despite attestation", trusted: []string{"tenant-a"}, tid: "tenant-b", wantVerified: true},
+		{name: "unlisted domain rejected", trusted: []string{"tenant-a"}, tid: "evil.example.com", wantVerified: true},
 	}
 
 	for _, tt := range tests {
@@ -1334,9 +1350,9 @@ func TestMicrosoftProvider_TenantIdentityResolution(t *testing.T) {
 	}{
 		{name: "domain tenant succeeds", tenant: "contoso.onmicrosoft.com", tid: contosoTenantGUID, wantVerified: true},
 		{name: "guid tenant succeeds", tenant: contosoTenantGUID, tid: contosoTenantGUID, wantVerified: true},
-		{name: "unlisted tenant rejected and marked", tenant: "common", trusted: []string{otherTenantGUID}, tid: contosoTenantGUID, wantUntrusted: true},
+		{name: "unlisted tenant rejected and marked", tenant: "common", trusted: []string{otherTenantGUID}, tid: contosoTenantGUID, wantVerified: true, wantUntrusted: true},
 		{name: "allowlist domain matches", tenant: "common", trusted: []string{"contoso.onmicrosoft.com"}, tid: contosoTenantGUID, wantVerified: true},
-		{name: "allowlist domain does not match", tenant: "common", trusted: []string{"contoso.onmicrosoft.com"}, tid: otherTenantGUID, wantUntrusted: true},
+		{name: "allowlist domain does not match", tenant: "common", trusted: []string{"contoso.onmicrosoft.com"}, tid: otherTenantGUID, wantVerified: true, wantUntrusted: true},
 		{name: "unresolvable domain surfaces a config error", tenant: "unresolvable.onmicrosoft.com", tid: contosoTenantGUID, wantErrCode: errors.CodeInvalidConfig},
 	}
 
@@ -1384,6 +1400,39 @@ func TestMicrosoftProvider_TenantIdentityResolution(t *testing.T) {
 			}
 			if c.UntrustedTenant != tt.wantUntrusted {
 				t.Errorf("UntrustedTenant = %v; want %v", c.UntrustedTenant, tt.wantUntrusted)
+			}
+		})
+	}
+}
+
+func TestMicrosoftProvider_TenantResolutionFailureClassification(t *testing.T) {
+	var status atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(int(status.Load()))
+	}))
+	defer server.Close()
+
+	tests := []struct {
+		name   string
+		status int
+		want   errors.Code
+	}{
+		{name: "missing domain is a configuration defect", status: http.StatusNotFound, want: errors.CodeInvalidConfig},
+		{name: "provider outage stays operational", status: http.StatusServiceUnavailable, want: errors.CodeOAuthProviderError},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			status.Store(int32(tt.status))
+			p := NewMicrosoftProvider(config.MicrosoftConfig{
+				ClientID:    "client-test-id",
+				Tenant:      "contoso.onmicrosoft.com",
+				RedirectURI: "https://example.com/callback",
+			}, WithEndpoints(EndpointOverride{DiscoveryURL: server.URL}))
+
+			_, err := p.tenantAuthority(context.Background())
+			var appErr *errors.Error
+			if !errors.As(err, &appErr) || appErr.Code() != tt.want {
+				t.Fatalf("error = %v; want code %q", err, tt.want)
 			}
 		})
 	}
