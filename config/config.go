@@ -768,6 +768,14 @@ func (c *Config) Validate() error {
 		default:
 			return errors.ErrOAuthProviderUnknown
 		}
+		if id == "microsoft" {
+			tenant, err := normalizeMicrosoftTenant(provider.Tenant)
+			if err != nil {
+				return err
+			}
+			provider.Tenant = tenant
+			c.OAuth.Providers[id] = provider
+		}
 		if !provider.Enabled {
 			continue
 		}
@@ -791,31 +799,30 @@ func (c *Config) Validate() error {
 	}
 
 	if c.OAuth.Microsoft != nil {
-		if c.OAuth.Microsoft.ClientID == "" {
-			return errors.ErrOAuthClientIDRequired
-		}
-		if c.OAuth.Microsoft.ClientSecret == "" {
-			return errors.ErrOAuthClientSecretRequired
-		}
-		if c.OAuth.Microsoft.RedirectURI == "" {
-			return errors.ErrOAuthRedirectURLRequired
+		if providerEnabled(c.OAuth.Microsoft.Enabled) {
+			if c.OAuth.Microsoft.ClientID == "" {
+				return errors.ErrOAuthClientIDRequired
+			}
+			if c.OAuth.Microsoft.ClientSecret == "" {
+				return errors.ErrOAuthClientSecretRequired
+			}
+			if c.OAuth.Microsoft.RedirectURI == "" {
+				return errors.ErrOAuthRedirectURLRequired
+			}
 		}
 		// Merge rule: typed defaults materialise only without a map entry for
 		// this provider. A pre-merge "common"/scope/TTL default reads as an
 		// explicit typed value and would otherwise shadow explicit map config.
 		_, msMapEntry := c.OAuth.Providers["microsoft"]
-		tenant := strings.ToLower(strings.TrimSpace(c.OAuth.Microsoft.Tenant))
-		if tenant == "" && !msMapEntry {
+		tenant := c.OAuth.Microsoft.Tenant
+		if strings.TrimSpace(tenant) == "" && !msMapEntry {
 			tenant = "common"
 		}
-		c.OAuth.Microsoft.Tenant = tenant
-		switch tenant {
-		case "", "common", "organizations", "consumers":
-		default:
-			if !isMicrosoftTenantRef(tenant) {
-				return errors.WrapOverride(errors.ErrOAuthTenantInvalid, errors.CodeInvalidConfig, "oauth microsoft tenant is invalid: "+tenant)
-			}
+		normalized, err := normalizeMicrosoftTenant(tenant)
+		if err != nil {
+			return err
 		}
+		c.OAuth.Microsoft.Tenant = normalized
 		trusted := make([]string, 0, len(c.OAuth.Microsoft.TrustedTenants))
 		for _, t := range c.OAuth.Microsoft.TrustedTenants {
 			if t = strings.ToLower(strings.TrimSpace(t)); t != "" {
@@ -832,38 +839,44 @@ func (c *Config) Validate() error {
 	}
 
 	if c.OAuth.Discord != nil {
-		if c.OAuth.Discord.ClientID == "" {
-			return errors.ErrOAuthClientIDRequired
-		}
-		if c.OAuth.Discord.ClientSecret == "" {
-			return errors.ErrOAuthClientSecretRequired
-		}
-		if c.OAuth.Discord.RedirectURI == "" {
-			return errors.ErrOAuthRedirectURLRequired
+		if providerEnabled(c.OAuth.Discord.Enabled) {
+			if c.OAuth.Discord.ClientID == "" {
+				return errors.ErrOAuthClientIDRequired
+			}
+			if c.OAuth.Discord.ClientSecret == "" {
+				return errors.ErrOAuthClientSecretRequired
+			}
+			if c.OAuth.Discord.RedirectURI == "" {
+				return errors.ErrOAuthRedirectURLRequired
+			}
 		}
 	}
 
 	if c.OAuth.Facebook != nil {
-		if c.OAuth.Facebook.AppID == "" {
-			return errors.ErrOAuthClientIDRequired
-		}
-		if c.OAuth.Facebook.AppSecret == "" {
-			return errors.ErrOAuthClientSecretRequired
-		}
-		if c.OAuth.Facebook.RedirectURI == "" {
-			return errors.ErrOAuthRedirectURLRequired
+		if providerEnabled(c.OAuth.Facebook.Enabled) {
+			if c.OAuth.Facebook.AppID == "" {
+				return errors.ErrOAuthClientIDRequired
+			}
+			if c.OAuth.Facebook.AppSecret == "" {
+				return errors.ErrOAuthClientSecretRequired
+			}
+			if c.OAuth.Facebook.RedirectURI == "" {
+				return errors.ErrOAuthRedirectURLRequired
+			}
 		}
 	}
 
 	if c.OAuth.X != nil {
-		if c.OAuth.X.ClientID == "" {
-			return errors.ErrOAuthClientIDRequired
-		}
-		if c.OAuth.X.ClientSecret == "" {
-			return errors.ErrOAuthClientSecretRequired
-		}
-		if c.OAuth.X.RedirectURI == "" {
-			return errors.ErrOAuthRedirectURLRequired
+		if providerEnabled(c.OAuth.X.Enabled) {
+			if c.OAuth.X.ClientID == "" {
+				return errors.ErrOAuthClientIDRequired
+			}
+			if c.OAuth.X.ClientSecret == "" {
+				return errors.ErrOAuthClientSecretRequired
+			}
+			if c.OAuth.X.RedirectURI == "" {
+				return errors.ErrOAuthRedirectURLRequired
+			}
 		}
 		// Same merge rule as Microsoft above: no pre-merge default when a map
 		// entry carries explicit scopes.
@@ -1042,6 +1055,26 @@ var (
 // Callers must lowercase tenant first; named authorities are handled separately.
 func isMicrosoftTenantRef(tenant string) bool {
 	return tenantGUIDRegex.MatchString(tenant) || tenantDomainRegex.MatchString(tenant)
+}
+
+// providerEnabled reports whether a typed provider section registers.
+// The tri-state switch treats an absent value as enabled.
+func providerEnabled(enabled *bool) bool {
+	return enabled == nil || *enabled
+}
+
+// normalizeMicrosoftTenant lowercases and trims tenant, then rejects anything
+// that is not a named authority, GUID, or domain.
+func normalizeMicrosoftTenant(tenant string) (string, error) {
+	tenant = strings.ToLower(strings.TrimSpace(tenant))
+	switch tenant {
+	case "", "common", "organizations", "consumers":
+		return tenant, nil
+	}
+	if !isMicrosoftTenantRef(tenant) {
+		return "", errors.WrapOverride(errors.ErrOAuthTenantInvalid, errors.CodeInvalidConfig, "oauth microsoft tenant is invalid: "+tenant)
+	}
+	return tenant, nil
 }
 
 func isSecretParam(k string) bool {
