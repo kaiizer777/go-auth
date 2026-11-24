@@ -144,7 +144,7 @@ func TestNewProvider(t *testing.T) {
 	})
 }
 
-func TestNewProviderFacebookEmailVerificationGate(t *testing.T) {
+func TestNewProviderFacebookEmailAttestation(t *testing.T) {
 	t.Parallel()
 
 	graph := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -154,18 +154,22 @@ func TestNewProviderFacebookEmailVerificationGate(t *testing.T) {
 
 	// Builds the adapter through the validated config surface, the same path
 	// startup takes, then points only the userinfo call at the fake Graph API.
-	newAdapter := func(t *testing.T, failClosed bool) *FacebookProvider {
+	// A nil assert leaves the field absent, which must behave like false.
+	newAdapter := func(t *testing.T, assert *bool) *FacebookProvider {
 		t.Helper()
 		cfg := config.DefaultConfig()
 		cfg.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
 		cfg.BaseURL = "https://example.com"
 		cfg.OAuth.StateSecret = "test-state-secret-at-least-32-bytes!"
-		cfg.OAuth.Facebook = &config.FacebookConfig{
-			AppID:                       "fb-id",
-			AppSecret:                   "fb-secret",
-			RedirectURI:                 "https://example.com/cb",
-			FailClosedEmailVerification: failClosed,
+		fb := &config.FacebookConfig{
+			AppID:       "fb-id",
+			AppSecret:   "fb-secret",
+			RedirectURI: "https://example.com/cb",
 		}
+		if assert != nil {
+			fb.AssertEmailVerified = *assert
+		}
+		cfg.OAuth.Facebook = fb
 		if err := cfg.Validate(); err != nil {
 			t.Fatalf("Validate = %v", err)
 		}
@@ -181,9 +185,9 @@ func TestNewProviderFacebookEmailVerificationGate(t *testing.T) {
 		return fp
 	}
 
-	fetch := func(t *testing.T, failClosed bool) *OAuthUser {
+	fetch := func(t *testing.T, assert *bool) *OAuthUser {
 		t.Helper()
-		user, err := newAdapter(t, failClosed).FetchUserInfo(context.Background(), &OAuthToken{AccessToken: "at-1"})
+		user, err := newAdapter(t, assert).FetchUserInfo(context.Background(), &OAuthToken{AccessToken: "at-1"})
 		if err != nil {
 			t.Fatalf("FetchUserInfo = %v", err)
 		}
@@ -193,22 +197,35 @@ func TestNewProviderFacebookEmailVerificationGate(t *testing.T) {
 		return user
 	}
 
-	t.Run("fail-closed config blocks an unverified email from merging", func(t *testing.T) {
+	boolPtr := func(v bool) *bool { return &v }
+
+	t.Run("asserted config reports the Graph email verified", func(t *testing.T) {
 		t.Parallel()
-		user := fetch(t, true)
+		user := fetch(t, boolPtr(true))
+		if !user.EmailVerified {
+			t.Fatal("EmailVerified = false; want true under assert_email_verified")
+		}
+		if err := validateProviderIdentity(user); err != nil {
+			t.Fatalf("validateProviderIdentity = %v; want the merge gate open", err)
+		}
+	})
+
+	t.Run("absent flag keeps the Graph email unverified and blocks merging", func(t *testing.T) {
+		t.Parallel()
+		user := fetch(t, nil)
 		if user.EmailVerified {
-			t.Fatal("EmailVerified = true; want false under the configured fail-closed trust")
+			t.Fatal("EmailVerified = true; a non-empty Graph email is not an attested claim")
 		}
 		if err := validateProviderIdentity(user); !errors.Is(err, errors.ErrOAuthEmailUnverified) {
 			t.Fatalf("validateProviderIdentity = %v; want ErrOAuthEmailUnverified", err)
 		}
 	})
 
-	t.Run("default config reports the Graph email unverified", func(t *testing.T) {
+	t.Run("explicit false keeps the Graph email unverified", func(t *testing.T) {
 		t.Parallel()
-		user := fetch(t, false)
+		user := fetch(t, boolPtr(false))
 		if user.EmailVerified {
-			t.Fatal("EmailVerified = true; a non-empty Graph email is not an attested claim")
+			t.Fatal("EmailVerified = true; want false when the operator does not assert it")
 		}
 		if err := validateProviderIdentity(user); !errors.Is(err, errors.ErrOAuthEmailUnverified) {
 			t.Fatalf("validateProviderIdentity = %v; want ErrOAuthEmailUnverified", err)

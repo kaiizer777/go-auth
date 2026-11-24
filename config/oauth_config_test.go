@@ -856,28 +856,28 @@ func TestConfigValidate_NormalizesProviderMapWithoutMutatingInput(t *testing.T) 
 	}
 }
 
-func TestFacebookFailClosedEmailVerificationWiring(t *testing.T) {
+func TestFacebookAssertEmailVerifiedWiring(t *testing.T) {
 	t.Run("typed flag projects into the resolved provider map", func(t *testing.T) {
 		var fb FacebookConfig
-		if err := json.Unmarshal([]byte(`{"fail_closed_email_verification":true}`), &fb); err != nil {
+		if err := json.Unmarshal([]byte(`{"assert_email_verified":true}`), &fb); err != nil {
 			t.Fatalf("unmarshal facebook config: %v", err)
 		}
-		if !fb.FailClosedEmailVerification {
-			t.Error("json fail_closed_email_verification = false; want true")
+		if !fb.AssertEmailVerified {
+			t.Error("json assert_email_verified = false; want true")
 		}
 
 		cfg := validOAuthBase()
 		cfg.OAuth.Facebook = &FacebookConfig{
-			AppID:                       "fb-id",
-			AppSecret:                   "fb-secret",
-			RedirectURI:                 "https://example.com/cb",
-			FailClosedEmailVerification: true,
+			AppID:               "fb-id",
+			AppSecret:           "fb-secret",
+			RedirectURI:         "https://example.com/cb",
+			AssertEmailVerified: true,
 		}
 		if err := cfg.Validate(); err != nil {
 			t.Fatalf("Validate = %v", err)
 		}
-		if !cfg.OAuth.Providers["facebook"].FailClosedEmailVerification {
-			t.Error("resolved map FailClosedEmailVerification = false; want true")
+		if !cfg.OAuth.Providers["facebook"].AssertEmailVerified {
+			t.Error("resolved map AssertEmailVerified = false; want true")
 		}
 	})
 
@@ -890,16 +890,31 @@ func TestFacebookFailClosedEmailVerificationWiring(t *testing.T) {
 			Enabled:      true,
 		}}
 		cfg.OAuth.Facebook = &FacebookConfig{
-			AppID:                       "typed-id",
-			AppSecret:                   "typed-secret",
-			RedirectURI:                 "https://example.com/cb",
-			FailClosedEmailVerification: true,
+			AppID:               "typed-id",
+			AppSecret:           "typed-secret",
+			RedirectURI:         "https://example.com/cb",
+			AssertEmailVerified: true,
 		}
 		if err := cfg.Validate(); err != nil {
 			t.Fatalf("Validate = %v", err)
 		}
-		if !cfg.OAuth.Providers["facebook"].FailClosedEmailVerification {
-			t.Error("resolved map FailClosedEmailVerification = false; want typed true")
+		if !cfg.OAuth.Providers["facebook"].AssertEmailVerified {
+			t.Error("resolved map AssertEmailVerified = false; want typed true")
+		}
+	})
+
+	t.Run("unset flag stays false after resolution", func(t *testing.T) {
+		cfg := validOAuthBase()
+		cfg.OAuth.Facebook = &FacebookConfig{
+			AppID:       "fb-id",
+			AppSecret:   "fb-secret",
+			RedirectURI: "https://example.com/cb",
+		}
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("Validate = %v", err)
+		}
+		if cfg.OAuth.Providers["facebook"].AssertEmailVerified {
+			t.Error("resolved map AssertEmailVerified = true; want the fail-closed default")
 		}
 	})
 }

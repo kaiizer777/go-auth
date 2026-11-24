@@ -186,8 +186,8 @@ func NewProvider(id string, cfg config.ProviderConfig, oCfg ...*config.OAuthConf
 		return NewMicrosoftProvider(mergeMicrosoftConfig(cfg, typed)), nil
 	case "facebook":
 		merged := mergeFacebookConfig(cfg, typed)
-		if merged.FailClosedEmailVerification {
-			return NewFacebookProvider(merged, FacebookFailClosedEmailVerification()), nil
+		if merged.AssertEmailVerified {
+			return NewFacebookProvider(merged, FacebookAssertEmailVerified()), nil
 		}
 		return NewFacebookProvider(merged), nil
 	case "discord":
@@ -255,12 +255,12 @@ func mergeMicrosoftConfig(cfg config.ProviderConfig, typed *config.OAuthConfig) 
 // reason as mergeMicrosoftConfig above.
 func mergeFacebookConfig(cfg config.ProviderConfig, typed *config.OAuthConfig) config.FacebookConfig {
 	merged := config.FacebookConfig{
-		AppID:                       cfg.ClientID,
-		AppSecret:                   cfg.ClientSecret,
-		RedirectURI:                 cfg.RedirectURL,
-		Scopes:                      cfg.Scopes,
-		GraphVersion:                cfg.GraphVersion,
-		FailClosedEmailVerification: cfg.FailClosedEmailVerification,
+		AppID:               cfg.ClientID,
+		AppSecret:           cfg.ClientSecret,
+		RedirectURI:         cfg.RedirectURL,
+		Scopes:              cfg.Scopes,
+		GraphVersion:        cfg.GraphVersion,
+		AssertEmailVerified: cfg.AssertEmailVerified,
 	}
 	if typed == nil || typed.Facebook == nil {
 		return merged
@@ -281,8 +281,8 @@ func mergeFacebookConfig(cfg config.ProviderConfig, typed *config.OAuthConfig) c
 	if t.GraphVersion != "" {
 		merged.GraphVersion = t.GraphVersion
 	}
-	if t.FailClosedEmailVerification {
-		merged.FailClosedEmailVerification = true
+	if t.AssertEmailVerified {
+		merged.AssertEmailVerified = true
 	}
 	return merged
 }

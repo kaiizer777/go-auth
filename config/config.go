@@ -55,9 +55,11 @@ type ProviderConfig struct {
 	// by every other adapter.
 	GraphVersion string `json:"graph_version,omitempty"`
 
-	// FailClosedEmailVerification stops treating an email returned by the
-	// Facebook Graph API as verified; ignored by every other adapter.
-	FailClosedEmailVerification bool `json:"fail_closed_email_verification,omitempty"`
+	// AssertEmailVerified declares that the operator trusts a non-empty email
+	// from the Facebook Graph API as provider-verified, which enables the
+	// existing-account merge. Default false keeps the address unattested;
+	// ignored by every other adapter.
+	AssertEmailVerified bool `json:"assert_email_verified,omitempty"`
 }
 
 // LogValue implements slog.LogValuer to ensure ClientSecret and PrivateKey are masked in logs.
@@ -83,7 +85,7 @@ func (p ProviderConfig) LogValue() slog.Value {
 		slog.Any("trusted_tenants", p.TrustedTenants),
 		slog.Duration("jwks_cache_ttl", p.JWKSCacheTTL),
 		slog.String("graph_version", p.GraphVersion),
-		slog.Bool("fail_closed_email_verification", p.FailClosedEmailVerification),
+		slog.Bool("assert_email_verified", p.AssertEmailVerified),
 	)
 }
 
