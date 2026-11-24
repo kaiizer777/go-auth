@@ -762,6 +762,9 @@ func (c *Config) Validate() error {
 	if !isCookiePath(c.OAuth.StateCookiePath) {
 		return errors.ErrOAuthStateCookiePathInvalid
 	}
+	// Normalized entries land in a fresh map: writing back into the map under
+	// range leaves a partially normalized map behind on a later entry's error.
+	normalizedProviders := make(map[string]ProviderConfig, len(c.OAuth.Providers))
 	for id, provider := range c.OAuth.Providers {
 		switch id {
 		case "google", "github", "apple", "microsoft", "discord", "facebook", "x":
@@ -774,8 +777,8 @@ func (c *Config) Validate() error {
 				return err
 			}
 			provider.Tenant = tenant
-			c.OAuth.Providers[id] = provider
 		}
+		normalizedProviders[id] = provider
 		if !provider.Enabled {
 			continue
 		}
@@ -797,6 +800,7 @@ func (c *Config) Validate() error {
 			}
 		}
 	}
+	c.OAuth.Providers = normalizedProviders
 
 	if c.OAuth.Microsoft != nil {
 		if providerEnabled(c.OAuth.Microsoft.Enabled) {

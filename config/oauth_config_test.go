@@ -763,6 +763,45 @@ func TestConfigValidate_MapMicrosoftTenantNormalisation(t *testing.T) {
 	}
 }
 
+func TestConfigValidate_NormalizesProviderMapWithoutMutatingInput(t *testing.T) {
+	input := map[string]ProviderConfig{
+		"google": {
+			ClientID:     "google-client-id",
+			ClientSecret: "google-client-secret",
+			RedirectURL:  "https://example.com/auth/oauth/google/callback",
+			Enabled:      true,
+		},
+		"microsoft": {
+			ClientID:     "ms-client-id",
+			ClientSecret: "ms-client-secret",
+			RedirectURL:  "https://example.com/auth/oauth/microsoft/callback",
+			Enabled:      true,
+			Tenant:       "  Contoso.OnMicrosoft.com  ",
+		},
+	}
+
+	cfg := validOAuthBase()
+	cfg.OAuth.Providers = input
+	for run := 0; run < 2; run++ {
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("Validate run %d = %v", run, err)
+		}
+		if got := cfg.OAuth.Providers["microsoft"].Tenant; got != "contoso.onmicrosoft.com" {
+			t.Fatalf("Validate run %d Tenant = %q; want contoso.onmicrosoft.com", run, got)
+		}
+		if len(cfg.OAuth.Providers) != len(input) {
+			t.Fatalf("Validate run %d providers = %d; want %d", run, len(cfg.OAuth.Providers), len(input))
+		}
+	}
+
+	if got := input["microsoft"].Tenant; got != "  Contoso.OnMicrosoft.com  " {
+		t.Errorf("source map Tenant = %q; want the input left untouched", got)
+	}
+	if got := input["google"].Tenant; got != "" {
+		t.Errorf("source map google Tenant = %q; want empty", got)
+	}
+}
+
 func TestProviderConfigJSONTags(t *testing.T) {
 	var p ProviderConfig
 	raw := `{"client_id":"id","tenant":"tenant-guid","trusted_tenants":["partner-guid"],"jwks_cache_ttl":3600000000000,"graph_version":"v20.0"}`
