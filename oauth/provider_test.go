@@ -144,6 +144,78 @@ func TestNewProvider(t *testing.T) {
 	})
 }
 
+func TestNewProviderFacebookEmailVerificationGate(t *testing.T) {
+	t.Parallel()
+
+	graph := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"id":"fb-user-1","name":"Fb User","email":"fb@example.com"}`)
+	}))
+	t.Cleanup(graph.Close)
+
+	// Builds the adapter through the validated config surface, the same path
+	// startup takes, then points only the userinfo call at the fake Graph API.
+	newAdapter := func(t *testing.T, failClosed bool) *FacebookProvider {
+		t.Helper()
+		cfg := config.DefaultConfig()
+		cfg.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+		cfg.BaseURL = "https://example.com"
+		cfg.OAuth.StateSecret = "test-state-secret-at-least-32-bytes!"
+		cfg.OAuth.Facebook = &config.FacebookConfig{
+			AppID:                       "fb-id",
+			AppSecret:                   "fb-secret",
+			RedirectURI:                 "https://example.com/cb",
+			FailClosedEmailVerification: failClosed,
+		}
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("Validate = %v", err)
+		}
+		p, err := NewProvider("facebook", cfg.OAuth.Providers["facebook"])
+		if err != nil {
+			t.Fatalf("NewProvider(facebook) = %v", err)
+		}
+		fp, ok := p.(*FacebookProvider)
+		if !ok {
+			t.Fatalf("provider type = %T; want *FacebookProvider", p)
+		}
+		fp.userInfoURL = graph.URL
+		return fp
+	}
+
+	fetch := func(t *testing.T, failClosed bool) *OAuthUser {
+		t.Helper()
+		user, err := newAdapter(t, failClosed).FetchUserInfo(context.Background(), &OAuthToken{AccessToken: "at-1"})
+		if err != nil {
+			t.Fatalf("FetchUserInfo = %v", err)
+		}
+		if user.Email != "fb@example.com" {
+			t.Fatalf("Email = %q; want fb@example.com", user.Email)
+		}
+		return user
+	}
+
+	t.Run("fail-closed config blocks an unverified email from merging", func(t *testing.T) {
+		t.Parallel()
+		user := fetch(t, true)
+		if user.EmailVerified {
+			t.Fatal("EmailVerified = true; want false under the configured fail-closed trust")
+		}
+		if err := validateProviderIdentity(user); !errors.Is(err, errors.ErrOAuthEmailUnverified) {
+			t.Fatalf("validateProviderIdentity = %v; want ErrOAuthEmailUnverified", err)
+		}
+	})
+
+	t.Run("default config trusts the Graph email and allows the merge", func(t *testing.T) {
+		t.Parallel()
+		user := fetch(t, false)
+		if !user.EmailVerified {
+			t.Fatal("EmailVerified = false; want true with the default trust")
+		}
+		if err := validateProviderIdentity(user); err != nil {
+			t.Fatalf("validateProviderIdentity = %v; want nil", err)
+		}
+	})
+}
+
 func TestNewProviderPropagatesAuthoritySettings(t *testing.T) {
 	t.Parallel()
 

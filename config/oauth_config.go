@@ -96,6 +96,9 @@ type FacebookConfig struct {
 	RedirectURI  string   `json:"redirect_uri"`
 	Scopes       []string `json:"scopes"`
 	GraphVersion string   `json:"graph_version"` // Default: "v19.0"
+	// FailClosedEmailVerification stops trusting the Graph email field: an
+	// address is returned but never treated as verified.
+	FailClosedEmailVerification bool `json:"fail_closed_email_verification,omitempty"`
 	// Enabled disables the provider when explicitly false. Absent means enabled.
 	Enabled *bool `json:"enabled,omitempty"`
 }
@@ -112,6 +115,7 @@ func (f FacebookConfig) LogValue() slog.Value {
 		slog.String("redirect_uri", f.RedirectURI),
 		slog.Any("scopes", f.Scopes),
 		slog.String("graph_version", f.GraphVersion),
+		slog.Bool("fail_closed_email_verification", f.FailClosedEmailVerification),
 	)
 }
 
@@ -232,11 +236,12 @@ func (o *OAuthConfig) typedProviders() map[string]typedProvider {
 		typed["facebook"] = typedProvider{
 			enabled: f.Enabled,
 			cfg: ProviderConfig{
-				ClientID:     f.AppID,
-				ClientSecret: f.AppSecret,
-				RedirectURL:  f.RedirectURI,
-				Scopes:       f.Scopes,
-				GraphVersion: f.GraphVersion,
+				ClientID:                    f.AppID,
+				ClientSecret:                f.AppSecret,
+				RedirectURL:                 f.RedirectURI,
+				Scopes:                      f.Scopes,
+				GraphVersion:                f.GraphVersion,
+				FailClosedEmailVerification: f.FailClosedEmailVerification,
 			},
 		}
 	}
@@ -290,6 +295,9 @@ func mergeProviderConfig(base ProviderConfig, hasEntry bool, typed typedProvider
 	}
 	if typed.cfg.GraphVersion != "" {
 		base.GraphVersion = typed.cfg.GraphVersion
+	}
+	if typed.cfg.FailClosedEmailVerification {
+		base.FailClosedEmailVerification = true
 	}
 	return base
 }

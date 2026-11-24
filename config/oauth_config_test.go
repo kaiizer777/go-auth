@@ -802,6 +802,54 @@ func TestConfigValidate_NormalizesProviderMapWithoutMutatingInput(t *testing.T) 
 	}
 }
 
+func TestFacebookFailClosedEmailVerificationWiring(t *testing.T) {
+	t.Run("typed flag projects into the resolved provider map", func(t *testing.T) {
+		var fb FacebookConfig
+		if err := json.Unmarshal([]byte(`{"fail_closed_email_verification":true}`), &fb); err != nil {
+			t.Fatalf("unmarshal facebook config: %v", err)
+		}
+		if !fb.FailClosedEmailVerification {
+			t.Error("json fail_closed_email_verification = false; want true")
+		}
+
+		cfg := validOAuthBase()
+		cfg.OAuth.Facebook = &FacebookConfig{
+			AppID:                       "fb-id",
+			AppSecret:                   "fb-secret",
+			RedirectURI:                 "https://example.com/cb",
+			FailClosedEmailVerification: true,
+		}
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("Validate = %v", err)
+		}
+		if !cfg.OAuth.Providers["facebook"].FailClosedEmailVerification {
+			t.Error("resolved map FailClosedEmailVerification = false; want true")
+		}
+	})
+
+	t.Run("typed flag wins over a map entry that omits it", func(t *testing.T) {
+		cfg := validOAuthBase()
+		cfg.OAuth.Providers = map[string]ProviderConfig{"facebook": {
+			ClientID:     "map-id",
+			ClientSecret: "map-secret",
+			RedirectURL:  "https://example.com/cb",
+			Enabled:      true,
+		}}
+		cfg.OAuth.Facebook = &FacebookConfig{
+			AppID:                       "typed-id",
+			AppSecret:                   "typed-secret",
+			RedirectURI:                 "https://example.com/cb",
+			FailClosedEmailVerification: true,
+		}
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("Validate = %v", err)
+		}
+		if !cfg.OAuth.Providers["facebook"].FailClosedEmailVerification {
+			t.Error("resolved map FailClosedEmailVerification = false; want typed true")
+		}
+	})
+}
+
 func TestProviderConfigJSONTags(t *testing.T) {
 	var p ProviderConfig
 	raw := `{"client_id":"id","tenant":"tenant-guid","trusted_tenants":["partner-guid"],"jwks_cache_ttl":3600000000000,"graph_version":"v20.0"}`

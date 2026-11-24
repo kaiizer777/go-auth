@@ -54,6 +54,10 @@ type ProviderConfig struct {
 	// GraphVersion pins the Facebook Graph API version (e.g. "v19.0"); ignored
 	// by every other adapter.
 	GraphVersion string `json:"graph_version,omitempty"`
+
+	// FailClosedEmailVerification stops treating an email returned by the
+	// Facebook Graph API as verified; ignored by every other adapter.
+	FailClosedEmailVerification bool `json:"fail_closed_email_verification,omitempty"`
 }
 
 // LogValue implements slog.LogValuer to ensure ClientSecret and PrivateKey are masked in logs.
@@ -79,6 +83,7 @@ func (p ProviderConfig) LogValue() slog.Value {
 		slog.Any("trusted_tenants", p.TrustedTenants),
 		slog.Duration("jwks_cache_ttl", p.JWKSCacheTTL),
 		slog.String("graph_version", p.GraphVersion),
+		slog.Bool("fail_closed_email_verification", p.FailClosedEmailVerification),
 	)
 }
 
