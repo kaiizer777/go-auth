@@ -128,26 +128,21 @@ func NewWithStore(store db.Store, cfg config.Config) (*Auth, error) {
 
 	sessHandler := handler.NewSessionHandlerWithStore(sessionSvc, store, &cfg)
 
+	providers, err := newOAuthProviders(cfg.OAuth)
+	if err != nil {
+		close(limiterDone)
+		return nil, err
+	}
 	registry := oauth.NewRegistry()
-	enabled := 0
-	for id, pcfg := range cfg.OAuth.Providers {
-		if !pcfg.Enabled {
-			continue
-		}
-		p, err := oauth.NewProvider(id, pcfg, &cfg.OAuth)
-		if err != nil {
-			close(limiterDone)
-			return nil, err
-		}
+	for _, p := range providers {
 		if err := registry.Register(p); err != nil {
 			close(limiterDone)
 			return nil, err
 		}
-		enabled++
 	}
 	var oauthSvc oauth.Service
 	var oauthOpt handler.Option
-	if enabled > 0 {
+	if len(providers) > 0 {
 		oauthSvc = oauth.NewServiceWithRegistry(store, sessionSvc, registry, &cfg)
 		oauthOpt = handler.WithOAuthRegistry(oauthSvc, registry)
 	}
