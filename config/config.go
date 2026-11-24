@@ -430,7 +430,44 @@ func DefaultConfig() Config {
 }
 
 // Validate ensures required fields are set and connection parameters are sane.
+// It commits the normalization only after every check passes: a rejected config
+// keeps its original values instead of the half-applied defaults that were
+// written before the failing check.
 func (c *Config) Validate() error {
+	working := c.clone()
+	if err := working.validate(); err != nil {
+		return err
+	}
+	*c = *working
+	return nil
+}
+
+// clone isolates the sections validate writes into, so a failed validation
+// cannot reach the caller through the typed provider pointers.
+func (c *Config) clone() *Config {
+	cp := *c
+	if c.OAuth.Microsoft != nil {
+		v := *c.OAuth.Microsoft
+		cp.OAuth.Microsoft = &v
+	}
+	if c.OAuth.Facebook != nil {
+		v := *c.OAuth.Facebook
+		cp.OAuth.Facebook = &v
+	}
+	if c.OAuth.Discord != nil {
+		v := *c.OAuth.Discord
+		cp.OAuth.Discord = &v
+	}
+	if c.OAuth.X != nil {
+		v := *c.OAuth.X
+		cp.OAuth.X = &v
+	}
+	return &cp
+}
+
+// validate is the mutating body of Validate: it defaults and normalizes c in
+// place and reports the first failing check.
+func (c *Config) validate() error {
 	if c.DatabaseType == "" {
 		c.DatabaseType = DatabaseTypePostgres
 	}

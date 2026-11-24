@@ -5,12 +5,47 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/kaiizer777/go-auth/errors"
 )
+
+// TestConfigValidate_FailingValidationLeavesConfigUntouched pins the no-write
+// contract: defaults and provider normalization are applied to a working copy,
+// so a config rejected by a later check is not silently rewritten first.
+func TestConfigValidate_FailingValidationLeavesConfigUntouched(t *testing.T) {
+	cfg := validOAuthBase()
+	cfg.SessionIdleTimeout = 0
+	cfg.OAuth.Providers = map[string]ProviderConfig{
+		"microsoft": {
+			ClientID:     "ms-client-id",
+			ClientSecret: "ms-client-secret",
+			RedirectURL:  "https://example.com/auth/oauth/microsoft/callback",
+			Enabled:      true,
+			Tenant:       "  Contoso.OnMicrosoft.com  ",
+		},
+	}
+	// Fails at the TOTP key check, which runs after the session defaults and
+	// the provider-map normalization.
+	cfg.TOTP.EncryptionKey = "not-a-64-byte-hex-key"
+	want := cfg.clone()
+
+	if err := cfg.Validate(); !errors.Is(err, errors.ErrTOTPEncryptionKeyInvalid) {
+		t.Fatalf("Validate = %v; want %v", err, errors.ErrTOTPEncryptionKeyInvalid)
+	}
+	if cfg.SessionIdleTimeout != 0 {
+		t.Fatalf("SessionIdleTimeout = %v; want 0 (default written before the failing check)", cfg.SessionIdleTimeout)
+	}
+	if got := cfg.OAuth.Providers["microsoft"].Tenant; got != "  Contoso.OnMicrosoft.com  " {
+		t.Fatalf("microsoft tenant = %q; want the unnormalized input", got)
+	}
+	if !reflect.DeepEqual(cfg, *want) {
+		t.Fatalf("rejected Validate mutated the config:\n got %#v\nwant %#v", cfg, *want)
+	}
+}
 
 func TestDefaultConfig(t *testing.T) {
 	cfg := DefaultConfig()
