@@ -37,7 +37,7 @@ func (r *providerRegistry) Register(p Provider) error {
 	if p == nil {
 		return errors.New(errors.CodeInvalidConfig, "cannot register nil oauth provider", nil)
 	}
-	id := canonicalProviderSlug(p.ID())
+	id := CanonicalProviderSlug(p.ID())
 	if id == "" {
 		return errors.New(errors.CodeInvalidConfig, "cannot register provider with empty id", nil)
 	}
@@ -53,7 +53,7 @@ func (r *providerRegistry) Register(p Provider) error {
 func (r *providerRegistry) Get(providerID string) (Provider, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	p, ok := r.providers[canonicalProviderSlug(providerID)]
+	p, ok := r.providers[CanonicalProviderSlug(providerID)]
 	if !ok {
 		return nil, errors.New(errors.CodeOAuthProviderNotFound, "unsupported or unconfigured oauth provider: "+providerID, nil)
 	}
