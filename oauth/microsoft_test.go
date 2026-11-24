@@ -975,7 +975,7 @@ func TestMicrosoftProvider(t *testing.T) {
 			t.Fatal("expected error for future iat, got nil")
 		}
 
-		// 5. json.Number iat is parsed correctly
+		// 5. Numeric exp and iat are parsed
 		nowUnix := time.Now().Unix()
 		claimsJSONNumber := map[string]any{
 			"iss": "https://login.microsoftonline.com/tid-1/v2.0",
@@ -988,10 +988,10 @@ func TestMicrosoftProvider(t *testing.T) {
 		tokJSONNumber := signRS256JWT(t, privKey, "ms-key-1", claimsJSONNumber)
 		cNum, err := p.VerifyIDToken(ctx, tokJSONNumber, "")
 		if err != nil {
-			t.Fatalf("failed to verify token with json.Number: %v", err)
+			t.Fatalf("failed to verify token with numeric exp and iat: %v", err)
 		}
 		if cNum.IssuedAt != nowUnix {
-			t.Fatalf("expected IssuedAt %d from json.Number, got %d", nowUnix, cNum.IssuedAt)
+			t.Fatalf("expected IssuedAt %d from a numeric claim, got %d", nowUnix, cNum.IssuedAt)
 		}
 	})
 
@@ -1196,6 +1196,46 @@ func TestMicrosoftProvider_DomainOwnershipAttestation(t *testing.T) {
 			}
 			if c.UntrustedTenant != tt.wantUntrusted {
 				t.Errorf("UntrustedTenant = %v; want %v", c.UntrustedTenant, tt.wantUntrusted)
+			}
+		})
+	}
+}
+
+// TestMicrosoftProvider_EmailAttestationClaimShapes pins the xms_edov decoding.
+// The signature-verified payload decodes numbers as float64; the other numeric
+// and textual shapes are accepted defensively. Every other shape, an
+// out-of-band json.Number included, stays denied.
+func TestMicrosoftProvider_EmailAttestationClaimShapes(t *testing.T) {
+	p := NewMicrosoftProvider(config.MicrosoftConfig{ClientID: "client-test-id", Tenant: "common"})
+
+	tests := []struct {
+		name string
+		edov any
+		want bool
+	}{
+		{name: "bool true", edov: true, want: true},
+		{name: "bool false", edov: false},
+		{name: "string one", edov: "1", want: true},
+		{name: "string true", edov: "true", want: true},
+		{name: "string padded one", edov: " 1 ", want: true},
+		{name: "string zero", edov: "0"},
+		{name: "float one", edov: float64(1), want: true},
+		{name: "float zero", edov: float64(0)},
+		{name: "int one", edov: 1, want: true},
+		{name: "int64 one", edov: int64(1), want: true},
+		{name: "out-of-band json.Number stays denied", edov: json.Number("1")},
+		{name: "unsupported shape stays denied", edov: []any{true}},
+		{name: "missing claim", edov: nil},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			claims := map[string]any{}
+			if tt.edov != nil {
+				claims["xms_edov"] = tt.edov
+			}
+			if got := p.isEmailVerified("common", claims, "corp-tid"); got != tt.want {
+				t.Errorf("isEmailVerified = %v; want %v", got, tt.want)
 			}
 		})
 	}
