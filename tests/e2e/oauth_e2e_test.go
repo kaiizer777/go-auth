@@ -26,43 +26,14 @@ import (
 	"github.com/kaiizer777/go-auth/tests/oauthmock"
 )
 
-func setupOAuthE2EStack(t *testing.T) (http.Handler, *gorm.DB, *oauth.Registry, config.Config) {
+func setupOAuthE2EStack(t *testing.T, mutate ...func(*config.Config)) (http.Handler, *gorm.DB, *oauth.Registry, config.Config) {
 	t.Helper()
 	name := fmt.Sprintf("file:oauth_e2e_%s?mode=memory&cache=shared", uuid.New().String())
 	database, err := gorm.Open(sqlite.Open(name), &gorm.Config{Logger: logger.Discard})
 	if err != nil {
 		t.Fatalf("open sqlite: %v", err)
 	}
-	ddl := `
-	CREATE TABLE IF NOT EXISTS users (
-		id TEXT PRIMARY KEY, email TEXT COLLATE NOCASE UNIQUE NOT NULL, password_hash TEXT NOT NULL,
-		credential_version INTEGER NOT NULL DEFAULT 0, email_verified INTEGER NOT NULL DEFAULT 0,
-		created_at DATETIME, updated_at DATETIME
-	);
-	CREATE TABLE IF NOT EXISTS oauth_accounts (
-		id TEXT PRIMARY KEY, user_id TEXT NOT NULL, provider_id VARCHAR(32) NOT NULL,
-		provider_user_id VARCHAR(255) NOT NULL, email VARCHAR(255) NOT NULL,
-		verified INTEGER NOT NULL DEFAULT 0,
-		created_at DATETIME, updated_at DATETIME,
-		CONSTRAINT uq_oauth_accounts_provider_uid UNIQUE (provider_id, provider_user_id),
-		FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-	);
-	CREATE TABLE IF NOT EXISTS verification_tokens (
-		token_hash BLOB PRIMARY KEY, user_id TEXT NOT NULL, expires_at DATETIME NOT NULL, created_at DATETIME,
-		FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-	);
-	CREATE TABLE IF NOT EXISTS password_reset_tokens (
-		token_hash BLOB PRIMARY KEY, user_id TEXT NOT NULL, expires_at DATETIME NOT NULL, created_at DATETIME,
-		FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-	);
-	CREATE TABLE IF NOT EXISTS sessions (
-		id TEXT PRIMARY KEY, user_id TEXT NOT NULL, id_hash CHAR(64) UNIQUE NOT NULL,
-		session_type VARCHAR(10) NOT NULL DEFAULT 'cookie', ip_address VARCHAR(45) NOT NULL DEFAULT '',
-		user_agent TEXT NOT NULL DEFAULT '', credential_version INTEGER NOT NULL DEFAULT 0,
-		last_active_at DATETIME NOT NULL, absolute_expires_at DATETIME NOT NULL, created_at DATETIME,
-		FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-	);`
-	if err := database.Exec(ddl).Error; err != nil {
+	if err := database.Exec(sqliteSchema).Error; err != nil {
 		t.Fatalf("schema error: %v", err)
 	}
 	// PRAGMA is per-connection while database/sql pools connections: pin the
@@ -82,6 +53,9 @@ func setupOAuthE2EStack(t *testing.T) (http.Handler, *gorm.DB, *oauth.Registry, 
 	cfg.BaseURL = "http://localhost:8080"
 	cfg.OAuth.StateSecret = "super-secret-e2e-state-signing-key-32b"
 	cfg.SessionCookieSecure = false
+	for _, fn := range mutate {
+		fn(&cfg)
+	}
 
 	authSvc, err := auth.New(cfg, database, cfg.EmailHooks)
 	if err != nil {
@@ -244,7 +218,7 @@ func TestE2E_FullBrowserOAuthJourneys(t *testing.T) {
 		h, dbConn, pReg, cfg := setupOAuthE2EStack(t)
 
 		const tenant = "22222222-2222-2222-2222-222222222222"
-		idp, err := oauthmock.NewMicrosoftIdP()
+		idp, err := oauthmock.NewMicrosoftIdP(cfg.BaseURL + "/auth/oauth/microsoft/callback")
 		if err != nil {
 			t.Fatalf("NewMicrosoftIdP: %v", err)
 		}
@@ -333,7 +307,7 @@ func TestE2E_FullBrowserOAuthJourneys(t *testing.T) {
 	t.Run("journey 2: discord account linking to active session", func(t *testing.T) {
 		h, dbConn, pReg, cfg := setupOAuthE2EStack(t)
 
-		msIdP, err := oauthmock.NewMicrosoftIdP()
+		msIdP, err := oauthmock.NewMicrosoftIdP(cfg.BaseURL + "/auth/oauth/microsoft/callback")
 		if err != nil {
 			t.Fatalf("NewMicrosoftIdP: %v", err)
 		}
@@ -349,7 +323,7 @@ func TestE2E_FullBrowserOAuthJourneys(t *testing.T) {
 			RedirectURI:  cfg.BaseURL + "/auth/oauth/microsoft/callback",
 		}, oauth.WithEndpoints(microsoftEndpoints(msIdP)))
 
-		discordIdP := oauthmock.NewDiscordIdP()
+		discordIdP := oauthmock.NewDiscordIdP(cfg.BaseURL + "/auth/oauth/discord/callback")
 		defer discordIdP.Close()
 		discordIdP.UserID = "discord-snowflake-888"
 		discordIdP.Email = "existing-user@example.com"
@@ -417,7 +391,7 @@ func TestE2E_FullBrowserOAuthJourneys(t *testing.T) {
 	t.Run("journey 3: x missing email fail closed and returning user login", func(t *testing.T) {
 		h, dbConn, pReg, cfg := setupOAuthE2EStack(t)
 
-		idp := oauthmock.NewXIdP()
+		idp := oauthmock.NewXIdP(cfg.BaseURL + "/auth/oauth/x/callback")
 		defer idp.Close()
 		idp.UserID = "x-user-snowflake-333"
 
@@ -493,7 +467,7 @@ func TestE2E_FullBrowserOAuthJourneys(t *testing.T) {
 	t.Run("journey 4: facebook login", func(t *testing.T) {
 		h, dbConn, pReg, cfg := setupOAuthE2EStack(t)
 
-		idp := oauthmock.NewFacebookIdP()
+		idp := oauthmock.NewFacebookIdP(cfg.BaseURL + "/auth/oauth/facebook/callback")
 		defer idp.Close()
 		idp.UserID = "fb-app-scoped-uid-444"
 		idp.Email = "fb-user@example.com"
@@ -556,7 +530,7 @@ func TestE2E_FullBrowserOAuthJourneys(t *testing.T) {
 	t.Run("journey 5: facebook unverified email cannot merge", func(t *testing.T) {
 		h, dbConn, pReg, cfg := setupOAuthE2EStack(t)
 
-		idp := oauthmock.NewFacebookIdP()
+		idp := oauthmock.NewFacebookIdP(cfg.BaseURL + "/auth/oauth/facebook/callback")
 		defer idp.Close()
 		idp.UserID = "fb-unverified-uid-555"
 		idp.Email = "squatted@example.com"
@@ -617,7 +591,7 @@ func TestE2E_FullBrowserOAuthJourneys(t *testing.T) {
 
 		const trustedTenant = "44444444-4444-4444-4444-444444444444"
 		const attackerTenant = "55555555-5555-5555-5555-555555555555"
-		idp, err := oauthmock.NewMicrosoftIdP()
+		idp, err := oauthmock.NewMicrosoftIdP(cfg.BaseURL + "/auth/oauth/microsoft/callback")
 		if err != nil {
 			t.Fatalf("NewMicrosoftIdP: %v", err)
 		}
@@ -743,7 +717,7 @@ func TestE2E_FullBrowserOAuthJourneys(t *testing.T) {
 		h, dbConn, pReg, cfg := setupOAuthE2EStack(t)
 
 		const tenant = "66666666-6666-6666-6666-666666666666"
-		idp, err := oauthmock.NewMicrosoftIdP()
+		idp, err := oauthmock.NewMicrosoftIdP(cfg.BaseURL + "/auth/oauth/microsoft/callback")
 		if err != nil {
 			t.Fatalf("NewMicrosoftIdP: %v", err)
 		}
@@ -827,7 +801,7 @@ func TestE2E_FullBrowserOAuthJourneys(t *testing.T) {
 	t.Run("journey 9: microsoft userinfo-only identity", func(t *testing.T) {
 		h, dbConn, pReg, cfg := setupOAuthE2EStack(t)
 
-		idp, err := oauthmock.NewMicrosoftIdP()
+		idp, err := oauthmock.NewMicrosoftIdP(cfg.BaseURL + "/auth/oauth/microsoft/callback")
 		if err != nil {
 			t.Fatalf("NewMicrosoftIdP: %v", err)
 		}
@@ -887,7 +861,7 @@ func TestE2E_FullBrowserOAuthJourneys(t *testing.T) {
 		h, dbConn, pReg, cfg := setupOAuthE2EStack(t)
 
 		const tenant = "77777777-7777-7777-7777-777777777777"
-		idp, err := oauthmock.NewMicrosoftIdP()
+		idp, err := oauthmock.NewMicrosoftIdP(cfg.BaseURL + "/auth/oauth/microsoft/callback")
 		if err != nil {
 			t.Fatalf("NewMicrosoftIdP: %v", err)
 		}
@@ -938,7 +912,7 @@ func TestE2E_FullBrowserOAuthJourneys(t *testing.T) {
 			t.Run(tc.name, func(t *testing.T) {
 				h, dbConn, pReg, cfg := setupOAuthE2EStack(t)
 
-				idp := oauthmock.NewFacebookIdP()
+				idp := oauthmock.NewFacebookIdP(cfg.BaseURL + "/auth/oauth/facebook/callback")
 				defer idp.Close()
 				idp.Email = "confused-deputy@example.com"
 				idp.Debug = tc.debug
@@ -986,7 +960,7 @@ func TestE2E_FullBrowserOAuthJourneys(t *testing.T) {
 				h, dbConn, pReg, cfg := setupOAuthE2EStack(t)
 
 				const tenant = "88888888-8888-8888-8888-888888888888"
-				idp, err := oauthmock.NewMicrosoftIdP()
+				idp, err := oauthmock.NewMicrosoftIdP(cfg.BaseURL + "/auth/oauth/microsoft/callback")
 				if err != nil {
 					t.Fatalf("NewMicrosoftIdP: %v", err)
 				}
@@ -1027,11 +1001,12 @@ func TestE2E_FullBrowserOAuthJourneys(t *testing.T) {
 	// 13. Journey 13: an unverified link survives repeated logins until a
 	// password signup claims the address
 	t.Run("journey 13: unverified link is severed by a password signup", func(t *testing.T) {
-		h, dbConn, pReg, cfg := setupOAuthE2EStack(t)
-		cfg.DisableAsyncEmailDispatch = true
+		h, dbConn, pReg, cfg := setupOAuthE2EStack(t, func(c *config.Config) {
+			c.DisableAsyncEmailDispatch = true
+		})
 
 		const addr = "pending-fb@example.com"
-		idp := oauthmock.NewFacebookIdP()
+		idp := oauthmock.NewFacebookIdP(cfg.BaseURL + "/auth/oauth/facebook/callback")
 		defer idp.Close()
 		idp.UserID = "fb-pending-uid-13"
 		idp.Email = addr
