@@ -583,6 +583,39 @@ func (c *authorizeCodes) registerClient(redirectURI string, supported, required 
 	c.requiredScopes = append([]string(nil), required...)
 }
 
+// redirectTarget validates the request's redirect_uri against the client's
+// registration and returns the registered callback rebuilt from its validated
+// components. A relative, opaque, or non-http(s) target is rejected, as is any
+// scheme, host, or path the client did not register; the request value never
+// reaches http.Redirect.
+func (c *authorizeCodes) redirectTarget(requested string) (*url.URL, bool) {
+	registered, err := url.Parse(c.redirectURI)
+	if err != nil || !absoluteHTTP(registered) {
+		return nil, false
+	}
+	target, err := url.Parse(requested)
+	if err != nil || !absoluteHTTP(target) {
+		return nil, false
+	}
+	if target.Scheme != registered.Scheme ||
+		target.User.String() != registered.User.String() ||
+		target.Host != registered.Host ||
+		target.Path != registered.Path ||
+		target.RawQuery != registered.RawQuery ||
+		target.Fragment != registered.Fragment {
+		return nil, false
+	}
+	return registered, true
+}
+
+// absoluteHTTP rejects opaque, relative, and non-http(s) redirect values.
+func absoluteHTTP(u *url.URL) bool {
+	if u == nil || !u.IsAbs() || u.Host == "" {
+		return false
+	}
+	return u.Scheme == "https" || u.Scheme == "http"
+}
+
 // authorize validates the adapter's authorize request, records its challenge
 // and nonce, and redirects back to redirect_uri with a code.
 func (c *authorizeCodes) authorize(w http.ResponseWriter, r *http.Request, clientID string) {
@@ -596,16 +629,12 @@ func (c *authorizeCodes) authorize(w http.ResponseWriter, r *http.Request, clien
 		return
 	}
 	redirectRaw := q.Get("redirect_uri")
-	redirect, err := url.Parse(redirectRaw)
-	if err != nil || redirect.Scheme == "" || redirect.Host == "" {
-		http.Error(w, "invalid redirect_uri", http.StatusBadRequest)
-		return
-	}
 
 	c.mu.Lock()
-	if redirectRaw != c.redirectURI {
+	redirect, ok := c.redirectTarget(redirectRaw)
+	if !ok {
 		c.mu.Unlock()
-		http.Error(w, "unregistered redirect_uri", http.StatusBadRequest)
+		http.Error(w, "invalid redirect_uri", http.StatusBadRequest)
 		return
 	}
 	requested := strings.Fields(q.Get("scope"))
