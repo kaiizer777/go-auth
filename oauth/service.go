@@ -866,9 +866,9 @@ func (s *service) linkOrCreate(ctx context.Context, providerID string, info *Use
 	}
 
 	// 4. Validate the identity fields for unauthenticated registration. A
-	// present-but-unverified address may register its own account, but the
-	// unproven claim is not bound to it: createUserAndLink mints the link only
-	// once the address is verified.
+	// present-but-unverified address may register its own account: the link row
+	// is always inserted, and its verified flag carries the provider's
+	// attestation as-is, so the row grants no trust the claim did not have.
 	if gerr := validateProviderIdentityFields(info); gerr != nil {
 		return db.User{}, false, false, gerr
 	}
