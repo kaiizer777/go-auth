@@ -28,18 +28,23 @@ type XProvider struct {
 var _ Provider = (*XProvider)(nil)
 
 // NewXProvider constructs a new X (Twitter) OAuth 2.0 provider adapter.
-func NewXProvider(cfg config.XConfig) *XProvider {
+func NewXProvider(cfg config.XConfig, opts ...EndpointOption) *XProvider {
 	// Login needs only users.read (/2/users/me); tweet.read and
 	// offline.access are opt-in via config when the feature needs them.
 	if len(cfg.Scopes) == 0 {
 		cfg.Scopes = []string{"users.read"}
 	}
+	ep := resolveEndpoints(EndpointOverride{
+		AuthorizeURL: "https://twitter.com/i/oauth2/authorize",
+		TokenURL:     "https://api.twitter.com/2/oauth2/token",
+		UserInfoURL:  "https://api.twitter.com/2/users/me",
+	}, opts)
 	return &XProvider{
 		cfg:         cfg,
 		client:      newHTTPClient(),
-		authURL:     "https://twitter.com/i/oauth2/authorize",
-		tokenURL:    "https://api.twitter.com/2/oauth2/token",
-		userInfoURL: "https://api.twitter.com/2/users/me",
+		authURL:     ep.AuthorizeURL,
+		tokenURL:    ep.TokenURL,
+		userInfoURL: ep.UserInfoURL,
 	}
 }
 

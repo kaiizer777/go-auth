@@ -29,7 +29,7 @@ type MicrosoftProvider struct {
 }
 
 // NewMicrosoftProvider constructs a Microsoft Entra ID adapter.
-func NewMicrosoftProvider(cfg config.MicrosoftConfig) *MicrosoftProvider {
+func NewMicrosoftProvider(cfg config.MicrosoftConfig, opts ...EndpointOption) *MicrosoftProvider {
 	tenant := cfg.Tenant
 	if tenant == "" {
 		tenant = "common"
@@ -42,9 +42,12 @@ func NewMicrosoftProvider(cfg config.MicrosoftConfig) *MicrosoftProvider {
 	}
 
 	client := newHTTPClient()
-	authURL := fmt.Sprintf("https://login.microsoftonline.com/%s/oauth2/v2.0/authorize", tenant)
-	tokenURL := fmt.Sprintf("https://login.microsoftonline.com/%s/oauth2/v2.0/token", tenant)
-	jwksURL := fmt.Sprintf("https://login.microsoftonline.com/%s/discovery/v2.0/keys", tenant)
+	ep := resolveEndpoints(EndpointOverride{
+		AuthorizeURL: fmt.Sprintf("https://login.microsoftonline.com/%s/oauth2/v2.0/authorize", tenant),
+		TokenURL:     fmt.Sprintf("https://login.microsoftonline.com/%s/oauth2/v2.0/token", tenant),
+		JWKSURL:      fmt.Sprintf("https://login.microsoftonline.com/%s/discovery/v2.0/keys", tenant),
+		UserInfoURL:  "https://graph.microsoft.com/oidc/userinfo",
+	}, opts)
 
 	trusted := make(map[string]struct{}, len(cfg.TrustedTenants))
 	for _, t := range cfg.TrustedTenants {
@@ -53,17 +56,17 @@ func NewMicrosoftProvider(cfg config.MicrosoftConfig) *MicrosoftProvider {
 		}
 	}
 
-	mgr := NewJWKSManager(jwksURL, client, cfg.JWKSCacheTTL)
+	mgr := NewJWKSManager(ep.JWKSURL, client, cfg.JWKSCacheTTL)
 
 	return &MicrosoftProvider{
 		cfg:            cfg,
 		client:         client,
-		authURL:        authURL,
-		tokenURL:       tokenURL,
-		jwksURL:        jwksURL,
+		authURL:        ep.AuthorizeURL,
+		tokenURL:       ep.TokenURL,
+		jwksURL:        ep.JWKSURL,
 		jwksMgr:        mgr,
 		jwksRetriever:  mgr,
-		userinfoURL:    "https://graph.microsoft.com/oidc/userinfo",
+		userinfoURL:    ep.UserInfoURL,
 		trustedTenants: trusted,
 	}
 }

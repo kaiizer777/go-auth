@@ -39,6 +39,25 @@ func FacebookFailClosedEmailVerification() FacebookOption {
 	return func(p *FacebookProvider) { p.trustGraphEmail = false }
 }
 
+// FacebookEndpoints applies non-empty endpoint overrides. It is the FacebookOption
+// form of WithEndpoints, which the other adapters take directly.
+func FacebookEndpoints(o EndpointOverride) FacebookOption {
+	return func(p *FacebookProvider) {
+		if o.AuthorizeURL != "" {
+			p.authURL = o.AuthorizeURL
+		}
+		if o.TokenURL != "" {
+			p.tokenURL = o.TokenURL
+		}
+		if o.UserInfoURL != "" {
+			p.userInfoURL = o.UserInfoURL
+		}
+		if o.DebugURL != "" {
+			p.debugURL = o.DebugURL
+		}
+	}
+}
+
 // NewFacebookProvider constructs a new Facebook Graph API provider adapter.
 func NewFacebookProvider(cfg config.FacebookConfig, opts ...FacebookOption) *FacebookProvider {
 	version := cfg.GraphVersion
