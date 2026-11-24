@@ -399,23 +399,19 @@ func TestHandleCallbackState(t *testing.T) {
 }
 
 func TestHandleCallbackEmailGate(t *testing.T) {
-	t.Run("unverified email rejected before any DB write", func(t *testing.T) {
+	t.Run("unverified email cannot merge into an existing account", func(t *testing.T) {
 		t.Parallel()
 		database, cfg, _, svc := setupServiceTest(t,
 			&UserInfo{ProviderID: "google", ProviderUserID: "sub-9", Email: "victim@example.com"})
+		owner := db.User{ID: uuid.New(), Email: "victim@example.com", PasswordHash: "hash", EmailVerified: true}
+		if err := database.Create(&owner).Error; err != nil {
+			t.Fatalf("seed user: %v", err)
+		}
 		state, cookie := mustInitiate(t, svc, cfg, "google")
 		rec, req := callbackRequest(state, cookie)
 		_, _, _, err := svc.HandleCallback(req.Context(), rec, req, "google", "code-1", state, db.SessionTypeCookie)
 		requireCode(t, err, errors.CodeOAuthEmailUnverified, http.StatusBadRequest)
-		if n := countRows(t, database, &db.User{}); n != 0 {
-			t.Fatalf("users = %d; want 0", n)
-		}
-		if n := countRows(t, database, &db.OAuthAccount{}); n != 0 {
-			t.Fatalf("oauth_accounts = %d; want 0", n)
-		}
-		if n := countRows(t, database, &db.Session{}); n != 0 {
-			t.Fatalf("sessions = %d; want 0", n)
-		}
+		requireIdentityRows(t, database, 1, 0, 0)
 	})
 
 	t.Run("existing link succeeds with email omitted", func(t *testing.T) {
@@ -473,14 +469,23 @@ func TestHandleCallbackEmailGate(t *testing.T) {
 		requireIdentityRows(t, database, 1, 1, 1)
 	})
 
-	t.Run("no link unverified email writes zero rows", func(t *testing.T) {
+	t.Run("unverified email registers a fresh unverified account", func(t *testing.T) {
 		database, cfg, _, svc := setupServiceTest(t,
 			&UserInfo{ProviderID: "google", ProviderUserID: "sub-9", Email: "victim@example.com"})
 		state, cookie := mustInitiate(t, svc, cfg, "google")
 		rec, req := callbackRequest(state, cookie)
-		_, _, _, err := svc.HandleCallback(req.Context(), rec, req, "google", "code-1", state, db.SessionTypeCookie)
-		requireCode(t, err, errors.CodeOAuthEmailUnverified, http.StatusBadRequest)
-		requireIdentityRows(t, database, 0, 0, 0)
+		sess, _, _, err := svc.HandleCallback(req.Context(), rec, req, "google", "code-1", state, db.SessionTypeCookie)
+		if err != nil {
+			t.Fatalf("HandleCallback = %v; want fresh registration", err)
+		}
+		var user db.User
+		if err := database.Where("id = ?", sess.UserID).First(&user).Error; err != nil {
+			t.Fatalf("load user: %v", err)
+		}
+		if user.EmailVerified {
+			t.Fatal("unverified provider email minted a verified local user")
+		}
+		requireIdentityRows(t, database, 1, 1, 1)
 	})
 
 	t.Run("nil userinfo keeps the 400", func(t *testing.T) {
@@ -1285,6 +1290,34 @@ func TestService_CreateUserEmailRaceRecovery(t *testing.T) {
 			t.Fatalf("expected ErrOAuthAccountLinkConflict, got %v", err)
 		}
 	})
+
+	t.Run("race loser with unverified provider email never merges", func(t *testing.T) {
+		database, _, _, svc := setupServiceTest(t, nil)
+		ctx := context.Background()
+
+		winner := db.User{
+			ID:            uuid.New(),
+			Email:         "raced-unverified@example.com",
+			PasswordHash:  "hash",
+			EmailVerified: true,
+		}
+		if err := database.Create(&winner).Error; err != nil {
+			t.Fatalf("seed winner: %v", err)
+		}
+
+		info := &UserInfo{
+			ProviderUserID: "raced-unverified-subject",
+			Email:          "raced-unverified@example.com",
+			EmailVerified:  false,
+		}
+		_, _, _, err := svc.(*service).createUserAndLink(ctx, "facebook", info)
+		if !errors.Is(err, errors.ErrOAuthEmailUnverified) {
+			t.Fatalf("expected ErrOAuthEmailUnverified, got %v", err)
+		}
+		if n := countRows(t, database, &db.OAuthAccount{}); n != 0 {
+			t.Fatalf("oauth_accounts = %d; want 0 (no merge on an unverified claim)", n)
+		}
+	})
 }
 
 func TestService_SubjectCaseSensitivity(t *testing.T) {
@@ -1752,5 +1785,89 @@ func TestHandleCallbackActiveSessionUntrustedTenant(t *testing.T) {
 		if n := countRows(t, database, &db.OAuthAccount{}); n != 0 {
 			t.Fatalf("oauth_accounts = %d; want 0", n)
 		}
+	})
+}
+
+// TestFacebookFirstSignup drives the real Facebook adapter through the linking
+// engine: the Graph email decides whether a first-time signup can complete.
+func TestFacebookFirstSignup(t *testing.T) {
+	const appID = "fb-test-app"
+
+	graph := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/oauth/access_token":
+			if err := r.ParseForm(); err != nil {
+				http.Error(w, "bad form", http.StatusBadRequest)
+				return
+			}
+			fmt.Fprintf(w, `{"access_token":%q,"token_type":"bearer"}`, "token-"+r.PostFormValue("code"))
+		case "/debug_token":
+			if err := r.ParseForm(); err != nil {
+				http.Error(w, "bad form", http.StatusBadRequest)
+				return
+			}
+			if r.PostFormValue("input_token") == "" {
+				http.Error(w, "missing input_token", http.StatusBadRequest)
+				return
+			}
+			fmt.Fprintf(w, `{"data":{"app_id":%q,"is_valid":true}}`, appID)
+		case "/me":
+			switch strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ") {
+			case "token-code-with-email":
+				fmt.Fprint(w, `{"id":"fb-1001","name":"Alice","email":"alice@fb-test.com"}`)
+			case "token-code-without-email":
+				fmt.Fprint(w, `{"id":"fb-1002","name":"Bob"}`)
+			default:
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+			}
+		default:
+			http.Error(w, "not found", http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(graph.Close)
+
+	newService := func(t *testing.T) (*gorm.DB, *config.Config, Service) {
+		t.Helper()
+		database := serviceTestDB(t)
+		cfg := serviceTestConfig()
+		p := NewFacebookProvider(config.FacebookConfig{
+			AppID:        appID,
+			AppSecret:    "fb-test-secret",
+			RedirectURI:  "https://example.com/callback",
+			GraphVersion: "v19.0",
+		})
+		p.tokenURL = graph.URL + "/oauth/access_token"
+		p.debugURL = graph.URL + "/debug_token"
+		p.userInfoURL = graph.URL + "/me"
+		return database, cfg, NewService(database, session.NewService(database, cfg),
+			map[string]Provider{"facebook": p}, cfg)
+	}
+
+	t.Run("first signup with a Graph email succeeds", func(t *testing.T) {
+		database, cfg, svc := newService(t)
+		state, cookie := mustInitiate(t, svc, cfg, "facebook")
+		rec, req := callbackRequest(state, cookie)
+		sess, _, _, err := svc.HandleCallback(req.Context(), rec, req, "facebook", "code-with-email", state, db.SessionTypeCookie)
+		if err != nil {
+			t.Fatalf("HandleCallback = %v; want first-time facebook signup", err)
+		}
+		var user db.User
+		if err := database.Where("id = ?", sess.UserID).First(&user).Error; err != nil {
+			t.Fatalf("load user: %v", err)
+		}
+		if user.Email != "alice@fb-test.com" || !user.EmailVerified {
+			t.Fatalf("user email=%q verified=%v; want alice@fb-test.com/true", user.Email, user.EmailVerified)
+		}
+		requireIdentityRows(t, database, 1, 1, 1)
+	})
+
+	t.Run("first signup without a Graph email is rejected", func(t *testing.T) {
+		database, cfg, svc := newService(t)
+		state, cookie := mustInitiate(t, svc, cfg, "facebook")
+		rec, req := callbackRequest(state, cookie)
+		_, _, _, err := svc.HandleCallback(req.Context(), rec, req, "facebook", "code-without-email", state, db.SessionTypeCookie)
+		requireCode(t, err, errors.CodeOAuthEmailRequired, http.StatusBadRequest)
+		requireIdentityRows(t, database, 0, 0, 0)
 	})
 }

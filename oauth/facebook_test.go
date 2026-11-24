@@ -381,7 +381,15 @@ func TestFacebookProvider_FetchUserInfo(t *testing.T) {
 	})
 	p.userInfoURL = ts.URL
 
-	t.Run("full profile email stays unverified", func(t *testing.T) {
+	pClosed := NewFacebookProvider(config.FacebookConfig{
+		AppID:        "fb-test-app",
+		AppSecret:    "fb-test-secret",
+		RedirectURI:  "https://myapp.com/callback",
+		GraphVersion: "v19.0",
+	}, FacebookFailClosedEmailVerification())
+	pClosed.userInfoURL = ts.URL
+
+	t.Run("full profile email reports verified by default", func(t *testing.T) {
 		tok := &OAuthToken{AccessToken: "token-full-profile"}
 		user, err := p.FetchUserInfo(context.Background(), tok)
 		if err != nil {
@@ -400,14 +408,27 @@ func TestFacebookProvider_FetchUserInfo(t *testing.T) {
 		if user.Email != "alice@fb-test.com" {
 			t.Errorf("Email = %q; want alice@fb-test.com", user.Email)
 		}
-		// Graph exposes no per-address verification signal: a present
-		// address must never imply verified.
-		if user.EmailVerified {
-			t.Errorf("EmailVerified = true; want false for facebook email")
+		// Graph exposes the primary address only when the email permission is
+		// granted and the address is confirmed, so the default trusts it.
+		if !user.EmailVerified {
+			t.Error("EmailVerified = false; want true for a Graph-returned address")
 		}
 		expectedAvatar := "https://platform-lookaside.fbsbx.com/profile.jpg"
 		if user.AvatarURL != expectedAvatar {
 			t.Errorf("AvatarURL = %q; want %q", user.AvatarURL, expectedAvatar)
+		}
+	})
+
+	t.Run("fail-closed option reports a present email as unverified", func(t *testing.T) {
+		user, err := pClosed.FetchUserInfo(context.Background(), &OAuthToken{AccessToken: "token-full-profile"})
+		if err != nil {
+			t.Fatalf("FetchUserInfo failed: %v", err)
+		}
+		if user.Email != "alice@fb-test.com" {
+			t.Errorf("Email = %q; want the address kept for display", user.Email)
+		}
+		if user.EmailVerified {
+			t.Error("EmailVerified = true; want false under fail-closed trust")
 		}
 	})
 

@@ -478,15 +478,28 @@ var errOAuthProviderIdentityInvalid = errors.New(errors.CodeOAuthProviderError, 
 // writes: users.email, oauth_accounts.email and oauth_accounts.provider_user_id.
 const providerFieldMaxLen = 255
 
-// validateProviderIdentity gates the no-link paths, which are the only ones that
-// resolve a local account by email. Order is load-bearing: an unverified
-// identity reports OAUTH_EMAIL_UNVERIFIED before any field-validity rejection.
+// validateProviderIdentity gates the account-merge paths, which are the only
+// ones allowed to resolve an existing local account by email: an address the
+// provider did not verify must never resolve to or attach to an existing
+// account. Fresh registration uses validateProviderIdentityFields instead; the
+// takeover risk is binding an unverified address to an owner, not creating a
+// new account for it. Order is load-bearing: an unverified identity reports
+// OAUTH_EMAIL_UNVERIFIED before any field-validity rejection.
 func validateProviderIdentity(info *UserInfo) error {
 	if strings.TrimSpace(info.Email) == "" {
 		return errors.ErrOAuthEmailRequired
 	}
 	if !info.EmailVerified {
 		return errors.ErrOAuthEmailUnverified
+	}
+	return validateProviderIdentityFields(info)
+}
+
+// validateProviderIdentityFields rejects identity fields that cannot be stored,
+// shared by the merge and fresh-registration paths.
+func validateProviderIdentityFields(info *UserInfo) error {
+	if strings.TrimSpace(info.Email) == "" {
+		return errors.ErrOAuthEmailRequired
 	}
 	if info.ProviderUserID == "" || len(info.ProviderUserID) > providerFieldMaxLen {
 		return errOAuthProviderIdentityInvalid
@@ -603,12 +616,16 @@ func (s *service) relinkExisting(ctx context.Context, providerID, providerUserID
 }
 
 // linkRacedUser converges after losing a concurrent user-create race: re-read
-// the winner by normalized email, keep the pre-hijack gate, then link. The 409
-// is permanent by design: it mirrors password signup, which refuses an
-// already-registered email instead of taking it over, and no verification-mail
-// or takeover flow exists here, so the address stays blocked until the squatted
-// row is removed out of band.
+// the winner by normalized email, keep the pre-hijack gate, then link. An
+// unverified provider claim never merges into the winner. The 409 is permanent
+// by design: it mirrors password signup, which refuses an already-registered
+// email instead of taking it over, and no verification-mail or takeover flow
+// exists here, so the address stays blocked until the squatted row is removed
+// out of band.
 func (s *service) linkRacedUser(ctx context.Context, providerID string, info *UserInfo) (db.User, bool, bool, error) {
+	if !info.EmailVerified {
+		return db.User{}, false, false, errors.ErrOAuthEmailUnverified
+	}
 	existing, err := s.findUserByEmail(ctx, info.Email)
 	if err != nil {
 		return db.User{}, false, false, errors.New(errors.CodeInternalError, "failed to query user", err)
@@ -633,7 +650,7 @@ func (s *service) createUserAndLink(ctx context.Context, providerID string, info
 		ID:            uuid.New(),
 		Email:         info.Email,
 		PasswordHash:  "",
-		EmailVerified: true,
+		EmailVerified: info.EmailVerified,
 	}
 	userConflict, linkConflict := false, false
 	op := "failed to create oauth user"
@@ -728,14 +745,20 @@ func (s *service) linkOrCreate(ctx context.Context, providerID string, info *Use
 		return user, linked, false, nil
 	}
 
-	// 4. Validate provider identity for unauthenticated registration (requires verified email)
-	if gerr := validateProviderIdentity(info); gerr != nil {
+	// 4. Validate the identity fields for unauthenticated registration. A
+	// present-but-unverified address may register: binding it to an existing
+	// account (step 5) is the takeover risk, not creating its own account.
+	if gerr := validateProviderIdentityFields(info); gerr != nil {
 		return db.User{}, false, false, gerr
 	}
 
-	// 5. Existing local user check by verified email
+	// 5. Existing local user check by email. Merging stays fail-closed: an
+	// unverified provider claim never resolves to or attaches to an owner.
 	existing, err := s.findUserByEmail(ctx, info.Email)
 	if err == nil {
+		if !info.EmailVerified {
+			return db.User{}, false, false, errors.ErrOAuthEmailUnverified
+		}
 		// Pre-hijacking defense: never link onto an unverified local account.
 		if !existing.EmailVerified {
 			return db.User{}, false, false, errors.ErrOAuthAccountLinkConflict

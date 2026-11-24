@@ -18,18 +18,29 @@ import (
 
 // FacebookProvider implements OAuth 2.0 authentication for Meta Facebook Graph API v19.0+.
 type FacebookProvider struct {
-	cfg         config.FacebookConfig
-	client      *http.Client
-	authURL     string
-	tokenURL    string
-	debugURL    string
-	userInfoURL string
+	cfg             config.FacebookConfig
+	client          *http.Client
+	authURL         string
+	tokenURL        string
+	debugURL        string
+	userInfoURL     string
+	trustGraphEmail bool
 }
 
 var _ Provider = (*FacebookProvider)(nil)
 
+// FacebookOption customizes the Facebook adapter at construction.
+type FacebookOption func(*FacebookProvider)
+
+// FacebookFailClosedEmailVerification stops trusting the Graph email field: a
+// returned address then reports EmailVerified=false, which keeps the identity
+// on the registration/returning-login path and out of existing-account merges.
+func FacebookFailClosedEmailVerification() FacebookOption {
+	return func(p *FacebookProvider) { p.trustGraphEmail = false }
+}
+
 // NewFacebookProvider constructs a new Facebook Graph API provider adapter.
-func NewFacebookProvider(cfg config.FacebookConfig) *FacebookProvider {
+func NewFacebookProvider(cfg config.FacebookConfig, opts ...FacebookOption) *FacebookProvider {
 	version := cfg.GraphVersion
 	if version == "" {
 		version = "v19.0"
@@ -38,14 +49,21 @@ func NewFacebookProvider(cfg config.FacebookConfig) *FacebookProvider {
 		cfg.Scopes = []string{"email", "public_profile"}
 	}
 
-	return &FacebookProvider{
-		cfg:         cfg,
-		client:      newHTTPClient(),
-		authURL:     fmt.Sprintf("https://www.facebook.com/%s/dialog/oauth", version),
-		tokenURL:    fmt.Sprintf("https://graph.facebook.com/%s/oauth/access_token", version),
-		debugURL:    "https://graph.facebook.com/debug_token",
-		userInfoURL: fmt.Sprintf("https://graph.facebook.com/%s/me", version),
+	p := &FacebookProvider{
+		cfg:             cfg,
+		client:          newHTTPClient(),
+		authURL:         fmt.Sprintf("https://www.facebook.com/%s/dialog/oauth", version),
+		tokenURL:        fmt.Sprintf("https://graph.facebook.com/%s/oauth/access_token", version),
+		debugURL:        "https://graph.facebook.com/debug_token",
+		userInfoURL:     fmt.Sprintf("https://graph.facebook.com/%s/me", version),
+		trustGraphEmail: true,
 	}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(p)
+		}
+	}
+	return p
 }
 
 // ID returns the canonical provider slug.
@@ -195,10 +213,11 @@ func (p *FacebookProvider) FetchUserInfo(ctx context.Context, tokens *OAuthToken
 	email, _ := raw["email"].(string)
 	email = strings.TrimSpace(email)
 
-	// Facebook Graph API omits email if unverified or unregistered and
-	// exposes no per-address verification signal, so a present address
-	// proves nothing: fail closed and never treat it as verified.
-	emailVerified := false
+	// Graph only returns a primary address confirmed on the account when the
+	// email permission is granted, so a present address is the provider's
+	// ownership assertion. Operators who cannot rely on that opt out with
+	// FacebookFailClosedEmailVerification.
+	emailVerified := p.trustGraphEmail && email != ""
 
 	var avatarURL string
 	if picMap, ok := raw["picture"].(map[string]any); ok {
