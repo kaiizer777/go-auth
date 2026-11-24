@@ -15,6 +15,7 @@ import (
 
 	"github.com/kaiizer777/go-auth/config"
 	"github.com/kaiizer777/go-auth/db"
+	gormstore "github.com/kaiizer777/go-auth/db/gorm"
 	"github.com/kaiizer777/go-auth/errors"
 	"github.com/kaiizer777/go-auth/oauth"
 	"github.com/kaiizer777/go-auth/ratelimit"
@@ -181,6 +182,42 @@ func TestOAuthInitiateRoute(t *testing.T) {
 		if !strings.Contains(loc, "https://provider.example/auth") {
 			t.Fatalf("alias Location = %q", loc)
 		}
+	})
+
+	t.Run("non-canonical casing dispatches", func(t *testing.T) {
+		_, h := oauthTestEnv(t, &oauth.UserInfo{ProviderID: "google", ProviderUserID: "s", Email: "a@b.c", EmailVerified: true})
+		state, cookies, _ := driveInitiate(t, h, "/auth/oauth/GOOGLE")
+		req := httptest.NewRequest(http.MethodGet, "/auth/oauth/GOOGLE/callback?code=c&state="+state, nil)
+		req.AddCookie(stateCookie(t, cookies))
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusFound {
+			t.Fatalf("callback with non-canonical casing: status = %d; want 302 (%s)", rec.Code, rec.Body.String())
+		}
+	})
+
+	t.Run("attached provider map dispatches", func(t *testing.T) {
+		cfg := oauthTestConfig()
+		database := setupTestDB(t)
+		custom := &stubOAuthProvider{id: "custom-map", info: &oauth.UserInfo{
+			ProviderID: "custom-map", ProviderUserID: "map-sub", Email: "map@example.com", EmailVerified: true}}
+		providers := map[string]oauth.Provider{"custom-map": custom}
+		oauthSvc := oauth.NewService(database, session.NewService(database, &cfg), providers, &cfg)
+		h := New(database, cfg, nil, WithOAuthService(oauthSvc, providers))
+		driveInitiate(t, h, "/auth/oauth/custom-map")
+	})
+
+	t.Run("attached registry dispatches dynamic providers", func(t *testing.T) {
+		cfg := oauthTestConfig()
+		database := setupTestDB(t)
+		reg := oauth.NewRegistry()
+		if err := reg.Register(&stubOAuthProvider{id: "custom-idp", info: &oauth.UserInfo{
+			ProviderID: "custom-idp", ProviderUserID: "reg-sub", Email: "reg@example.com", EmailVerified: true}}); err != nil {
+			t.Fatalf("register provider: %v", err)
+		}
+		oauthSvc := oauth.NewServiceWithRegistry(gormstore.New(database), session.NewService(database, &cfg), reg, &cfg)
+		h := New(database, cfg, nil, WithOAuthRegistry(oauthSvc, reg))
+		driveInitiate(t, h, "/auth/oauth/custom-idp")
 	})
 
 	t.Run("unknown provider 404s", func(t *testing.T) {

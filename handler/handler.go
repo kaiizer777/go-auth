@@ -30,6 +30,8 @@ type Handler struct {
 	authSvc         auth.Service
 	sessionSvc      session.Service
 	oauthSvc        oauth.Service
+	oauthProviders  map[string]oauth.Provider
+	oauthRegistry   oauth.Registry
 	sessHandler     *SessionHandler
 	loginLimiter    *ratelimit.Limiter
 	signupLimiter   *ratelimit.Limiter
@@ -66,21 +68,22 @@ func WithSessionHandler(sh *SessionHandler) Option {
 	}
 }
 
-// WithOAuthService attaches the OAuth linking service. providers is retained
-// for source compatibility; the service resolves providers from its registry.
-func WithOAuthService(svc oauth.Service, _ map[string]oauth.Provider) Option {
-	return withOAuthService(svc)
-}
-
-// WithOAuthRegistry attaches the OAuth linking service. registry is retained
-// for source compatibility; the handler dispatches through the service.
-func WithOAuthRegistry(svc oauth.Service, _ oauth.Registry) Option {
-	return withOAuthService(svc)
-}
-
-func withOAuthService(svc oauth.Service) Option {
+// WithOAuthService attaches the OAuth linking service. providers widens the
+// handler's provider gate: a slug reachable only through that map is no longer
+// rejected as unknown before the service sees it.
+func WithOAuthService(svc oauth.Service, providers map[string]oauth.Provider) Option {
 	return func(h *Handler) {
 		h.oauthSvc = svc
+		h.oauthProviders = providers
+	}
+}
+
+// WithOAuthRegistry attaches the OAuth linking service and the registry that
+// resolves dynamic providers, so the handler's gate accepts them.
+func WithOAuthRegistry(svc oauth.Service, registry oauth.Registry) Option {
+	return func(h *Handler) {
+		h.oauthSvc = svc
+		h.oauthRegistry = registry
 	}
 }
 
