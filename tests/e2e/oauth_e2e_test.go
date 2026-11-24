@@ -71,6 +71,7 @@ func setupOAuthE2EStack(t *testing.T) (http.Handler, *gorm.DB, *oauth.Registry, 
 	if err != nil {
 		t.Fatalf("sql db: %v", err)
 	}
+	t.Cleanup(func() { _ = sqlDB.Close() })
 	sqlDB.SetMaxOpenConns(1)
 	if err := database.Exec("PRAGMA foreign_keys = ON;").Error; err != nil {
 		t.Fatalf("enable foreign_keys: %v", err)
@@ -232,10 +233,11 @@ func facebookEndpoints(idp *oauthmock.FacebookIdP) oauth.EndpointOverride {
 func TestE2E_FullBrowserOAuthJourneys(t *testing.T) {
 	t.Parallel()
 
-	// Every journey registers a production adapter pointed at a loopback IdP
-	// (tests/oauthmock), so authorize -> callback -> exchange -> identity ->
-	// link -> session runs through the real adapter. A failure here is an
-	// adapter regression, not fixture drift.
+	// Journeys 1-6 and 8-13 register a production adapter pointed at a loopback
+	// IdP (tests/oauthmock), so authorize -> callback -> exchange -> identity ->
+	// link -> session runs through the real adapter; a failure there is an
+	// adapter regression, not fixture drift. Journey 7 drives the store directly
+	// and covers the delete cascade, not an adapter.
 
 	// 1. Journey 1: Microsoft Enterprise Login
 	t.Run("journey 1: microsoft enterprise login", func(t *testing.T) {
@@ -264,8 +266,8 @@ func TestE2E_FullBrowserOAuthJourneys(t *testing.T) {
 		}
 
 		// Fails if the adapter stops verifying the id_token signature, keys
-		// the identity on oid instead of sub, or trusts the attestation for
-		// this tenant.
+		// the identity on oid instead of sub, or stops inheriting verification
+		// from the admitted tenant.
 		info := probeIdentity(t, provider)
 		if info.ProviderUserID != "ms-user-sub-1" {
 			t.Fatalf("adapter ProviderUserID = %q; want %q", info.ProviderUserID, "ms-user-sub-1")
@@ -624,8 +626,7 @@ func TestE2E_FullBrowserOAuthJourneys(t *testing.T) {
 		idp.OID = "ms-attacker-oid-666"
 		idp.Subject = "ms-attacker-sub-666"
 		idp.Email = "victim@example.com"
-		idp.EDov = "1" // domain attestation must not override the allowlist
-
+		idp.AttestDomain() // domain attestation must not override the allowlist
 		provider := oauth.NewMicrosoftProvider(config.MicrosoftConfig{
 			ClientID:       idp.ClientID,
 			ClientSecret:   idp.ClientSecret,
@@ -733,6 +734,372 @@ func TestE2E_FullBrowserOAuthJourneys(t *testing.T) {
 		}
 		if err := dbConn.Model(&db.Session{}).Where("user_id = ?", u.ID).Count(&count).Error; err != nil || count != 0 {
 			t.Fatalf("expected 0 session rows after cascade delete, got count=%d, err=%v", count, err)
+		}
+	})
+
+	// 8. Journey 8: a Microsoft tenant the allowlist admits but whose token
+	// carries no domain attestation
+	t.Run("journey 8: microsoft admitted tenant without attestation", func(t *testing.T) {
+		h, dbConn, pReg, cfg := setupOAuthE2EStack(t)
+
+		const tenant = "66666666-6666-6666-6666-666666666666"
+		idp, err := oauthmock.NewMicrosoftIdP()
+		if err != nil {
+			t.Fatalf("NewMicrosoftIdP: %v", err)
+		}
+		defer idp.Close()
+		idp.TenantID = tenant
+		idp.OID = "ms-unattested-oid-8"
+		idp.Subject = "ms-unattested-sub-8"
+		idp.Email = "squatted-ms@example.com"
+
+		// The authority stays "common" while the allowlist admits this tenant,
+		// so admission is real and attestation is absent: exactly the pair the
+		// nOauth gate has to keep apart.
+		provider := oauth.NewMicrosoftProvider(config.MicrosoftConfig{
+			ClientID:       idp.ClientID,
+			ClientSecret:   idp.ClientSecret,
+			RedirectURI:    cfg.BaseURL + "/auth/oauth/microsoft/callback",
+			TrustedTenants: []string{tenant},
+		}, oauth.WithEndpoints(microsoftEndpoints(idp)))
+		if err := (*pReg).Register(provider); err != nil {
+			t.Fatalf("register microsoft adapter: %v", err)
+		}
+
+		// Fails if tenant admission is reported as address attestation.
+		info := probeIdentity(t, provider)
+		if info.EmailVerified {
+			t.Fatal("an admitted tenant must not attest the address without xms_edov")
+		}
+		if untrusted, _ := info.RawClaims["untrusted_tenant"].(bool); untrusted {
+			t.Fatal("the allowlisted tenant must be admitted")
+		}
+
+		owner := db.User{
+			ID:            uuid.New(),
+			Email:         "squatted-ms@example.com",
+			PasswordHash:  "squat-password-hash",
+			EmailVerified: true,
+		}
+		if err := dbConn.Create(&owner).Error; err != nil {
+			t.Fatalf("seed owner: %v", err)
+		}
+
+		authorizeURL, cookies := initiateOAuth(t, h, "microsoft", "")
+		cbRec := callbackOAuth(t, h, authorizeAtIdP(t, authorizeURL), cookies...)
+		if cbRec.Code != http.StatusBadRequest {
+			t.Fatalf("unattested merge callback = %d (%s); want 400", cbRec.Code, cbRec.Body.String())
+		}
+		assertErrorCode(t, cbRec, "OAUTH_EMAIL_UNVERIFIED")
+		var linkCount int64
+		if err := dbConn.Model(&db.OAuthAccount{}).Where("user_id = ?", owner.ID).Count(&linkCount).Error; err != nil || linkCount != 0 {
+			t.Fatalf("expected no link on the squatted account, got count=%d err=%v", linkCount, err)
+		}
+
+		// Login still succeeds on an address nobody owns: an admitted but
+		// unattested tenant registers unverified rather than failing.
+		idp.Email = "fresh-ms@example.com"
+		freshAuthorizeURL, freshCookies := initiateOAuth(t, h, "microsoft", "")
+		freshRec := callbackOAuth(t, h, authorizeAtIdP(t, freshAuthorizeURL), freshCookies...)
+		if freshRec.Code != http.StatusFound {
+			t.Fatalf("unattested registration = %d (%s); want 302", freshRec.Code, freshRec.Body.String())
+		}
+		if responseCookie(t, freshRec, cfg.SessionCookieName) == nil {
+			t.Fatal("expected a session cookie for the unattested registration")
+		}
+		var fresh db.User
+		if err := dbConn.Where("email = ?", "fresh-ms@example.com").First(&fresh).Error; err != nil {
+			t.Fatalf("load unattested user: %v", err)
+		}
+		if fresh.EmailVerified {
+			t.Fatal("an unattested login must not verify the address")
+		}
+		var link db.OAuthAccount
+		if err := dbConn.Where("provider_id = ? AND user_id = ?", "microsoft", fresh.ID).First(&link).Error; err != nil {
+			t.Fatalf("load unattested link: %v", err)
+		}
+		if link.Verified {
+			t.Fatal("an unattested login must persist a verified=false link")
+		}
+	})
+
+	// 9. Journey 9: Microsoft token without id_token, identity from /userinfo
+	t.Run("journey 9: microsoft userinfo-only identity", func(t *testing.T) {
+		h, dbConn, pReg, cfg := setupOAuthE2EStack(t)
+
+		idp, err := oauthmock.NewMicrosoftIdP()
+		if err != nil {
+			t.Fatalf("NewMicrosoftIdP: %v", err)
+		}
+		defer idp.Close()
+		idp.OmitIDToken = true
+		idp.Subject = "ms-userinfo-sub-9"
+		idp.OID = "ms-userinfo-oid-9"
+		idp.Email = "userinfo-only@example.com"
+
+		// /oidc/userinfo carries neither tid nor a signed issuer, so only an
+		// unscoped authority can serve it; no allowlist here on purpose.
+		provider := oauth.NewMicrosoftProvider(config.MicrosoftConfig{
+			ClientID:     idp.ClientID,
+			ClientSecret: idp.ClientSecret,
+			RedirectURI:  cfg.BaseURL + "/auth/oauth/microsoft/callback",
+		}, oauth.WithEndpoints(microsoftEndpoints(idp)))
+		if err := (*pReg).Register(provider); err != nil {
+			t.Fatalf("register microsoft adapter: %v", err)
+		}
+
+		// Fails if the fallback keys on oid (the payload never carries one) or
+		// reports the unsigned address as attested.
+		info := probeIdentity(t, provider)
+		if info.ProviderUserID != "ms-userinfo-sub-9" {
+			t.Fatalf("userinfo ProviderUserID = %q; want the sub %q", info.ProviderUserID, "ms-userinfo-sub-9")
+		}
+		if info.EmailVerified {
+			t.Fatal("userinfo alone cannot attest nOauth domain ownership")
+		}
+
+		authorizeURL, cookies := initiateOAuth(t, h, "microsoft", "")
+		cbRec := callbackOAuth(t, h, authorizeAtIdP(t, authorizeURL), cookies...)
+		if cbRec.Code != http.StatusFound {
+			t.Fatalf("userinfo-only callback = %d (%s); want 302", cbRec.Code, cbRec.Body.String())
+		}
+		if responseCookie(t, cbRec, cfg.SessionCookieName) == nil {
+			t.Fatal("expected a session cookie for the userinfo-only login")
+		}
+		var user db.User
+		if err := dbConn.Where("email = ?", "userinfo-only@example.com").First(&user).Error; err != nil {
+			t.Fatalf("load userinfo-only user: %v", err)
+		}
+		if user.EmailVerified {
+			t.Fatal("userinfo-only login must not verify the address")
+		}
+		var link db.OAuthAccount
+		if err := dbConn.Where("provider_id = ? AND user_id = ?", "microsoft", user.ID).First(&link).Error; err != nil {
+			t.Fatalf("load userinfo-only link: %v", err)
+		}
+		if link.ProviderUserID != "ms-userinfo-sub-9" {
+			t.Fatalf("link provider_user_id = %q; want the sub %q", link.ProviderUserID, "ms-userinfo-sub-9")
+		}
+	})
+
+	// 10. Journey 10: the same missing id_token under a tenant-scoped deployment
+	t.Run("journey 10: microsoft userinfo-only fails closed when tenant scoped", func(t *testing.T) {
+		h, dbConn, pReg, cfg := setupOAuthE2EStack(t)
+
+		const tenant = "77777777-7777-7777-7777-777777777777"
+		idp, err := oauthmock.NewMicrosoftIdP()
+		if err != nil {
+			t.Fatalf("NewMicrosoftIdP: %v", err)
+		}
+		defer idp.Close()
+		idp.OmitIDToken = true
+		idp.TenantID = tenant
+		idp.Email = "scoped-userinfo@example.com"
+
+		provider := oauth.NewMicrosoftProvider(config.MicrosoftConfig{
+			ClientID:       idp.ClientID,
+			ClientSecret:   idp.ClientSecret,
+			RedirectURI:    cfg.BaseURL + "/auth/oauth/microsoft/callback",
+			TrustedTenants: []string{tenant},
+		}, oauth.WithEndpoints(microsoftEndpoints(idp)))
+		if err := (*pReg).Register(provider); err != nil {
+			t.Fatalf("register microsoft adapter: %v", err)
+		}
+
+		// Fails if the adapter starts trusting an unsigned /userinfo payload
+		// under a deployment that restricts tenants. The envelope masks the
+		// CodeInvalidConfig detail to INTERNAL_ERROR, so the 500 plus the zero
+		// rows below are the observable fail-closed signal.
+		authorizeURL, cookies := initiateOAuth(t, h, "microsoft", "")
+		cbRec := callbackOAuth(t, h, authorizeAtIdP(t, authorizeURL), cookies...)
+		if cbRec.Code != http.StatusInternalServerError {
+			t.Fatalf("tenant-scoped userinfo-only callback = %d (%s); want 500", cbRec.Code, cbRec.Body.String())
+		}
+		assertErrorCode(t, cbRec, "INTERNAL_ERROR")
+
+		var userCount, linkCount int64
+		if err := dbConn.Model(&db.User{}).Count(&userCount).Error; err != nil || userCount != 0 {
+			t.Fatalf("expected no user for the rejected userinfo login, got count=%d err=%v", userCount, err)
+		}
+		if err := dbConn.Model(&db.OAuthAccount{}).Count(&linkCount).Error; err != nil || linkCount != 0 {
+			t.Fatalf("expected no link for the rejected userinfo login, got count=%d err=%v", linkCount, err)
+		}
+	})
+
+	// 11. Journey 11: /debug_token verdicts that do not name this app
+	t.Run("journey 11: facebook confused deputy token rejected", func(t *testing.T) {
+		for _, tc := range []struct {
+			name  string
+			debug oauthmock.DebugToken
+		}{
+			{name: "foreign app_id", debug: oauthmock.DebugToken{AppID: "fb-someone-elses-app", IsValid: true}},
+			{name: "invalid token", debug: oauthmock.DebugToken{IsValid: false}},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				h, dbConn, pReg, cfg := setupOAuthE2EStack(t)
+
+				idp := oauthmock.NewFacebookIdP()
+				defer idp.Close()
+				idp.Email = "confused-deputy@example.com"
+				idp.Debug = tc.debug
+
+				provider := oauth.NewFacebookProvider(config.FacebookConfig{
+					AppID:       idp.AppID,
+					AppSecret:   idp.AppSecret,
+					RedirectURI: cfg.BaseURL + "/auth/oauth/facebook/callback",
+				}, oauth.FacebookEndpoints(facebookEndpoints(idp)))
+				if err := (*pReg).Register(provider); err != nil {
+					t.Fatalf("register facebook adapter: %v", err)
+				}
+
+				authorizeURL, cookies := initiateOAuth(t, h, "facebook", "")
+				cbRec := callbackOAuth(t, h, authorizeAtIdP(t, authorizeURL), cookies...)
+				if cbRec.Code != http.StatusBadGateway {
+					t.Fatalf("confused-deputy callback = %d (%s); want 502", cbRec.Code, cbRec.Body.String())
+				}
+				assertErrorCode(t, cbRec, "OAUTH_TOKEN_EXCHANGE_FAILED")
+
+				var userCount, linkCount int64
+				if err := dbConn.Model(&db.User{}).Count(&userCount).Error; err != nil || userCount != 0 {
+					t.Fatalf("expected no user, got count=%d err=%v", userCount, err)
+				}
+				if err := dbConn.Model(&db.OAuthAccount{}).Count(&linkCount).Error; err != nil || linkCount != 0 {
+					t.Fatalf("expected no link, got count=%d err=%v", linkCount, err)
+				}
+			})
+		}
+	})
+
+	// 12. Journey 12: Microsoft id_token rejections
+	t.Run("journey 12: microsoft invalid id_token rejected", func(t *testing.T) {
+		for _, tc := range []struct {
+			name       string
+			fault      oauthmock.IDTokenFault
+			wantStatus int
+			wantCode   string
+		}{
+			{name: "bad issuer", fault: oauthmock.FaultBadIssuer, wantStatus: http.StatusBadRequest, wantCode: "OAUTH_TENANT_INVALID"},
+			{name: "bad audience", fault: oauthmock.FaultBadAudience, wantStatus: http.StatusUnauthorized, wantCode: "OAUTH_ID_TOKEN_INVALID"},
+			{name: "bad signature", fault: oauthmock.FaultBadSignature, wantStatus: http.StatusUnauthorized, wantCode: "OAUTH_ID_TOKEN_INVALID"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				h, dbConn, pReg, cfg := setupOAuthE2EStack(t)
+
+				const tenant = "88888888-8888-8888-8888-888888888888"
+				idp, err := oauthmock.NewMicrosoftIdP()
+				if err != nil {
+					t.Fatalf("NewMicrosoftIdP: %v", err)
+				}
+				defer idp.Close()
+				idp.TenantID = tenant
+				idp.Email = "bad-token@example.com"
+				idp.Fault = tc.fault
+
+				provider := oauth.NewMicrosoftProvider(config.MicrosoftConfig{
+					ClientID:       idp.ClientID,
+					ClientSecret:   idp.ClientSecret,
+					RedirectURI:    cfg.BaseURL + "/auth/oauth/microsoft/callback",
+					Tenant:         tenant,
+					TrustedTenants: []string{tenant},
+				}, oauth.WithEndpoints(microsoftEndpoints(idp)))
+				if err := (*pReg).Register(provider); err != nil {
+					t.Fatalf("register microsoft adapter: %v", err)
+				}
+
+				authorizeURL, cookies := initiateOAuth(t, h, "microsoft", "")
+				cbRec := callbackOAuth(t, h, authorizeAtIdP(t, authorizeURL), cookies...)
+				if cbRec.Code != tc.wantStatus {
+					t.Fatalf("%s callback = %d (%s); want %d", tc.name, cbRec.Code, cbRec.Body.String(), tc.wantStatus)
+				}
+				assertErrorCode(t, cbRec, tc.wantCode)
+
+				var userCount, linkCount int64
+				if err := dbConn.Model(&db.User{}).Count(&userCount).Error; err != nil || userCount != 0 {
+					t.Fatalf("expected no user, got count=%d err=%v", userCount, err)
+				}
+				if err := dbConn.Model(&db.OAuthAccount{}).Count(&linkCount).Error; err != nil || linkCount != 0 {
+					t.Fatalf("expected no link, got count=%d err=%v", linkCount, err)
+				}
+			})
+		}
+	})
+
+	// 13. Journey 13: an unverified link survives repeated logins until a
+	// password signup claims the address
+	t.Run("journey 13: unverified link is severed by a password signup", func(t *testing.T) {
+		h, dbConn, pReg, cfg := setupOAuthE2EStack(t)
+		cfg.DisableAsyncEmailDispatch = true
+
+		const addr = "pending-fb@example.com"
+		idp := oauthmock.NewFacebookIdP()
+		defer idp.Close()
+		idp.UserID = "fb-pending-uid-13"
+		idp.Email = addr
+
+		provider := oauth.NewFacebookProvider(config.FacebookConfig{
+			AppID:       idp.AppID,
+			AppSecret:   idp.AppSecret,
+			RedirectURI: cfg.BaseURL + "/auth/oauth/facebook/callback",
+		}, oauth.FacebookEndpoints(facebookEndpoints(idp)))
+		if err := (*pReg).Register(provider); err != nil {
+			t.Fatalf("register facebook adapter: %v", err)
+		}
+
+		login := func() *httptest.ResponseRecorder {
+			authorizeURL, cookies := initiateOAuth(t, h, "facebook", "")
+			return callbackOAuth(t, h, authorizeAtIdP(t, authorizeURL), cookies...)
+		}
+
+		// Fails if the unverified link stops signing in its owner while the
+		// account still holds no proven credential.
+		for i := 1; i <= 2; i++ {
+			rec := login()
+			if rec.Code != http.StatusFound {
+				t.Fatalf("unverified login %d = %d (%s); want 302", i, rec.Code, rec.Body.String())
+			}
+			if responseCookie(t, rec, cfg.SessionCookieName) == nil {
+				t.Fatalf("unverified login %d set no session cookie", i)
+			}
+		}
+
+		var user db.User
+		if err := dbConn.Where("email = ?", addr).First(&user).Error; err != nil {
+			t.Fatalf("load unverified owner: %v", err)
+		}
+		if user.EmailVerified {
+			t.Fatal("an unverified provider address must not verify the account")
+		}
+
+		// Fails if the takeover rule is dropped: the signup binds a password to
+		// the pending row, so the unverified link must never sign in again.
+		authSvc, err := auth.New(cfg, dbConn, cfg.EmailHooks)
+		if err != nil {
+			t.Fatalf("auth.New: %v", err)
+		}
+		if _, _, err := authSvc.Signup(context.Background(), db.SignupRequest{Email: addr, Password: "CorrectHorseBattery9!"}); err != nil {
+			t.Fatalf("password signup: %v", err)
+		}
+
+		rec := login()
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("login through a spent unverified link = %d (%s); want 400", rec.Code, rec.Body.String())
+		}
+		assertErrorCode(t, rec, "OAUTH_EMAIL_UNVERIFIED")
+
+		var linkCount int64
+		if err := dbConn.Model(&db.OAuthAccount{}).Where("user_id = ?", user.ID).Count(&linkCount).Error; err != nil || linkCount != 0 {
+			t.Fatalf("expected the spent link to be deleted, got count=%d err=%v", linkCount, err)
+		}
+		var sessCount int64
+		if err := dbConn.Model(&db.Session{}).Where("user_id = ?", user.ID).Count(&sessCount).Error; err != nil || sessCount != 0 {
+			t.Fatalf("expected no live session after the rejected login, got count=%d err=%v", sessCount, err)
+		}
+		var claimed db.User
+		if err := dbConn.Where("id = ?", user.ID).First(&claimed).Error; err != nil {
+			t.Fatalf("reload claimed user: %v", err)
+		}
+		if claimed.PasswordHash == "" {
+			t.Fatal("password signup did not bind a password to the pending row")
 		}
 	})
 }
