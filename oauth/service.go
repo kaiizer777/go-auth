@@ -227,9 +227,15 @@ func (s *service) InitiateFlow(w http.ResponseWriter, r *http.Request, providerI
 	if err != nil {
 		return "", err
 	}
-	nonce, err := GenerateNonce()
-	if err != nil {
-		return "", err
+	// Only an OIDC provider checks an ID-token nonce at callback; storing one
+	// for a plain Provider would persist an unread value for the whole state TTL.
+	_, isOIDC := p.(OIDCProvider)
+	nonce := ""
+	if isOIDC {
+		nonce, err = GenerateNonce()
+		if err != nil {
+			return "", err
+		}
 	}
 	redirect := ""
 	logCtx := context.Background()
@@ -257,7 +263,7 @@ func (s *service) InitiateFlow(w http.ResponseWriter, r *http.Request, providerI
 		"ip", ip,
 		"user_agent", ua,
 	)
-	if _, ok := p.(OIDCProvider); ok {
+	if isOIDC {
 		return oidcAuthURL(p, state, pkce.Challenge, nonce)
 	}
 	return p.AuthURL(state, pkce.Challenge), nil

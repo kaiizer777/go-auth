@@ -1113,6 +1113,28 @@ func TestExplicitLinkRequiresClaimedOwner(t *testing.T) {
 	})
 }
 
+// TestInitiateFlowSkipsNonceForNonOIDC pins that a nonce is minted only for
+// providers that can verify an ID token: a plain Provider has no nonce channel
+// and never checks one at callback.
+func TestInitiateFlowSkipsNonceForNonOIDC(t *testing.T) {
+	database := serviceTestDB(t)
+	cfg := serviceTestConfig()
+	stub := &stubProvider{id: "google", info: verifiedInfo()}
+	svc := NewService(database, session.NewService(database, cfg), map[string]Provider{"google": stub}, cfg)
+
+	state, cookie := mustInitiate(t, svc, cfg, "google")
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/auth/oauth/google/callback", nil)
+	req.AddCookie(cookie)
+	payload, err := ValidateState(rec, req, cfg, "google", state)
+	if err != nil {
+		t.Fatalf("ValidateState = %v", err)
+	}
+	if payload.Nonce != "" {
+		t.Fatalf("state nonce = %q for a non-OIDC provider; want empty", payload.Nonce)
+	}
+}
+
 // failingGetByIDStore swaps the user store so GetByID can fail like a dead DB link.
 type failingGetByIDStore struct {
 	db.Store
