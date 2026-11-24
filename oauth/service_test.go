@@ -22,6 +22,7 @@ import (
 
 	"github.com/kaiizer777/go-auth/config"
 	"github.com/kaiizer777/go-auth/db"
+	gormstore "github.com/kaiizer777/go-auth/db/gorm"
 	"github.com/kaiizer777/go-auth/errors"
 	"github.com/kaiizer777/go-auth/session"
 )
@@ -1870,4 +1871,55 @@ func TestFacebookFirstSignup(t *testing.T) {
 		requireCode(t, err, errors.CodeOAuthEmailRequired, http.StatusBadRequest)
 		requireIdentityRows(t, database, 0, 0, 0)
 	})
+}
+
+// TestProviderLookupCanonicalSlug pins the dynamic registry path: a registered
+// provider must resolve under any casing, and the canonical slug is what reaches
+// the store.
+func TestProviderLookupCanonicalSlug(t *testing.T) {
+	database := serviceTestDB(t)
+	cfg := serviceTestConfig()
+	info := &UserInfo{ProviderID: "custom-idp", ProviderUserID: "custom-sub-1",
+		Email: "custom@example.com", EmailVerified: true}
+	reg := NewRegistry()
+	if err := reg.Register(&stubProvider{id: "custom-idp", info: info}); err != nil {
+		t.Fatalf("register dynamic provider: %v", err)
+	}
+	svc := NewServiceWithRegistry(gormstore.New(database), session.NewService(database, cfg), reg, cfg)
+	inner := svc.(*service)
+
+	p, err := inner.providerFor("  Custom-IDP ")
+	if err != nil || p == nil || p.ID() != "custom-idp" {
+		t.Fatalf("providerFor(non-canonical) = %v, err = %v; want custom-idp", p, err)
+	}
+
+	_, err = inner.providerFor("missing")
+	requireCode(t, err, errors.CodeOAuthProviderNotFound, http.StatusNotFound)
+
+	state, cookie := mustInitiate(t, svc, cfg, "Custom-IDP")
+	rec, req := callbackRequest(state, cookie)
+	sess, _, _, err := svc.HandleCallback(req.Context(), rec, req, "Custom-IDP", "code-1", state, db.SessionTypeCookie)
+	if err != nil {
+		t.Fatalf("HandleCallback(non-canonical) = %v", err)
+	}
+
+	var link db.OAuthAccount
+	if err := database.Where("provider_user_id = ?", "custom-sub-1").First(&link).Error; err != nil {
+		t.Fatalf("load link: %v", err)
+	}
+	if link.ProviderID != "custom-idp" {
+		t.Fatalf("stored provider_id = %q; want canonical custom-idp", link.ProviderID)
+	}
+
+	// A later login through the canonical slug must resolve the same identity.
+	state, cookie = mustInitiate(t, svc, cfg, "custom-idp")
+	rec, req = callbackRequest(state, cookie)
+	again, _, _, err := svc.HandleCallback(req.Context(), rec, req, "custom-idp", "code-1", state, db.SessionTypeCookie)
+	if err != nil {
+		t.Fatalf("HandleCallback(canonical) = %v", err)
+	}
+	if again.UserID != sess.UserID || link.UserID != sess.UserID {
+		t.Fatalf("second login user = %v; want %v", again.UserID, sess.UserID)
+	}
+	requireIdentityRows(t, database, 1, 1, 2)
 }
