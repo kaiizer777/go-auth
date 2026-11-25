@@ -245,8 +245,8 @@ func TestMigrations_DownRefusedOnSeededDB(t *testing.T) {
 	if _, err := sqlDB2.Exec(`DELETE FROM users WHERE email = 'down-rollback@example.com'`); err != nil {
 		t.Fatalf("failed to remove seed row: %v", err)
 	}
-	if verr, ddirty, verr2 := m2.Version(); verr2 != nil || verr != 9 || ddirty {
-		t.Fatalf("expected version 9 clean after re-up, got version=%d dirty=%v err=%v", verr, ddirty, verr2)
+	if verr, ddirty, verr2 := m2.Version(); verr2 != nil || verr != 10 || ddirty {
+		t.Fatalf("expected version 10 clean after re-up, got version=%d dirty=%v err=%v", verr, ddirty, verr2)
 	}
 }
 
@@ -543,6 +543,86 @@ func TestMigration000009_UpAndDown(t *testing.T) {
 	if _, err := sqlDB.Exec(`DELETE FROM users WHERE email LIKE 'legacy-%@example.com'`); err != nil {
 		t.Fatalf("failed to remove seed users: %v", err)
 	}
+	if err := m.Up(); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("restoring head failed: %v", err)
+	}
+}
+
+// TestMigration000010_UpAndDown pins the Microsoft duplicate link deduplication contract.
+func TestMigration000010_UpAndDown(t *testing.T) {
+	dbURL := resolveDatabaseURL()
+	testDB, err := sql.Open("pgx", dbURL)
+	if err != nil {
+		if os.Getenv("CI") != "" {
+			t.Fatalf("CI: failed to open postgres connection: %v", err)
+		}
+		t.Skipf("Postgres not available, skipping: %v", err)
+	}
+	pingCtx, pingCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer pingCancel()
+	if err := testDB.PingContext(pingCtx); err != nil {
+		_ = testDB.Close()
+		if os.Getenv("CI") != "" {
+			t.Fatalf("CI: PostgreSQL connection failed: %v", err)
+		}
+		t.Skipf("Postgres not available, skipping: %v", err)
+	}
+	_ = testDB.Close()
+
+	m, sqlDB := newMigrator(t, dbURL)
+	defer func() {
+		_, _ = m.Close()
+		_ = sqlDB.Close()
+	}()
+
+	if err := m.Migrate(9); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("m.Migrate(9) failed: %v", err)
+	}
+
+	var userID string
+	if err := sqlDB.QueryRow(`INSERT INTO users (email, password_hash, credential_version, email_verified) VALUES
+		('ms-dedup@example.com', 'hash', 1, true) RETURNING id`).Scan(&userID); err != nil {
+		t.Fatalf("failed to seed user: %v", err)
+	}
+
+	if _, err := sqlDB.Exec(`INSERT INTO oauth_accounts (user_id, provider_id, provider_user_id, email, verified, created_at) VALUES
+		($1, 'microsoft', 'ms-old-oid', 'ms-dedup@example.com', true, '2026-01-01 00:00:00Z'),
+		($1, 'microsoft', 'ms-new-sub', 'ms-dedup@example.com', true, '2026-02-01 00:00:00Z')`, userID); err != nil {
+		t.Fatalf("failed to seed microsoft duplicate links: %v", err)
+	}
+
+	if err := m.Steps(1); err != nil {
+		t.Fatalf("000010 up migration failed: %v", err)
+	}
+
+	var remainingLinks int
+	if err := sqlDB.QueryRow(`SELECT COUNT(*) FROM oauth_accounts WHERE user_id = $1 AND provider_id = 'microsoft'`, userID).Scan(&remainingLinks); err != nil {
+		t.Fatalf("failed to count remaining links: %v", err)
+	}
+	if remainingLinks != 1 {
+		t.Fatalf("expected 1 remaining link after 000010 deduplication, got %d", remainingLinks)
+	}
+
+	var keptSub string
+	if err := sqlDB.QueryRow(`SELECT provider_user_id FROM oauth_accounts WHERE user_id = $1 AND provider_id = 'microsoft'`, userID).Scan(&keptSub); err != nil {
+		t.Fatalf("failed to read retained link: %v", err)
+	}
+	if keptSub != "ms-new-sub" {
+		t.Fatalf("expected newer link 'ms-new-sub' retained, got %s", keptSub)
+	}
+
+	// 000010 down is a no-op
+	if err := m.Steps(-1); err != nil {
+		t.Fatalf("000010 down migration failed: %v", err)
+	}
+
+	if _, err := sqlDB.Exec(`DELETE FROM oauth_accounts WHERE user_id = $1`, userID); err != nil {
+		t.Fatalf("failed to cleanup links: %v", err)
+	}
+	if _, err := sqlDB.Exec(`DELETE FROM users WHERE id = $1`, userID); err != nil {
+		t.Fatalf("failed to cleanup user: %v", err)
+	}
+
 	if err := m.Up(); err != nil && err != migrate.ErrNoChange {
 		t.Fatalf("restoring head failed: %v", err)
 	}
