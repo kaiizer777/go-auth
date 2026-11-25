@@ -212,19 +212,24 @@ func Connect(cfg config.Config) (*MongoStore, error) {
 	dbName := cfg.MongoDB.Database
 	database := client.Database(dbName)
 
-	idxCtx, idxCancel := context.WithTimeout(context.Background(), connectTimeout)
-	defer idxCancel()
-	if err := EnsureIndexes(idxCtx, database); err != nil {
-		_ = client.Disconnect(context.Background())
-		return nil, errors.Wrap(err, errors.CodeDatabaseError, "failed to provision mongodb indexes")
+	initOp := func(fn func(context.Context, *mongo.Database) error, opName string) error {
+		ctx, cancel := context.WithTimeout(context.Background(), connectTimeout)
+		defer cancel()
+		if err := fn(ctx, database); err != nil {
+			_ = client.Disconnect(context.Background())
+			return errors.Wrap(err, errors.CodeDatabaseError, opName)
+		}
+		return nil
 	}
-	if err := BackfillOAuthAccountVerified(idxCtx, database); err != nil {
-		_ = client.Disconnect(context.Background())
-		return nil, errors.Wrap(err, errors.CodeDatabaseError, "failed to backfill oauth account verification")
+
+	if err := initOp(EnsureIndexes, "failed to provision mongodb indexes"); err != nil {
+		return nil, err
 	}
-	if err := BackfillMicrosoftOIDLinks(idxCtx, database); err != nil {
-		_ = client.Disconnect(context.Background())
-		return nil, errors.Wrap(err, errors.CodeDatabaseError, "failed to backfill microsoft oid links")
+	if err := initOp(BackfillOAuthAccountVerified, "failed to backfill oauth account verification"); err != nil {
+		return nil, err
+	}
+	if err := initOp(BackfillMicrosoftOIDLinks, "failed to backfill microsoft oid links"); err != nil {
+		return nil, err
 	}
 
 	return New(client, database, cfg.MongoDB.AllowNonTransactionalMongo), nil

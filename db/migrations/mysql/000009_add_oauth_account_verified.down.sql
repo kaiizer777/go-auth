@@ -5,4 +5,4 @@
 -- unproven, and is deleted once the owner proves it (email verification or
 -- password reset). Attested links on verified accounts come back through the
 -- backfill unchanged.
-ALTER TABLE oauth_accounts DROP COLUMN verified;
+ALTER TABLE oauth_accounts DROP COLUMN IF EXISTS verified;

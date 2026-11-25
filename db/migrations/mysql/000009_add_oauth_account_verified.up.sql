@@ -25,7 +25,7 @@
 -- column present but every row still 0. Recovery: do NOT re-run the ALTER.
 -- Inspect oauth_accounts.verified, run the UPDATE above by hand, then force
 -- version 9 (migrate force 9) so the migrator stops retrying the ALTER.
-ALTER TABLE oauth_accounts ADD COLUMN verified TINYINT(1) NOT NULL DEFAULT 0;
+ALTER TABLE oauth_accounts ADD COLUMN IF NOT EXISTS verified TINYINT(1) NOT NULL DEFAULT 0;
 
 UPDATE oauth_accounts SET verified = 1
 WHERE EXISTS (

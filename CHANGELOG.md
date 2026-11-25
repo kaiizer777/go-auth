@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Breaking Changes
+
+- `OAuthAccountStore.DeleteByUserID(ctx context.Context, userID uuid.UUID) error` was added to the `OAuthAccountStore` interface. External or custom implementations of `OAuthAccountStore` must implement this method to support account deletion and unverified link purges.
+
 ### Added
 
 - `oauth_accounts.verified` records whether the provider attested the linked

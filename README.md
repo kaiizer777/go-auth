@@ -36,6 +36,13 @@ go-auth/
 1. **Zero Logic in Root**: The project root only contains `goauth.go`, serving as the clean public entry point. This eliminates package circular dependencies and prevents the root package from becoming an unmaintainable catch-all.
 2. **Modular Subpackages**: Callers can import specific subsystems or plug custom implementations (e.g. custom database adapters or rate limiters) adhering to cleanly separated interfaces.
 
+### Store Interfaces & Custom Adapters
+
+`go-auth` exposes interfaces in `db/store.go` (`UserStore`, `SessionStore`, `OAuthAccountStore`, `VerificationTokenStore`, `PasswordResetTokenStore`, `TotpStore`).
+
+> [!NOTE]
+> **Breaking Change:** `OAuthAccountStore` includes `DeleteByUserID(ctx context.Context, userID uuid.UUID) error`. Custom `OAuthAccountStore` implementations must implement this method for atomic link revocation.
+
 ---
 
 ## Installation

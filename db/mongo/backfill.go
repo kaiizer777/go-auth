@@ -179,11 +179,12 @@ func BackfillMicrosoftOIDLinks(ctx context.Context, database *mongo.Database) er
 	pipeline := mongo.Pipeline{
 		{{Key: "$match", Value: bson.M{"provider_id": "microsoft"}}},
 		{{Key: "$sort", Value: bson.D{
+			{Key: "verified", Value: -1},
 			{Key: "created_at", Value: -1},
 			{Key: "_id", Value: -1},
 		}}},
 		{{Key: "$group", Value: bson.M{
-			"_id":   "$user_id",
+			"_id":   "$provider_user_id",
 			"count": bson.M{"$sum": 1},
 			"docs":  bson.M{"$push": "$_id"},
 		}}},
@@ -199,13 +200,20 @@ func BackfillMicrosoftOIDLinks(ctx context.Context, database *mongo.Database) er
 	deleted := int64(0)
 	for cursor.Next(ctx) {
 		var res struct {
-			Docs []string `bson:"docs"`
+			ProviderUserID string   `bson:"_id"`
+			Docs           []string `bson:"docs"`
 		}
 		if derr := cursor.Decode(&res); derr != nil {
 			return derr
 		}
 		if len(res.Docs) > 1 {
-			toDelete = append(toDelete, res.Docs[1:]...)
+			for _, docID := range res.Docs[1:] {
+				slog.InfoContext(ctx, "microsoft_duplicate_link_deleted",
+					"_id", docID,
+					"provider_user_id", res.ProviderUserID,
+				)
+				toDelete = append(toDelete, docID)
+			}
 		}
 		if len(toDelete) >= 1000 {
 			dres, derr := links.DeleteMany(ctx, bson.M{"_id": bson.M{"$in": toDelete}})
