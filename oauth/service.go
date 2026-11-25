@@ -789,7 +789,11 @@ func (s *service) mergeOrConverge(ctx context.Context, providerID string, existi
 			}
 			if !found && providerID == "microsoft" && info.RawClaims != nil {
 				if oid, _ := info.RawClaims["oid"].(string); oid != "" && oid != info.ProviderUserID {
-					if legacyLink, legacyFound, lerr := s.findLink(ctx, providerID, oid); lerr == nil && legacyFound {
+					legacyLink, legacyFound, lerr := s.findLink(ctx, providerID, oid)
+					if lerr != nil {
+						return db.User{}, false, false, errors.New(errors.CodeInternalError, "failed to query oauth account", lerr)
+					}
+					if legacyFound {
 						link = legacyLink
 						found = true
 						if uerr := s.store.OAuthAccounts().UpdateProviderUserID(ctx, link.ID, info.ProviderUserID); uerr != nil {

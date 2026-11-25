@@ -79,6 +79,7 @@ func NewFacebookProvider(cfg config.FacebookConfig, opts ...FacebookOption) *Fac
 			opt(&fo)
 		}
 	}
+	assertsVerifiedEmail := fo.assertsVerifiedEmail || cfg.AssertEmailVerified
 	return &FacebookProvider{
 		cfg:                  cfg,
 		client:               newHTTPClient(),
@@ -86,7 +87,7 @@ func NewFacebookProvider(cfg config.FacebookConfig, opts ...FacebookOption) *Fac
 		tokenURL:             fo.endpoints.TokenURL,
 		userInfoURL:          fo.endpoints.UserInfoURL,
 		debugURL:             fo.endpoints.DebugURL,
-		assertsVerifiedEmail: fo.assertsVerifiedEmail,
+		assertsVerifiedEmail: assertsVerifiedEmail,
 	}
 }
 

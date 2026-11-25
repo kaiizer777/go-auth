@@ -170,6 +170,13 @@ func (p *MicrosoftProvider) resolveDomain(ctx context.Context, domain string) (s
 	p.resolveMu.Unlock()
 
 	v, err, _ := p.resolveFlight.Do(domain, func() (any, error) {
+		p.resolveMu.Lock()
+		if guid, ok := p.resolvedGUIDs[domain]; ok {
+			p.resolveMu.Unlock()
+			return guid, nil
+		}
+		p.resolveMu.Unlock()
+
 		// Detach from the triggering request so a canceled login does not fail
 		// the logins that joined this flight; the bound still caps the lookup.
 		lookupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), p.resolveTimeout)
@@ -223,8 +230,8 @@ func (p *MicrosoftProvider) fetchTenantGUID(ctx context.Context, domain string) 
 
 // tenantTrusted reports whether the allowlist accepts the verified tenant.
 // Entries may be GUIDs or domains; a domain entry is resolved to its GUID so
-// it matches the GUID the token actually carries. An empty allowlist keeps
-// multi-tenant mode.
+// it matches the GUID the token actually carries. An empty allowlist denies
+// all tenants (fail-closed).
 //
 // Entries are walked in sorted order, so the outcome never depends on map
 // iteration order. Only a domain entry can require discovery, and a resolution
@@ -234,7 +241,7 @@ func (p *MicrosoftProvider) fetchTenantGUID(ctx context.Context, domain string) 
 // than silently marking the tenant untrusted.
 func (p *MicrosoftProvider) tenantTrusted(ctx context.Context, tenantID, issuer string) (bool, error) {
 	if len(p.trustedTenants) == 0 {
-		return true, nil
+		return false, nil
 	}
 	ids := []string{normalizeTenant(tenantID), normalizeTenant(issuerTenant(issuer))}
 	matches := func(candidate string) bool {

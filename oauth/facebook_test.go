@@ -20,6 +20,25 @@ func (f failingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	return f(req)
 }
 
+func TestFacebookProvider_ConfigAssertEmailVerified(t *testing.T) {
+	t.Parallel()
+
+	pDefault := NewFacebookProvider(config.FacebookConfig{})
+	if pDefault.assertsVerifiedEmail {
+		t.Fatal("expected assertsVerifiedEmail to default to false")
+	}
+
+	pConfig := NewFacebookProvider(config.FacebookConfig{AssertEmailVerified: true})
+	if !pConfig.assertsVerifiedEmail {
+		t.Fatal("expected assertsVerifiedEmail to be true when configured in config")
+	}
+
+	pOption := NewFacebookProvider(config.FacebookConfig{}, FacebookAssertEmailVerified())
+	if !pOption.assertsVerifiedEmail {
+		t.Fatal("expected assertsVerifiedEmail to be true when configured via option")
+	}
+}
+
 func TestFacebookProvider_AuthCodeURL(t *testing.T) {
 	t.Parallel()
 

@@ -173,7 +173,6 @@ func (m *JWKSManager) resolveRefreshFailure(kid string, refreshErr error) (JWKSK
 		return key, nil
 	}
 	if fresh {
-		m.recordMiss(kid)
 		return JWKSKey{}, errUnknownKid(kid)
 	}
 	if ok && now.Before(expires.Add(jwksStaleGracePeriod)) {

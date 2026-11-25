@@ -342,10 +342,10 @@ func TestJWKSManager_RefreshFailureOnFreshSetStaysAuthError(t *testing.T) {
 
 	before := jwksRequests.Load()
 	if _, err := mgr.GetKey(ctx, "unknown-kid"); err == nil {
-		t.Fatal("expected auth failure for cached miss, got nil")
+		t.Fatal("expected auth failure for retry, got nil")
 	}
-	if got := jwksRequests.Load(); got != before {
-		t.Fatalf("recorded miss cost %d fetches, want 0", got-before)
+	if got := jwksRequests.Load(); got == before {
+		t.Fatalf("failed fetch must not record a negative cache miss, got %d fetches", got-before)
 	}
 }
 
@@ -733,7 +733,7 @@ func TestMicrosoftProvider(t *testing.T) {
 	})
 
 	t.Run("tenant admission and email attestation are independent", func(t *testing.T) {
-		pMulti := newTestProvider("common", nil)
+		pMulti := newTestProvider("common", []string{"untrusted-guid"})
 		pCommon := newTestProvider("common", []string{"trusted-partner-guid"})
 
 		// 1. Admitted tenant without xms_edov -> unverified identity, not untrusted.
@@ -754,7 +754,7 @@ func TestMicrosoftProvider(t *testing.T) {
 			t.Errorf("nOauth vulnerability: unattested address should have EmailVerified == false")
 		}
 		if cUntrusted.UntrustedTenant {
-			t.Errorf("tenant admitted by an empty allowlist must not be marked untrusted")
+			t.Errorf("tenant admitted by an allowlist must not be marked untrusted")
 		}
 
 		// 2. Attested address with xms_edov == '1' -> EmailVerified must be TRUE
@@ -1153,12 +1153,12 @@ func TestMicrosoftProvider_DomainOwnershipAttestation(t *testing.T) {
 		wantVerified  bool
 		wantUntrusted bool
 	}{
-		{name: "no allowlist string one", tenant: unlistedTenant, edov: "1", setEdov: true, wantVerified: true},
-		{name: "no allowlist string true", tenant: unlistedTenant, edov: "true", setEdov: true, wantVerified: true},
-		{name: "no allowlist bool true", tenant: unlistedTenant, edov: true, setEdov: true, wantVerified: true},
-		{name: "no allowlist string zero", tenant: unlistedTenant, edov: "0", setEdov: true},
-		{name: "no allowlist bool false", tenant: unlistedTenant, edov: false, setEdov: true},
-		{name: "no allowlist missing claim", tenant: unlistedTenant},
+		{name: "no allowlist string one", tenant: unlistedTenant, edov: "1", setEdov: true, wantVerified: true, wantUntrusted: true},
+		{name: "no allowlist string true", tenant: unlistedTenant, edov: "true", setEdov: true, wantVerified: true, wantUntrusted: true},
+		{name: "no allowlist bool true", tenant: unlistedTenant, edov: true, setEdov: true, wantVerified: true, wantUntrusted: true},
+		{name: "no allowlist string zero", tenant: unlistedTenant, edov: "0", setEdov: true, wantUntrusted: true},
+		{name: "no allowlist bool false", tenant: unlistedTenant, edov: false, setEdov: true, wantUntrusted: true},
+		{name: "no allowlist missing claim", tenant: unlistedTenant, wantUntrusted: true},
 		// The allowlist bounds tenant admission; domain attestation
 		// independently decides whether the email is verified.
 		{name: "allowlist listed tenant unattested", trusted: allowlist, tenant: listedTenant},
@@ -1303,7 +1303,7 @@ func TestMicrosoftProvider_TenantAllowlist(t *testing.T) {
 		wantTrusted  bool
 		wantVerified bool
 	}{
-		{name: "no allowlist accepts any tenant", tid: "tenant-a", wantTrusted: true, wantVerified: true},
+		{name: "no allowlist denies any tenant (fail-closed)", tid: "tenant-a", wantTrusted: false, wantVerified: true},
 		{name: "listed guid", trusted: []string{"tenant-a"}, tid: "tenant-a", wantTrusted: true, wantVerified: true},
 		{name: "listed guid uppercase entry", trusted: []string{"TENANT-A"}, tid: "tenant-a", wantTrusted: true, wantVerified: true},
 		{name: "listed guid uppercase tid", trusted: []string{"tenant-a"}, tid: "TENANT-A", wantTrusted: true, wantVerified: true},
@@ -1388,8 +1388,8 @@ func TestMicrosoftProvider_TenantIdentityResolution(t *testing.T) {
 		wantVerified  bool
 		wantUntrusted bool
 	}{
-		{name: "domain tenant succeeds", tenant: "contoso.onmicrosoft.com", tid: contosoTenantGUID, wantVerified: true},
-		{name: "guid tenant succeeds", tenant: contosoTenantGUID, tid: contosoTenantGUID, wantVerified: true},
+		{name: "domain tenant succeeds", tenant: "contoso.onmicrosoft.com", trusted: []string{"contoso.onmicrosoft.com"}, tid: contosoTenantGUID, wantVerified: true},
+		{name: "guid tenant succeeds", tenant: contosoTenantGUID, trusted: []string{contosoTenantGUID}, tid: contosoTenantGUID, wantVerified: true},
 		{name: "unlisted tenant rejected and marked", tenant: "common", trusted: []string{otherTenantGUID}, tid: contosoTenantGUID, wantVerified: true, wantUntrusted: true},
 		{name: "allowlist domain matches", tenant: "common", trusted: []string{"contoso.onmicrosoft.com"}, tid: contosoTenantGUID, wantVerified: true},
 		{name: "allowlist domain does not match", tenant: "common", trusted: []string{"contoso.onmicrosoft.com"}, tid: otherTenantGUID, wantVerified: true, wantUntrusted: true},
