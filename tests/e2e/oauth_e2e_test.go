@@ -1066,6 +1066,21 @@ func TestE2E_FullBrowserOAuthJourneys(t *testing.T) {
 		}
 		assertErrorCode(t, rec, "OAUTH_EMAIL_UNVERIFIED")
 
+		// Re-seed an unverified link to explicitly test that ResetPassword purges it.
+		if err := dbConn.Create(&db.OAuthAccount{
+			UserID:         user.ID,
+			ProviderID:     "facebook",
+			ProviderUserID: idp.UserID,
+			Email:          addr,
+			Verified:       false,
+		}).Error; err != nil {
+			t.Fatalf("seed unverified link before reset: %v", err)
+		}
+
+		if err := dbConn.Model(&db.OAuthAccount{}).Where("user_id = ?", user.ID).Count(&linkCount).Error; err != nil || linkCount != 1 {
+			t.Fatalf("expected 1 unverified link before password reset, got count=%d err=%v", linkCount, err)
+		}
+
 		// The reset token is delivered to the mailbox, so consuming it proves the
 		// address: the account is claimed and the unverified link is deleted.
 		resetToken, err := authSvc.RequestPasswordReset(context.Background(), db.PasswordResetRequest{Email: addr})
