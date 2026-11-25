@@ -114,15 +114,23 @@ func TestOAuthVerification_UnverifiedLinkSeveredByPasswordSignup(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("password signup: %v", err)
 	}
-	// A password signup over the pending row proves nothing: the request never
-	// demonstrated it reads the mailbox, and the same call is the squat. The
-	// link therefore keeps signing in until the address is proven.
-	if resp := login(); resp.StatusCode != http.StatusFound {
-		t.Fatalf("login after a password-only signup = %d; want 302", resp.StatusCode)
+	// An unverified link must not survive a password claim. Setting a password
+	// on the account atomically purges any unverified OAuth links on that account.
+	var linkCount int64
+	if err := database.Model(&db.OAuthAccount{}).Where("user_id = ?", user.ID).Count(&linkCount).Error; err != nil || linkCount != 0 {
+		t.Fatalf("expected the unverified link to be purged by password signup, got count=%d err=%v", linkCount, err)
+	}
+
+	resp := login()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("login after a password-only signup = %d; want 400", resp.StatusCode)
+	}
+	if code := responseErrorCode(t, resp); code != "OAUTH_EMAIL_UNVERIFIED" {
+		t.Fatalf("error code = %q; want OAUTH_EMAIL_UNVERIFIED", code)
 	}
 
 	// The reset token is delivered to the mailbox, so consuming it proves the
-	// address: the account is claimed and the unverified link is deleted.
+	// address: the account is claimed and email verified.
 	resetToken, err := authSvc.RequestPasswordReset(context.Background(), db.PasswordResetRequest{Email: "pending-pg@example.com"})
 	if err != nil {
 		t.Fatalf("RequestPasswordReset: %v", err)
@@ -133,12 +141,11 @@ func TestOAuthVerification_UnverifiedLinkSeveredByPasswordSignup(t *testing.T) {
 		t.Fatalf("ResetPassword: %v", err)
 	}
 
-	var linkCount int64
 	if err := database.Model(&db.OAuthAccount{}).Where("user_id = ?", user.ID).Count(&linkCount).Error; err != nil || linkCount != 0 {
-		t.Fatalf("expected the spent link to be deleted, got count=%d err=%v", linkCount, err)
+		t.Fatalf("expected link count to remain 0, got count=%d err=%v", linkCount, err)
 	}
 
-	resp := login()
+	resp = login()
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("login through a spent unverified link = %d; want 400", resp.StatusCode)
 	}
