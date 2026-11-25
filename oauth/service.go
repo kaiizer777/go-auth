@@ -713,8 +713,14 @@ func (s *service) resolveLinkedUser(ctx context.Context, providerID string, info
 		return db.User{}, db.OAuthAccount{}, false, nil
 	}
 	legacyLink, legacyFound, lerr := s.findLink(ctx, providerID, oid)
-	if lerr != nil || !legacyFound {
-		return db.User{}, db.OAuthAccount{}, legacyFound, lerr
+	if lerr != nil {
+		return db.User{}, db.OAuthAccount{}, false, lerr
+	}
+	if !legacyFound {
+		// Callback 1 may have migrated oid to sub concurrently between our
+		// primary linkedUser lookup and our findLink(oid) fallback. Retry
+		// linkedUser by sub before assuming the user is unlinked.
+		return s.linkedUser(ctx, providerID, info.ProviderUserID)
 	}
 	// Migrate the legacy link row's provider_user_id to the primary sub key.
 	if uerr := s.store.OAuthAccounts().UpdateProviderUserID(ctx, legacyLink.ID, info.ProviderUserID); uerr != nil {
@@ -734,9 +740,13 @@ func (s *service) resolveLinkedUser(ctx context.Context, providerID string, info
 // relinkExisting re-reads the link row that won a concurrent insert race and
 // loads its owner. Used when our insert hits the unique constraint.
 func (s *service) relinkExisting(ctx context.Context, providerID, providerUserID string) (db.User, bool, bool, error) {
-	user, _, found, err := s.linkedUser(ctx, providerID, providerUserID)
+	user, link, found, err := s.linkedUser(ctx, providerID, providerUserID)
 	if err != nil || !found {
 		return db.User{}, false, false, errors.New(errors.CodeInternalError, "failed to query oauth account", err)
+	}
+	if !link.Verified && link.Email != "" && isClaimedAccount(user) {
+		s.invalidateLink(ctx, link)
+		return db.User{}, false, false, errors.ErrOAuthEmailUnverified
 	}
 	return user, false, false, nil
 }
@@ -772,7 +782,7 @@ func (s *service) linkRacedUser(ctx context.Context, providerID string, info *Us
 // commit first.
 func (s *service) mergeOrConverge(ctx context.Context, providerID string, existing db.User, info *UserInfo) (db.User, bool, bool, error) {
 	if gerr := validateProviderIdentity(info); gerr != nil {
-		if errors.Is(gerr, errors.ErrOAuthEmailUnverified) && holdsNoCredential(existing) {
+		if errors.Is(gerr, errors.ErrOAuthEmailUnverified) && !isClaimedAccount(existing) {
 			link, found, err := s.findLink(ctx, providerID, info.ProviderUserID)
 			if err != nil {
 				return db.User{}, false, false, errors.New(errors.CodeInternalError, "failed to query oauth account", err)
@@ -782,7 +792,20 @@ func (s *service) mergeOrConverge(ctx context.Context, providerID string, existi
 					if legacyLink, legacyFound, lerr := s.findLink(ctx, providerID, oid); lerr == nil && legacyFound {
 						link = legacyLink
 						found = true
-						if uerr := s.store.OAuthAccounts().UpdateProviderUserID(ctx, link.ID, info.ProviderUserID); uerr == nil {
+						if uerr := s.store.OAuthAccounts().UpdateProviderUserID(ctx, link.ID, info.ProviderUserID); uerr != nil {
+							if isUniqueViolation(uerr) {
+								racedLink, rfound, rerr := s.findLink(ctx, providerID, info.ProviderUserID)
+								if rerr != nil {
+									return db.User{}, false, false, errors.New(errors.CodeInternalError, "failed to query oauth account", rerr)
+								}
+								if !rfound {
+									return db.User{}, false, false, errors.New(errors.CodeInternalError, "failed to update provider user id", uerr)
+								}
+								link = racedLink
+							} else {
+								return db.User{}, false, false, errors.New(errors.CodeInternalError, "failed to update provider user id", uerr)
+							}
+						} else {
 							link.ProviderUserID = info.ProviderUserID
 						}
 					}
@@ -817,15 +840,6 @@ func (s *service) mergeOrConverge(ctx context.Context, providerID string, existi
 // it must never authorize attaching a provider identity to that account.
 func isClaimedAccount(u db.User) bool {
 	return u.EmailVerified
-}
-
-// holdsNoCredential reports the weaker state an unverified provider claim may
-// converge on: no proven address and no password. It is deliberately stricter
-// than !isClaimedAccount, because converging mints a session on the existing row
-// instead of attaching a link, and a row that already carries a caller-set
-// password belongs to whoever set it.
-func holdsNoCredential(u db.User) bool {
-	return !u.EmailVerified && u.PasswordHash == ""
 }
 
 // invalidateLink deletes a spent unverified link. The delete is best-effort by

@@ -732,14 +732,45 @@ func TestUnverifiedSignupLinkProvenance(t *testing.T) {
 		if err := database.Create(&winnerLink).Error; err != nil {
 			t.Fatalf("seed winner link: %v", err)
 		}
-		got, _, created, err := rawSvc.(*service).linkOrCreate(context.Background(), "google", unverified(), "")
+		// Calling createUserAndLink exercises the losing create-race path:
+		// attempting to create the user fails on email uniqueness, invoking
+		// linkRacedUser and mergeOrConverge.
+		got, _, created, err := rawSvc.(*service).createUserAndLink(context.Background(), "google", unverified())
 		if err != nil {
-			t.Fatalf("linkOrCreate over a pending row = %v; want convergence", err)
+			t.Fatalf("createUserAndLink over a pending row = %v; want convergence", err)
 		}
 		if got.ID != pending.ID || created {
 			t.Fatalf("converged on %v (created=%v); want %v", got.ID, created, pending.ID)
 		}
 		requireIdentityRows(t, database, 1, 1, 0)
+	})
+
+	t.Run("relinkExisting invalidates unverified link on claimed account", func(t *testing.T) {
+		database, _, _, rawSvc := setupServiceTest(t, nil)
+		claimed := db.User{ID: uuid.New(), Email: "claimed@example.com", EmailVerified: true}
+		if err := database.Create(&claimed).Error; err != nil {
+			t.Fatalf("seed claimed user: %v", err)
+		}
+		unverifiedLink := db.OAuthAccount{
+			ID:             uuid.New(),
+			UserID:         claimed.ID,
+			ProviderID:     "google",
+			ProviderUserID: "sub-unverified-race",
+			Email:          "claimed@example.com",
+			Verified:       false,
+		}
+		if err := database.Create(&unverifiedLink).Error; err != nil {
+			t.Fatalf("seed unverified link: %v", err)
+		}
+		_, _, _, err := rawSvc.(*service).relinkExisting(context.Background(), "google", "sub-unverified-race")
+		if !errors.Is(err, errors.ErrOAuthEmailUnverified) {
+			t.Fatalf("relinkExisting on unverified link for claimed account = %v; want ErrOAuthEmailUnverified", err)
+		}
+		var count int64
+		database.Model(&db.OAuthAccount{}).Where("id = ?", unverifiedLink.ID).Count(&count)
+		if count != 0 {
+			t.Fatalf("expected unverified link to be deleted, got count = %d", count)
+		}
 	})
 
 	t.Run("unattested email cannot take over pending unclaimed account", func(t *testing.T) {
@@ -1316,7 +1347,7 @@ func TestHandleCallbackLinkConflictForeignOwner(t *testing.T) {
 		}
 	}
 	won := db.OAuthAccount{ID: uuid.New(), UserID: foreign.ID, ProviderID: "google",
-		ProviderUserID: "sub-conflict", Email: foreign.Email}
+		ProviderUserID: "sub-conflict", Email: foreign.Email, Verified: true}
 	if err := database.Create(&won).Error; err != nil {
 		t.Fatalf("seed link: %v", err)
 	}
@@ -1697,7 +1728,7 @@ func TestHandleCallbackAuditFlags(t *testing.T) {
 			t.Fatalf("seed user: %v", err)
 		}
 		link := db.OAuthAccount{ID: uuid.New(), UserID: owner.ID, ProviderID: "google",
-			ProviderUserID: "sub-123", Email: owner.Email}
+			ProviderUserID: "sub-123", Email: owner.Email, Verified: true}
 		if err := database.Create(&link).Error; err != nil {
 			t.Fatalf("seed link: %v", err)
 		}
