@@ -121,54 +121,61 @@ func (m *JWKSManager) GetKey(ctx context.Context, kid string) (JWKSKey, error) {
 		return key, nil
 	}
 	if !ok && neg && time.Now().Before(missExp) {
-		return JWKSKey{}, errors.New(errors.CodeOAuthIDTokenInvalid, fmt.Sprintf("signing key with kid %q not found in jwks", kid), nil)
+		return JWKSKey{}, errUnknownKid(kid)
 	}
 
 	// Singleflight deduplication across concurrent cache misses.
-	fetched, err := m.refreshFlight("jwks_refresh", kid, ctx)
-	if err != nil {
-		return m.staleOrError(kid, err)
+	if err := m.refreshFlight("jwks_refresh", kid, ctx); err != nil {
+		return m.resolveRefreshFailure(kid, err)
 	}
-	// A concurrent commit can supersede this fetch; committed material wins because
-	// generation only proves "someone committed later", not which document is newer.
+	// Only the committed document may authorize a kid. A superseded fetch is
+	// discarded even when it lists the kid: a later flight already published
+	// the current set, and a kid absent from it must not authenticate.
 	if key, ok := m.cachedKey(kid); ok {
-		m.clearMiss(kid)
-		return key, nil
-	}
-	// The superseded document still proves the provider served kid, so it covers
-	// kids the committed cache genuinely lacks.
-	if key, ok := fetched[kid]; ok {
 		m.clearMiss(kid)
 		return key, nil
 	}
 
-	// If missing after joiner flight, refresh under singleflight deduplication to avoid stampedes
-	fetched, err = m.refreshFlight("jwks_rollover_refresh", kid, ctx)
-	if err != nil {
-		return m.staleOrError(kid, err)
+	// The kid may have rotated in after this flight's fetch, so confirm against
+	// one rollover fetch before recording a miss.
+	if err := m.refreshFlight("jwks_rollover_refresh", kid, ctx); err != nil {
+		return m.resolveRefreshFailure(kid, err)
 	}
 	if key, ok := m.cachedKey(kid); ok {
-		m.clearMiss(kid)
-		return key, nil
-	}
-	if key, ok := fetched[kid]; ok {
 		m.clearMiss(kid)
 		return key, nil
 	}
 	m.recordMiss(kid)
-	return JWKSKey{}, errors.New(errors.CodeOAuthIDTokenInvalid, fmt.Sprintf("signing key with kid %q not found in jwks", kid), nil)
+	return JWKSKey{}, errUnknownKid(kid)
 }
 
-// staleOrError serves the last-known-good key while it is still inside the
-// stale grace period, so a transient JWKS outage degrades to older keys
-// instead of locking out every login. Beyond the grace period the refresh
-// error is returned.
-func (m *JWKSManager) staleOrError(kid string, refreshErr error) (JWKSKey, error) {
+// errUnknownKid is an authentication failure: the token names a kid the
+// provider's current signing set does not contain.
+func errUnknownKid(kid string) error {
+	return errors.New(errors.CodeOAuthIDTokenInvalid, fmt.Sprintf("signing key with kid %q not found in jwks", kid), nil)
+}
+
+// resolveRefreshFailure classifies a failed flight. The committed set decides the
+// outcome: a fresh set that lacks the kid is an auth failure, not a provider
+// outage, so only a stale set may surface the refresh error. A single RLock
+// snapshot coordinates the decision so concurrent refreshes or clock steps cannot
+// misclassify a 401 as a 502 (or vice-versa) across fragmented locks.
+func (m *JWKSManager) resolveRefreshFailure(kid string, refreshErr error) (JWKSKey, error) {
 	m.mu.RLock()
 	key, ok := m.keys[kid]
-	expired := m.expires
+	expires := m.expires
 	m.mu.RUnlock()
-	if ok && time.Now().Before(expired.Add(jwksStaleGracePeriod)) {
+
+	now := time.Now()
+	fresh := now.Before(expires)
+	if ok && fresh {
+		m.clearMiss(kid)
+		return key, nil
+	}
+	if fresh {
+		return JWKSKey{}, errUnknownKid(kid)
+	}
+	if ok && now.Before(expires.Add(jwksStaleGracePeriod)) {
 		return key, nil
 	}
 	return JWKSKey{}, refreshErr
@@ -209,14 +216,18 @@ func (m *JWKSManager) recordMiss(kid string) {
 func (m *JWKSManager) cachedKey(kid string) (JWKSKey, bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
+	// Call sites run after a refreshFlight, so a stale entry is not expected
+	// today; enforcing the bound keeps the freshness invariant local to the read.
+	if !time.Now().Before(m.expires) {
+		return JWKSKey{}, false
+	}
 	key, ok := m.keys[kid]
 	return key, ok
 }
 
 // refreshFlight runs one deduplicated refresh unless the key is already cached and fresh.
-// The fetched set is returned even when another flight committed first.
-func (m *JWKSManager) refreshFlight(name, kid string, ctx context.Context) (map[string]JWKSKey, error) {
-	v, err, _ := m.sf.Do(name, func() (any, error) {
+func (m *JWKSManager) refreshFlight(name, kid string, ctx context.Context) error {
+	_, err, _ := m.sf.Do(name, func() (any, error) {
 		m.mu.RLock()
 		_, ok := m.keys[kid]
 		fresh := time.Now().Before(m.expires)
@@ -224,16 +235,12 @@ func (m *JWKSManager) refreshFlight(name, kid string, ctx context.Context) (map[
 		if ok && fresh {
 			return nil, nil
 		}
-		return m.refresh(ctx)
+		return nil, m.refresh(ctx)
 	})
-	if err != nil {
-		return nil, err
-	}
-	fetched, _ := v.(map[string]JWKSKey)
-	return fetched, nil
+	return err
 }
 
-func (m *JWKSManager) refresh(ctx context.Context) (map[string]JWKSKey, error) {
+func (m *JWKSManager) refresh(ctx context.Context) error {
 	m.mu.RLock()
 	startGen := m.gen
 	m.mu.RUnlock()
@@ -243,24 +250,24 @@ func (m *JWKSManager) refresh(ctx context.Context) (map[string]JWKSKey, error) {
 
 	req, err := http.NewRequestWithContext(fetchCtx, http.MethodGet, m.jwksURL, nil)
 	if err != nil {
-		return nil, errors.New(errors.CodeOAuthProviderError, "oauth jwks request failed", err)
+		return errors.New(errors.CodeOAuthProviderError, "oauth jwks request failed", err)
 	}
 	req.Header.Set("Accept", "application/json")
 
 	resp, err := m.client.Do(req)
 	if err != nil {
-		return nil, errors.New(errors.CodeOAuthProviderError, "oauth jwks fetch failed", err)
+		return errors.New(errors.CodeOAuthProviderError, "oauth jwks fetch failed", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, oauthBodyLimit))
-		return nil, errors.New(errors.CodeOAuthProviderError, fmt.Sprintf("oauth provider jwks responded with status %d", resp.StatusCode), nil)
+		return errors.New(errors.CodeOAuthProviderError, fmt.Sprintf("oauth provider jwks responded with status %d", resp.StatusCode), nil)
 	}
 
 	var doc JWKDoc
 	if err := json.NewDecoder(io.LimitReader(resp.Body, oauthBodyLimit)).Decode(&doc); err != nil {
-		return nil, errors.New(errors.CodeOAuthProviderError, "oauth provider returned invalid jwks response", err)
+		return errors.New(errors.CodeOAuthProviderError, "oauth provider returned invalid jwks response", err)
 	}
 
 	parsedKeys := make(map[string]JWKSKey, len(doc.Keys))
@@ -278,7 +285,7 @@ func (m *JWKSManager) refresh(ctx context.Context) (map[string]JWKSKey, error) {
 	}
 
 	if len(parsedKeys) == 0 {
-		return nil, errors.New(errors.CodeOAuthProviderError, "oauth provider returned jwks with no valid rsa keys", nil)
+		return errors.New(errors.CodeOAuthProviderError, "oauth provider returned jwks with no valid rsa keys", nil)
 	}
 
 	m.mu.Lock()
@@ -294,7 +301,7 @@ func (m *JWKSManager) refresh(ctx context.Context) (map[string]JWKSKey, error) {
 			delete(m.misses, kid)
 		}
 	}
-	return parsedKeys, nil
+	return nil
 }
 
 // parseRSAPublicKey converts base64url-encoded modulus (n) and exponent (e) to *rsa.PublicKey.
@@ -320,6 +327,16 @@ func parseRSAPublicKey(nRaw, eRaw string) (*rsa.PublicKey, bool) {
 	return &rsa.PublicKey{N: n, E: int(e.Int64())}, true
 }
 
+// discoveryStatusError carries the upstream status so a caller can tell a
+// misconfigured authority (404) from a provider outage (5xx).
+type discoveryStatusError struct {
+	status int
+}
+
+func (e *discoveryStatusError) Error() string {
+	return fmt.Sprintf("oidc discovery endpoint responded with status %d", e.status)
+}
+
 // FetchOIDCDiscovery fetches and parses the OpenID Connect discovery document.
 func FetchOIDCDiscovery(ctx context.Context, client *http.Client, discoveryURL string) (*OIDCDiscovery, error) {
 	if client == nil {
@@ -342,7 +359,8 @@ func FetchOIDCDiscovery(ctx context.Context, client *http.Client, discoveryURL s
 
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, oauthBodyLimit))
-		return nil, errors.New(errors.CodeOAuthProviderError, fmt.Sprintf("oidc discovery endpoint responded with status %d", resp.StatusCode), nil)
+		return nil, errors.New(errors.CodeOAuthProviderError, "oidc discovery request failed",
+			&discoveryStatusError{status: resp.StatusCode})
 	}
 
 	var disc OIDCDiscovery
@@ -492,7 +510,7 @@ func verifyKeyIssuer(key JWKSKey, claims map[string]any) error {
 
 	iss, _ := claims["iss"].(string)
 	if iss != expected {
-		return errors.New(errors.CodeOAuthIDTokenInvalid, fmt.Sprintf("id_token issuer %q does not match signing key issuer %q", iss, expected), nil)
+		return issuerRejection(errors.CodeOAuthIDTokenInvalid, "id_token issuer does not match the signing key issuer", iss, expected)
 	}
 	return nil
 }

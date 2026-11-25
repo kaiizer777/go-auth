@@ -164,7 +164,8 @@ func isStandaloneTransactionError(err error) bool {
 }
 
 // Connect establishes a connection to MongoDB, validates connectivity via ping,
-// and idempotently provisions native indexes.
+// and idempotently provisions native indexes and the oauth_accounts.verified
+// data backfill.
 func Connect(cfg config.Config) (*MongoStore, error) {
 	opts := options.Client().ApplyURI(cfg.DatabaseURL)
 
@@ -211,11 +212,24 @@ func Connect(cfg config.Config) (*MongoStore, error) {
 	dbName := cfg.MongoDB.Database
 	database := client.Database(dbName)
 
-	idxCtx, idxCancel := context.WithTimeout(context.Background(), connectTimeout)
-	defer idxCancel()
-	if err := EnsureIndexes(idxCtx, database); err != nil {
-		_ = client.Disconnect(context.Background())
-		return nil, errors.Wrap(err, errors.CodeDatabaseError, "failed to provision mongodb indexes")
+	initOp := func(fn func(context.Context, *mongo.Database) error, opName string) error {
+		ctx, cancel := context.WithTimeout(context.Background(), connectTimeout)
+		defer cancel()
+		if err := fn(ctx, database); err != nil {
+			_ = client.Disconnect(context.Background())
+			return errors.Wrap(err, errors.CodeDatabaseError, opName)
+		}
+		return nil
+	}
+
+	if err := initOp(EnsureIndexes, "failed to provision mongodb indexes"); err != nil {
+		return nil, err
+	}
+	if err := initOp(BackfillOAuthAccountVerified, "failed to backfill oauth account verification"); err != nil {
+		return nil, err
+	}
+	if err := initOp(BackfillMicrosoftOIDLinks, "failed to backfill microsoft oid links"); err != nil {
+		return nil, err
 	}
 
 	return New(client, database, cfg.MongoDB.AllowNonTransactionalMongo), nil
@@ -697,6 +711,20 @@ func (s *oauthAccountStore) GetByUserID(ctx context.Context, userID uuid.UUID) (
 		accounts = append(accounts, docs[i].toDomain())
 	}
 	return accounts, nil
+}
+
+func (s *oauthAccountStore) UpdateProviderUserID(ctx context.Context, id uuid.UUID, providerUserID string) error {
+	res, err := s.collection().UpdateOne(s.store.resolveCtx(ctx),
+		bson.M{"_id": id.String()},
+		bson.M{"$set": bson.M{"provider_user_id": providerUserID, "updated_at": time.Now().UTC()}},
+	)
+	if err != nil {
+		return NormalizeMongoError(err)
+	}
+	if res.MatchedCount == 0 {
+		return gorm.ErrRecordNotFound
+	}
+	return nil
 }
 
 func (s *oauthAccountStore) Delete(ctx context.Context, id uuid.UUID) error {

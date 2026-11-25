@@ -245,8 +245,8 @@ func TestMigrations_DownRefusedOnSeededDB(t *testing.T) {
 	if _, err := sqlDB2.Exec(`DELETE FROM users WHERE email = 'down-rollback@example.com'`); err != nil {
 		t.Fatalf("failed to remove seed row: %v", err)
 	}
-	if verr, ddirty, verr2 := m2.Version(); verr2 != nil || verr != 8 || ddirty {
-		t.Fatalf("expected version 8 clean after re-up, got version=%d dirty=%v err=%v", verr, ddirty, verr2)
+	if verr, ddirty, verr2 := m2.Version(); verr2 != nil || verr != 10 || ddirty {
+		t.Fatalf("expected version 10 clean after re-up, got version=%d dirty=%v err=%v", verr, ddirty, verr2)
 	}
 }
 
@@ -276,9 +276,10 @@ func TestMigration000008_UpAndDown(t *testing.T) {
 		_ = sqlDB.Close()
 	}()
 
-	// Ensure migrated to latest (000008)
-	if err := m.Up(); err != nil && err != migrate.ErrNoChange {
-		t.Fatalf("m.Up() failed: %v", err)
+	// Pin to 000008: head is 000009, so a bare Up() would leave the totp-down
+	// assertion stepping down the wrong migration.
+	if err := m.Migrate(8); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("m.Migrate(8) failed: %v", err)
 	}
 
 	// 1. Verify tables exist
@@ -415,5 +416,228 @@ func TestMigration000008_DownRefusedOnSeededDB(t *testing.T) {
 	}
 	if _, err := sqlDB2.Exec(`DELETE FROM users WHERE email = 'totp-down-refusal@example.com'`); err != nil {
 		t.Fatalf("failed to remove seed user row: %v", err)
+	}
+}
+
+// TestMigration000009_UpAndDown pins the trust flag's migration contract: the
+// column backfills from the owning account's local verification so legacy users
+// keep signing in, while links whose owner was never locally verified stay
+// unverified. The down removes only the column, leaving every link row intact.
+func TestMigration000009_UpAndDown(t *testing.T) {
+	dbURL := resolveDatabaseURL()
+
+	testDB, err := sql.Open("pgx", dbURL)
+	if err != nil {
+		if os.Getenv("CI") != "" {
+			t.Fatalf("CI: failed to open postgres connection: %v", err)
+		}
+		t.Skipf("Postgres not available, skipping: %v", err)
+	}
+	pingCtx, pingCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer pingCancel()
+	if err := testDB.PingContext(pingCtx); err != nil {
+		_ = testDB.Close()
+		if os.Getenv("CI") != "" {
+			t.Fatalf("CI: PostgreSQL connection failed: %v", err)
+		}
+		t.Skipf("Postgres not available, skipping: %v", err)
+	}
+	_ = testDB.Close()
+
+	m, sqlDB := newMigrator(t, dbURL)
+	t.Cleanup(func() {
+		_, _ = m.Close()
+		_ = sqlDB.Close()
+	})
+
+	if err := m.Migrate(8); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("m.Migrate(8) failed: %v", err)
+	}
+
+	// A link created before 000009 carries no value for the flag. Three owners:
+	// a locally verified address, an unclaimed address, and a password-claimed
+	// address with no local verification.
+	if _, err := sqlDB.Exec(`INSERT INTO users (email, password_hash, credential_version, email_verified) VALUES
+		('legacy-trusted@example.com', 'hash', 1, true),
+		('legacy-untrusted@example.com', '', 1, false),
+		('legacy-password-only@example.com', 'hash', 1, false)`); err != nil {
+		t.Fatalf("failed to seed users: %v", err)
+	}
+	for sub, addr := range map[string]string{
+		"legacy-trusted-sub":       "legacy-trusted@example.com",
+		"legacy-untrusted-sub":     "legacy-untrusted@example.com",
+		"legacy-password-only-sub": "legacy-password-only@example.com",
+	} {
+		if _, err := sqlDB.Exec(`INSERT INTO oauth_accounts (user_id, provider_id, provider_user_id, email) SELECT id, 'google', $1, email FROM users WHERE email = $2`, sub, addr); err != nil {
+			t.Fatalf("failed to seed link %s: %v", sub, err)
+		}
+	}
+	t.Cleanup(func() {
+		_, _ = sqlDB.Exec(`DELETE FROM oauth_accounts WHERE provider_user_id IN ('legacy-trusted-sub', 'legacy-untrusted-sub', 'legacy-password-only-sub')`)
+		_, _ = sqlDB.Exec(`DELETE FROM users WHERE email IN ('legacy-trusted@example.com', 'legacy-untrusted@example.com', 'legacy-password-only@example.com')`)
+	})
+
+	if err := m.Steps(1); err != nil {
+		t.Fatalf("000009 up migration failed: %v", err)
+	}
+
+	var nullable bool
+	if err := sqlDB.QueryRow(`
+		SELECT is_nullable = 'YES'
+		FROM information_schema.columns
+		WHERE table_schema = 'public' AND table_name = 'oauth_accounts' AND column_name = 'verified'
+	`).Scan(&nullable); err != nil {
+		t.Fatalf("failed to inspect verified column: %v", err)
+	}
+	if nullable {
+		t.Fatal("oauth_accounts.verified must be NOT NULL")
+	}
+
+	requireLinkVerified := func(t *testing.T, sub string, want bool) {
+		t.Helper()
+		var verified bool
+		if err := sqlDB.QueryRow(`SELECT verified FROM oauth_accounts WHERE provider_user_id = $1`, sub).Scan(&verified); err != nil {
+			t.Fatalf("failed to read %s.verified: %v", sub, err)
+		}
+		if verified != want {
+			t.Fatalf("%s verified = %v; want %v", sub, verified, want)
+		}
+	}
+	// Trust survives only where the owner's address was verified locally.
+	requireLinkVerified(t, "legacy-trusted-sub", true)
+	requireLinkVerified(t, "legacy-untrusted-sub", false)
+	requireLinkVerified(t, "legacy-password-only-sub", false)
+
+	// A link the provider attested after 000009 on a password-claimed account is
+	// the data a down/up cycle cannot restore: the flag is re-derived from
+	// users.email_verified, which is false here.
+	if _, err := sqlDB.Exec(`UPDATE oauth_accounts SET verified = TRUE WHERE provider_user_id = 'legacy-password-only-sub'`); err != nil {
+		t.Fatalf("failed to attest link: %v", err)
+	}
+
+	if err := m.Steps(-1); err != nil {
+		t.Fatalf("000009 down migration failed: %v", err)
+	}
+	var hasColumn bool
+	if err := sqlDB.QueryRow(`
+		SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'oauth_accounts' AND column_name = 'verified')
+	`).Scan(&hasColumn); err != nil {
+		t.Fatalf("failed to inspect dropped column: %v", err)
+	}
+	if hasColumn {
+		t.Fatal("000009 down must drop the verified column")
+	}
+	var links int
+	if err := sqlDB.QueryRow(`SELECT COUNT(*) FROM oauth_accounts WHERE provider_user_id LIKE 'legacy-%-sub'`).Scan(&links); err != nil {
+		t.Fatalf("failed to count links after down: %v", err)
+	}
+	if links != 3 {
+		t.Fatalf("links after 000009 down = %d; want 3 (down drops the flag, not the links)", links)
+	}
+
+	if err := m.Steps(1); err != nil {
+		t.Fatalf("re-applying 000009 failed: %v", err)
+	}
+	requireLinkVerified(t, "legacy-trusted-sub", true)
+	requireLinkVerified(t, "legacy-password-only-sub", false)
+
+	if _, err := sqlDB.Exec(`DELETE FROM oauth_accounts WHERE provider_user_id LIKE 'legacy-%-sub'`); err != nil {
+		t.Fatalf("failed to remove seed links: %v", err)
+	}
+	if _, err := sqlDB.Exec(`DELETE FROM users WHERE email LIKE 'legacy-%@example.com'`); err != nil {
+		t.Fatalf("failed to remove seed users: %v", err)
+	}
+	if err := m.Up(); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("restoring head failed: %v", err)
+	}
+}
+
+// TestMigration000010_UpAndDown pins the Microsoft duplicate link deduplication contract.
+func TestMigration000010_UpAndDown(t *testing.T) {
+	dbURL := resolveDatabaseURL()
+	testDB, err := sql.Open("pgx", dbURL)
+	if err != nil {
+		if os.Getenv("CI") != "" {
+			t.Fatalf("CI: failed to open postgres connection: %v", err)
+		}
+		t.Skipf("Postgres not available, skipping: %v", err)
+	}
+	pingCtx, pingCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer pingCancel()
+	if err := testDB.PingContext(pingCtx); err != nil {
+		_ = testDB.Close()
+		if os.Getenv("CI") != "" {
+			t.Fatalf("CI: PostgreSQL connection failed: %v", err)
+		}
+		t.Skipf("Postgres not available, skipping: %v", err)
+	}
+	_ = testDB.Close()
+
+	m, sqlDB := newMigrator(t, dbURL)
+	t.Cleanup(func() {
+		_, _ = m.Close()
+		_ = sqlDB.Close()
+	})
+
+	if err := m.Migrate(9); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("m.Migrate(9) failed: %v", err)
+	}
+
+	var userID string
+	if err := sqlDB.QueryRow(`INSERT INTO users (email, password_hash, credential_version, email_verified) VALUES
+		('ms-dedup@example.com', 'hash', 1, true) RETURNING id`).Scan(&userID); err != nil {
+		t.Fatalf("failed to seed user: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = sqlDB.Exec(`DELETE FROM oauth_accounts WHERE user_id = $1`, userID)
+		_, _ = sqlDB.Exec(`DELETE FROM users WHERE id = $1`, userID)
+	})
+
+	// Seed duplicate Microsoft links for the same user with matching email (e.g. legacy oid vs new sub)
+	// One verified and one unverified (survivor rule: verified wins)
+	// Plus distinct identities on the same user with different emails to prove dedup never collapses across distinct emails
+	if _, err := sqlDB.Exec(`INSERT INTO oauth_accounts (user_id, provider_id, provider_user_id, email, verified, created_at) VALUES
+		($1, 'microsoft', 'ms-old-oid', 'ms-dedup@example.com', false, '2026-01-01 00:00:00Z'),
+		($1, 'microsoft', 'ms-new-sub', 'ms-dedup@example.com', true, '2026-02-01 00:00:00Z'),
+		($1, 'microsoft', 'ms-work-sub', 'ms-work@example.com', true, '2026-01-01 00:00:00Z'),
+		($1, 'microsoft', 'ms-personal-sub', 'ms-personal@example.com', true, '2026-01-01 00:00:00Z')`, userID); err != nil {
+		t.Fatalf("failed to seed microsoft duplicate links: %v", err)
+	}
+
+	if err := m.Steps(1); err != nil {
+		t.Fatalf("000010 up migration failed: %v", err)
+	}
+
+	var remainingLinks int
+	if err := sqlDB.QueryRow(`SELECT COUNT(*) FROM oauth_accounts WHERE user_id = $1 AND provider_id = 'microsoft'`, userID).Scan(&remainingLinks); err != nil {
+		t.Fatalf("failed to count remaining links: %v", err)
+	}
+	if remainingLinks != 3 {
+		t.Fatalf("expected 3 remaining links (1 deduped + 2 distinct identities), got %d", remainingLinks)
+	}
+
+	var keptVerified bool
+	var keptSub string
+	if err := sqlDB.QueryRow(`SELECT verified, provider_user_id FROM oauth_accounts WHERE user_id = $1 AND provider_id = 'microsoft' AND email = 'ms-dedup@example.com'`, userID).Scan(&keptVerified, &keptSub); err != nil {
+		t.Fatalf("failed to read retained link: %v", err)
+	}
+	if !keptVerified || keptSub != "ms-new-sub" {
+		t.Fatalf("expected verified link with sub 'ms-new-sub' retained, got verified=%v sub=%s", keptVerified, keptSub)
+	}
+
+	// 000010 down is a no-op
+	if err := m.Steps(-1); err != nil {
+		t.Fatalf("000010 down migration failed: %v", err)
+	}
+
+	if _, err := sqlDB.Exec(`DELETE FROM oauth_accounts WHERE user_id = $1`, userID); err != nil {
+		t.Fatalf("failed to cleanup links: %v", err)
+	}
+	if _, err := sqlDB.Exec(`DELETE FROM users WHERE id = $1`, userID); err != nil {
+		t.Fatalf("failed to cleanup user: %v", err)
+	}
+
+	if err := m.Up(); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("restoring head failed: %v", err)
 	}
 }

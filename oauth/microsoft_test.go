@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -219,7 +220,7 @@ func TestOIDC_DiscoveryAndJWKS(t *testing.T) {
 	})
 }
 
-func TestJWKSManager_UnknownKidSingleFetch(t *testing.T) {
+func TestJWKSManager_UnknownKidRepeatUsesNegativeCache(t *testing.T) {
 	_, nRaw, eRaw := generateTestRSAKey(t)
 	var jwksRequests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -239,8 +240,8 @@ func TestJWKSManager_UnknownKidSingleFetch(t *testing.T) {
 	if _, err := mgr.GetKey(ctx, "unknown-kid"); err == nil {
 		t.Fatal("expected not-found error for unknown kid, got nil")
 	}
-	// Merge premise (oauth sync): the first miss costs one fetch per flight
-	// (refresh + rollover re-check); the negative cache makes the repeat free.
+	// A first miss costs the primary fetch plus the rollover re-check that
+	// confirms a rotation; the negative cache makes the repeat free.
 	if got := jwksRequests.Load(); got != 2 {
 		t.Fatalf("sequential unknown-kid lookups cost %d fetches, want 2", got)
 	}
@@ -266,8 +267,8 @@ func TestJWKSManager_UnknownKidPerKidCooldown(t *testing.T) {
 	ctx := context.Background()
 	mgr := NewJWKSManager(server.URL, server.Client(), time.Hour)
 
-	// Merge premise (oauth sync): each first miss costs one fetch per flight
-	// (refresh + rollover re-check); repeats ride the per-kid negative cache.
+	// Each first miss costs the primary fetch plus the rollover re-check;
+	// repeats ride the per-kid negative cache.
 	if _, err := mgr.GetKey(ctx, "unknown-a"); err == nil {
 		t.Fatal("expected not-found for unknown-a, got nil")
 	}
@@ -302,6 +303,49 @@ func TestJWKSManager_UnknownKidPerKidCooldown(t *testing.T) {
 	}
 	if got := jwksRequests.Load(); got != 5 {
 		t.Fatalf("repeat unknown-a cost %d fetches, want 5", got)
+	}
+}
+
+func TestJWKSManager_RefreshFailureOnFreshSetStaysAuthError(t *testing.T) {
+	_, nRaw, eRaw := generateTestRSAKey(t)
+	var fail atomic.Bool
+	var jwksRequests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		jwksRequests.Add(1)
+		if fail.Load() {
+			http.Error(w, "upstream down", http.StatusBadGateway)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(JWKDoc{Keys: []JWKKey{
+			{Kty: "RSA", Use: "sig", Kid: "key-1", Alg: "RS256", N: nRaw, E: eRaw},
+		}})
+	}))
+	defer server.Close()
+
+	ctx := context.Background()
+	mgr := NewJWKSManager(server.URL, server.Client(), time.Hour)
+	if _, err := mgr.GetKey(ctx, "key-1"); err != nil {
+		t.Fatalf("warm fetch failed: %v", err)
+	}
+	fail.Store(true)
+
+	// The committed set is fresh, so a failed fetch cannot explain the kid away:
+	// an unknown kid is an auth failure, never a provider 502.
+	_, err := mgr.GetKey(ctx, "unknown-kid")
+	if err == nil {
+		t.Fatal("expected auth failure for unknown kid, got nil")
+	}
+	var appErr *errors.Error
+	if !errors.As(err, &appErr) || appErr.Code() != errors.CodeOAuthIDTokenInvalid {
+		t.Fatalf("expected CodeOAuthIDTokenInvalid against a fresh set, got %v", err)
+	}
+
+	before := jwksRequests.Load()
+	if _, err := mgr.GetKey(ctx, "unknown-kid"); err == nil {
+		t.Fatal("expected auth failure for retry, got nil")
+	}
+	if got := jwksRequests.Load(); got == before {
+		t.Fatalf("failed fetch must not record a negative cache miss, got %d fetches", got-before)
 	}
 }
 
@@ -688,10 +732,11 @@ func TestMicrosoftProvider(t *testing.T) {
 		}
 	})
 
-	t.Run("nOauth defense - untrusted tenant vs domain ownership attestation", func(t *testing.T) {
+	t.Run("tenant admission and email attestation are independent", func(t *testing.T) {
+		pMulti := newTestProvider("common", []string{"untrusted-guid"})
 		pCommon := newTestProvider("common", []string{"trusted-partner-guid"})
 
-		// 1. Untrusted tenant without xms_edov -> EmailVerified must be FALSE
+		// 1. Admitted tenant without xms_edov -> unverified identity, not untrusted.
 		claimsUntrusted := map[string]any{
 			"iss":   "https://login.microsoftonline.com/untrusted-guid/v2.0",
 			"sub":   "attacker-sub",
@@ -701,22 +746,20 @@ func TestMicrosoftProvider(t *testing.T) {
 			"tid":   "untrusted-guid",
 		}
 		tokUntrusted := signRS256JWT(t, privKey, "ms-key-1", claimsUntrusted)
-		cUntrusted, err := pCommon.VerifyIDToken(ctx, tokUntrusted, "")
+		cUntrusted, err := pMulti.VerifyIDToken(ctx, tokUntrusted, "")
 		if err != nil {
 			t.Fatalf("unexpected verification error: %v", err)
 		}
 		if cUntrusted.EmailVerified {
-			t.Errorf("nOauth vulnerability: untrusted tenant should have EmailVerified == false")
+			t.Errorf("nOauth vulnerability: unattested address should have EmailVerified == false")
 		}
-		if !cUntrusted.UntrustedTenant {
-			t.Errorf("untrusted tenant must set UntrustedTenant == true")
+		if cUntrusted.UntrustedTenant {
+			t.Errorf("tenant admitted by an allowlist must not be marked untrusted")
 		}
 
-		// 2. Untrusted tenant with xms_edov == '1' -> EmailVerified must be TRUE.
-		// Merge premise (oauth sync): the hardening trust model keeps attestation
-		// as sufficient evidence regardless of the allowlist, because the
-		// allowlist attests tenant identity only — tenant admins can claim
-		// foreign-domain addresses, so the allowlist alone never verifies.
+		// 2. Attested address with xms_edov == '1' -> EmailVerified must be TRUE
+		// when no allowlist bounds the tenants. The allowlist case is covered by
+		// the tenant-allowlist table below.
 		claimsAttested := map[string]any{
 			"iss":      "https://login.microsoftonline.com/untrusted-guid/v2.0",
 			"sub":      "verified-sub",
@@ -727,7 +770,7 @@ func TestMicrosoftProvider(t *testing.T) {
 			"xms_edov": "1",
 		}
 		tokAttested := signRS256JWT(t, privKey, "ms-key-1", claimsAttested)
-		cAttested, err := pCommon.VerifyIDToken(ctx, tokAttested, "")
+		cAttested, err := pMulti.VerifyIDToken(ctx, tokAttested, "")
 		if err != nil {
 			t.Fatalf("unexpected verification error: %v", err)
 		}
@@ -749,7 +792,7 @@ func TestMicrosoftProvider(t *testing.T) {
 			"xms_edov": true,
 		}
 		tokBool := signRS256JWT(t, privKey, "ms-key-1", claimsBool)
-		cBool, err := pCommon.VerifyIDToken(ctx, tokBool, "")
+		cBool, err := pMulti.VerifyIDToken(ctx, tokBool, "")
 		if err != nil {
 			t.Fatalf("unexpected verification error: %v", err)
 		}
@@ -771,7 +814,7 @@ func TestMicrosoftProvider(t *testing.T) {
 			"xms_edov": 1,
 		}
 		tokNum := signRS256JWT(t, privKey, "ms-key-1", claimsNum)
-		cNum, err := pCommon.VerifyIDToken(ctx, tokNum, "")
+		cNum, err := pMulti.VerifyIDToken(ctx, tokNum, "")
 		if err != nil {
 			t.Fatalf("unexpected verification error: %v", err)
 		}
@@ -793,15 +836,15 @@ func TestMicrosoftProvider(t *testing.T) {
 			"xms_edov": false,
 		}
 		tokFalse := signRS256JWT(t, privKey, "ms-key-1", claimsFalse)
-		cFalse, err := pCommon.VerifyIDToken(ctx, tokFalse, "")
+		cFalse, err := pMulti.VerifyIDToken(ctx, tokFalse, "")
 		if err != nil {
 			t.Fatalf("unexpected verification error: %v", err)
 		}
 		if cFalse.EmailVerified {
 			t.Errorf("expected EmailVerified == false when xms_edov is bool false")
 		}
-		if !cFalse.UntrustedTenant {
-			t.Errorf("denied attestation must set UntrustedTenant == true")
+		if cFalse.UntrustedTenant {
+			t.Errorf("denied attestation alone must not mark an admitted tenant untrusted")
 		}
 
 		// 3. Whitelist alone never verifies the email value.
@@ -821,8 +864,8 @@ func TestMicrosoftProvider(t *testing.T) {
 		if cTrusted.EmailVerified {
 			t.Errorf("whitelist alone must leave EmailVerified == false")
 		}
-		if !cTrusted.UntrustedTenant {
-			t.Errorf("whitelist alone must set UntrustedTenant == true")
+		if cTrusted.UntrustedTenant {
+			t.Errorf("allowlisted tenant without attestation must remain admitted")
 		}
 
 		// 3b. Whitelist + attestation verifies.
@@ -845,6 +888,25 @@ func TestMicrosoftProvider(t *testing.T) {
 		}
 		if cTrustedAttested.UntrustedTenant {
 			t.Errorf("attested whitelisted tenant must leave UntrustedTenant == false")
+		}
+
+		// 4. Admission is the only thing that marks a tenant untrusted.
+		claimsForeign := map[string]any{
+			"iss":      "https://login.microsoftonline.com/untrusted-guid/v2.0",
+			"sub":      "foreign-sub",
+			"aud":      "client-test-id",
+			"exp":      time.Now().Add(10 * time.Minute).Unix(),
+			"email":    "user@foreign-corp.com",
+			"tid":      "untrusted-guid",
+			"xms_edov": true,
+		}
+		tokForeign := signRS256JWT(t, privKey, "ms-key-1", claimsForeign)
+		cForeign, err := pCommon.VerifyIDToken(ctx, tokForeign, "")
+		if err != nil {
+			t.Fatalf("unexpected verification error: %v", err)
+		}
+		if !cForeign.UntrustedTenant {
+			t.Errorf("tenant missing from the allowlist must be marked untrusted")
 		}
 	})
 
@@ -913,7 +975,7 @@ func TestMicrosoftProvider(t *testing.T) {
 			t.Fatal("expected error for future iat, got nil")
 		}
 
-		// 5. json.Number iat is parsed correctly
+		// 5. Numeric exp and iat are parsed
 		nowUnix := time.Now().Unix()
 		claimsJSONNumber := map[string]any{
 			"iss": "https://login.microsoftonline.com/tid-1/v2.0",
@@ -926,14 +988,46 @@ func TestMicrosoftProvider(t *testing.T) {
 		tokJSONNumber := signRS256JWT(t, privKey, "ms-key-1", claimsJSONNumber)
 		cNum, err := p.VerifyIDToken(ctx, tokJSONNumber, "")
 		if err != nil {
-			t.Fatalf("failed to verify token with json.Number: %v", err)
+			t.Fatalf("failed to verify token with numeric exp and iat: %v", err)
 		}
 		if cNum.IssuedAt != nowUnix {
-			t.Fatalf("expected IssuedAt %d from json.Number, got %d", nowUnix, cNum.IssuedAt)
+			t.Fatalf("expected IssuedAt %d from a numeric claim, got %d", nowUnix, cNum.IssuedAt)
 		}
 	})
 
-	t.Run("FetchUserInfo maps OID and uses only the email claim", func(t *testing.T) {
+	t.Run("VerifyIDToken requires an identity claim", func(t *testing.T) {
+		p := newTestProvider("common", nil)
+
+		claimsMissing := map[string]any{
+			"iss": "https://login.microsoftonline.com/tid-1/v2.0",
+			"aud": "client-test-id",
+			"exp": time.Now().Add(10 * time.Minute).Unix(),
+			"tid": "tid-1",
+		}
+		tokMissing := signRS256JWT(t, privKey, "ms-key-1", claimsMissing)
+		_, err := p.VerifyIDToken(ctx, tokMissing, "")
+		if err == nil {
+			t.Fatal("expected rejection for token missing sub and oid")
+		}
+		var appErr *errors.Error
+		if !errors.As(err, &appErr) || appErr.Code() != errors.CodeOAuthIDTokenInvalid {
+			t.Fatalf("expected CodeOAuthIDTokenInvalid, got %v", err)
+		}
+
+		claimsOIDOnly := map[string]any{
+			"iss": "https://login.microsoftonline.com/tid-1/v2.0",
+			"oid": "oid-only",
+			"aud": "client-test-id",
+			"exp": time.Now().Add(10 * time.Minute).Unix(),
+			"tid": "tid-1",
+		}
+		tokOIDOnly := signRS256JWT(t, privKey, "ms-key-1", claimsOIDOnly)
+		if _, err := p.VerifyIDToken(ctx, tokOIDOnly, ""); err != nil {
+			t.Fatalf("token with oid but no sub must verify: %v", err)
+		}
+	})
+
+	t.Run("FetchUserInfo keys the identity on sub", func(t *testing.T) {
 		p := newTestProvider("common", nil)
 
 		newToken := func(t *testing.T, extra map[string]any) string {
@@ -959,8 +1053,8 @@ func TestMicrosoftProvider(t *testing.T) {
 			if err != nil {
 				t.Fatalf("FetchUserInfo failed: %v", err)
 			}
-			if user.ProviderUserID != "immutable-oid-guid" {
-				t.Errorf("ProviderUserID = %q, want immutable-oid-guid", user.ProviderUserID)
+			if user.ProviderUserID != "sub-fallback" {
+				t.Errorf("ProviderUserID = %q, want sub-fallback", user.ProviderUserID)
 			}
 			// Merge premise (oauth sync): the fail-closed UPN fallback keeps
 			// the admin-mutable address for display but never verifies it, so
@@ -1051,30 +1145,30 @@ func TestMicrosoftProvider_DomainOwnershipAttestation(t *testing.T) {
 	allowlist := []string{listedTenant}
 
 	tests := []struct {
-		name         string
-		trusted      []string
-		tenant       string
-		edov         any
-		setEdov      bool
-		wantVerified bool
+		name          string
+		trusted       []string
+		tenant        string
+		edov          any
+		setEdov       bool
+		wantVerified  bool
+		wantUntrusted bool
 	}{
-		{name: "no allowlist string one", tenant: unlistedTenant, edov: "1", setEdov: true, wantVerified: true},
-		{name: "no allowlist string true", tenant: unlistedTenant, edov: "true", setEdov: true, wantVerified: true},
-		{name: "no allowlist bool true", tenant: unlistedTenant, edov: true, setEdov: true, wantVerified: true},
-		{name: "no allowlist string zero", tenant: unlistedTenant, edov: "0", setEdov: true},
-		{name: "no allowlist bool false", tenant: unlistedTenant, edov: false, setEdov: true},
-		{name: "no allowlist missing claim", tenant: unlistedTenant},
-		// Merge premise (oauth sync): the hardening trust model keeps the
-		// allowlist as tenant-identity evidence only, so a listed tenant still
-		// needs domain attestation, while attestation verifies any tenant.
+		{name: "no allowlist string one", tenant: unlistedTenant, edov: "1", setEdov: true, wantVerified: true, wantUntrusted: true},
+		{name: "no allowlist string true", tenant: unlistedTenant, edov: "true", setEdov: true, wantVerified: true, wantUntrusted: true},
+		{name: "no allowlist bool true", tenant: unlistedTenant, edov: true, setEdov: true, wantVerified: true, wantUntrusted: true},
+		{name: "no allowlist string zero", tenant: unlistedTenant, edov: "0", setEdov: true, wantUntrusted: true},
+		{name: "no allowlist bool false", tenant: unlistedTenant, edov: false, setEdov: true, wantUntrusted: true},
+		{name: "no allowlist missing claim", tenant: unlistedTenant, wantUntrusted: true},
+		// The allowlist bounds tenant admission; domain attestation
+		// independently decides whether the email is verified.
 		{name: "allowlist listed tenant unattested", trusted: allowlist, tenant: listedTenant},
 		{name: "allowlist listed tenant attested", trusted: allowlist, tenant: listedTenant, edov: "1", setEdov: true, wantVerified: true},
-		{name: "allowlist unlisted tenant string one", trusted: allowlist, tenant: unlistedTenant, edov: "1", setEdov: true, wantVerified: true},
-		{name: "allowlist unlisted tenant string true", trusted: allowlist, tenant: unlistedTenant, edov: "true", setEdov: true, wantVerified: true},
-		{name: "allowlist unlisted tenant bool true", trusted: allowlist, tenant: unlistedTenant, edov: true, setEdov: true, wantVerified: true},
-		{name: "allowlist unlisted tenant string zero", trusted: allowlist, tenant: unlistedTenant, edov: "0", setEdov: true},
-		{name: "allowlist unlisted tenant bool false", trusted: allowlist, tenant: unlistedTenant, edov: false, setEdov: true},
-		{name: "allowlist unlisted tenant missing claim", trusted: allowlist, tenant: unlistedTenant},
+		{name: "allowlist unlisted tenant string one", trusted: allowlist, tenant: unlistedTenant, edov: "1", setEdov: true, wantVerified: true, wantUntrusted: true},
+		{name: "allowlist unlisted tenant string true", trusted: allowlist, tenant: unlistedTenant, edov: "true", setEdov: true, wantVerified: true, wantUntrusted: true},
+		{name: "allowlist unlisted tenant bool true", trusted: allowlist, tenant: unlistedTenant, edov: true, setEdov: true, wantVerified: true, wantUntrusted: true},
+		{name: "allowlist unlisted tenant string zero", trusted: allowlist, tenant: unlistedTenant, edov: "0", setEdov: true, wantUntrusted: true},
+		{name: "allowlist unlisted tenant bool false", trusted: allowlist, tenant: unlistedTenant, edov: false, setEdov: true, wantUntrusted: true},
+		{name: "allowlist unlisted tenant missing claim", trusted: allowlist, tenant: unlistedTenant, wantUntrusted: true},
 	}
 
 	for _, tt := range tests {
@@ -1100,14 +1194,872 @@ func TestMicrosoftProvider_DomainOwnershipAttestation(t *testing.T) {
 			if c.EmailVerified != tt.wantVerified {
 				t.Fatalf("EmailVerified = %v; want %v", c.EmailVerified, tt.wantVerified)
 			}
-			if !tt.wantVerified && !c.UntrustedTenant {
-				t.Error("rejected tenant is missing the untrusted_tenant marker")
-			}
-			if tt.wantVerified && c.UntrustedTenant {
-				t.Error("verified tenant carries the untrusted_tenant marker")
+			if c.UntrustedTenant != tt.wantUntrusted {
+				t.Errorf("UntrustedTenant = %v; want %v", c.UntrustedTenant, tt.wantUntrusted)
 			}
 		})
 	}
+}
+
+// TestMicrosoftProvider_EmailAttestationClaimShapes pins the xms_edov decoding.
+// The signature-verified payload decodes numbers as float64; the other numeric
+// and textual shapes are accepted defensively. Every other shape, an
+// out-of-band json.Number included, stays denied.
+func TestMicrosoftProvider_EmailAttestationClaimShapes(t *testing.T) {
+	p := NewMicrosoftProvider(config.MicrosoftConfig{ClientID: "client-test-id", Tenant: "common"})
+
+	tests := []struct {
+		name string
+		edov any
+		want bool
+	}{
+		{name: "bool true", edov: true, want: true},
+		{name: "bool false", edov: false},
+		{name: "string one", edov: "1", want: true},
+		{name: "string true", edov: "true", want: true},
+		{name: "string padded one", edov: " 1 ", want: true},
+		{name: "string zero", edov: "0"},
+		{name: "float one", edov: float64(1), want: true},
+		{name: "float zero", edov: float64(0)},
+		{name: "int one", edov: 1, want: true},
+		{name: "int64 one", edov: int64(1), want: true},
+		{name: "out-of-band json.Number stays denied", edov: json.Number("1")},
+		{name: "unsupported shape stays denied", edov: []any{true}},
+		{name: "missing claim", edov: nil},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			claims := map[string]any{}
+			if tt.edov != nil {
+				claims["xms_edov"] = tt.edov
+			}
+			if got := p.isEmailVerified("common", claims, "corp-tid"); got != tt.want {
+				t.Errorf("isEmailVerified = %v; want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+const (
+	contosoTenantGUID = "11111111-2222-3333-4444-555555555555"
+	otherTenantGUID   = "99999999-8888-7777-6666-555555555555"
+)
+
+func TestMicrosoftProvider_TenantAllowlist(t *testing.T) {
+	privKey, nRaw, eRaw := generateTestRSAKey(t)
+
+	var serverURL string
+	discovery := map[string]string{
+		"contoso.onmicrosoft.com": contosoTenantGUID,
+		"other.onmicrosoft.com":   otherTenantGUID,
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		domain, ok := strings.CutSuffix(r.URL.Path, "/v2.0/.well-known/openid-configuration")
+		if ok {
+			guid, found := discovery[strings.TrimPrefix(domain, "/")]
+			if !found {
+				http.NotFound(w, r)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(OIDCDiscovery{
+				Issuer:                serverURL + "/" + guid + "/v2.0",
+				AuthorizationEndpoint: serverURL + "/authorize",
+				TokenEndpoint:         serverURL + "/token",
+				JWKSURI:               serverURL + "/keys",
+			})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(JWKDoc{Keys: []JWKKey{{
+			Kty: "RSA", Use: "sig", Kid: "ms-key-1", Alg: "RS256", N: nRaw, E: eRaw,
+		}}})
+	}))
+	defer server.Close()
+	serverURL = server.URL
+
+	newProvider := func(t *testing.T, tenant string, trusted []string) *MicrosoftProvider {
+		t.Helper()
+		if tenant == "" {
+			tenant = "common"
+		}
+		p := NewMicrosoftProvider(config.MicrosoftConfig{
+			ClientID:       "client-test-id",
+			Tenant:         tenant,
+			TrustedTenants: trusted,
+			RedirectURI:    "https://example.com/callback",
+		}, WithEndpoints(EndpointOverride{DiscoveryURL: server.URL}))
+		p.client = server.Client()
+		p.jwksMgr = NewJWKSManager(server.URL, p.client, time.Hour)
+		p.jwksRetriever = p.jwksMgr
+		return p
+	}
+
+	tests := []struct {
+		name         string
+		tenantCfg    string
+		trusted      []string
+		tid          string
+		issuer       string
+		wantTrusted  bool
+		wantVerified bool
+	}{
+		{name: "no allowlist denies any tenant (fail-closed)", tid: "tenant-a", wantTrusted: false, wantVerified: true},
+		{name: "listed guid", trusted: []string{"tenant-a"}, tid: "tenant-a", wantTrusted: true, wantVerified: true},
+		{name: "listed guid uppercase entry", trusted: []string{"TENANT-A"}, tid: "tenant-a", wantTrusted: true, wantVerified: true},
+		{name: "listed guid uppercase tid", trusted: []string{"tenant-a"}, tid: "TENANT-A", wantTrusted: true, wantVerified: true},
+		{name: "listed domain resolves to guid", trusted: []string{"contoso.onmicrosoft.com"}, tid: contosoTenantGUID, wantTrusted: true, wantVerified: true},
+		{name: "listed domain uppercase entry", trusted: []string{"Contoso.OnMicrosoft.com"}, tid: contosoTenantGUID, wantTrusted: true, wantVerified: true},
+		{name: "domain tenant and domain allowlist", tenantCfg: "contoso.onmicrosoft.com", trusted: []string{"contoso.onmicrosoft.com"}, tid: contosoTenantGUID, wantTrusted: true, wantVerified: true},
+		{name: "allowlist domain does not match", trusted: []string{"contoso.onmicrosoft.com"}, tid: otherTenantGUID, wantVerified: true},
+		{name: "unlisted tenant rejected despite attestation", trusted: []string{"tenant-a"}, tid: "tenant-b", wantVerified: true},
+		{name: "unlisted domain rejected", trusted: []string{"tenant-a"}, tid: "evil.example.com", wantVerified: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := newProvider(t, tt.tenantCfg, tt.trusted)
+			issuer := tt.issuer
+			if issuer == "" {
+				issuer = "https://login.microsoftonline.com/" + tt.tid + "/v2.0"
+			}
+			claims := map[string]any{
+				"iss":      issuer,
+				"sub":      "sub-1",
+				"aud":      "client-test-id",
+				"exp":      time.Now().Add(10 * time.Minute).Unix(),
+				"email":    "user@example.com",
+				"tid":      tt.tid,
+				"xms_edov": "1",
+			}
+			tok := signRS256JWT(t, privKey, "ms-key-1", claims)
+
+			c, err := p.VerifyIDToken(context.Background(), tok, "")
+			if err != nil {
+				t.Fatalf("VerifyIDToken = %v", err)
+			}
+			if c.UntrustedTenant == tt.wantTrusted {
+				t.Errorf("UntrustedTenant = %v; want trusted = %v", c.UntrustedTenant, tt.wantTrusted)
+			}
+			if c.EmailVerified != tt.wantVerified {
+				t.Errorf("EmailVerified = %v; want %v", c.EmailVerified, tt.wantVerified)
+			}
+		})
+	}
+}
+
+// TestMicrosoftProvider_TenantIdentityResolution pins the domain-vs-GUID rule:
+// Microsoft always emits a GUID tid and a GUID issuer, so a domain configured
+// as the authority or in the allowlist must be resolved to its tenant GUID.
+func TestMicrosoftProvider_TenantIdentityResolution(t *testing.T) {
+	privKey, nRaw, eRaw := generateTestRSAKey(t)
+
+	var serverURL string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		domain, ok := strings.CutSuffix(r.URL.Path, "/v2.0/.well-known/openid-configuration")
+		if ok {
+			guid, found := map[string]string{
+				"contoso.onmicrosoft.com": contosoTenantGUID,
+			}[strings.TrimPrefix(domain, "/")]
+			if !found {
+				http.NotFound(w, r)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(OIDCDiscovery{
+				Issuer:                serverURL + "/" + guid + "/v2.0",
+				AuthorizationEndpoint: serverURL + "/authorize",
+				TokenEndpoint:         serverURL + "/token",
+				JWKSURI:               serverURL + "/keys",
+			})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(JWKDoc{Keys: []JWKKey{{
+			Kty: "RSA", Use: "sig", Kid: "ms-key-1", Alg: "RS256", N: nRaw, E: eRaw,
+		}}})
+	}))
+	defer server.Close()
+	serverURL = server.URL
+
+	tests := []struct {
+		name          string
+		tenant        string
+		trusted       []string
+		tid           string
+		wantErrCode   errors.Code
+		wantVerified  bool
+		wantUntrusted bool
+	}{
+		{name: "domain tenant succeeds", tenant: "contoso.onmicrosoft.com", trusted: []string{"contoso.onmicrosoft.com"}, tid: contosoTenantGUID, wantVerified: true},
+		{name: "guid tenant succeeds", tenant: contosoTenantGUID, trusted: []string{contosoTenantGUID}, tid: contosoTenantGUID, wantVerified: true},
+		{name: "unlisted tenant rejected and marked", tenant: "common", trusted: []string{otherTenantGUID}, tid: contosoTenantGUID, wantVerified: true, wantUntrusted: true},
+		{name: "allowlist domain matches", tenant: "common", trusted: []string{"contoso.onmicrosoft.com"}, tid: contosoTenantGUID, wantVerified: true},
+		{name: "allowlist domain does not match", tenant: "common", trusted: []string{"contoso.onmicrosoft.com"}, tid: otherTenantGUID, wantVerified: true, wantUntrusted: true},
+		{name: "unresolvable domain surfaces a config error", tenant: "unresolvable.onmicrosoft.com", tid: contosoTenantGUID, wantErrCode: errors.CodeInvalidConfig},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := NewMicrosoftProvider(config.MicrosoftConfig{
+				ClientID:       "client-test-id",
+				Tenant:         tt.tenant,
+				TrustedTenants: tt.trusted,
+				RedirectURI:    "https://example.com/callback",
+			}, WithEndpoints(EndpointOverride{DiscoveryURL: server.URL}))
+			p.client = server.Client()
+			p.jwksMgr = NewJWKSManager(server.URL+"/keys", p.client, time.Hour)
+			p.jwksRetriever = p.jwksMgr
+
+			claims := map[string]any{
+				"iss":   "https://login.microsoftonline.com/" + tt.tid + "/v2.0",
+				"sub":   "sub-1",
+				"aud":   "client-test-id",
+				"exp":   time.Now().Add(10 * time.Minute).Unix(),
+				"email": "user@contoso.com",
+				"tid":   tt.tid,
+			}
+			if tt.tenant == "common" {
+				claims["xms_edov"] = true
+			}
+			tok := signRS256JWT(t, privKey, "ms-key-1", claims)
+
+			c, err := p.VerifyIDToken(context.Background(), tok, "")
+			if tt.wantErrCode != "" {
+				if err == nil {
+					t.Fatal("expected error, got nil")
+				}
+				var appErr *errors.Error
+				if !errors.As(err, &appErr) || appErr.Code() != tt.wantErrCode {
+					t.Fatalf("error = %v; want code %q", err, tt.wantErrCode)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("VerifyIDToken = %v", err)
+			}
+			if c.EmailVerified != tt.wantVerified {
+				t.Errorf("EmailVerified = %v; want %v", c.EmailVerified, tt.wantVerified)
+			}
+			if c.UntrustedTenant != tt.wantUntrusted {
+				t.Errorf("UntrustedTenant = %v; want %v", c.UntrustedTenant, tt.wantUntrusted)
+			}
+		})
+	}
+}
+
+func TestMicrosoftProvider_TenantResolutionFailureClassification(t *testing.T) {
+	var status atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(int(status.Load()))
+	}))
+	defer server.Close()
+
+	tests := []struct {
+		name   string
+		status int
+		want   errors.Code
+	}{
+		{name: "missing domain is a configuration defect", status: http.StatusNotFound, want: errors.CodeInvalidConfig},
+		{name: "provider outage stays operational", status: http.StatusServiceUnavailable, want: errors.CodeOAuthProviderError},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			status.Store(int32(tt.status))
+			p := NewMicrosoftProvider(config.MicrosoftConfig{
+				ClientID:    "client-test-id",
+				Tenant:      "contoso.onmicrosoft.com",
+				RedirectURI: "https://example.com/callback",
+			}, WithEndpoints(EndpointOverride{DiscoveryURL: server.URL}))
+
+			_, err := p.tenantAuthority(context.Background())
+			var appErr *errors.Error
+			if !errors.As(err, &appErr) || appErr.Code() != tt.want {
+				t.Fatalf("error = %v; want code %q", err, tt.want)
+			}
+		})
+	}
+}
+
+func TestMicrosoftProvider_SingleTenantVerification(t *testing.T) {
+	privKey, nRaw, eRaw := generateTestRSAKey(t)
+
+	var serverURL string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, ok := strings.CutSuffix(r.URL.Path, "/v2.0/.well-known/openid-configuration"); ok {
+			_ = json.NewEncoder(w).Encode(OIDCDiscovery{
+				Issuer:                serverURL + "/" + contosoTenantGUID + "/v2.0",
+				AuthorizationEndpoint: serverURL + "/authorize",
+				TokenEndpoint:         serverURL + "/token",
+				JWKSURI:               serverURL + "/keys",
+			})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(JWKDoc{Keys: []JWKKey{{
+			Kty: "RSA", Use: "sig", Kid: "ms-key-1", Alg: "RS256", N: nRaw, E: eRaw,
+		}}})
+	}))
+	defer server.Close()
+	serverURL = server.URL
+
+	newProvider := func(t *testing.T, tenant string) *MicrosoftProvider {
+		t.Helper()
+		p := NewMicrosoftProvider(config.MicrosoftConfig{
+			ClientID:    "client-test-id",
+			Tenant:      tenant,
+			RedirectURI: "https://example.com/callback",
+		}, WithEndpoints(EndpointOverride{DiscoveryURL: server.URL}))
+		p.client = server.Client()
+		p.jwksMgr = NewJWKSManager(server.URL, p.client, time.Hour)
+		p.jwksRetriever = p.jwksMgr
+		return p
+	}
+
+	tests := []struct {
+		name         string
+		tenantCfg    string
+		issuerTenant string
+		tid          string
+		wantErr      bool
+		wantVerified bool
+	}{
+		{name: "matching tid inherits verification", tenantCfg: "contoso-guid", issuerTenant: "contoso-guid", tid: "contoso-guid", wantVerified: true},
+		{name: "matching tid is case insensitive", tenantCfg: "contoso-guid", issuerTenant: "contoso-guid", tid: "CONTOSO-GUID", wantVerified: true},
+		{name: "domain tenant inherits verification by resolved guid", tenantCfg: "contoso.onmicrosoft.com", issuerTenant: contosoTenantGUID, tid: contosoTenantGUID, wantVerified: true},
+		{name: "domain tenant foreign tid does not inherit verification", tenantCfg: "contoso.onmicrosoft.com", issuerTenant: contosoTenantGUID, tid: otherTenantGUID},
+		{name: "foreign tid does not inherit verification", tenantCfg: "contoso-guid", issuerTenant: "contoso-guid", tid: "other-guid"},
+		{name: "foreign issuer rejected", tenantCfg: "contoso-guid", issuerTenant: "other-guid", tid: "contoso-guid", wantErr: true},
+		{name: "domain tenant foreign issuer rejected", tenantCfg: "contoso.onmicrosoft.com", issuerTenant: otherTenantGUID, tid: contosoTenantGUID, wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			claims := map[string]any{
+				"iss":   "https://login.microsoftonline.com/" + tt.issuerTenant + "/v2.0",
+				"sub":   "sub-1",
+				"aud":   "client-test-id",
+				"exp":   time.Now().Add(10 * time.Minute).Unix(),
+				"email": "user@contoso.com",
+				"tid":   tt.tid,
+			}
+			tok := signRS256JWT(t, privKey, "ms-key-1", claims)
+
+			c, err := newProvider(t, tt.tenantCfg).VerifyIDToken(context.Background(), tok, "")
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("expected issuer rejection")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("VerifyIDToken = %v", err)
+			}
+			if c.EmailVerified != tt.wantVerified {
+				t.Errorf("EmailVerified = %v; want %v", c.EmailVerified, tt.wantVerified)
+			}
+		})
+	}
+}
+
+func TestMicrosoftProvider_UserInfoTenantGate(t *testing.T) {
+	var discoveryRequests atomic.Int32
+	discovery := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		discoveryRequests.Add(1)
+		http.NotFound(w, nil)
+	}))
+	defer discovery.Close()
+
+	var userinfoClaims atomic.Value
+	userinfo := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(userinfoClaims.Load())
+	}))
+	defer userinfo.Close()
+
+	newProvider := func(t *testing.T, tenant string, trusted []string) *MicrosoftProvider {
+		t.Helper()
+		p := NewMicrosoftProvider(config.MicrosoftConfig{
+			ClientID:       "client-test-id",
+			Tenant:         tenant,
+			TrustedTenants: trusted,
+			RedirectURI:    "https://example.com/callback",
+		}, WithEndpoints(EndpointOverride{DiscoveryURL: discovery.URL}))
+		p.client = userinfo.Client()
+		p.userinfoURL = userinfo.URL
+		return p
+	}
+
+	// /oidc/userinfo returns no tid and no signed issuer, so any tenant
+	// constraint is unenforceable on this path: the adapter must reject the
+	// token instead of accepting the unvalidated identity.
+	scoped := []struct {
+		name    string
+		tenant  string
+		trusted []string
+	}{
+		{name: "allowlist", tenant: "common", trusted: []string{"tenant-a"}},
+		{name: "specific guid tenant", tenant: "tenant-a"},
+		{name: "domain tenant", tenant: "contoso.onmicrosoft.com"},
+		{name: "consumers authority", tenant: "consumers"},
+		{name: "organizations authority", tenant: "organizations"},
+	}
+	for _, tt := range scoped {
+		t.Run("tenant constraint fails closed: "+tt.name, func(t *testing.T) {
+			userinfoClaims.Store(map[string]any{"sub": "sub-1", "email": "user@example.com"})
+			_, err := newProvider(t, tt.tenant, tt.trusted).FetchUserInfo(context.Background(), &OAuthToken{AccessToken: "access-token"})
+			if err == nil {
+				t.Fatal("expected a fail-closed error for a tenant-scoped deployment")
+			}
+			var appErr *errors.Error
+			if !errors.As(err, &appErr) || appErr.Code() != errors.CodeInvalidConfig {
+				t.Fatalf("error = %v; want code %q", err, errors.CodeInvalidConfig)
+			}
+		})
+	}
+	if got := discoveryRequests.Load(); got != 0 {
+		t.Errorf("discovery requests = %d; the gate must not resolve tenants to enforce them", got)
+	}
+
+	t.Run("multi-tenant deployment accepts a documented userinfo payload", func(t *testing.T) {
+		userinfoClaims.Store(map[string]any{
+			"sub":         "sub-1",
+			"name":        "User One",
+			"family_name": "One",
+			"given_name":  "User",
+			"email":       "user@example.com",
+		})
+		user, err := newProvider(t, "common", nil).FetchUserInfo(context.Background(), &OAuthToken{AccessToken: "access-token"})
+		if err != nil {
+			t.Fatalf("FetchUserInfo = %v", err)
+		}
+		if user.EmailVerified {
+			t.Error("userinfo alone must never verify the email")
+		}
+		if user.ProviderUserID != "sub-1" {
+			t.Errorf("ProviderUserID = %q; want sub-1", user.ProviderUserID)
+		}
+		if _, ok := user.RawClaims["untrusted_tenant"]; ok {
+			t.Error("multi-tenant userinfo must not carry a tenant marker it cannot evaluate")
+		}
+	})
+}
+
+func TestMicrosoftProvider_FetchUserInfoCarriesRawClaims(t *testing.T) {
+	privKey, nRaw, eRaw := generateTestRSAKey(t)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(JWKDoc{Keys: []JWKKey{{
+			Kty: "RSA", Use: "sig", Kid: "ms-key-1", Alg: "RS256", N: nRaw, E: eRaw,
+		}}})
+	}))
+	defer server.Close()
+
+	p := NewMicrosoftProvider(config.MicrosoftConfig{
+		ClientID:       "client-test-id",
+		Tenant:         "common",
+		TrustedTenants: []string{"tenant-a"},
+		RedirectURI:    "https://example.com/callback",
+	})
+	p.client = server.Client()
+	p.jwksMgr = NewJWKSManager(server.URL, p.client, time.Hour)
+	p.jwksRetriever = p.jwksMgr
+
+	claims := map[string]any{
+		"iss":   "https://login.microsoftonline.com/tenant-b/v2.0",
+		"sub":   "sub-1",
+		"oid":   "immutable-oid",
+		"aud":   "client-test-id",
+		"exp":   time.Now().Add(10 * time.Minute).Unix(),
+		"email": "user@example.com",
+		"tid":   "tenant-b",
+	}
+	tok := signRS256JWT(t, privKey, "ms-key-1", claims)
+
+	user, err := p.FetchUserInfo(context.Background(), &OAuthToken{IDToken: tok})
+	if err != nil {
+		t.Fatalf("FetchUserInfo = %v", err)
+	}
+	if untrusted, _ := user.RawClaims["untrusted_tenant"].(bool); !untrusted {
+		t.Fatal("identity claims dropped the untrusted_tenant marker")
+	}
+	if user.ProviderUserID != "sub-1" {
+		t.Errorf("ProviderUserID = %q; want sub-1", user.ProviderUserID)
+	}
+	if got := user.RawClaims["oid"]; got != "immutable-oid" {
+		t.Errorf("RawClaims[oid] = %v; want immutable-oid", got)
+	}
+	if got := user.RawClaims["tid"]; got != "tenant-b" {
+		t.Errorf("RawClaims[tid] = %v; want tenant-b", got)
+	}
+}
+
+func TestMicrosoftProvider_ProviderUserIDConsistency(t *testing.T) {
+	privKey, nRaw, eRaw := generateTestRSAKey(t)
+
+	jwks := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(JWKDoc{Keys: []JWKKey{{
+			Kty: "RSA", Use: "sig", Kid: "ms-key-1", Alg: "RS256", N: nRaw, E: eRaw,
+		}}})
+	}))
+	defer jwks.Close()
+
+	var userinfoClaims atomic.Value
+	userinfo := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(userinfoClaims.Load())
+	}))
+	defer userinfo.Close()
+
+	newProvider := func(t *testing.T) *MicrosoftProvider {
+		t.Helper()
+		p := NewMicrosoftProvider(config.MicrosoftConfig{
+			ClientID:    "client-test-id",
+			Tenant:      "common",
+			RedirectURI: "https://example.com/callback",
+		})
+		p.client = jwks.Client()
+		p.jwksMgr = NewJWKSManager(jwks.URL, p.client, time.Hour)
+		p.jwksRetriever = p.jwksMgr
+		p.userinfoURL = userinfo.URL
+		return p
+	}
+
+	idToken := func(t *testing.T, extra map[string]any) string {
+		t.Helper()
+		claims := map[string]any{
+			"iss": "https://login.microsoftonline.com/tid-1/v2.0",
+			"aud": "client-test-id",
+			"exp": time.Now().Add(10 * time.Minute).Unix(),
+			"tid": "tid-1",
+		}
+		for k, v := range extra {
+			claims[k] = v
+		}
+		return signRS256JWT(t, privKey, "ms-key-1", claims)
+	}
+
+	t.Run("id token", func(t *testing.T) {
+		tests := []struct {
+			name string
+			oid  string
+			sub  string
+			want string
+		}{
+			{name: "sub is the identity key", oid: "immutable-oid", sub: "app-sub", want: "app-sub"},
+			{name: "oid fallback without sub", oid: "immutable-oid", want: "immutable-oid"},
+		}
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				claims := map[string]any{"sub": tt.sub}
+				if tt.oid != "" {
+					claims["oid"] = tt.oid
+				}
+				user, err := newProvider(t).FetchUserInfo(context.Background(), &OAuthToken{IDToken: idToken(t, claims)})
+				if err != nil {
+					t.Fatalf("FetchUserInfo = %v", err)
+				}
+				if user.ProviderUserID != tt.want {
+					t.Errorf("ProviderUserID = %q; want %q", user.ProviderUserID, tt.want)
+				}
+			})
+		}
+	})
+
+	t.Run("userinfo", func(t *testing.T) {
+		tests := []struct {
+			name   string
+			claims map[string]any
+			want   string
+		}{
+			{name: "sub is the identity key", claims: map[string]any{"oid": "immutable-oid", "sub": "app-sub"}, want: "app-sub"},
+			{name: "oid fallback without sub", claims: map[string]any{"oid": "immutable-oid"}, want: "immutable-oid"},
+			{name: "oid without sub", claims: map[string]any{"oid": "immutable-oid"}, want: "immutable-oid"},
+		}
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				userinfoClaims.Store(tt.claims)
+				user, err := newProvider(t).FetchUserInfo(context.Background(), &OAuthToken{AccessToken: "access-token"})
+				if err != nil {
+					t.Fatalf("FetchUserInfo = %v", err)
+				}
+				if user.ProviderUserID != tt.want {
+					t.Errorf("ProviderUserID = %q; want %q", user.ProviderUserID, tt.want)
+				}
+			})
+		}
+
+		t.Run("rejects missing oid and sub", func(t *testing.T) {
+			userinfoClaims.Store(map[string]any{"email": "user@example.com"})
+			_, err := newProvider(t).FetchUserInfo(context.Background(), &OAuthToken{AccessToken: "access-token"})
+			if err == nil {
+				t.Fatal("expected rejection for userinfo without a subject identifier")
+			}
+			var appErr *errors.Error
+			if !errors.As(err, &appErr) || appErr.Code() != errors.CodeOAuthProviderError {
+				t.Fatalf("expected CodeOAuthProviderError, got %v", err)
+			}
+		})
+	})
+}
+
+// TestMicrosoftProvider_UserInfoIdentityKey pins the identity claim set to what
+// /oidc/userinfo actually returns: sub is the key, and oid never outranks it.
+// A payload with neither key is the only userinfo shape that may fail, so
+// re-adding a claim the endpoint does not send breaks these assertions.
+func TestMicrosoftProvider_UserInfoIdentityKey(t *testing.T) {
+	var payload atomic.Value
+	userinfo := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(payload.Load())
+	}))
+	defer userinfo.Close()
+
+	p := NewMicrosoftProvider(config.MicrosoftConfig{
+		ClientID:    "client-test-id",
+		RedirectURI: "https://example.com/callback",
+	})
+	p.client = userinfo.Client()
+	p.userinfoURL = userinfo.URL
+
+	fetch := func(t *testing.T, claims map[string]any) (*OAuthUser, error) {
+		t.Helper()
+		payload.Store(claims)
+		return p.FetchUserInfo(context.Background(), &OAuthToken{AccessToken: "access-token"})
+	}
+
+	t.Run("documented payload keys on sub without synthesized tenant claims", func(t *testing.T) {
+		user, err := fetch(t, map[string]any{
+			"sub":         "pairwise-sub",
+			"name":        "User One",
+			"family_name": "One",
+			"given_name":  "User",
+			"picture":     "https://graph.example.com/photo.jpg",
+			"email":       "user@example.com",
+		})
+		if err != nil {
+			t.Fatalf("FetchUserInfo = %v", err)
+		}
+		if user.ProviderUserID != "pairwise-sub" {
+			t.Errorf("ProviderUserID = %q; want pairwise-sub", user.ProviderUserID)
+		}
+		for _, claim := range []string{"oid", "tid"} {
+			if _, ok := user.RawClaims[claim]; ok {
+				t.Errorf("RawClaims carries %q, which /oidc/userinfo never returns", claim)
+			}
+		}
+		if user.EmailVerified {
+			t.Error("userinfo alone must never verify the email")
+		}
+	})
+
+	t.Run("oid cannot outrank sub", func(t *testing.T) {
+		user, err := fetch(t, map[string]any{"sub": "pairwise-sub", "oid": "directory-oid"})
+		if err != nil {
+			t.Fatalf("FetchUserInfo = %v", err)
+		}
+		if user.ProviderUserID != "pairwise-sub" {
+			t.Errorf("ProviderUserID = %q; want pairwise-sub", user.ProviderUserID)
+		}
+	})
+
+	t.Run("oid is the fallback when sub is absent", func(t *testing.T) {
+		user, err := fetch(t, map[string]any{"oid": "directory-oid"})
+		if err != nil {
+			t.Fatalf("FetchUserInfo = %v", err)
+		}
+		if user.ProviderUserID != "directory-oid" {
+			t.Errorf("ProviderUserID = %q; want directory-oid", user.ProviderUserID)
+		}
+	})
+}
+
+// TestMicrosoftProvider_TenantResolutionCaching pins the domain→GUID lookup
+// costs: a direct GUID match never touches discovery, a resolved domain is
+// cached, concurrent logins share one lookup, and a failure is negatively
+// cached as a configuration error.
+func TestMicrosoftProvider_TenantResolutionCaching(t *testing.T) {
+	const (
+		contosoDomain = "contoso.onmicrosoft.com"
+		otherDomain   = "other.onmicrosoft.com"
+	)
+
+	privKey, nRaw, eRaw := generateTestRSAKey(t)
+
+	fixtures := map[string]string{
+		contosoDomain: contosoTenantGUID,
+		otherDomain:   otherTenantGUID,
+		// A discovery document whose issuer carries no usable tenant GUID.
+		"bad.onmicrosoft.com": "not-a-guid",
+	}
+
+	var (
+		mu          sync.Mutex
+		lookupCount int
+	)
+	var serverURL string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		const suffix = "/v2.0/.well-known/openid-configuration"
+		if strings.HasSuffix(r.URL.Path, suffix) {
+			domain := strings.TrimPrefix(strings.TrimSuffix(r.URL.Path, suffix), "/")
+			mu.Lock()
+			lookupCount++
+			mu.Unlock()
+			guid, ok := fixtures[domain]
+			if !ok {
+				http.NotFound(w, r)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(OIDCDiscovery{
+				Issuer:                serverURL + "/" + guid + "/v2.0",
+				AuthorizationEndpoint: serverURL + "/authorize",
+				TokenEndpoint:         serverURL + "/token",
+				JWKSURI:               serverURL + "/keys",
+			})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(JWKDoc{Keys: []JWKKey{{
+			Kty: "RSA", Use: "sig", Kid: "ms-key-1", Alg: "RS256", N: nRaw, E: eRaw,
+		}}})
+	}))
+	defer server.Close()
+	serverURL = server.URL
+
+	newProvider := func(trusted ...string) *MicrosoftProvider {
+		p := NewMicrosoftProvider(config.MicrosoftConfig{
+			ClientID:       "client-test-id",
+			Tenant:         "common",
+			TrustedTenants: trusted,
+			RedirectURI:    "https://example.com/callback",
+		}, WithEndpoints(EndpointOverride{DiscoveryURL: server.URL}))
+		p.client = server.Client()
+		p.jwksMgr = NewJWKSManager(server.URL+"/keys", p.client, time.Hour)
+		p.jwksRetriever = p.jwksMgr
+		p.resolveTimeout = time.Second
+		return p
+	}
+
+	// Tokens are minted before any goroutine starts: signing reports failures
+	// through *testing.T, which only the test goroutine may use.
+	idToken := func(t *testing.T, tid string) string {
+		t.Helper()
+		claims := map[string]any{
+			"iss":      "https://login.microsoftonline.com/" + tid + "/v2.0",
+			"sub":      "sub-" + tid,
+			"aud":      "client-test-id",
+			"exp":      time.Now().Add(10 * time.Minute).Unix(),
+			"email":    "user@example.com",
+			"tid":      tid,
+			"xms_edov": "1",
+		}
+		return signRS256JWT(t, privKey, "ms-key-1", claims)
+	}
+
+	reset := func() {
+		mu.Lock()
+		lookupCount = 0
+		mu.Unlock()
+	}
+	requests := func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return lookupCount
+	}
+
+	t.Run("direct guid match skips discovery", func(t *testing.T) {
+		reset()
+		// The allowlist also names an unresolvable domain: a GUID match must
+		// settle before any resolution is attempted.
+		p := newProvider(contosoTenantGUID, "broken.onmicrosoft.com")
+		if _, err := p.VerifyIDToken(context.Background(), idToken(t, contosoTenantGUID), ""); err != nil {
+			t.Fatalf("VerifyIDToken = %v", err)
+		}
+		if got := requests(); got != 0 {
+			t.Fatalf("discovery requests = %d; want 0 for a direct guid match", got)
+		}
+	})
+
+	t.Run("resolved domain is cached", func(t *testing.T) {
+		reset()
+		p := newProvider(contosoDomain)
+		for i := 0; i < 3; i++ {
+			if _, err := p.VerifyIDToken(context.Background(), idToken(t, contosoTenantGUID), ""); err != nil {
+				t.Fatalf("VerifyIDToken = %v", err)
+			}
+		}
+		if got := requests(); got != 1 {
+			t.Fatalf("discovery requests = %d; want 1 after caching", got)
+		}
+	})
+
+	t.Run("concurrent logins resolve once", func(t *testing.T) {
+		reset()
+		p := newProvider(contosoDomain)
+		const logins = 16
+		tokens := make([]string, logins)
+		for i := range tokens {
+			tokens[i] = idToken(t, contosoTenantGUID)
+		}
+		var wg sync.WaitGroup
+		errs := make([]error, logins)
+		start := make(chan struct{})
+		for i := 0; i < logins; i++ {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				<-start
+				_, errs[i] = p.VerifyIDToken(context.Background(), tokens[i], "")
+			}(i)
+		}
+		close(start)
+		wg.Wait()
+		for i, err := range errs {
+			if err != nil {
+				t.Fatalf("login %d = %v", i, err)
+			}
+		}
+		if got := requests(); got != 1 {
+			t.Fatalf("discovery requests = %d under %d concurrent logins; want 1", got, logins)
+		}
+	})
+
+	t.Run("failed resolution is cached as a config error", func(t *testing.T) {
+		reset()
+		p := newProvider("broken.onmicrosoft.com")
+		tok := idToken(t, contosoTenantGUID)
+
+		_, err := p.VerifyIDToken(context.Background(), tok, "")
+		if err == nil {
+			t.Fatal("expected an unresolvable allowlist domain to fail closed")
+		}
+		var appErr *errors.Error
+		if !errors.As(err, &appErr) || appErr.Code() != errors.CodeInvalidConfig {
+			t.Fatalf("error = %v; want code %q", err, errors.CodeInvalidConfig)
+		}
+
+		start := time.Now()
+		if _, err := p.VerifyIDToken(context.Background(), tok, ""); err == nil {
+			t.Fatal("expected the cached failure to keep failing closed")
+		}
+		if elapsed := time.Since(start); elapsed > 250*time.Millisecond {
+			t.Fatalf("cached failure took %v; want a fail-fast path", elapsed)
+		}
+		if got := requests(); got != 1 {
+			t.Fatalf("discovery requests = %d; want 1 with the failure cached", got)
+		}
+	})
+
+	t.Run("non-guid issuer stays out of the client message", func(t *testing.T) {
+		reset()
+		p := newProvider("bad.onmicrosoft.com")
+		_, err := p.VerifyIDToken(context.Background(), idToken(t, contosoTenantGUID), "")
+		if err == nil {
+			t.Fatal("expected a non-GUID discovery issuer to fail closed")
+		}
+		var appErr *errors.Error
+		if !errors.As(err, &appErr) || appErr.Code() != errors.CodeInvalidConfig {
+			t.Fatalf("error = %v; want code %q", err, errors.CodeInvalidConfig)
+		}
+		if strings.Contains(appErr.Message(), "not-a-guid") {
+			t.Errorf("message = %q; the discovery issuer must not be client-visible", appErr.Message())
+		}
+		if !strings.Contains(err.Error(), "not-a-guid") {
+			t.Errorf("error = %v; want the issuer kept in the cause chain", err)
+		}
+	})
 }
 
 func TestMicrosoftProvider_KeyIssuerBinding(t *testing.T) {
@@ -1149,8 +2101,21 @@ func TestMicrosoftProvider_KeyIssuerBinding(t *testing.T) {
 
 	t.Run("key scoped to a foreign tenant is rejected", func(t *testing.T) {
 		p := serve(t, "https://login.microsoftonline.com/"+tenantB+"/v2.0")
-		if _, err := p.VerifyIDToken(ctx, rawJWT, ""); err == nil {
+		_, err := p.VerifyIDToken(ctx, rawJWT, "")
+		if err == nil {
 			t.Fatal("token verified with a key scoped to another tenant")
+		}
+		var appErr *errors.Error
+		if !errors.As(err, &appErr) {
+			t.Fatalf("error = %v; want an *errors.Error", err)
+		}
+		for _, secret := range []string{tenantA, tenantB} {
+			if strings.Contains(appErr.Message(), secret) {
+				t.Errorf("message = %q; it discloses %q", appErr.Message(), secret)
+			}
+		}
+		if !strings.Contains(err.Error(), tenantB) {
+			t.Errorf("error = %v; want the signing key issuer kept in the cause", err)
 		}
 	})
 
@@ -1160,4 +2125,276 @@ func TestMicrosoftProvider_KeyIssuerBinding(t *testing.T) {
 			t.Fatalf("verification failed: %v", err)
 		}
 	})
+}
+
+// TestMicrosoftProvider_ConsumersAuthorityBindsTIDToIssuer pins the issuer↔tid
+// binding for the consumers authority: the consumer issuer alone must not admit
+// a token whose tid names an organisation tenant.
+func TestMicrosoftProvider_ConsumersAuthorityBindsTIDToIssuer(t *testing.T) {
+	privKey, nRaw, eRaw := generateTestRSAKey(t)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(JWKDoc{Keys: []JWKKey{{
+			Kty: "RSA", Use: "sig", Kid: "ms-key-1", Alg: "RS256", N: nRaw, E: eRaw,
+		}}})
+	}))
+	defer server.Close()
+
+	p := NewMicrosoftProvider(config.MicrosoftConfig{
+		ClientID:    "client-test-id",
+		Tenant:      "consumers",
+		RedirectURI: "https://example.com/callback",
+	})
+	p.client = server.Client()
+	p.jwksMgr = NewJWKSManager(server.URL, p.client, time.Hour)
+	p.jwksRetriever = p.jwksMgr
+
+	consumerIssuer := "https://login.microsoftonline.com/" + MicrosoftConsumerTenantGUID + "/v2.0"
+	mint := func(tid string) string {
+		return signRS256JWT(t, privKey, "ms-key-1", map[string]any{
+			"iss":   consumerIssuer,
+			"sub":   "sub-1",
+			"aud":   "client-test-id",
+			"exp":   time.Now().Add(10 * time.Minute).Unix(),
+			"email": "user@outlook.com",
+			"tid":   tid,
+		})
+	}
+
+	ctx := context.Background()
+	if _, err := p.VerifyIDToken(ctx, mint(MicrosoftConsumerTenantGUID), ""); err != nil {
+		t.Fatalf("consumer token rejected: %v", err)
+	}
+
+	_, err := p.VerifyIDToken(ctx, mint(otherTenantGUID), "")
+	if err == nil {
+		t.Fatal("consumers authority accepted a token whose tid names another tenant")
+	}
+	var appErr *errors.Error
+	if !errors.As(err, &appErr) || appErr.Code() != errors.CodeOAuthIDTokenInvalid {
+		t.Fatalf("error = %v; want code %q", err, errors.CodeOAuthIDTokenInvalid)
+	}
+}
+
+// TestMicrosoftProvider_ConsumerTIDMatchingIsCaseInsensitive pins both consumer
+// tenant comparisons to the normalized tid: an upper-case spelling of the
+// consumer GUID must still attest under common and stay rejected under
+// organizations.
+func TestMicrosoftProvider_ConsumerTIDMatchingIsCaseInsensitive(t *testing.T) {
+	privKey, nRaw, eRaw := generateTestRSAKey(t)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(JWKDoc{Keys: []JWKKey{{
+			Kty: "RSA", Use: "sig", Kid: "ms-key-1", Alg: "RS256", N: nRaw, E: eRaw,
+		}}})
+	}))
+	defer server.Close()
+
+	newProvider := func(tenant string) *MicrosoftProvider {
+		p := NewMicrosoftProvider(config.MicrosoftConfig{
+			ClientID:    "client-test-id",
+			Tenant:      tenant,
+			RedirectURI: "https://example.com/callback",
+		})
+		p.client = server.Client()
+		p.jwksMgr = NewJWKSManager(server.URL, p.client, time.Hour)
+		p.jwksRetriever = p.jwksMgr
+		return p
+	}
+
+	upperTID := strings.ToUpper(MicrosoftConsumerTenantGUID)
+	tok := signRS256JWT(t, privKey, "ms-key-1", map[string]any{
+		"iss":   "https://login.microsoftonline.com/" + upperTID + "/v2.0",
+		"sub":   "sub-1",
+		"aud":   "client-test-id",
+		"exp":   time.Now().Add(10 * time.Minute).Unix(),
+		"email": "user@outlook.com",
+		"tid":   upperTID,
+	})
+
+	ctx := context.Background()
+
+	t.Run("common authority attests the consumer tid", func(t *testing.T) {
+		c, err := newProvider("common").VerifyIDToken(ctx, tok, "")
+		if err != nil {
+			t.Fatalf("VerifyIDToken = %v", err)
+		}
+		if !c.EmailVerified {
+			t.Error("EmailVerified = false; a consumer tid is attested regardless of its case")
+		}
+	})
+
+	t.Run("organizations authority rejects a consumer account", func(t *testing.T) {
+		_, err := newProvider("organizations").VerifyIDToken(ctx, tok, "")
+		if err == nil {
+			t.Fatal("organizations authority admitted a consumer account")
+		}
+		var appErr *errors.Error
+		if !errors.As(err, &appErr) || appErr.Code() != errors.CodeOAuthIDTokenInvalid {
+			t.Fatalf("error = %v; want code %q", err, errors.CodeOAuthIDTokenInvalid)
+		}
+	})
+}
+
+// TestMicrosoftProvider_IssuerRejectionKeepsTenantOutOfClientMessage pins the
+// disclosure boundary: the token's issuer and the tenant the authority expects
+// are server-side facts and stay in the cause, never in the client message.
+func TestMicrosoftProvider_IssuerRejectionKeepsTenantOutOfClientMessage(t *testing.T) {
+	privKey, nRaw, eRaw := generateTestRSAKey(t)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(JWKDoc{Keys: []JWKKey{{
+			Kty: "RSA", Use: "sig", Kid: "ms-key-1", Alg: "RS256", N: nRaw, E: eRaw,
+		}}})
+	}))
+	defer server.Close()
+
+	const foreignIssuer = "https://login.microsoftonline.com/" + otherTenantGUID + "/v2.0"
+
+	tests := []struct {
+		name string
+		// authority configured on the adapter.
+		tenant string
+		// the token's tid and iss, which disagree with the authority.
+		tid string
+		iss string
+		// values that would identify the token's or the configured tenant.
+		secrets []string
+		code    errors.Code
+	}{
+		{
+			name: "consumers authority", tenant: "consumers", tid: otherTenantGUID, iss: foreignIssuer,
+			secrets: []string{foreignIssuer, otherTenantGUID},
+			code:    errors.CodeOAuthIDTokenInvalid,
+		},
+		{
+			name: "organizations authority", tenant: "organizations", tid: contosoTenantGUID, iss: foreignIssuer,
+			secrets: []string{foreignIssuer, contosoTenantGUID},
+			code:    errors.CodeOAuthIDTokenInvalid,
+		},
+		{
+			name: "common authority", tenant: "common", tid: contosoTenantGUID, iss: foreignIssuer,
+			secrets: []string{foreignIssuer, contosoTenantGUID},
+			code:    errors.CodeOAuthIDTokenInvalid,
+		},
+		{
+			name: "specific tenant", tenant: contosoTenantGUID, tid: otherTenantGUID, iss: foreignIssuer,
+			secrets: []string{foreignIssuer, otherTenantGUID, contosoTenantGUID},
+			code:    errors.CodeOAuthTenantInvalid,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := NewMicrosoftProvider(config.MicrosoftConfig{
+				ClientID:    "client-test-id",
+				Tenant:      tt.tenant,
+				RedirectURI: "https://example.com/callback",
+			})
+			p.client = server.Client()
+			p.jwksMgr = NewJWKSManager(server.URL, p.client, time.Hour)
+			p.jwksRetriever = p.jwksMgr
+
+			tok := signRS256JWT(t, privKey, "ms-key-1", map[string]any{
+				"iss":   tt.iss,
+				"sub":   "sub-1",
+				"aud":   "client-test-id",
+				"exp":   time.Now().Add(10 * time.Minute).Unix(),
+				"email": "user@example.com",
+				"tid":   tt.tid,
+			})
+
+			_, err := p.VerifyIDToken(context.Background(), tok, "")
+			if err == nil {
+				t.Fatal("expected an issuer rejection, got nil")
+			}
+			var appErr *errors.Error
+			if !errors.As(err, &appErr) || appErr.Code() != tt.code {
+				t.Fatalf("error = %v; want code %q", err, tt.code)
+			}
+			for _, secret := range tt.secrets {
+				if strings.Contains(appErr.Message(), secret) {
+					t.Errorf("message = %q; it discloses %q", appErr.Message(), secret)
+				}
+			}
+			if !strings.Contains(err.Error(), tt.iss) {
+				t.Errorf("error = %v; want the issuer kept in the cause chain", err)
+			}
+		})
+	}
+}
+
+// TestMicrosoftProvider_StaleAllowlistEntryDoesNotBlockAdmittedTenant pins the
+// scope of per-login domain resolution: an allowlist entry that no longer
+// resolves must not decide the login of a tenant another entry admits. Map
+// iteration order previously picked which entry was resolved first, so the same
+// login succeeded or failed run to run.
+func TestMicrosoftProvider_StaleAllowlistEntryDoesNotBlockAdmittedTenant(t *testing.T) {
+	privKey, nRaw, eRaw := generateTestRSAKey(t)
+
+	var serverURL string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		const suffix = "/v2.0/.well-known/openid-configuration"
+		if domain, ok := strings.CutSuffix(r.URL.Path, suffix); ok {
+			if strings.TrimPrefix(domain, "/") != "contoso.onmicrosoft.com" {
+				http.NotFound(w, r)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(OIDCDiscovery{
+				Issuer:                serverURL + "/" + contosoTenantGUID + "/v2.0",
+				AuthorizationEndpoint: serverURL + "/authorize",
+				TokenEndpoint:         serverURL + "/token",
+				JWKSURI:               serverURL + "/keys",
+			})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(JWKDoc{Keys: []JWKKey{{
+			Kty: "RSA", Use: "sig", Kid: "ms-key-1", Alg: "RS256", N: nRaw, E: eRaw,
+		}}})
+	}))
+	defer server.Close()
+	serverURL = server.URL
+
+	tok := signRS256JWT(t, privKey, "ms-key-1", map[string]any{
+		"iss":   "https://login.microsoftonline.com/" + contosoTenantGUID + "/v2.0",
+		"sub":   "sub-1",
+		"aud":   "client-test-id",
+		"exp":   time.Now().Add(10 * time.Minute).Unix(),
+		"email": "user@contoso.com",
+		"tid":   contosoTenantGUID,
+	})
+
+	// The failure of a stale entry may only be held back once that entry has
+	// been walked, so the stale domain is placed at both ends of the sorted
+	// walk: first covers the held-back path, last covers early admission.
+	tests := []struct {
+		name    string
+		trusted []string
+	}{
+		{name: "stale entry sorts first", trusted: []string{"aaa-stale.onmicrosoft.com", "contoso.onmicrosoft.com"}},
+		{name: "stale entry sorts last", trusted: []string{"contoso.onmicrosoft.com", "zzz-stale.onmicrosoft.com"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := NewMicrosoftProvider(config.MicrosoftConfig{
+				ClientID:       "client-test-id",
+				Tenant:         "common",
+				TrustedTenants: tt.trusted,
+				RedirectURI:    "https://example.com/callback",
+			}, WithEndpoints(EndpointOverride{DiscoveryURL: server.URL}))
+			p.client = server.Client()
+			p.jwksMgr = NewJWKSManager(server.URL+"/keys", p.client, time.Hour)
+			p.jwksRetriever = p.jwksMgr
+
+			for i := 0; i < 20; i++ {
+				c, err := p.VerifyIDToken(context.Background(), tok, "")
+				if err != nil {
+					t.Fatalf("run %d: VerifyIDToken = %v; a stale sibling entry must not fail an admitted tenant's login", i, err)
+				}
+				if c.UntrustedTenant {
+					t.Fatalf("run %d: UntrustedTenant = true; a resolvable domain entry admits this tenant", i)
+				}
+			}
+		})
+	}
 }

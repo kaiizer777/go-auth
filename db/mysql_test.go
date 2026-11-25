@@ -57,8 +57,8 @@ func TestMySQLDefaultMigrationsEmbedded(t *testing.T) {
 		current = next
 	}
 
-	if count != 8 {
-		t.Fatalf("expected 8 mysql migration versions, found %d", count)
+	if count != 10 {
+		t.Fatalf("expected 10 mysql migration versions, found %d", count)
 	}
 }
 
@@ -188,6 +188,51 @@ func TestMySQLMigration000008_DownRefusesOnTotpSecrets(t *testing.T) {
 	if idxTwoFactor > idxTotpUsed || idxTotpUsed > idxTotpSecrets {
 		t.Errorf("mysql migration 8 down drop order must be two_factor_tokens -> totp_used_codes -> totp_secrets, got indices %d, %d, %d",
 			idxTwoFactor, idxTotpUsed, idxTotpSecrets)
+	}
+}
+
+func TestMySQLMigration000009_AddsVerifiedFlag(t *testing.T) {
+	data, err := defaultMigrationsFS.ReadFile("migrations/mysql/000009_add_oauth_account_verified.up.sql")
+	if err != nil {
+		t.Fatalf("failed to read mysql migration 9 up: %v", err)
+	}
+	content := string(data)
+
+	alterIdx := strings.Index(content, "ALTER TABLE oauth_accounts ADD COLUMN")
+	if alterIdx == -1 || !strings.Contains(content, "verified TINYINT(1) NOT NULL DEFAULT 0") {
+		t.Fatal("mysql migration 9 up must add oauth_accounts.verified as TINYINT(1) NOT NULL DEFAULT 0")
+	}
+	backfillIdx := strings.Index(content, "UPDATE oauth_accounts SET verified = 1")
+	if backfillIdx == -1 {
+		t.Fatal("mysql migration 9 up must backfill verified from the owning account")
+	}
+	if alterIdx > backfillIdx {
+		t.Errorf("mysql migration 9 column add (idx %d) must precede the backfill (idx %d)", alterIdx, backfillIdx)
+	}
+	backfill := content[backfillIdx:]
+	if semi := strings.Index(backfill, ";"); semi != -1 {
+		backfill = backfill[:semi]
+	}
+	if !strings.Contains(backfill, "users.email_verified = 1") {
+		t.Errorf("mysql migration 9 backfill must gate trust on users.email_verified: %q", backfill)
+	}
+	if !strings.Contains(backfill, "users.id = oauth_accounts.user_id") {
+		t.Errorf("mysql migration 9 backfill must correlate the link to its owning user: %q", backfill)
+	}
+
+	downData, err := defaultMigrationsFS.ReadFile("migrations/mysql/000009_add_oauth_account_verified.down.sql")
+	if err != nil {
+		t.Fatalf("failed to read mysql migration 9 down: %v", err)
+	}
+	downContent := string(downData)
+	if !strings.Contains(downContent, "ALTER TABLE oauth_accounts DROP COLUMN") || !strings.Contains(downContent, "verified") {
+		t.Error("mysql migration 9 down must drop the verified column")
+	}
+	if strings.Contains(strings.ToUpper(downContent), "DROP TABLE") {
+		t.Error("mysql migration 9 down must drop only the column, never the links table")
+	}
+	if strings.Contains(downContent, "loses no identity data") {
+		t.Error("mysql migration 9 down must not claim the rollback is lossless")
 	}
 }
 
@@ -460,5 +505,27 @@ func TestPrepareMySQLMigrationDSN_MultiStatements(t *testing.T) {
 	var appErr *errors.Error
 	if !errors.As(err, &appErr) || appErr.Code() != errors.CodeDatabaseError {
 		t.Fatalf("expected CodeDatabaseError, got: %v", err)
+	}
+}
+
+func TestMySQLMigration000010_DeduplicatesMicrosoftOIDLinks(t *testing.T) {
+	data, err := defaultMigrationsFS.ReadFile("migrations/mysql/000010_resolve_microsoft_oid_links.up.sql")
+	if err != nil {
+		t.Fatalf("failed to read mysql migration 10 up: %v", err)
+	}
+	content := string(data)
+	if !strings.Contains(content, "DELETE a FROM oauth_accounts a") {
+		t.Fatal("mysql migration 10 up must delete duplicate oauth_accounts")
+	}
+	if !strings.Contains(content, "a.provider_id = 'microsoft'") {
+		t.Fatal("mysql migration 10 up must be scoped to microsoft provider")
+	}
+
+	downData, err := defaultMigrationsFS.ReadFile("migrations/mysql/000010_resolve_microsoft_oid_links.down.sql")
+	if err != nil {
+		t.Fatalf("failed to read mysql migration 10 down: %v", err)
+	}
+	if len(downData) == 0 {
+		t.Fatal("mysql migration 10 down file must exist")
 	}
 }

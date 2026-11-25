@@ -178,6 +178,7 @@ func TestDocumentSerialization_RoundTrip(t *testing.T) {
 			ProviderID:     "google",
 			ProviderUserID: "google-uid-123",
 			Email:          "user@example.com",
+			Verified:       true,
 			CreatedAt:      now,
 			UpdatedAt:      now,
 		}
@@ -197,8 +198,38 @@ func TestDocumentSerialization_RoundTrip(t *testing.T) {
 		if roundTripped.ID != acc.ID || roundTripped.UserID != acc.UserID ||
 			roundTripped.ProviderID != acc.ProviderID ||
 			roundTripped.ProviderUserID != acc.ProviderUserID ||
-			roundTripped.Email != acc.Email {
+			roundTripped.Email != acc.Email ||
+			!roundTripped.Verified {
 			t.Fatalf("roundtrip mismatch: got %+v, want %+v", roundTripped, acc)
+		}
+	})
+
+	t.Run("OAuthAccountDoc without verified decodes unverified", func(t *testing.T) {
+		// Documents written before the flag existed carry no verified field;
+		// the missing field must land on the fail-closed zero value.
+		legacy := bson.M{
+			"_id":              uuid.New().String(),
+			"user_id":          uuid.New().String(),
+			"provider_id":      "google",
+			"provider_user_id": "legacy-uid",
+			"email":            "legacy@example.com",
+			"created_at":       now,
+			"updated_at":       now,
+		}
+		data, err := bson.Marshal(legacy)
+		if err != nil {
+			t.Fatalf("bson.Marshal failed: %v", err)
+		}
+
+		var unmarshaled OAuthAccountDoc
+		if err := bson.Unmarshal(data, &unmarshaled); err != nil {
+			t.Fatalf("bson.Unmarshal failed: %v", err)
+		}
+		if unmarshaled.Verified {
+			t.Fatal("missing verified field must decode false")
+		}
+		if got := unmarshaled.toDomain(); got.Verified {
+			t.Fatalf("legacy document decoded Verified=%v; want false", got.Verified)
 		}
 	})
 
@@ -348,6 +379,7 @@ func TestIndexSpecifications_Completeness(t *testing.T) {
 		name string
 	}{
 		{"users", "uq_users_email"},
+		{"users", "idx_users_email_verified"},
 		{"sessions", "uq_sessions_id_hash"},
 		{"sessions", "idx_sessions_user_id"},
 		{"sessions", "ttl_sessions_expiry"},
@@ -609,6 +641,306 @@ func TestMongoStore_ResolveCtx_DynamicBinding(t *testing.T) {
 	}
 }
 
+// TestBackfillOAuthAccountVerified pins the MongoDB mirror of SQL migration
+// 000009: a legacy document written without the flag is promoted only for a
+// locally verified owner, an unverified owner keeps the fail-closed default, and
+// the run is idempotent and marked.
+func TestBackfillOAuthAccountVerified(t *testing.T) {
+	uri := os.Getenv("TEST_MONGO_URI")
+	if uri == "" {
+		t.Skip("TEST_MONGO_URI unset; skipping live MongoDB backfill test")
+	}
+	opts := options.Client().ApplyURI(uri)
+	client, err := mongo.Connect(opts)
+	if err != nil {
+		t.Fatalf("mongo.Connect failed: %v", err)
+	}
+	database := client.Database(fmt.Sprintf("goauth_test_backfill_%s", strings.ReplaceAll(uuid.New().String(), "-", "")))
+	t.Cleanup(func() {
+		_ = database.Drop(context.Background())
+		_ = client.Disconnect(context.Background())
+	})
+	ctx := context.Background()
+
+	verifiedOwner, unverifiedOwner := uuid.New(), uuid.New()
+	users := database.Collection("users")
+	if _, err := users.InsertMany(ctx, []any{
+		bson.M{"_id": verifiedOwner.String(), "email": "verified@example.com", "email_verified": true},
+		bson.M{"_id": unverifiedOwner.String(), "email": "unverified@example.com", "email_verified": false},
+	}); err != nil {
+		t.Fatalf("seed users: %v", err)
+	}
+	links := database.Collection("oauth_accounts")
+	legacyVerified, legacyUnverified := uuid.New().String(), uuid.New().String()
+	if _, err := links.InsertMany(ctx, []any{
+		// Legacy documents carry no verified field at all.
+		bson.M{"_id": legacyVerified, "user_id": verifiedOwner.String(), "provider_id": "google",
+			"provider_user_id": "sub-legacy-verified", "email": "verified@example.com"},
+		bson.M{"_id": legacyUnverified, "user_id": unverifiedOwner.String(), "provider_id": "google",
+			"provider_user_id": "sub-legacy-unverified", "email": "unverified@example.com"},
+	}); err != nil {
+		t.Fatalf("seed links: %v", err)
+	}
+
+	readVerified := func(t *testing.T, id string) bool {
+		t.Helper()
+		var doc OAuthAccountDoc
+		if err := links.FindOne(ctx, bson.M{"_id": id}).Decode(&doc); err != nil {
+			t.Fatalf("load link %s: %v", id, err)
+		}
+		return doc.Verified
+	}
+
+	for run := 1; run <= 2; run++ {
+		if err := BackfillOAuthAccountVerified(ctx, database); err != nil {
+			t.Fatalf("run %d: %v", run, err)
+		}
+		if !readVerified(t, legacyVerified) {
+			t.Fatalf("run %d: link on a verified owner stayed unverified", run)
+		}
+		if readVerified(t, legacyUnverified) {
+			t.Fatalf("run %d: link on an unverified owner must stay unverified", run)
+		}
+	}
+	if n, err := database.Collection("schema_migrations").CountDocuments(ctx, bson.M{"_id": oauthVerifiedBackfillID}); err != nil || n != 1 {
+		t.Fatalf("migration marker rows = %d (err %v); want 1", n, err)
+	}
+	if n, err := database.Collection("schema_migrations").CountDocuments(ctx, bson.M{"_id": oauthVerifiedProgressID}); err != nil || n != 0 {
+		t.Fatalf("progress marker rows = %d; want 0 (cleaned up)", n)
+	}
+}
+
+func TestBackfillOAuthAccountVerified_BatchingAndResumability(t *testing.T) {
+	uri := os.Getenv("TEST_MONGO_URI")
+	if uri == "" {
+		t.Skip("TEST_MONGO_URI unset; skipping live MongoDB backfill test")
+	}
+	opts := options.Client().ApplyURI(uri)
+	client, err := mongo.Connect(opts)
+	if err != nil {
+		t.Fatalf("mongo.Connect failed: %v", err)
+	}
+	database := client.Database(fmt.Sprintf("goauth_test_backfill_batch_%s", strings.ReplaceAll(uuid.New().String(), "-", "")))
+	t.Cleanup(func() {
+		_ = database.Drop(context.Background())
+		_ = client.Disconnect(context.Background())
+	})
+	ctx := context.Background()
+
+	oldBatchSize := backfillBatchSize
+	backfillBatchSize = 2
+	defer func() { backfillBatchSize = oldBatchSize }()
+
+	users := database.Collection("users")
+	links := database.Collection("oauth_accounts")
+	markers := database.Collection("schema_migrations")
+
+	owners := []string{"u1", "u2", "u3", "u4", "u5"}
+	var userDocs []any
+	var linkDocs []any
+	for _, id := range owners {
+		userDocs = append(userDocs, bson.M{"_id": id, "email": id + "@example.com", "email_verified": true})
+		linkDocs = append(linkDocs, bson.M{
+			"_id":              "link-" + id,
+			"user_id":          id,
+			"provider_id":      "google",
+			"provider_user_id": "sub-" + id,
+			"email":            id + "@example.com",
+		})
+	}
+	if _, err := users.InsertMany(ctx, userDocs); err != nil {
+		t.Fatalf("seed users: %v", err)
+	}
+	if _, err := links.InsertMany(ctx, linkDocs); err != nil {
+		t.Fatalf("seed links: %v", err)
+	}
+
+	// 1. Simulate a prior truncated run that processed up to u2
+	if _, err := markers.InsertOne(ctx, bson.M{
+		"_id":          oauthVerifiedProgressID,
+		"last_user_id": "u2",
+		"updated_at":   time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("seed progress: %v", err)
+	}
+
+	// Run the backfill - it should resume from u3 onwards
+	if err := BackfillOAuthAccountVerified(ctx, database); err != nil {
+		t.Fatalf("BackfillOAuthAccountVerified resume run failed: %v", err)
+	}
+
+	// Verify all links from u3 to u5 are now verified
+	for _, id := range []string{"u3", "u4", "u5"} {
+		var doc OAuthAccountDoc
+		if err := links.FindOne(ctx, bson.M{"_id": "link-" + id}).Decode(&doc); err != nil {
+			t.Fatalf("find link-%s: %v", id, err)
+		}
+		if !doc.Verified {
+			t.Errorf("expected link-%s to be verified after resume", id)
+		}
+	}
+
+	// Verify links u1 and u2 were skipped (remain unverified)
+	for _, id := range []string{"u1", "u2"} {
+		var doc OAuthAccountDoc
+		if err := links.FindOne(ctx, bson.M{"_id": "link-" + id}).Decode(&doc); err != nil {
+			t.Fatalf("find link-%s: %v", id, err)
+		}
+		if doc.Verified {
+			t.Errorf("expected link-%s to remain unverified (skipped by resume)", id)
+		}
+	}
+
+	// Verify completion marker exists
+	var m bson.M
+	if err := markers.FindOne(ctx, bson.M{"_id": oauthVerifiedBackfillID}).Decode(&m); err != nil {
+		t.Fatalf("completion marker not found: %v", err)
+	}
+
+	// Verify progress marker was cleaned up
+	var prog bson.M
+	err = markers.FindOne(ctx, bson.M{"_id": oauthVerifiedProgressID}).Decode(&prog)
+	if !errors.Is(err, mongo.ErrNoDocuments) {
+		t.Fatalf("expected progress marker to be deleted, got err: %v", err)
+	}
+
+	// Verify email_verified index was created
+	cursor, err := users.Indexes().List(ctx)
+	if err != nil {
+		t.Fatalf("list indexes: %v", err)
+	}
+	var foundIndex bool
+	for cursor.Next(ctx) {
+		var idx struct {
+			Name string `bson:"name"`
+		}
+		if err := cursor.Decode(&idx); err == nil && idx.Name == "idx_users_email_verified" {
+			foundIndex = true
+			break
+		}
+	}
+	if !foundIndex {
+		t.Errorf("expected index idx_users_email_verified to be created")
+	}
+}
+
+func TestBackfillMicrosoftOIDLinks(t *testing.T) {
+	uri := os.Getenv("TEST_MONGO_URI")
+	if uri == "" {
+		t.Skip("TEST_MONGO_URI unset; skipping live MongoDB backfill test")
+	}
+	opts := options.Client().ApplyURI(uri)
+	client, err := mongo.Connect(opts)
+	if err != nil {
+		t.Fatalf("mongo.Connect failed: %v", err)
+	}
+	database := client.Database(fmt.Sprintf("goauth_test_ms_backfill_%s", strings.ReplaceAll(uuid.New().String(), "-", "")))
+	t.Cleanup(func() {
+		_ = database.Drop(context.Background())
+		_ = client.Disconnect(context.Background())
+	})
+	ctx := context.Background()
+
+	ownerID := uuid.New().String()
+	links := database.Collection("oauth_accounts")
+	now := time.Now().UTC()
+
+	// 1. Identity duplicate on (user_id, email): verified beats newer unverified
+	olderVerifiedID := uuid.New().String()
+	newerUnverifiedID := uuid.New().String()
+	sharedEmail := "ms-shared@example.com"
+
+	// 2. Different emails on same user_id: both must survive
+	workLinkID := uuid.New().String()
+	personalLinkID := uuid.New().String()
+
+	// 3. 3+ duplicate links for same user_id and email: newest verified survives
+	tripleEmail := "ms-triple@example.com"
+	tripleOldUnverifiedID := uuid.New().String()
+	tripleOlderVerifiedID := uuid.New().String()
+	tripleNewestVerifiedID := uuid.New().String()
+
+	// 4. Missing created_at handled gracefully
+	missingCreatedAtEmail := "ms-missing-created@example.com"
+	missingCreatedAtID := uuid.New().String()
+	validCreatedAtID := uuid.New().String()
+
+	if _, err := links.InsertMany(ctx, []any{
+		// Pair 1
+		bson.M{"_id": olderVerifiedID, "user_id": ownerID, "provider_id": "microsoft",
+			"provider_user_id": "ms-oid-1", "email": sharedEmail, "verified": true, "created_at": now.Add(-10 * time.Minute)},
+		bson.M{"_id": newerUnverifiedID, "user_id": ownerID, "provider_id": "microsoft",
+			"provider_user_id": "ms-sub-1", "email": sharedEmail, "verified": false, "created_at": now},
+
+		// Pair 2: distinct emails on same user
+		bson.M{"_id": workLinkID, "user_id": ownerID, "provider_id": "microsoft",
+			"provider_user_id": "ms-work-uid", "email": "work@example.com", "verified": true, "created_at": now},
+		bson.M{"_id": personalLinkID, "user_id": ownerID, "provider_id": "microsoft",
+			"provider_user_id": "ms-personal-uid", "email": "personal@example.com", "verified": true, "created_at": now},
+
+		// Triple group
+		bson.M{"_id": tripleOldUnverifiedID, "user_id": ownerID, "provider_id": "microsoft",
+			"provider_user_id": "ms-triple-1", "email": tripleEmail, "verified": false, "created_at": now.Add(-20 * time.Minute)},
+		bson.M{"_id": tripleOlderVerifiedID, "user_id": ownerID, "provider_id": "microsoft",
+			"provider_user_id": "ms-triple-2", "email": tripleEmail, "verified": true, "created_at": now.Add(-10 * time.Minute)},
+		bson.M{"_id": tripleNewestVerifiedID, "user_id": ownerID, "provider_id": "microsoft",
+			"provider_user_id": "ms-triple-3", "email": tripleEmail, "verified": true, "created_at": now},
+
+		// Missing created_at
+		bson.M{"_id": missingCreatedAtID, "user_id": ownerID, "provider_id": "microsoft",
+			"provider_user_id": "ms-nocreated-sub", "email": missingCreatedAtEmail, "verified": false},
+		bson.M{"_id": validCreatedAtID, "user_id": ownerID, "provider_id": "microsoft",
+			"provider_user_id": "ms-validcreated-sub", "email": missingCreatedAtEmail, "verified": true, "created_at": now},
+	}); err != nil {
+		t.Fatalf("seed links: %v", err)
+	}
+
+	for run := 1; run <= 2; run++ {
+		if err := BackfillMicrosoftOIDLinks(ctx, database); err != nil {
+			t.Fatalf("run %d: %v", run, err)
+		}
+
+		// Check Pair 1: verified survived, unverified deleted
+		var doc OAuthAccountDoc
+		if err := links.FindOne(ctx, bson.M{"_id": olderVerifiedID}).Decode(&doc); err != nil {
+			t.Fatalf("run %d: verified link should survive: %v", run, err)
+		}
+		if err := links.FindOne(ctx, bson.M{"_id": newerUnverifiedID}).Decode(&doc); !errors.Is(err, mongo.ErrNoDocuments) {
+			t.Fatalf("run %d: unverified duplicate should be deleted, err=%v", run, err)
+		}
+
+		// Check Pair 2: distinct identities on same user both survived
+		if err := links.FindOne(ctx, bson.M{"_id": workLinkID}).Decode(&doc); err != nil {
+			t.Fatalf("run %d: work link should survive: %v", run, err)
+		}
+		if err := links.FindOne(ctx, bson.M{"_id": personalLinkID}).Decode(&doc); err != nil {
+			t.Fatalf("run %d: personal link should survive: %v", run, err)
+		}
+
+		// Check Triple group: only newest verified survived
+		if err := links.FindOne(ctx, bson.M{"_id": tripleNewestVerifiedID}).Decode(&doc); err != nil {
+			t.Fatalf("run %d: newest verified triple link should survive: %v", run, err)
+		}
+		if err := links.FindOne(ctx, bson.M{"_id": tripleOldUnverifiedID}).Decode(&doc); !errors.Is(err, mongo.ErrNoDocuments) {
+			t.Fatalf("run %d: old unverified triple duplicate should be deleted, err=%v", run, err)
+		}
+		if err := links.FindOne(ctx, bson.M{"_id": tripleOlderVerifiedID}).Decode(&doc); !errors.Is(err, mongo.ErrNoDocuments) {
+			t.Fatalf("run %d: older verified triple duplicate should be deleted, err=%v", run, err)
+		}
+
+		// Check Missing created_at: verified with created_at survived
+		if err := links.FindOne(ctx, bson.M{"_id": validCreatedAtID}).Decode(&doc); err != nil {
+			t.Fatalf("run %d: valid created_at link should survive: %v", run, err)
+		}
+		if err := links.FindOne(ctx, bson.M{"_id": missingCreatedAtID}).Decode(&doc); !errors.Is(err, mongo.ErrNoDocuments) {
+			t.Fatalf("run %d: duplicate missing created_at should be deleted, err=%v", run, err)
+		}
+	}
+	if n, err := database.Collection("schema_migrations").CountDocuments(ctx, bson.M{"_id": microsoftOIDBackfillID}); err != nil || n != 1 {
+		t.Fatalf("migration marker rows = %d (err %v); want 1", n, err)
+	}
+}
+
 func TestUserStore_Delete_Cascade(t *testing.T) {
 	uri := os.Getenv("TEST_MONGO_URI")
 	if uri == "" {
@@ -824,14 +1156,15 @@ func TestMongoStore_CanceledContext_AllMethods(t *testing.T) {
 	acc := &db.OAuthAccount{
 		ID:             uuid.New(),
 		UserID:         uid,
-		ProviderID:     "gh",
-		ProviderUserID: "123",
+		ProviderID:     "github",
+		ProviderUserID: "gh_user_42",
 	}
 	assertCanceled("OAuthAccounts.Create", store.OAuthAccounts().Create(ctx, acc))
-	_, err = store.OAuthAccounts().GetByProvider(ctx, "gh", "123")
+	_, err = store.OAuthAccounts().GetByProvider(ctx, "github", "gh_user_42")
 	assertCanceled("OAuthAccounts.GetByProvider", err)
 	_, err = store.OAuthAccounts().GetByUserID(ctx, uid)
 	assertCanceled("OAuthAccounts.GetByUserID", err)
+	assertCanceled("OAuthAccounts.UpdateProviderUserID", store.OAuthAccounts().UpdateProviderUserID(ctx, acc.ID, "123_upd"))
 	assertCanceled("OAuthAccounts.Delete", store.OAuthAccounts().Delete(ctx, acc.ID))
 	assertCanceled("OAuthAccounts.DeleteByUserID", store.OAuthAccounts().DeleteByUserID(ctx, uid))
 

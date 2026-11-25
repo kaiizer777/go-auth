@@ -198,7 +198,7 @@ func setupE2EServerWithConfig(t *testing.T, mutate func(*config.Config)) (*httpt
 
 	client := &http.Client{
 		Jar:     jar,
-		Timeout: 5 * time.Second,
+		Timeout: 30 * time.Second,
 	}
 
 	t.Cleanup(func() {

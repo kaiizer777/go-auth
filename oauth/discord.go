@@ -24,17 +24,23 @@ type DiscordProvider struct {
 var _ Provider = (*DiscordProvider)(nil)
 
 // NewDiscordProvider constructs a new Discord OAuth provider adapter.
-func NewDiscordProvider(cfg config.DiscordConfig) *DiscordProvider {
+func NewDiscordProvider(cfg config.DiscordConfig, opts ...EndpointOption) *DiscordProvider {
 	if len(cfg.Scopes) == 0 {
 		cfg.Scopes = []string{"identify", "email"}
 	}
 
+	ep := resolveEndpoints(EndpointOverride{
+		AuthorizeURL: "https://discord.com/oauth2/authorize",
+		TokenURL:     "https://discord.com/api/v10/oauth2/token",
+		UserInfoURL:  "https://discord.com/api/v10/users/@me",
+	}, opts)
+
 	return &DiscordProvider{
 		cfg:         cfg,
 		client:      newHTTPClient(),
-		authURL:     "https://discord.com/oauth2/authorize",
-		tokenURL:    "https://discord.com/api/v10/oauth2/token",
-		userInfoURL: "https://discord.com/api/v10/users/@me",
+		authURL:     ep.AuthorizeURL,
+		tokenURL:    ep.TokenURL,
+		userInfoURL: ep.UserInfoURL,
 	}
 }
 

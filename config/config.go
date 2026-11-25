@@ -54,6 +54,12 @@ type ProviderConfig struct {
 	// GraphVersion pins the Facebook Graph API version (e.g. "v19.0"); ignored
 	// by every other adapter.
 	GraphVersion string `json:"graph_version,omitempty"`
+
+	// AssertEmailVerified declares that the operator trusts a non-empty email
+	// from the Facebook Graph API as provider-verified, which enables the
+	// existing-account merge. Default false keeps the address unattested;
+	// ignored by every other adapter.
+	AssertEmailVerified bool `json:"assert_email_verified,omitempty"`
 }
 
 // LogValue implements slog.LogValuer to ensure ClientSecret and PrivateKey are masked in logs.
@@ -79,6 +85,7 @@ func (p ProviderConfig) LogValue() slog.Value {
 		slog.Any("trusted_tenants", p.TrustedTenants),
 		slog.Duration("jwks_cache_ttl", p.JWKSCacheTTL),
 		slog.String("graph_version", p.GraphVersion),
+		slog.Bool("assert_email_verified", p.AssertEmailVerified),
 	)
 }
 
@@ -425,7 +432,50 @@ func DefaultConfig() Config {
 }
 
 // Validate ensures required fields are set and connection parameters are sane.
+// It commits the normalization only after every check passes: a rejected config
+// keeps its original values instead of the half-applied defaults that were
+// written before the failing check.
 func (c *Config) Validate() error {
+	working := c.clone()
+	if err := working.validate(); err != nil {
+		return err
+	}
+	*c = *working
+	return nil
+}
+
+// clone isolates the sections validate writes into, so a failed validation
+// cannot reach the caller through the typed provider pointers or the
+// AllowedOrigins backing array.
+func (c *Config) clone() *Config {
+	cp := *c
+	// validate normalizes origins in place; a shared backing array would mutate
+	// the caller's slice even when the config is rejected.
+	if c.AllowedOrigins != nil {
+		cp.AllowedOrigins = append([]string(nil), c.AllowedOrigins...)
+	}
+	if c.OAuth.Microsoft != nil {
+		v := *c.OAuth.Microsoft
+		cp.OAuth.Microsoft = &v
+	}
+	if c.OAuth.Facebook != nil {
+		v := *c.OAuth.Facebook
+		cp.OAuth.Facebook = &v
+	}
+	if c.OAuth.Discord != nil {
+		v := *c.OAuth.Discord
+		cp.OAuth.Discord = &v
+	}
+	if c.OAuth.X != nil {
+		v := *c.OAuth.X
+		cp.OAuth.X = &v
+	}
+	return &cp
+}
+
+// validate is the mutating body of Validate: it defaults and normalizes c in
+// place and reports the first failing check.
+func (c *Config) validate() error {
 	if c.DatabaseType == "" {
 		c.DatabaseType = DatabaseTypePostgres
 	}
@@ -762,60 +812,40 @@ func (c *Config) Validate() error {
 	if !isCookiePath(c.OAuth.StateCookiePath) {
 		return errors.ErrOAuthStateCookiePathInvalid
 	}
+	// Normalized entries land in a fresh map: writing back into the map under
+	// range leaves a partially normalized map behind on a later entry's error.
+	normalizedProviders := make(map[string]ProviderConfig, len(c.OAuth.Providers))
 	for id, provider := range c.OAuth.Providers {
 		switch id {
 		case "google", "github", "apple", "microsoft", "discord", "facebook", "x":
 		default:
 			return errors.ErrOAuthProviderUnknown
 		}
-		if !provider.Enabled {
-			continue
-		}
-		if provider.ClientID == "" {
-			return errors.ErrOAuthClientIDRequired
-		}
-		if provider.RedirectURL == "" {
-			return errors.ErrOAuthRedirectURLRequired
-		}
-		switch id {
-		case "google", "github", "microsoft", "discord", "facebook", "x":
-			if provider.ClientSecret == "" {
-				return errors.ErrOAuthClientSecretRequired
+		if id == "microsoft" {
+			tenant, err := normalizeMicrosoftTenant(provider.Tenant)
+			if err != nil {
+				return err
 			}
-		case "apple":
-			if provider.ClientSecret == "" &&
-				(provider.TeamID == "" || provider.KeyID == "" || provider.PrivateKey == "") {
-				return errors.ErrOAuthClientSecretRequired
-			}
+			provider.Tenant = tenant
 		}
+		normalizedProviders[id] = provider
 	}
+	c.OAuth.Providers = normalizedProviders
 
 	if c.OAuth.Microsoft != nil {
-		if c.OAuth.Microsoft.ClientID == "" {
-			return errors.ErrOAuthClientIDRequired
-		}
-		if c.OAuth.Microsoft.ClientSecret == "" {
-			return errors.ErrOAuthClientSecretRequired
-		}
-		if c.OAuth.Microsoft.RedirectURI == "" {
-			return errors.ErrOAuthRedirectURLRequired
-		}
 		// Merge rule: typed defaults materialise only without a map entry for
 		// this provider. A pre-merge "common"/scope/TTL default reads as an
 		// explicit typed value and would otherwise shadow explicit map config.
 		_, msMapEntry := c.OAuth.Providers["microsoft"]
-		tenant := strings.ToLower(strings.TrimSpace(c.OAuth.Microsoft.Tenant))
-		if tenant == "" && !msMapEntry {
+		tenant := c.OAuth.Microsoft.Tenant
+		if strings.TrimSpace(tenant) == "" && !msMapEntry {
 			tenant = "common"
 		}
-		c.OAuth.Microsoft.Tenant = tenant
-		switch tenant {
-		case "", "common", "organizations", "consumers":
-		default:
-			if !isMicrosoftTenantRef(tenant) {
-				return errors.WrapOverride(errors.ErrOAuthTenantInvalid, errors.CodeInvalidConfig, "oauth microsoft tenant is invalid: "+tenant)
-			}
+		normalized, err := normalizeMicrosoftTenant(tenant)
+		if err != nil {
+			return err
 		}
+		c.OAuth.Microsoft.Tenant = normalized
 		trusted := make([]string, 0, len(c.OAuth.Microsoft.TrustedTenants))
 		for _, t := range c.OAuth.Microsoft.TrustedTenants {
 			if t = strings.ToLower(strings.TrimSpace(t)); t != "" {
@@ -831,40 +861,7 @@ func (c *Config) Validate() error {
 		}
 	}
 
-	if c.OAuth.Discord != nil {
-		if c.OAuth.Discord.ClientID == "" {
-			return errors.ErrOAuthClientIDRequired
-		}
-		if c.OAuth.Discord.ClientSecret == "" {
-			return errors.ErrOAuthClientSecretRequired
-		}
-		if c.OAuth.Discord.RedirectURI == "" {
-			return errors.ErrOAuthRedirectURLRequired
-		}
-	}
-
-	if c.OAuth.Facebook != nil {
-		if c.OAuth.Facebook.AppID == "" {
-			return errors.ErrOAuthClientIDRequired
-		}
-		if c.OAuth.Facebook.AppSecret == "" {
-			return errors.ErrOAuthClientSecretRequired
-		}
-		if c.OAuth.Facebook.RedirectURI == "" {
-			return errors.ErrOAuthRedirectURLRequired
-		}
-	}
-
 	if c.OAuth.X != nil {
-		if c.OAuth.X.ClientID == "" {
-			return errors.ErrOAuthClientIDRequired
-		}
-		if c.OAuth.X.ClientSecret == "" {
-			return errors.ErrOAuthClientSecretRequired
-		}
-		if c.OAuth.X.RedirectURI == "" {
-			return errors.ErrOAuthRedirectURLRequired
-		}
 		// Same merge rule as Microsoft above: no pre-merge default when a map
 		// entry carries explicit scopes.
 		_, xMapEntry := c.OAuth.Providers["x"]
@@ -873,14 +870,36 @@ func (c *Config) Validate() error {
 		}
 	}
 
-	// Resolve after the per-surface credential checks: defaults are applied once,
-	// to the merged result, so no default can overwrite explicit map or typed
-	// configuration. The graph version only matters on the merged entry, so it is
-	// validated here — one check for both surfaces.
+	// Resolve folds typed sections into Providers and defaults merged entries.
 	c.OAuth.resolveProviders()
-	if fb, ok := c.OAuth.Providers["facebook"]; ok {
-		if err := validateGraphVersion(fb.GraphVersion); err != nil {
-			return err
+
+	// Validate credentials on the resolved providers. Every check routes through
+	// the resolved enabled state (resolveEnabled).
+	for id, provider := range c.OAuth.Providers {
+		if !provider.Enabled {
+			continue
+		}
+		if provider.ClientID == "" {
+			return errors.ErrOAuthClientIDRequired
+		}
+		switch id {
+		case "google", "github", "microsoft", "discord", "facebook", "x":
+			if provider.ClientSecret == "" {
+				return errors.ErrOAuthClientSecretRequired
+			}
+		case "apple":
+			if provider.ClientSecret == "" &&
+				(provider.TeamID == "" || provider.KeyID == "" || provider.PrivateKey == "") {
+				return errors.ErrOAuthClientSecretRequired
+			}
+		}
+		if provider.RedirectURL == "" {
+			return errors.ErrOAuthRedirectURLRequired
+		}
+		if id == "facebook" {
+			if err := validateGraphVersion(provider.GraphVersion); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -1042,6 +1061,20 @@ var (
 // Callers must lowercase tenant first; named authorities are handled separately.
 func isMicrosoftTenantRef(tenant string) bool {
 	return tenantGUIDRegex.MatchString(tenant) || tenantDomainRegex.MatchString(tenant)
+}
+
+// normalizeMicrosoftTenant lowercases and trims tenant, then rejects anything
+// that is not a named authority, GUID, or domain.
+func normalizeMicrosoftTenant(tenant string) (string, error) {
+	tenant = strings.ToLower(strings.TrimSpace(tenant))
+	switch tenant {
+	case "", "common", "organizations", "consumers":
+		return tenant, nil
+	}
+	if !isMicrosoftTenantRef(tenant) {
+		return "", errors.WrapOverride(errors.ErrOAuthTenantInvalid, errors.CodeInvalidConfig, "oauth microsoft tenant is invalid: "+tenant)
+	}
+	return tenant, nil
 }
 
 func isSecretParam(k string) bool {

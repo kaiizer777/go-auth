@@ -20,7 +20,6 @@ import (
 
 	"github.com/kaiizer777/go-auth/auth"
 	"github.com/kaiizer777/go-auth/config"
-	"github.com/kaiizer777/go-auth/crypto"
 	"github.com/kaiizer777/go-auth/db"
 	gormstore "github.com/kaiizer777/go-auth/db/gorm"
 	"github.com/kaiizer777/go-auth/errors"
@@ -50,6 +49,7 @@ func setupAntiHijackingDB(t *testing.T) (*gorm.DB, db.Store) {
 	CREATE TABLE IF NOT EXISTS oauth_accounts (
 		id TEXT PRIMARY KEY, user_id TEXT NOT NULL, provider_id VARCHAR(32) NOT NULL,
 		provider_user_id VARCHAR(255) NOT NULL, email VARCHAR(255) NOT NULL,
+		verified INTEGER NOT NULL DEFAULT 0,
 		created_at DATETIME, updated_at DATETIME,
 		CONSTRAINT uq_oauth_accounts_provider_uid UNIQUE (provider_id, provider_user_id)
 	);
@@ -275,7 +275,7 @@ func TestSecurity_UntrustedTenantKeepsExistingLink(t *testing.T) {
 		t.Fatalf("create owner: %v", err)
 	}
 	link := db.OAuthAccount{ID: uuid.New(), UserID: owner.ID, ProviderID: "microsoft",
-		ProviderUserID: "ms-untrusted-linked-sub", Email: owner.Email}
+		ProviderUserID: "ms-untrusted-linked-sub", Email: owner.Email, Verified: true}
 	if err := database.Create(&link).Error; err != nil {
 		t.Fatalf("create link: %v", err)
 	}
@@ -448,8 +448,9 @@ func TestSecurity_StateCookieTamperingAndReplay(t *testing.T) {
 	}
 }
 
-func TestSecurity_AntiEnumerationDummyHashTimingParity(t *testing.T) {
-	t.Parallel()
+func TestSecurity_AntiEnumerationDummyHashRunsOnce(t *testing.T) {
+	// Not parallel: TotalAlloc is process-wide, and a parallel Argon2id pass
+	// would mask a skipped dummy hash in the measured window.
 	database, _ := setupAntiHijackingDB(t)
 	cfg := config.DefaultConfig()
 	cfg.DatabaseURL = "postgres://postgres:postgres@localhost:5432/testdb"
@@ -461,33 +462,31 @@ func TestSecurity_AntiEnumerationDummyHashTimingParity(t *testing.T) {
 	}
 
 	// Attempt password login with an email that has no user row, so the
-	// lookup-miss branch burns the dummy Argon2id hash (401 invariant).
-	start := time.Now()
-	_, err = authSvc.Login(context.Background(), db.LoginRequest{
-		Email:    "no-such-user@example.com",
-		Password: "AttemptedPassword#123",
+	// lookup-miss branch must burn the configured dummy Argon2id work.
+	var loginErr error
+	alloc := allocDelta(func() {
+		_, loginErr = authSvc.Login(context.Background(), db.LoginRequest{
+			Email:    "no-such-user@example.com",
+			Password: "AttemptedPassword#123",
+		})
 	})
-	elapsed := time.Since(start)
 
-	if err == nil {
+	if loginErr == nil {
 		t.Fatal("expected login to fail for unknown email, got nil")
 	}
-	if !errors.Is(err, errors.ErrInvalidCredentials) {
-		t.Fatalf("expected ErrInvalidCredentials, got %v", err)
+	if !errors.Is(loginErr, errors.ErrInvalidCredentials) {
+		t.Fatalf("expected ErrInvalidCredentials, got %v", loginErr)
 	}
 
-	// Measure dummy hash time directly to verify parity
-	dummyHash, err := crypto.GenerateDummyHash(crypto.DefaultHashParams())
-	if err != nil {
-		t.Fatalf("GenerateDummyHash failed: %v", err)
-	}
-	dummyStart := time.Now()
-	_, _ = crypto.VerifyPassword("AttemptedPassword#123", dummyHash)
-	dummyElapsed := time.Since(dummyStart)
-
-	// Elapsed login time should be at least within 50% of the Argon2id computation
-	if elapsed < (dummyElapsed / 2) {
-		t.Fatalf("timing discrepancy: login elapsed %v, dummy hash took %v (indicates bypass of Argon2id)", elapsed, dummyElapsed)
+	// The oauth-only and missing-user entry points pin the configured work
+	// floor; here the shape of the work is the property under test. One
+	// derivation allocates exactly Memory*1024 bytes (Argon2 allocates one KiB
+	// block per unit), so more than 1.5x means the lookup-miss branch burned the
+	// dummy hash twice. Load can only raise TotalAlloc, and the 32 MiB of slack
+	// at the default cost keeps the bound independent of the runner.
+	derivation := uint64(cfg.Argon2.Memory) * 1024
+	if alloc > derivation+derivation/2 {
+		t.Fatalf("unknown-email login allocated %d bytes; want <= %d (a single Argon2id derivation at m=%d KiB)", alloc, derivation+derivation/2, cfg.Argon2.Memory)
 	}
 }
 

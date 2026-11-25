@@ -16,8 +16,8 @@ import (
 
 // OAuthInitiate starts the provider dance: state cookie set, 302 to provider.
 func (h *Handler) OAuthInitiate(w http.ResponseWriter, r *http.Request) {
-	providerID := r.PathValue("provider")
-	if _, ok := oauth.SupportedProviders[providerID]; !ok {
+	providerID := oauth.CanonicalProviderSlug(r.PathValue("provider"))
+	if !h.oauthProviderKnown(providerID) {
 		errors.WriteHTTP(w, errors.ErrOAuthProviderNotFound)
 		return
 	}
@@ -43,8 +43,8 @@ func (h *Handler) OAuthInitiate(w http.ResponseWriter, r *http.Request) {
 // Explicit bearer selectors additionally mint a bearer-typed session and
 // receive its raw token; a bare Accept: application/json stays cookie-typed.
 func (h *Handler) OAuthCallback(w http.ResponseWriter, r *http.Request) {
-	providerID := r.PathValue("provider")
-	if _, ok := oauth.SupportedProviders[providerID]; !ok {
+	providerID := oauth.CanonicalProviderSlug(r.PathValue("provider"))
+	if !h.oauthProviderKnown(providerID) {
 		errors.WriteHTTP(w, errors.ErrOAuthProviderNotFound)
 		return
 	}
@@ -144,6 +144,24 @@ func (h *Handler) OAuthCallback(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Pragma", "no-cache")
 	http.Redirect(w, r, safeOAuthRedirect(redirect), http.StatusFound)
+}
+
+// oauthProviderKnown reports whether the handler may dispatch providerID. The
+// static set is the base; an attached provider map or registry widens it so a
+// dynamically registered provider is not rejected before the service sees it.
+func (h *Handler) oauthProviderKnown(providerID string) bool {
+	if oauth.IsSupportedProvider(providerID) {
+		return true
+	}
+	if _, ok := h.oauthProviders[providerID]; ok {
+		return true
+	}
+	if h.oauthRegistry != nil {
+		if p, err := h.oauthRegistry.Get(providerID); err == nil && p != nil {
+			return true
+		}
+	}
+	return false
 }
 
 // allowOAuth enforces the per-IP OAuth limiter on initiate and callback.

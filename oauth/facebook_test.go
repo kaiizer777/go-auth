@@ -20,6 +20,25 @@ func (f failingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	return f(req)
 }
 
+func TestFacebookProvider_ConfigAssertEmailVerified(t *testing.T) {
+	t.Parallel()
+
+	pDefault := NewFacebookProvider(config.FacebookConfig{})
+	if pDefault.assertsVerifiedEmail {
+		t.Fatal("expected assertsVerifiedEmail to default to false")
+	}
+
+	pConfig := NewFacebookProvider(config.FacebookConfig{AssertEmailVerified: true})
+	if !pConfig.assertsVerifiedEmail {
+		t.Fatal("expected assertsVerifiedEmail to be true when configured in config")
+	}
+
+	pOption := NewFacebookProvider(config.FacebookConfig{}, FacebookAssertEmailVerified())
+	if !pOption.assertsVerifiedEmail {
+		t.Fatal("expected assertsVerifiedEmail to be true when configured via option")
+	}
+}
+
 func TestFacebookProvider_AuthCodeURL(t *testing.T) {
 	t.Parallel()
 
@@ -381,7 +400,15 @@ func TestFacebookProvider_FetchUserInfo(t *testing.T) {
 	})
 	p.userInfoURL = ts.URL
 
-	t.Run("full profile email stays unverified", func(t *testing.T) {
+	pAsserted := NewFacebookProvider(config.FacebookConfig{
+		AppID:        "fb-test-app",
+		AppSecret:    "fb-test-secret",
+		RedirectURI:  "https://myapp.com/callback",
+		GraphVersion: "v19.0",
+	}, FacebookAssertEmailVerified())
+	pAsserted.userInfoURL = ts.URL
+
+	t.Run("full profile email stays unverified by default", func(t *testing.T) {
 		tok := &OAuthToken{AccessToken: "token-full-profile"}
 		user, err := p.FetchUserInfo(context.Background(), tok)
 		if err != nil {
@@ -400,14 +427,27 @@ func TestFacebookProvider_FetchUserInfo(t *testing.T) {
 		if user.Email != "alice@fb-test.com" {
 			t.Errorf("Email = %q; want alice@fb-test.com", user.Email)
 		}
-		// Graph exposes no per-address verification signal: a present
-		// address must never imply verified.
+		// Meta documents no attestation for the Graph email field, so a
+		// present address must not unlock the existing-account merge.
 		if user.EmailVerified {
-			t.Errorf("EmailVerified = true; want false for facebook email")
+			t.Error("EmailVerified = true; Graph email is not a documented attestation")
 		}
 		expectedAvatar := "https://platform-lookaside.fbsbx.com/profile.jpg"
 		if user.AvatarURL != expectedAvatar {
 			t.Errorf("AvatarURL = %q; want %q", user.AvatarURL, expectedAvatar)
+		}
+	})
+
+	t.Run("operator assertion reports a present email as verified", func(t *testing.T) {
+		user, err := pAsserted.FetchUserInfo(context.Background(), &OAuthToken{AccessToken: "token-full-profile"})
+		if err != nil {
+			t.Fatalf("FetchUserInfo failed: %v", err)
+		}
+		if user.Email != "alice@fb-test.com" {
+			t.Errorf("Email = %q; want the address kept for display", user.Email)
+		}
+		if !user.EmailVerified {
+			t.Error("EmailVerified = false; want true under an explicit operator assertion")
 		}
 	})
 

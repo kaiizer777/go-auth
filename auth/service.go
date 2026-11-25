@@ -145,6 +145,9 @@ func (s *authService) Signup(ctx context.Context, req db.SignupRequest) (*db.Use
 					if _, err := txStore.Users().IncrementCredentialVersion(ctx, user.ID); err != nil {
 						return err
 					}
+					if err := purgeUnverifiedLinks(ctx, txStore, user.ID); err != nil {
+						return err
+					}
 					if err := txStore.VerificationTokens().DeleteByUserID(ctx, user.ID); err != nil {
 						return err
 					}
@@ -272,6 +275,9 @@ func (s *authService) Logout(ctx context.Context, sessionID string) error {
 }
 
 // VerifyEmail consumes a single-use verification token and marks the account verified.
+// The claim also invalidates the account's unverified OAuth links: they were
+// built from a provider claim nobody proved, and the proven owner takes the
+// account back.
 func (s *authService) VerifyEmail(ctx context.Context, req db.VerifyEmailRequest) (*db.User, error) {
 	if err := req.Validate(); err != nil {
 		return nil, err
@@ -299,6 +305,10 @@ func (s *authService) VerifyEmail(ctx context.Context, req db.VerifyEmailRequest
 			return err
 		}
 
+		if _, err := txStore.Users().GetByIDForUpdate(ctx, tok.UserID); err != nil {
+			return err
+		}
+
 		rows, err := txStore.VerificationTokens().Delete(ctx, tokenHash[:])
 		if err != nil {
 			return err
@@ -310,9 +320,21 @@ func (s *authService) VerifyEmail(ctx context.Context, req db.VerifyEmailRequest
 		if err := txStore.Users().SetEmailVerified(ctx, tok.UserID, true); err != nil {
 			return err
 		}
-		u, err := txStore.Users().GetByID(ctx, tok.UserID)
-		if err != nil {
+		if _, err := txStore.Users().IncrementCredentialVersion(ctx, tok.UserID); err != nil {
 			return err
+		}
+		if err := purgeUnverifiedLinks(ctx, txStore, tok.UserID); err != nil {
+			return err
+		}
+		if err := txStore.VerificationTokens().DeleteByUserID(ctx, tok.UserID); err != nil {
+			return err
+		}
+		if err := txStore.Sessions().DeleteByUserID(ctx, tok.UserID); err != nil {
+			return err
+		}
+		u, uerr := txStore.Users().GetByID(ctx, tok.UserID)
+		if uerr != nil {
+			return uerr
 		}
 		verifiedUser = *u
 		return nil
@@ -386,7 +408,10 @@ func (s *authService) RequestPasswordReset(ctx context.Context, req db.PasswordR
 }
 
 // ResetPassword consumes a reset token, updates the password hash, and purges all
-// active password reset tokens for the user (ASVS L1 token invalidation).
+// active password reset tokens for the user (ASVS L1 token invalidation). A
+// consumed token also proves the caller reads the mailbox, so the account is
+// marked email-verified and its unverified OAuth links are deleted: an attested
+// link keeps working, a link built from an unverified provider claim does not.
 func (s *authService) ResetPassword(ctx context.Context, req db.PasswordResetConfirmRequest) (*db.User, error) {
 	if err := crypto.ValidatePassword(req.NewPassword, s.cfg.PasswordMinLength, s.cfg.PasswordMaxLength); err != nil {
 		return nil, err
@@ -438,7 +463,17 @@ func (s *authService) ResetPassword(ctx context.Context, req db.PasswordResetCon
 		if err := txStore.Users().UpdatePassword(ctx, tok.UserID, newHash); err != nil {
 			return err
 		}
+		// A consumed reset token proves the caller reads the mailbox, so the
+		// address is now locally verified: claimed for link attachment, and no
+		// unverified provider link may keep minting sessions on this account.
+		if err := txStore.Users().SetEmailVerified(ctx, tok.UserID, true); err != nil {
+			return err
+		}
 		if _, err := txStore.Users().IncrementCredentialVersion(ctx, tok.UserID); err != nil {
+			return err
+		}
+
+		if err := purgeUnverifiedLinks(ctx, txStore, tok.UserID); err != nil {
 			return err
 		}
 
@@ -466,6 +501,27 @@ func (s *authService) ResetPassword(ctx context.Context, req db.PasswordResetCon
 	}
 
 	return &resetUser, nil
+}
+
+// purgeUnverifiedLinks deletes the oauth links whose provider never attested the
+// address. It runs when the account's address becomes locally proven: from then
+// on an unverified link is untrusted, so it is removed instead of left behind to
+// be rejected on its next callback. Attested links are legitimate login methods
+// and are never touched.
+func purgeUnverifiedLinks(ctx context.Context, store db.Store, userID uuid.UUID) error {
+	links, err := store.OAuthAccounts().GetByUserID(ctx, userID)
+	if err != nil {
+		return err
+	}
+	for _, link := range links {
+		if link == nil || link.Verified {
+			continue
+		}
+		if err := store.OAuthAccounts().Delete(ctx, link.ID); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // emailHookTimeout returns the bound for email hook execution, defaulting to

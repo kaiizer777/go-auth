@@ -119,6 +119,7 @@ func setupSQLiteAdapter(t *testing.T) TestAdapter {
 		provider_id VARCHAR(32) NOT NULL,
 		provider_user_id VARCHAR(255) NOT NULL,
 		email VARCHAR(255) NOT NULL,
+		verified INTEGER NOT NULL DEFAULT 0,
 		created_at DATETIME,
 		updated_at DATETIME,
 		CONSTRAINT uq_oauth_accounts_provider_uid UNIQUE (provider_id, provider_user_id)

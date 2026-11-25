@@ -695,12 +695,27 @@ func TestOAuthAccountStore_AllMethods(t *testing.T) {
 		t.Fatalf("GetByUserID got %d items, err=%v", len(list), err)
 	}
 
-	// 4. Delete
+	// 4. UpdateProviderUserID
+	if err := oauth.UpdateProviderUserID(ctx, acc.ID, "gh_456_updated"); err != nil {
+		t.Fatalf("UpdateProviderUserID failed: %v", err)
+	}
+	gotUpdated, err := oauth.GetByProvider(ctx, "github", "gh_456_updated")
+	if err != nil || gotUpdated == nil || gotUpdated.ProviderUserID != "gh_456_updated" || gotUpdated.ID != acc.ID {
+		t.Fatalf("expected updated provider_user_id, got %v, err=%v", gotUpdated, err)
+	}
+	if _, err := oauth.GetByProvider(ctx, "github", "gh_user_42"); !errors.Is(err, gormdriver.ErrRecordNotFound) {
+		t.Fatalf("expected old provider_user_id to not exist, got err=%v", err)
+	}
+	if err := oauth.UpdateProviderUserID(ctx, uuid.New(), "non_existent"); !errors.Is(err, gormdriver.ErrRecordNotFound) {
+		t.Fatalf("expected gormdriver.ErrRecordNotFound for non-existent link, got %v", err)
+	}
+
+	// 5. Delete
 	if err := oauth.Delete(ctx, acc.ID); err != nil {
 		t.Fatalf("Delete oauth account failed: %v", err)
 	}
 
-	// 5. DeleteByUserID
+	// 6. DeleteByUserID
 	acc2 := &db.OAuthAccount{
 		UserID:         userID,
 		ProviderID:     "google",

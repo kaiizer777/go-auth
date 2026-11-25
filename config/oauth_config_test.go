@@ -618,6 +618,38 @@ func TestConfigValidate_OAuth(t *testing.T) {
 			},
 			wantErr: nil,
 		},
+		{
+			name: "disabled microsoft section without credentials passes",
+			mutate: func(c *Config) {
+				off := false
+				c.OAuth.Microsoft = &MicrosoftConfig{Enabled: &off}
+			},
+			wantErr: nil,
+		},
+		{
+			name: "disabled discord section without credentials passes",
+			mutate: func(c *Config) {
+				off := false
+				c.OAuth.Discord = &DiscordConfig{Enabled: &off}
+			},
+			wantErr: nil,
+		},
+		{
+			name: "disabled facebook section without credentials passes",
+			mutate: func(c *Config) {
+				off := false
+				c.OAuth.Facebook = &FacebookConfig{Enabled: &off}
+			},
+			wantErr: nil,
+		},
+		{
+			name: "disabled x section without credentials passes",
+			mutate: func(c *Config) {
+				off := false
+				c.OAuth.X = &XConfig{Enabled: &off}
+			},
+			wantErr: nil,
+		},
 	}
 
 	for _, tt := range tests {
@@ -681,6 +713,225 @@ func TestConfigValidate_MicrosoftTenantNormalisation(t *testing.T) {
 		if cfg.OAuth.Microsoft.TrustedTenants[i] != want[i] {
 			t.Errorf("TrustedTenants[%d] = %q; want %q", i, cfg.OAuth.Microsoft.TrustedTenants[i], want[i])
 		}
+	}
+}
+
+func TestConfigValidate_MapMicrosoftTenantNormalisation(t *testing.T) {
+	msMap := func(tenant string) map[string]ProviderConfig {
+		return map[string]ProviderConfig{"microsoft": {
+			ClientID:     "ms-client-id",
+			ClientSecret: "ms-client-secret",
+			RedirectURL:  "https://example.com/callback",
+			Enabled:      true,
+			Tenant:       tenant,
+		}}
+	}
+
+	tests := []struct {
+		name    string
+		tenant  string
+		want    string
+		wantErr *errors.Error
+	}{
+		{name: "named authority lowercased", tenant: "Common", want: "common"},
+		{name: "surrounding space trimmed", tenant: " common ", want: "common"},
+		{name: "uppercase guid lowercased", tenant: "  9188040D-6C67-4C5B-B112-36A304B66DAD  ", want: "9188040d-6c67-4c5b-b112-36a304b66dad"},
+		{name: "domain lowercased", tenant: "Contoso.OnMicrosoft.com", want: "contoso.onmicrosoft.com"},
+		{name: "empty defaults to common", tenant: "", want: "common"},
+		{name: "garbage rejected", tenant: "not a tenant!!", wantErr: errors.ErrOAuthTenantInvalid},
+		{name: "single label rejected", tenant: "mytenant", wantErr: errors.ErrOAuthTenantInvalid},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := validOAuthBase()
+			cfg.OAuth.Providers = msMap(tt.tenant)
+			err := cfg.Validate()
+			if tt.wantErr != nil {
+				if !errors.Is(err, tt.wantErr) {
+					t.Fatalf("Validate = %v; want %v", err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Validate = %v; want nil", err)
+			}
+			if got := cfg.OAuth.Providers["microsoft"].Tenant; got != tt.want {
+				t.Errorf("Tenant = %q; want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestConfigValidate_TenantValidationParity(t *testing.T) {
+	tests := []struct {
+		name    string
+		tenant  string
+		want    string
+		wantErr *errors.Error
+	}{
+		{name: "named authority", tenant: " Common ", want: "common"},
+		{name: "uppercase guid", tenant: "  9188040D-6C67-4C5B-B112-36A304B66DAD  ", want: "9188040d-6c67-4c5b-b112-36a304b66dad"},
+		{name: "mixed-case domain", tenant: "Contoso.OnMicrosoft.com", want: "contoso.onmicrosoft.com"},
+		{name: "empty", tenant: "", want: "common"},
+		{name: "garbage", tenant: "not a tenant!!", wantErr: errors.ErrOAuthTenantInvalid},
+		{name: "single label", tenant: "mytenant", wantErr: errors.ErrOAuthTenantInvalid},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mapCfg := validOAuthBase()
+			mapCfg.OAuth.Providers = map[string]ProviderConfig{"microsoft": {
+				ClientID:     "map-id",
+				ClientSecret: "map-secret",
+				RedirectURL:  "https://example.com/cb",
+				Enabled:      true,
+				Tenant:       tt.tenant,
+			}}
+			mapErr := mapCfg.Validate()
+
+			typedCfg := validOAuthBase()
+			typedCfg.OAuth.Microsoft = &MicrosoftConfig{
+				ClientID:     "typed-id",
+				ClientSecret: "typed-secret",
+				RedirectURI:  "https://example.com/cb",
+				Tenant:       tt.tenant,
+			}
+			typedErr := typedCfg.Validate()
+
+			if tt.wantErr != nil {
+				if !errors.Is(mapErr, tt.wantErr) || !errors.Is(typedErr, tt.wantErr) {
+					t.Fatalf("map err = %v, typed err = %v; want both %v", mapErr, typedErr, tt.wantErr)
+				}
+				return
+			}
+			if mapErr != nil || typedErr != nil {
+				t.Fatalf("map err = %v, typed err = %v; want nil", mapErr, typedErr)
+			}
+			mapTenant := mapCfg.OAuth.Providers["microsoft"].Tenant
+			typedTenant := typedCfg.OAuth.Providers["microsoft"].Tenant
+			if mapTenant != tt.want || typedTenant != tt.want {
+				t.Errorf("map Tenant = %q, typed Tenant = %q; want %q", mapTenant, typedTenant, tt.want)
+			}
+		})
+	}
+}
+
+func TestConfigValidate_NormalizesProviderMapWithoutMutatingInput(t *testing.T) {
+	input := map[string]ProviderConfig{
+		"google": {
+			ClientID:     "google-client-id",
+			ClientSecret: "google-client-secret",
+			RedirectURL:  "https://example.com/auth/oauth/google/callback",
+			Enabled:      true,
+		},
+		"microsoft": {
+			ClientID:     "ms-client-id",
+			ClientSecret: "ms-client-secret",
+			RedirectURL:  "https://example.com/auth/oauth/microsoft/callback",
+			Enabled:      true,
+			Tenant:       "  Contoso.OnMicrosoft.com  ",
+		},
+	}
+
+	cfg := validOAuthBase()
+	cfg.OAuth.Providers = input
+	for run := 0; run < 2; run++ {
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("Validate run %d = %v", run, err)
+		}
+		if got := cfg.OAuth.Providers["microsoft"].Tenant; got != "contoso.onmicrosoft.com" {
+			t.Fatalf("Validate run %d Tenant = %q; want contoso.onmicrosoft.com", run, got)
+		}
+		if len(cfg.OAuth.Providers) != len(input) {
+			t.Fatalf("Validate run %d providers = %d; want %d", run, len(cfg.OAuth.Providers), len(input))
+		}
+	}
+
+	if got := input["microsoft"].Tenant; got != "  Contoso.OnMicrosoft.com  " {
+		t.Errorf("source map Tenant = %q; want the input left untouched", got)
+	}
+	if got := input["google"].Tenant; got != "" {
+		t.Errorf("source map google Tenant = %q; want empty", got)
+	}
+}
+
+func TestFacebookAssertEmailVerifiedWiring(t *testing.T) {
+	t.Run("typed flag projects into the resolved provider map", func(t *testing.T) {
+		var fb FacebookConfig
+		if err := json.Unmarshal([]byte(`{"assert_email_verified":true}`), &fb); err != nil {
+			t.Fatalf("unmarshal facebook config: %v", err)
+		}
+		if !fb.AssertEmailVerified {
+			t.Error("json assert_email_verified = false; want true")
+		}
+
+		cfg := validOAuthBase()
+		cfg.OAuth.Facebook = &FacebookConfig{
+			AppID:               "fb-id",
+			AppSecret:           "fb-secret",
+			RedirectURI:         "https://example.com/cb",
+			AssertEmailVerified: true,
+		}
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("Validate = %v", err)
+		}
+		if !cfg.OAuth.Providers["facebook"].AssertEmailVerified {
+			t.Error("resolved map AssertEmailVerified = false; want true")
+		}
+	})
+
+	t.Run("typed flag wins over a map entry that omits it", func(t *testing.T) {
+		cfg := validOAuthBase()
+		cfg.OAuth.Providers = map[string]ProviderConfig{"facebook": {
+			ClientID:     "map-id",
+			ClientSecret: "map-secret",
+			RedirectURL:  "https://example.com/cb",
+			Enabled:      true,
+		}}
+		cfg.OAuth.Facebook = &FacebookConfig{
+			AppID:               "typed-id",
+			AppSecret:           "typed-secret",
+			RedirectURI:         "https://example.com/cb",
+			AssertEmailVerified: true,
+		}
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("Validate = %v", err)
+		}
+		if !cfg.OAuth.Providers["facebook"].AssertEmailVerified {
+			t.Error("resolved map AssertEmailVerified = false; want typed true")
+		}
+	})
+
+	t.Run("unset flag stays false after resolution", func(t *testing.T) {
+		cfg := validOAuthBase()
+		cfg.OAuth.Facebook = &FacebookConfig{
+			AppID:       "fb-id",
+			AppSecret:   "fb-secret",
+			RedirectURI: "https://example.com/cb",
+		}
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("Validate = %v", err)
+		}
+		if cfg.OAuth.Providers["facebook"].AssertEmailVerified {
+			t.Error("resolved map AssertEmailVerified = true; want the fail-closed default")
+		}
+	})
+}
+
+// TestValidateRejectedConfigLeavesAllowedOriginsAlone pins the clone boundary: a
+// rejected config must not normalize the caller's origin slice in place, which a
+// shared backing array would do even though the error discards the config.
+func TestValidateRejectedConfigLeavesAllowedOriginsAlone(t *testing.T) {
+	cfg := validOAuthBase()
+	origins := []string{" https://app.example.com/ ", "app.example.com"}
+	cfg.AllowedOrigins = origins
+
+	if err := cfg.Validate(); !errors.Is(err, errors.ErrAllowedOriginInvalid) {
+		t.Fatalf("Validate = %v; want %v", err, errors.ErrAllowedOriginInvalid)
+	}
+	if origins[0] != " https://app.example.com/ " {
+		t.Fatalf("caller origin = %q; want the input left untouched", origins[0])
 	}
 }
 
@@ -1128,13 +1379,13 @@ func TestOAuthConfig_ResolvesProvidersAfterDefaults(t *testing.T) {
 
 	t.Run("map tenant survives defaults", func(t *testing.T) {
 		cfg := validOAuthBase()
-		cfg.OAuth.Providers = msMap("corp-guid")
+		cfg.OAuth.Providers = msMap("44444444-4444-4444-4444-444444444444")
 		if err := cfg.Validate(); err != nil {
 			t.Fatalf("Validate = %v", err)
 		}
 		p := cfg.OAuth.Providers["microsoft"]
-		if p.Tenant != "corp-guid" {
-			t.Errorf("Tenant = %q; want corp-guid", p.Tenant)
+		if p.Tenant != "44444444-4444-4444-4444-444444444444" {
+			t.Errorf("Tenant = %q; want guid", p.Tenant)
 		}
 		if len(p.Scopes) != 4 {
 			t.Errorf("Scopes = %v; want defaults", p.Scopes)
@@ -1148,7 +1399,7 @@ func TestOAuthConfig_ResolvesProvidersAfterDefaults(t *testing.T) {
 	// Validate enforces the tenant gate (fail closed on non-GUID/domain refs).
 	t.Run("typed tenant wins over map tenant", func(t *testing.T) {
 		cfg := validOAuthBase()
-		cfg.OAuth.Providers = msMap("map-guid")
+		cfg.OAuth.Providers = msMap("55555555-5555-5555-5555-555555555555")
 		cfg.OAuth.Microsoft = msTyped("22222222-2222-2222-2222-222222222222")
 		if err := cfg.Validate(); err != nil {
 			t.Fatalf("Validate = %v", err)
@@ -1200,7 +1451,7 @@ func TestOAuthConfig_ResolvesProvidersAfterDefaults(t *testing.T) {
 	t.Run("explicit map enabled false disables a typed provider", func(t *testing.T) {
 		off := false
 		cfg := validOAuthBase()
-		cfg.OAuth.Providers = msMap("corp-guid")
+		cfg.OAuth.Providers = msMap("44444444-4444-4444-4444-444444444444")
 		entry := cfg.OAuth.Providers["microsoft"]
 		entry.Enabled = off
 		cfg.OAuth.Providers["microsoft"] = entry
@@ -1217,7 +1468,7 @@ func TestOAuthConfig_ResolvesProvidersAfterDefaults(t *testing.T) {
 		off := false
 		cfg := validOAuthBase()
 		cfg.OAuth.StateSecret = ""
-		cfg.OAuth.Providers = msMap("corp-guid")
+		cfg.OAuth.Providers = msMap("44444444-4444-4444-4444-444444444444")
 		typed := msTyped("")
 		typed.Enabled = &off
 		cfg.OAuth.Microsoft = typed

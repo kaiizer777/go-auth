@@ -18,18 +18,48 @@ import (
 
 // FacebookProvider implements OAuth 2.0 authentication for Meta Facebook Graph API v19.0+.
 type FacebookProvider struct {
-	cfg         config.FacebookConfig
-	client      *http.Client
+	cfg    config.FacebookConfig
+	client *http.Client
+
 	authURL     string
 	tokenURL    string
 	debugURL    string
 	userInfoURL string
+
+	// assertsVerifiedEmail is an operator assertion that the Graph email field
+	// is provider-attested. Meta documents no such guarantee, so it defaults to
+	// false and only then may an address unlock the existing-account merge.
+	assertsVerifiedEmail bool
 }
 
 var _ Provider = (*FacebookProvider)(nil)
 
+// facebookOptions is the constructor state Facebook options mutate.
+type facebookOptions struct {
+	endpoints            EndpointOverride
+	assertsVerifiedEmail bool
+}
+
+// FacebookOption customizes the Facebook adapter at construction.
+type FacebookOption func(*facebookOptions)
+
+// FacebookAssertEmailVerified declares that the operator treats the Graph email
+// field as an assertion that Meta verified the address, enabling the
+// existing-account merge for Facebook identities. Do not infer it from a
+// non-empty response: only assert it when app review scopes guarantee it.
+// Without this option the adapter applies no attestation.
+func FacebookAssertEmailVerified() FacebookOption {
+	return func(o *facebookOptions) { o.assertsVerifiedEmail = true }
+}
+
+// FacebookEndpoints applies non-empty endpoint overrides through the shared
+// merge, so the adapter accepts the same fields as the others.
+func FacebookEndpoints(o EndpointOverride) FacebookOption {
+	return func(opts *facebookOptions) { applyEndpoints(&opts.endpoints, o) }
+}
+
 // NewFacebookProvider constructs a new Facebook Graph API provider adapter.
-func NewFacebookProvider(cfg config.FacebookConfig) *FacebookProvider {
+func NewFacebookProvider(cfg config.FacebookConfig, opts ...FacebookOption) *FacebookProvider {
 	version := cfg.GraphVersion
 	if version == "" {
 		version = "v19.0"
@@ -38,13 +68,26 @@ func NewFacebookProvider(cfg config.FacebookConfig) *FacebookProvider {
 		cfg.Scopes = []string{"email", "public_profile"}
 	}
 
+	fo := facebookOptions{endpoints: EndpointOverride{
+		AuthorizeURL: fmt.Sprintf("https://www.facebook.com/%s/dialog/oauth", version),
+		TokenURL:     fmt.Sprintf("https://graph.facebook.com/%s/oauth/access_token", version),
+		UserInfoURL:  fmt.Sprintf("https://graph.facebook.com/%s/me", version),
+		DebugURL:     "https://graph.facebook.com/debug_token",
+	}}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(&fo)
+		}
+	}
+	assertsVerifiedEmail := fo.assertsVerifiedEmail || cfg.AssertEmailVerified
 	return &FacebookProvider{
-		cfg:         cfg,
-		client:      newHTTPClient(),
-		authURL:     fmt.Sprintf("https://www.facebook.com/%s/dialog/oauth", version),
-		tokenURL:    fmt.Sprintf("https://graph.facebook.com/%s/oauth/access_token", version),
-		debugURL:    "https://graph.facebook.com/debug_token",
-		userInfoURL: fmt.Sprintf("https://graph.facebook.com/%s/me", version),
+		cfg:                  cfg,
+		client:               newHTTPClient(),
+		authURL:              fo.endpoints.AuthorizeURL,
+		tokenURL:             fo.endpoints.TokenURL,
+		userInfoURL:          fo.endpoints.UserInfoURL,
+		debugURL:             fo.endpoints.DebugURL,
+		assertsVerifiedEmail: assertsVerifiedEmail,
 	}
 }
 
@@ -195,10 +238,12 @@ func (p *FacebookProvider) FetchUserInfo(ctx context.Context, tokens *OAuthToken
 	email, _ := raw["email"].(string)
 	email = strings.TrimSpace(email)
 
-	// Facebook Graph API omits email if unverified or unregistered and
-	// exposes no per-address verification signal, so a present address
-	// proves nothing: fail closed and never treat it as verified.
-	emailVerified := false
+	// Graph returns a primary address when the email permission is granted, but
+	// Meta documents no attestation for it: a non-empty email is therefore not
+	// proof of ownership and stays unverified unless the operator asserts the
+	// attestation explicitly. Unverified identities may register but can never
+	// merge into an existing account.
+	emailVerified := p.assertsVerifiedEmail && email != ""
 
 	var avatarURL string
 	if picMap, ok := raw["picture"].(map[string]any); ok {

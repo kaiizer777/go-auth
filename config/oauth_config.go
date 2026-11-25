@@ -96,6 +96,12 @@ type FacebookConfig struct {
 	RedirectURI  string   `json:"redirect_uri"`
 	Scopes       []string `json:"scopes"`
 	GraphVersion string   `json:"graph_version"` // Default: "v19.0"
+	// AssertEmailVerified declares that the operator trusts a non-empty email
+	// from the Facebook Graph API as provider-verified. Default false returns
+	// the address unverified, which keeps the identity off the merge path.
+	// Renamed from fail_closed_email_verification: the default was already
+	// fail-closed, so the flag now names the only thing it can change.
+	AssertEmailVerified bool `json:"assert_email_verified,omitempty"`
 	// Enabled disables the provider when explicitly false. Absent means enabled.
 	Enabled *bool `json:"enabled,omitempty"`
 }
@@ -112,6 +118,7 @@ func (f FacebookConfig) LogValue() slog.Value {
 		slog.String("redirect_uri", f.RedirectURI),
 		slog.Any("scopes", f.Scopes),
 		slog.String("graph_version", f.GraphVersion),
+		slog.Bool("assert_email_verified", f.AssertEmailVerified),
 	)
 }
 
@@ -232,11 +239,12 @@ func (o *OAuthConfig) typedProviders() map[string]typedProvider {
 		typed["facebook"] = typedProvider{
 			enabled: f.Enabled,
 			cfg: ProviderConfig{
-				ClientID:     f.AppID,
-				ClientSecret: f.AppSecret,
-				RedirectURL:  f.RedirectURI,
-				Scopes:       f.Scopes,
-				GraphVersion: f.GraphVersion,
+				ClientID:            f.AppID,
+				ClientSecret:        f.AppSecret,
+				RedirectURL:         f.RedirectURI,
+				Scopes:              f.Scopes,
+				GraphVersion:        f.GraphVersion,
+				AssertEmailVerified: f.AssertEmailVerified,
 			},
 		}
 	}
@@ -290,6 +298,9 @@ func mergeProviderConfig(base ProviderConfig, hasEntry bool, typed typedProvider
 	}
 	if typed.cfg.GraphVersion != "" {
 		base.GraphVersion = typed.cfg.GraphVersion
+	}
+	if typed.cfg.AssertEmailVerified {
+		base.AssertEmailVerified = true
 	}
 	return base
 }

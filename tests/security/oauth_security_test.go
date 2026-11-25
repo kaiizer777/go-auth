@@ -10,7 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"sort"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -48,6 +48,7 @@ func setupOAuthSecurityApp(t *testing.T, mocks map[string]*oauthmock.Mock, modif
 	CREATE TABLE IF NOT EXISTS oauth_accounts (
 		id TEXT PRIMARY KEY, user_id TEXT NOT NULL, provider_id VARCHAR(32) NOT NULL,
 		provider_user_id VARCHAR(255) NOT NULL, email VARCHAR(255) NOT NULL,
+		verified INTEGER NOT NULL DEFAULT 0,
 		created_at DATETIME, updated_at DATETIME,
 		CONSTRAINT uq_oauth_accounts_provider_uid UNIQUE (provider_id, provider_user_id)
 	);
@@ -225,7 +226,27 @@ func TestOAuthSecurity_LocalUnverifiedLinkConflict(t *testing.T) {
 	}
 }
 
-func TestOAuthSecurity_OAuthOnlyLoginDummyTiming(t *testing.T) {
+// argon2MemoryFloor is the smallest allocation one Argon2id derivation at the
+// given memory cost can produce: Argon2 allocates one KiB block per unit, so the
+// exact footprint is memoryKiB*1024 and the floor keeps only 10% headroom for the
+// allocations the surrounding login path adds. TotalAlloc is monotonic, so a
+// loaded runner can only push the measurement up, never below the floor, while a
+// dummy hash run at half the configured memory lands near 0.5x and stays visible.
+func argon2MemoryFloor(memoryKiB uint32) uint64 {
+	return uint64(memoryKiB) * 1024 * 9 / 10
+}
+
+// allocDelta reports bytes allocated by fn, so a memory-hard derivation that
+// did not run is visible without measuring elapsed time.
+func allocDelta(fn func()) uint64 {
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	fn()
+	runtime.ReadMemStats(&after)
+	return after.TotalAlloc - before.TotalAlloc
+}
+
+func TestOAuthSecurity_OAuthOnlyLoginDummyHashCost(t *testing.T) {
 	m := oauthmock.New("google", "sub-timing", "timing@example.com", true)
 	h, database, cfg := setupOAuthSecurityApp(t, map[string]*oauthmock.Mock{"google": m})
 
@@ -247,7 +268,7 @@ func TestOAuthSecurity_OAuthOnlyLoginDummyTiming(t *testing.T) {
 
 	signupViaService(t, database, cfg, "normal@example.com", "NormalPass123!")
 
-	login := func(email, password string) (int, string, time.Duration) {
+	login := func(email, password string) (int, string, uint64) {
 		csrfRec := httptest.NewRecorder()
 		h.ServeHTTP(csrfRec, httptest.NewRequest(http.MethodGet, "/auth/csrf", nil))
 		var tok struct {
@@ -267,27 +288,19 @@ func TestOAuthSecurity_OAuthOnlyLoginDummyTiming(t *testing.T) {
 		r.Header.Set("Content-Type", "application/json")
 		r.AddCookie(jar)
 		r.Header.Set(cfg.CSRFHeaderName, tok.CSRFToken)
-		start := time.Now()
-		out := httptest.NewRecorder()
-		h.ServeHTTP(out, r)
-		return out.Code, out.Body.String(), time.Since(start)
+		var code int
+		var respBody string
+		alloc := allocDelta(func() {
+			out := httptest.NewRecorder()
+			h.ServeHTTP(out, r)
+			code, respBody = out.Code, out.Body.String()
+		})
+		return code, respBody, alloc
 	}
 
-	const rounds = 5
-	timeLogin := func(email string) (time.Duration, int, string) {
-		var ds []time.Duration
-		var code int
-		var body string
-		for range rounds {
-			c, b, d := login(email, "WrongPass000!")
-			ds, code, body = append(ds, d), c, b
-		}
-		sort.Slice(ds, func(i, j int) bool { return ds[i] < ds[j] })
-		return ds[len(ds)/2], code, body
-	}
-	oauthMed, oauthCode, oauthBody := timeLogin("timing@example.com")
-	normalMed, normalCode, normalBody := timeLogin("normal@example.com")
-	ghostMed, ghostCode, ghostBody := timeLogin("ghost@example.com")
+	oauthCode, oauthBody, oauthAlloc := login("timing@example.com", "WrongPass000!")
+	normalCode, normalBody, normalAlloc := login("normal@example.com", "WrongPass000!")
+	ghostCode, ghostBody, ghostAlloc := login("ghost@example.com", "WrongPass000!")
 
 	for name, code := range map[string]int{"oauth-only": oauthCode, "normal": normalCode, "ghost": ghostCode} {
 		if code != http.StatusUnauthorized {
@@ -297,13 +310,10 @@ func TestOAuthSecurity_OAuthOnlyLoginDummyTiming(t *testing.T) {
 	if oauthBody != ghostBody || normalBody != ghostBody {
 		t.Fatal("login bodies must be identical across oauth-only, normal, and missing users")
 	}
-	if oauthMed < 5*time.Millisecond {
-		t.Fatalf("oauth-only median %v too fast; dummy Argon2id work missing", oauthMed)
-	}
-	for name, med := range map[string]time.Duration{"normal": normalMed, "ghost": ghostMed} {
-		ratio := float64(oauthMed) / float64(med)
-		if ratio < 0.2 || ratio > 5 {
-			t.Fatalf("oauth-only median %v vs %s %v (ratio %.2f); want within [0.2,5]", oauthMed, name, med, ratio)
+	floor := argon2MemoryFloor(cfg.Argon2.Memory)
+	for name, alloc := range map[string]uint64{"oauth-only": oauthAlloc, "normal": normalAlloc, "ghost": ghostAlloc} {
+		if alloc < floor {
+			t.Fatalf("%s login allocated %d bytes; want >= %d (Argon2id m=%d KiB did not run)", name, alloc, floor, cfg.Argon2.Memory)
 		}
 	}
 }
@@ -448,6 +458,7 @@ func secServiceDB(t *testing.T) (*gorm.DB, config.Config) {
 	CREATE TABLE IF NOT EXISTS oauth_accounts (
 		id TEXT PRIMARY KEY, user_id TEXT NOT NULL, provider_id VARCHAR(32) NOT NULL,
 		provider_user_id VARCHAR(255) NOT NULL, email VARCHAR(255) NOT NULL,
+		verified INTEGER NOT NULL DEFAULT 0,
 		created_at DATETIME, updated_at DATETIME,
 		CONSTRAINT uq_oauth_accounts_provider_uid UNIQUE (provider_id, provider_user_id)
 	);
@@ -678,8 +689,15 @@ func TestOAuthSecurity_CallbackFailureReasons(t *testing.T) {
 		wantReason string
 	}{
 		{
-			name:       "email_unverified",
-			mock:       oauthmock.New("google", "sub-reason-unverified", "reason-unverified@example.com", false),
+			name: "email_unverified_merge_gate",
+			mock: oauthmock.New("google", "sub-reason-unverified", "reason-unverified@example.com", false),
+			seed: func(t *testing.T, database *gorm.DB) {
+				t.Helper()
+				local := db.User{ID: uuid.New(), Email: "reason-unverified@example.com", PasswordHash: "hash", EmailVerified: true}
+				if err := database.Create(&local).Error; err != nil {
+					t.Fatalf("seed local: %v", err)
+				}
+			},
 			query:      func(state string) string { return "?code=c&state=" + state },
 			wantStatus: http.StatusBadRequest, wantReason: "email_unverified",
 		},

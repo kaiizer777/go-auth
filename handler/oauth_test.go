@@ -15,6 +15,7 @@ import (
 
 	"github.com/kaiizer777/go-auth/config"
 	"github.com/kaiizer777/go-auth/db"
+	gormstore "github.com/kaiizer777/go-auth/db/gorm"
 	"github.com/kaiizer777/go-auth/errors"
 	"github.com/kaiizer777/go-auth/oauth"
 	"github.com/kaiizer777/go-auth/ratelimit"
@@ -72,6 +73,7 @@ func oauthTestEnv(t *testing.T, info *oauth.UserInfo, opts ...Option) (*gorm.DB,
 		provider_id VARCHAR(32) NOT NULL,
 		provider_user_id VARCHAR(255) NOT NULL,
 		email VARCHAR(255) NOT NULL,
+		verified INTEGER NOT NULL DEFAULT 0,
 		created_at DATETIME,
 		updated_at DATETIME
 	)`).Error; err != nil {
@@ -183,6 +185,57 @@ func TestOAuthInitiateRoute(t *testing.T) {
 		}
 	})
 
+	t.Run("non-canonical casing dispatches", func(t *testing.T) {
+		_, h := oauthTestEnv(t, &oauth.UserInfo{ProviderID: "google", ProviderUserID: "s", Email: "a@b.c", EmailVerified: true})
+		state, cookies, _ := driveInitiate(t, h, "/auth/oauth/GOOGLE")
+		req := httptest.NewRequest(http.MethodGet, "/auth/oauth/GOOGLE/callback?code=c&state="+state, nil)
+		req.AddCookie(stateCookie(t, cookies))
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusFound {
+			t.Fatalf("callback with non-canonical casing: status = %d; want 302 (%s)", rec.Code, rec.Body.String())
+		}
+	})
+
+	t.Run("attached provider map dispatches", func(t *testing.T) {
+		cfg := oauthTestConfig()
+		database := setupTestDB(t)
+		custom := &stubOAuthProvider{id: "custom-map", info: &oauth.UserInfo{
+			ProviderID: "custom-map", ProviderUserID: "map-sub", Email: "map@example.com", EmailVerified: true}}
+		providers := map[string]oauth.Provider{"custom-map": custom}
+		oauthSvc := oauth.NewService(database, session.NewService(database, &cfg), providers, &cfg)
+		h := New(database, cfg, nil, WithOAuthService(oauthSvc, providers))
+		driveInitiate(t, h, "/auth/oauth/custom-map")
+	})
+
+	t.Run("attached registry dispatches dynamic providers", func(t *testing.T) {
+		cfg := oauthTestConfig()
+		database := setupTestDB(t)
+		reg := oauth.NewRegistry()
+		if err := reg.Register(&stubOAuthProvider{id: "custom-idp", info: &oauth.UserInfo{
+			ProviderID: "custom-idp", ProviderUserID: "reg-sub", Email: "reg@example.com", EmailVerified: true}}); err != nil {
+			t.Fatalf("register provider: %v", err)
+		}
+		oauthSvc := oauth.NewServiceWithRegistry(gormstore.New(database), session.NewService(database, &cfg), reg, &cfg)
+		h := New(database, cfg, nil, WithOAuthRegistry(oauthSvc, reg))
+		driveInitiate(t, h, "/auth/oauth/custom-idp")
+	})
+
+	t.Run("attached providers without a service report the wiring bug", func(t *testing.T) {
+		cfg := oauthTestConfig()
+		providers := map[string]oauth.Provider{"google": &stubOAuthProvider{id: "google"}}
+		h := New(nil, cfg, nil, WithOAuthService(nil, providers))
+		req := httptest.NewRequest(http.MethodGet, "/auth/oauth/google", nil)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusInternalServerError {
+			t.Fatalf("status = %d; want 500 (%s)", rec.Code, rec.Body.String())
+		}
+		if code := decodeErrCode(t, rec); code != errors.CodeInternalError {
+			t.Fatalf("code = %s; want INTERNAL_ERROR", code)
+		}
+	})
+
 	t.Run("unknown provider 404s", func(t *testing.T) {
 		_, h := oauthTestEnv(t, &oauth.UserInfo{ProviderID: "google", ProviderUserID: "s", Email: "a@b.c", EmailVerified: true})
 		for _, path := range []string{"/auth/oauth/discord", "/api/auth/oauth/microsoft"} {
@@ -223,9 +276,47 @@ func TestOAuthCallbackRoute(t *testing.T) {
 		}
 	})
 
-	t.Run("unverified email 400s with zero writes", func(t *testing.T) {
+	t.Run("unverified email registers unverified user", func(t *testing.T) {
 		database, h := oauthTestEnv(t,
-			&oauth.UserInfo{ProviderID: "google", ProviderUserID: "sub-9", Email: "victim@example.com"})
+			&oauth.UserInfo{ProviderID: "google", ProviderUserID: "sub-9", Email: "new@example.com"})
+		state, cookies, _ := driveInitiate(t, h, "/auth/oauth/google")
+		req := httptest.NewRequest(http.MethodGet, "/auth/oauth/google/callback?code=c&state="+state, nil)
+		req.AddCookie(stateCookie(t, cookies))
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusFound {
+			t.Fatalf("status = %d; want 302 (%s)", rec.Code, rec.Body.String())
+		}
+		var user db.User
+		if err := database.Where("email = ?", "new@example.com").First(&user).Error; err != nil {
+			t.Fatalf("load user: %v", err)
+		}
+		if user.EmailVerified {
+			t.Fatal("user EmailVerified = true; want false")
+		}
+		var links, sessions int64
+		if err := database.Model(&db.OAuthAccount{}).Count(&links).Error; err != nil || links != 1 {
+			t.Fatalf("links = %d, err = %v; want 1 unverified link", links, err)
+		}
+		var link db.OAuthAccount
+		if err := database.First(&link).Error; err != nil {
+			t.Fatalf("load link: %v", err)
+		}
+		if link.Verified {
+			t.Fatal("link Verified = true; want false for an unattested address")
+		}
+		if err := database.Model(&db.Session{}).Count(&sessions).Error; err != nil || sessions != 1 {
+			t.Fatalf("sessions = %d, err = %v; want 1", sessions, err)
+		}
+	})
+
+	t.Run("unverified email cannot merge into existing account", func(t *testing.T) {
+		database, h := oauthTestEnv(t,
+			&oauth.UserInfo{ProviderID: "google", ProviderUserID: "sub-10", Email: "victim@example.com"})
+		victim := db.User{ID: uuid.New(), Email: "victim@example.com", PasswordHash: "hash", EmailVerified: true}
+		if err := database.Create(&victim).Error; err != nil {
+			t.Fatalf("seed: %v", err)
+		}
 		state, cookies, _ := driveInitiate(t, h, "/auth/oauth/google")
 		req := httptest.NewRequest(http.MethodGet, "/auth/oauth/google/callback?code=c&state="+state, nil)
 		req.AddCookie(stateCookie(t, cookies))
@@ -237,11 +328,21 @@ func TestOAuthCallbackRoute(t *testing.T) {
 		if code := decodeErrCode(t, rec); code != errors.CodeOAuthEmailUnverified {
 			t.Fatalf("code = %s; want OAUTH_EMAIL_UNVERIFIED", code)
 		}
-		for _, m := range []any{&db.User{}, &db.OAuthAccount{}, &db.Session{}} {
+		for _, m := range []struct {
+			model any
+			want  int64
+		}{{&db.User{}, 1}, {&db.OAuthAccount{}, 0}, {&db.Session{}, 0}} {
 			var n int64
-			if err := database.Model(m).Count(&n).Error; err != nil || n != 0 {
-				t.Fatalf("model %T count = %d, err = %v; want 0", m, n, err)
+			if err := database.Model(m.model).Count(&n).Error; err != nil || n != m.want {
+				t.Fatalf("model %T count = %d, err = %v; want %d", m.model, n, err, m.want)
 			}
+		}
+		var after db.User
+		if err := database.Where("id = ?", victim.ID).First(&after).Error; err != nil {
+			t.Fatalf("victim missing: %v", err)
+		}
+		if after.PasswordHash != "hash" || !after.EmailVerified {
+			t.Fatalf("victim mutated: %+v", after)
 		}
 	})
 
@@ -637,7 +738,11 @@ func TestOAuthCallbackRedirectSetsNoStore(t *testing.T) {
 }
 
 func TestOAuthCallbackFailureHasNoCacheHeaders(t *testing.T) {
-	_, h := oauthTestEnv(t, &oauth.UserInfo{ProviderID: "google", ProviderUserID: "sub-nostore-fail", Email: "nostore-fail@example.com"})
+	database, h := oauthTestEnv(t, &oauth.UserInfo{ProviderID: "google", ProviderUserID: "sub-nostore-fail", Email: "nostore-fail@example.com"})
+	existing := db.User{ID: uuid.New(), Email: "nostore-fail@example.com", PasswordHash: "hash", EmailVerified: true}
+	if err := database.Create(&existing).Error; err != nil {
+		t.Fatalf("seed: %v", err)
+	}
 	state, cookies, _ := driveInitiate(t, h, "/auth/oauth/google")
 	req := httptest.NewRequest(http.MethodGet, "/auth/oauth/google/callback?code=c&state="+state, nil)
 	req.AddCookie(stateCookie(t, cookies))
@@ -645,6 +750,9 @@ func TestOAuthCallbackFailureHasNoCacheHeaders(t *testing.T) {
 	h.ServeHTTP(rec, req)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d; want 400 (%s)", rec.Code, rec.Body.String())
+	}
+	if code := decodeErrCode(t, rec); code != errors.CodeOAuthEmailUnverified {
+		t.Fatalf("code = %s; want OAUTH_EMAIL_UNVERIFIED", code)
 	}
 	if got := rec.Header().Get("Cache-Control"); got != "" {
 		t.Errorf("Cache-Control = %q; want empty on failure", got)

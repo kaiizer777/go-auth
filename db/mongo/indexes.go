@@ -22,6 +22,10 @@ func IndexSpecifications() map[string][]mongo.IndexModel {
 						Strength: 2,
 					}),
 			},
+			{
+				Keys:    bson.D{{Key: "email_verified", Value: 1}},
+				Options: options.Index().SetName("idx_users_email_verified"),
+			},
 		},
 		"sessions": {
 			{

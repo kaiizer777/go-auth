@@ -36,6 +36,16 @@ go-auth/
 1. **Zero Logic in Root**: The project root only contains `goauth.go`, serving as the clean public entry point. This eliminates package circular dependencies and prevents the root package from becoming an unmaintainable catch-all.
 2. **Modular Subpackages**: Callers can import specific subsystems or plug custom implementations (e.g. custom database adapters or rate limiters) adhering to cleanly separated interfaces.
 
+### Store Interfaces & Custom Adapters
+
+`go-auth` exposes interfaces in `db/store.go` (`UserStore`, `SessionStore`, `OAuthAccountStore`, `VerificationTokenStore`, `PasswordResetTokenStore`, `TotpStore`).
+
+> [!NOTE]
+> **Breaking Change:** `OAuthAccountStore` includes `UpdateProviderUserID(ctx context.Context, id uuid.UUID, providerUserID string) error`. Custom `OAuthAccountStore` implementations must implement this method to support provider user ID updates (such as migrating legacy Microsoft OIDs to pairwise subjects).
+
+> [!NOTE]
+> **Behavior Change:** For Microsoft OAuth in multi-tenant mode (`Tenant: "common"` or `"organizations"`), an empty `trusted_tenants` allowlist fails closed (denies all incoming tenants as untrusted). Operators must explicitly configure `trusted_tenants` with allowed tenant IDs or domains.
+
 ---
 
 ## Installation

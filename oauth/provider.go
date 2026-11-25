@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"time"
 
@@ -87,7 +88,8 @@ type OAuthUser struct {
 type UserInfo = OAuthUser
 
 // Provider defines the standard contract required for any OAuth2 / OIDC identity provider.
-// AuthCodeURL is additive to AuthURL: adapters implement it as a one-line AuthURL delegate.
+// AuthURL is the option-free authorization URL. Providers that additionally
+// accept per-login options expose AuthCodeURLProvider.
 type Provider interface {
 	// ID returns the canonical provider slug (e.g. "google", "github", "apple", "microsoft").
 	ID() string
@@ -95,14 +97,25 @@ type Provider interface {
 	// AuthURL constructs the provider authorization URL with PKCE challenge, state, and scopes.
 	AuthURL(state, codeChallenge string) string
 
-	// AuthCodeURL constructs the authorization redirect URL with state, PKCE challenge, and options.
-	AuthCodeURL(state, codeChallenge string, opts ...AuthCodeOption) string
-
 	// ExchangeCode exchanges an authorization code and PKCE code verifier for tokens.
 	ExchangeCode(ctx context.Context, code, codeVerifier string) (*OAuthToken, error)
 
 	// FetchUserInfo retrieves and normalizes user profile information using the granted tokens.
 	FetchUserInfo(ctx context.Context, tokens *OAuthToken) (*OAuthUser, error)
+}
+
+// AuthCodeURLProvider is the optional capability for providers that build the
+// authorization redirect with per-login options such as an OIDC nonce. Keeping
+// it out of Provider preserves source compatibility for implementers written
+// against the original contract; callers type-assert before using it.
+// An OIDCProvider without this capability still receives the nonce: the service
+// appends it to the AuthURL result, because the callback verifies every OIDC
+// ID-token nonce.
+// Tenant-scoped providers (Microsoft) pin the tenant in the endpoint when the
+// provider is constructed, so the tenant travels through this same path.
+type AuthCodeURLProvider interface {
+	// AuthCodeURL constructs the authorization redirect URL with state, PKCE challenge, and options.
+	AuthCodeURL(state, codeChallenge string, opts ...AuthCodeOption) string
 }
 
 // OIDCProvider extends Provider for OpenID Connect compliant providers supporting ID token discovery & verification.
@@ -131,15 +144,25 @@ type IDTokenClaims struct {
 	UntrustedTenant   bool     `json:"untrusted_tenant,omitempty"`
 }
 
-// SupportedProviders defines the canonical set of supported OAuth providers.
-var SupportedProviders = map[string]struct{}{
-	"google":    {},
-	"github":    {},
-	"apple":     {},
-	"microsoft": {},
-	"facebook":  {},
-	"discord":   {},
-	"x":         {},
+// supportedProviderIDs is the canonical, immutable provider set. Authorization
+// decisions read this slice so no package-level map mutation can widen it.
+var supportedProviderIDs = [...]string{
+	"google", "github", "apple", "microsoft", "facebook", "discord", "x",
+}
+
+// SupportedProviders is a snapshot kept for source compatibility. Mutating it
+// does not affect authorization decisions; call IsSupportedProvider instead.
+var SupportedProviders = func() map[string]struct{} {
+	m := make(map[string]struct{}, len(supportedProviderIDs))
+	for _, id := range supportedProviderIDs {
+		m[id] = struct{}{}
+	}
+	return m
+}()
+
+// IsSupportedProvider reports whether id is a canonical provider slug.
+func IsSupportedProvider(id string) bool {
+	return slices.Contains(supportedProviderIDs[:], id)
 }
 
 // NewProvider instantiates a concrete OAuth provider for the given provider slug.
@@ -162,7 +185,11 @@ func NewProvider(id string, cfg config.ProviderConfig, oCfg ...*config.OAuthConf
 	case "microsoft":
 		return NewMicrosoftProvider(mergeMicrosoftConfig(cfg, typed)), nil
 	case "facebook":
-		return NewFacebookProvider(mergeFacebookConfig(cfg, typed)), nil
+		merged := mergeFacebookConfig(cfg, typed)
+		if merged.AssertEmailVerified {
+			return NewFacebookProvider(merged, FacebookAssertEmailVerified()), nil
+		}
+		return NewFacebookProvider(merged), nil
 	case "discord":
 		return NewDiscordProvider(config.DiscordConfig{
 			ClientID:     cfg.ClientID,
@@ -228,11 +255,12 @@ func mergeMicrosoftConfig(cfg config.ProviderConfig, typed *config.OAuthConfig) 
 // reason as mergeMicrosoftConfig above.
 func mergeFacebookConfig(cfg config.ProviderConfig, typed *config.OAuthConfig) config.FacebookConfig {
 	merged := config.FacebookConfig{
-		AppID:        cfg.ClientID,
-		AppSecret:    cfg.ClientSecret,
-		RedirectURI:  cfg.RedirectURL,
-		Scopes:       cfg.Scopes,
-		GraphVersion: cfg.GraphVersion,
+		AppID:               cfg.ClientID,
+		AppSecret:           cfg.ClientSecret,
+		RedirectURI:         cfg.RedirectURL,
+		Scopes:              cfg.Scopes,
+		GraphVersion:        cfg.GraphVersion,
+		AssertEmailVerified: cfg.AssertEmailVerified,
 	}
 	if typed == nil || typed.Facebook == nil {
 		return merged
@@ -252,6 +280,9 @@ func mergeFacebookConfig(cfg config.ProviderConfig, typed *config.OAuthConfig) c
 	}
 	if t.GraphVersion != "" {
 		merged.GraphVersion = t.GraphVersion
+	}
+	if t.AssertEmailVerified {
+		merged.AssertEmailVerified = true
 	}
 	return merged
 }
@@ -339,7 +370,14 @@ func postTokenForm(ctx context.Context, client *http.Client, endpoint, form stri
 		return nil, err
 	}
 	if msg, _ := raw["error"].(string); msg != "" {
-		return nil, errors.New(errors.CodeOAuthProviderError, "oauth token exchange failed", nil)
+		// Upstream text never becomes the caller-facing message, so it rides
+		// the cause for server-side logs.
+		detail := "upstream error: " + msg
+		if desc, _ := raw["error_description"].(string); desc != "" {
+			detail += ": " + desc
+		}
+		return nil, errors.New(errors.CodeOAuthProviderError, "oauth token exchange failed",
+			errors.New(errors.CodeOAuthProviderError, detail, nil))
 	}
 	return tokenFromRaw(raw), nil
 }

@@ -28,18 +28,23 @@ type XProvider struct {
 var _ Provider = (*XProvider)(nil)
 
 // NewXProvider constructs a new X (Twitter) OAuth 2.0 provider adapter.
-func NewXProvider(cfg config.XConfig) *XProvider {
+func NewXProvider(cfg config.XConfig, opts ...EndpointOption) *XProvider {
 	// Login needs only users.read (/2/users/me); tweet.read and
 	// offline.access are opt-in via config when the feature needs them.
 	if len(cfg.Scopes) == 0 {
 		cfg.Scopes = []string{"users.read"}
 	}
+	ep := resolveEndpoints(EndpointOverride{
+		AuthorizeURL: "https://twitter.com/i/oauth2/authorize",
+		TokenURL:     "https://api.twitter.com/2/oauth2/token",
+		UserInfoURL:  "https://api.twitter.com/2/users/me",
+	}, opts)
 	return &XProvider{
 		cfg:         cfg,
 		client:      newHTTPClient(),
-		authURL:     "https://twitter.com/i/oauth2/authorize",
-		tokenURL:    "https://api.twitter.com/2/oauth2/token",
-		userInfoURL: "https://api.twitter.com/2/users/me",
+		authURL:     ep.AuthorizeURL,
+		tokenURL:    ep.TokenURL,
+		userInfoURL: ep.UserInfoURL,
 	}
 }
 
@@ -136,6 +141,18 @@ func parseXErrorWithHeader(statusCode int, body []byte, header http.Header) erro
 		if problem.Title != "" {
 			return errors.New(errors.CodeOAuthProviderError, "oauth provider request failed", errors.New(errors.CodeOAuthProviderError, "upstream title: "+problem.Title, nil))
 		}
+		// Some failures carry the only diagnostic in the nested error array,
+		// with no top-level title/detail. Keep it server-side on the cause.
+		for _, e := range problem.Errors {
+			detail := e.Message
+			if detail == "" {
+				detail = e.Detail
+			}
+			if detail != "" {
+				return errors.New(errors.CodeOAuthProviderError, "oauth provider request failed",
+					errors.New(errors.CodeOAuthProviderError, "upstream error: "+detail, nil))
+			}
+		}
 	}
 
 	return errors.New(errors.CodeOAuthProviderError, fmt.Sprintf("oauth provider responded with status %d", statusCode), nil)
@@ -186,7 +203,10 @@ func (p *XProvider) ExchangeCode(ctx context.Context, code, codeVerifier string)
 		return nil, errors.New(errors.CodeOAuthProviderError, "oauth provider returned invalid response", err)
 	}
 	if msg, _ := raw["error"].(string); msg != "" {
-		return nil, errors.New(errors.CodeOAuthProviderError, "oauth token exchange failed: "+msg, nil)
+		// Same invariant as parseXErrorWithHeader: upstream text never becomes
+		// the caller-facing message, so it rides the cause for server-side logs.
+		return nil, errors.New(errors.CodeOAuthProviderError, "oauth token exchange failed",
+			errors.New(errors.CodeOAuthProviderError, "upstream error: "+msg, nil))
 	}
 
 	return tokenFromRaw(raw), nil

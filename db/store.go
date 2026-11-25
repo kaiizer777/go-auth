@@ -60,6 +60,7 @@ type OAuthAccountStore interface {
 	Create(ctx context.Context, account *OAuthAccount) error
 	GetByProvider(ctx context.Context, providerID, providerUserID string) (*OAuthAccount, error)
 	GetByUserID(ctx context.Context, userID uuid.UUID) ([]*OAuthAccount, error)
+	UpdateProviderUserID(ctx context.Context, id uuid.UUID, providerUserID string) error
 	Delete(ctx context.Context, id uuid.UUID) error
 	DeleteByUserID(ctx context.Context, userID uuid.UUID) error
 }

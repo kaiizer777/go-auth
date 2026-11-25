@@ -40,6 +40,14 @@ func TestSupportedProviders(t *testing.T) {
 		if _, ok := SupportedProviders[id]; !ok {
 			t.Errorf("missing provider %q", id)
 		}
+		if !IsSupportedProvider(id) {
+			t.Errorf("IsSupportedProvider(%q) = false; want true", id)
+		}
+	}
+	for _, id := range []string{"", "slack", "GOOGLE", "google "} {
+		if IsSupportedProvider(id) {
+			t.Errorf("IsSupportedProvider(%q) = true; want false", id)
+		}
 	}
 }
 
@@ -132,6 +140,95 @@ func TestNewProvider(t *testing.T) {
 			if appErr.HTTPStatus() != http.StatusNotFound {
 				t.Errorf("NewProvider(%q) status = %d; want 404", id, appErr.HTTPStatus())
 			}
+		}
+	})
+}
+
+func TestNewProviderFacebookEmailAttestation(t *testing.T) {
+	t.Parallel()
+
+	graph := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"id":"fb-user-1","name":"Fb User","email":"fb@example.com"}`)
+	}))
+	t.Cleanup(graph.Close)
+
+	// Builds the adapter through the validated config surface, the same path
+	// startup takes, then points only the userinfo call at the fake Graph API.
+	// A nil assert leaves the field absent, which must behave like false.
+	newAdapter := func(t *testing.T, assert *bool) *FacebookProvider {
+		t.Helper()
+		cfg := config.DefaultConfig()
+		cfg.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+		cfg.BaseURL = "https://example.com"
+		cfg.OAuth.StateSecret = "test-state-secret-at-least-32-bytes!"
+		fb := &config.FacebookConfig{
+			AppID:       "fb-id",
+			AppSecret:   "fb-secret",
+			RedirectURI: "https://example.com/cb",
+		}
+		if assert != nil {
+			fb.AssertEmailVerified = *assert
+		}
+		cfg.OAuth.Facebook = fb
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("Validate = %v", err)
+		}
+		p, err := NewProvider("facebook", cfg.OAuth.Providers["facebook"])
+		if err != nil {
+			t.Fatalf("NewProvider(facebook) = %v", err)
+		}
+		fp, ok := p.(*FacebookProvider)
+		if !ok {
+			t.Fatalf("provider type = %T; want *FacebookProvider", p)
+		}
+		fp.userInfoURL = graph.URL
+		return fp
+	}
+
+	fetch := func(t *testing.T, assert *bool) *OAuthUser {
+		t.Helper()
+		user, err := newAdapter(t, assert).FetchUserInfo(context.Background(), &OAuthToken{AccessToken: "at-1"})
+		if err != nil {
+			t.Fatalf("FetchUserInfo = %v", err)
+		}
+		if user.Email != "fb@example.com" {
+			t.Fatalf("Email = %q; want fb@example.com", user.Email)
+		}
+		return user
+	}
+
+	boolPtr := func(v bool) *bool { return &v }
+
+	t.Run("asserted config reports the Graph email verified", func(t *testing.T) {
+		t.Parallel()
+		user := fetch(t, boolPtr(true))
+		if !user.EmailVerified {
+			t.Fatal("EmailVerified = false; want true under assert_email_verified")
+		}
+		if err := validateProviderIdentity(user); err != nil {
+			t.Fatalf("validateProviderIdentity = %v; want the merge gate open", err)
+		}
+	})
+
+	t.Run("absent flag keeps the Graph email unverified and blocks merging", func(t *testing.T) {
+		t.Parallel()
+		user := fetch(t, nil)
+		if user.EmailVerified {
+			t.Fatal("EmailVerified = true; a non-empty Graph email is not an attested claim")
+		}
+		if err := validateProviderIdentity(user); !errors.Is(err, errors.ErrOAuthEmailUnverified) {
+			t.Fatalf("validateProviderIdentity = %v; want ErrOAuthEmailUnverified", err)
+		}
+	})
+
+	t.Run("explicit false keeps the Graph email unverified", func(t *testing.T) {
+		t.Parallel()
+		user := fetch(t, boolPtr(false))
+		if user.EmailVerified {
+			t.Fatal("EmailVerified = true; want false when the operator does not assert it")
+		}
+		if err := validateProviderIdentity(user); !errors.Is(err, errors.ErrOAuthEmailUnverified) {
+			t.Fatalf("validateProviderIdentity = %v; want ErrOAuthEmailUnverified", err)
 		}
 	})
 }
@@ -315,4 +412,67 @@ func TestProviderHTTPHelpers(t *testing.T) {
 		_, err := getJSON(context.Background(), http.DefaultClient, url, "at-1")
 		mustProviderMessage(t, err, "oauth provider returned invalid response")
 	})
+}
+
+// TestPostTokenFormKeepsProviderErrorOutOfMessage pins the same boundary the X
+// adapter keeps: a token response carrying an OAuth error is reported to the
+// client generically, with error and error_description preserved in the cause
+// for server-side logs.
+func TestPostTokenFormKeepsProviderErrorOutOfMessage(t *testing.T) {
+	t.Parallel()
+
+	const genericMessage = "oauth token exchange failed"
+
+	exchange := func(t *testing.T, body string) (*TokenResponse, error) {
+		t.Helper()
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = io.WriteString(w, body)
+		}))
+		t.Cleanup(srv.Close)
+		return postTokenForm(context.Background(), srv.Client(), srv.URL, "grant_type=authorization_code")
+	}
+
+	tests := []struct {
+		name    string
+		body    string
+		details []string
+	}{
+		{
+			name:    "error and description",
+			body:    `{"error":"invalid_grant","error_description":"AADSTS70008: the refresh token has expired"}`,
+			details: []string{"invalid_grant", "AADSTS70008: the refresh token has expired"},
+		},
+		{
+			name:    "error code alone",
+			body:    `{"error":"invalid_client"}`,
+			details: []string{"invalid_client"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			tok, err := exchange(t, tt.body)
+			if tok != nil {
+				t.Fatalf("token = %v; want nil for a provider error body", tok)
+			}
+			requireProviderError(t, err)
+
+			var appErr *errors.Error
+			if !errors.As(err, &appErr) {
+				t.Fatalf("error type = %T; want *errors.Error", err)
+			}
+			if got := appErr.Message(); got != genericMessage {
+				t.Fatalf("message = %q; want %q", got, genericMessage)
+			}
+			for _, detail := range tt.details {
+				if strings.Contains(appErr.Message(), detail) {
+					t.Errorf("message = %q; the provider detail %q must not be client-visible", appErr.Message(), detail)
+				}
+				if !strings.Contains(err.Error(), detail) {
+					t.Errorf("error = %v; want %q kept in the cause chain", err, detail)
+				}
+			}
+		})
+	}
 }

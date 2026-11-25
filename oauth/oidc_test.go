@@ -9,13 +9,17 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/kaiizer777/go-auth/config"
+	apperrors "github.com/kaiizer777/go-auth/errors"
 )
 
-// Reproduces the rollover lost-update: caller A fetches the post-rollover document
-// while caller B's older fetch commits first, superseding A's generation.
-func TestJWKSManager_SupersededRefreshServesRequestedKid(t *testing.T) {
+// A superseded fetch must not authorize a kid absent from the committed set:
+// caller A fetches the post-rollover document while caller B's older fetch
+// commits first, superseding A's generation.
+func TestJWKSManager_SupersededRefreshRejectsUncommittedKid(t *testing.T) {
 	_, oldN, oldE := generateTestRSAKey(t)
-	newPriv, newN, newE := generateTestRSAKey(t)
+	_, newN, newE := generateTestRSAKey(t)
 
 	oldSet := JWKDoc{Keys: []JWKKey{{
 		Kty: "RSA", Use: "sig", Kid: "kid_old", Alg: "RS256", N: oldN, E: oldE,
@@ -30,7 +34,6 @@ func TestJWKSManager_SupersededRefreshServesRequestedKid(t *testing.T) {
 	releaseRollover := make(chan struct{})
 	var releaseOnce sync.Once
 	release := func() { releaseOnce.Do(func() { close(releaseRollover) }) }
-	defer release()
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		switch requests.Add(1) {
@@ -45,6 +48,9 @@ func TestJWKSManager_SupersededRefreshServesRequestedKid(t *testing.T) {
 		}
 	}))
 	defer srv.Close()
+	// Registered after Close so it runs first (LIFO): a Fatal must not leave a
+	// handler parked on releaseRollover while Close waits for it.
+	defer release()
 
 	mgr := NewJWKSManager(srv.URL, srv.Client(), time.Hour)
 
@@ -89,11 +95,12 @@ func TestJWKSManager_SupersededRefreshServesRequestedKid(t *testing.T) {
 	release()
 
 	res := <-aDone
-	if res.err != nil {
-		t.Fatalf("superseded refresh lost kid_new: %v", res.err)
+	if res.err == nil {
+		t.Fatal("superseded refresh authorized a kid absent from the committed set")
 	}
-	if res.key.Key.N.Cmp(newPriv.N) != 0 {
-		t.Fatal("returned key is not the rollover key")
+	var appErr *apperrors.Error
+	if !apperrors.As(res.err, &appErr) || appErr.Code() != apperrors.CodeOAuthIDTokenInvalid {
+		t.Fatalf("expected CodeOAuthIDTokenInvalid, got %v", res.err)
 	}
 	if got := requests.Load(); got != 3 {
 		t.Fatalf("jwks requests = %d; want 3", got)
@@ -280,5 +287,147 @@ func TestJWKSManager_SupersededPrimaryFlightPrefersCommittedKey(t *testing.T) {
 	}
 	if got := requests.Load(); got != 3 {
 		t.Fatalf("jwks requests = %d; want 3", got)
+	}
+}
+
+func TestJWKSManager_RolloverRefreshFailureStaysAuthError(t *testing.T) {
+	_, n, e := generateTestRSAKey(t)
+	var requests atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if requests.Add(1) == 1 {
+			_ = json.NewEncoder(w).Encode(JWKDoc{Keys: []JWKKey{
+				{Kty: "RSA", Use: "sig", Kid: "kid-1", Alg: "RS256", N: n, E: e},
+			}})
+			return
+		}
+		http.Error(w, "upstream down", http.StatusBadGateway)
+	}))
+	defer srv.Close()
+
+	mgr := NewJWKSManager(srv.URL, srv.Client(), time.Hour)
+	_, err := mgr.GetKey(context.Background(), "kid-missing")
+	if err == nil {
+		t.Fatal("expected not-found error, got nil")
+	}
+	var appErr *apperrors.Error
+	if !apperrors.As(err, &appErr) || appErr.Code() != apperrors.CodeOAuthIDTokenInvalid {
+		t.Fatalf("expected auth failure CodeOAuthIDTokenInvalid, got %v", err)
+	}
+	if got := requests.Load(); got != 2 {
+		t.Fatalf("jwks requests = %d; want 2", got)
+	}
+}
+
+func TestJWKSManager_CachedKeyRejectsExpiredDocument(t *testing.T) {
+	_, n, e := generateTestRSAKey(t)
+	pub, ok := parseRSAPublicKey(n, e)
+	if !ok {
+		t.Fatal("failed to parse public key")
+	}
+	mgr := NewJWKSManager("http://unused", nil, time.Hour)
+	mgr.mu.Lock()
+	mgr.keys = map[string]JWKSKey{"kid-1": {Key: pub}}
+	mgr.expires = time.Now().Add(time.Minute)
+	mgr.mu.Unlock()
+
+	if _, ok := mgr.cachedKey("kid-1"); !ok {
+		t.Fatal("fresh cached key rejected")
+	}
+
+	mgr.mu.Lock()
+	mgr.expires = time.Now().Add(-time.Second)
+	mgr.mu.Unlock()
+	if _, ok := mgr.cachedKey("kid-1"); ok {
+		t.Fatal("expired cached key accepted")
+	}
+}
+
+type staticKeyRetriever struct{ key JWKSKey }
+
+func (s staticKeyRetriever) GetKey(context.Context, string) (JWKSKey, error) {
+	return s.key, nil
+}
+
+func TestMicrosoftVerifyIDToken_ClaimsMatrix(t *testing.T) {
+	privKey, _, _ := generateTestRSAKey(t)
+	provider := &MicrosoftProvider{
+		cfg:           config.MicrosoftConfig{ClientID: "client-1", Tenant: "common"},
+		jwksRetriever: staticKeyRetriever{key: JWKSKey{Key: &privKey.PublicKey}},
+	}
+	now := time.Now()
+	baseClaims := func() map[string]any {
+		return map[string]any{
+			"iss": "https://login.microsoftonline.com/tenant-a/v2.0",
+			"sub": "user-1",
+			"aud": "client-1",
+			"tid": "tenant-a",
+			"exp": now.Add(5 * time.Minute).Unix(),
+			"iat": now.Unix(),
+		}
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(map[string]any)
+	}{
+		{name: "expired", mutate: func(c map[string]any) { c["exp"] = now.Add(-5 * time.Minute).Unix() }},
+		{name: "wrong audience", mutate: func(c map[string]any) { c["aud"] = "client-2" }},
+		{name: "wrong issuer", mutate: func(c map[string]any) { c["iss"] = "https://login.microsoftonline.com/tenant-b/v2.0" }},
+		{name: "issued in the future", mutate: func(c map[string]any) { c["iat"] = now.Add(5 * time.Minute).Unix() }},
+		{name: "missing subject", mutate: func(c map[string]any) { delete(c, "sub") }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			claims := baseClaims()
+			tt.mutate(claims)
+			raw := signRS256JWT(t, privKey, "kid-1", claims)
+
+			_, err := provider.VerifyIDToken(context.Background(), raw, "")
+			if err == nil {
+				t.Fatal("expected rejection, got nil")
+			}
+			var appErr *apperrors.Error
+			if !apperrors.As(err, &appErr) || appErr.Code() != apperrors.CodeOAuthIDTokenInvalid {
+				t.Fatalf("expected CodeOAuthIDTokenInvalid, got %v", err)
+			}
+		})
+	}
+}
+
+func TestVerifyRS256JWT_KeyIssuerExactMatch(t *testing.T) {
+	privKey, _, _ := generateTestRSAKey(t)
+	const keyIssuer = "https://issuer.example/v2.0"
+	retriever := staticKeyRetriever{key: JWKSKey{Key: &privKey.PublicKey, Issuer: keyIssuer}}
+
+	tests := []struct {
+		name    string
+		iss     string
+		wantErr bool
+	}{
+		{name: "exact issuer", iss: keyIssuer},
+		{name: "different case", iss: "https://ISSUER.example/v2.0", wantErr: true},
+		{name: "trailing slash", iss: keyIssuer + "/", wantErr: true},
+		{name: "suffix", iss: keyIssuer + ".evil", wantErr: true},
+		{name: "prefix", iss: "https://evil.example/" + keyIssuer, wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			raw := signRS256JWT(t, privKey, "kid-1", map[string]any{"iss": tt.iss, "sub": "user-1"})
+
+			_, err := VerifyRS256JWT(context.Background(), raw, retriever)
+			if !tt.wantErr {
+				if err != nil {
+					t.Fatalf("exact issuer rejected: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("expected issuer mismatch rejection, got nil")
+			}
+			var appErr *apperrors.Error
+			if !apperrors.As(err, &appErr) || appErr.Code() != apperrors.CodeOAuthIDTokenInvalid {
+				t.Fatalf("expected CodeOAuthIDTokenInvalid, got %v", err)
+			}
+		})
 	}
 }

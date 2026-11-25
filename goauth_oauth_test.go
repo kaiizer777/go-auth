@@ -200,7 +200,7 @@ func TestNewOAuthProviders_TenantPrecedence(t *testing.T) {
 					ClientSecret: "map-secret",
 					RedirectURL:  "https://map.example/cb",
 					Enabled:      true,
-					Tenant:       "corp-guid",
+					Tenant:       "66666666-6666-6666-6666-666666666666",
 				},
 			}
 			c.OAuth.Microsoft = &config.MicrosoftConfig{
@@ -217,8 +217,8 @@ func TestNewOAuthProviders_TenantPrecedence(t *testing.T) {
 		if len(providers) != 1 {
 			t.Fatalf("providers = %d; want 1 (no double registration)", len(providers))
 		}
-		if got := microsoftAuthority(t, providers["microsoft"]); got != "corp-guid" {
-			t.Errorf("microsoft authority = %q; want corp-guid", got)
+		if got := microsoftAuthority(t, providers["microsoft"]); got != "66666666-6666-6666-6666-666666666666" {
+			t.Errorf("microsoft authority = %q; want map guid", got)
 		}
 	})
 
@@ -231,7 +231,7 @@ func TestNewOAuthProviders_TenantPrecedence(t *testing.T) {
 					ClientSecret: "map-secret",
 					RedirectURL:  "https://map.example/cb",
 					Enabled:      true,
-					Tenant:       "map-guid",
+					Tenant:       "77777777-7777-7777-7777-777777777777",
 				},
 			}
 			c.OAuth.Microsoft = &config.MicrosoftConfig{
@@ -264,7 +264,7 @@ func TestNewOAuthProviders_TenantPrecedence(t *testing.T) {
 						"ClientSecret": "map-secret",
 						"RedirectURL": "https://auth.example.com/auth/oauth/microsoft/callback",
 						"Enabled": true,
-						"tenant": "corp-guid"
+						"tenant": "66666666-6666-6666-6666-666666666666"
 					}
 				}
 			}
@@ -288,8 +288,8 @@ func TestNewOAuthProviders_TenantPrecedence(t *testing.T) {
 		if !ok {
 			t.Fatal("json map entry did not register a microsoft provider")
 		}
-		if got := microsoftAuthority(t, p); got != "corp-guid" {
-			t.Errorf("microsoft authority = %q; want corp-guid", got)
+		if got := microsoftAuthority(t, p); got != "66666666-6666-6666-6666-666666666666" {
+			t.Errorf("microsoft authority = %q; want map guid", got)
 		}
 	})
 }

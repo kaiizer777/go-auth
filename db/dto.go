@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/mail"
 	"strings"
+	"unicode"
 
 	"github.com/google/uuid"
 
@@ -15,13 +16,13 @@ import (
 // It enforces non-empty, max 255 length, no spaces, RFC 5322 compliance via net/mail,
 // and domain structure (at least one dot, no empty labels, no trailing/leading dots).
 func ValidateEmail(email string) error {
-	if email == "" {
+	if email == "" || strings.TrimSpace(email) == "" {
 		return errors.New(errors.CodeInvalidEmail, "email is required", nil)
 	}
 	if len(email) > 255 {
 		return errors.New(errors.CodeInvalidEmail, "email exceeds maximum length of 255 characters", nil)
 	}
-	if strings.Contains(email, " ") {
+	if strings.IndexFunc(email, unicode.IsSpace) >= 0 {
 		return errors.New(errors.CodeInvalidEmail, "email cannot contain spaces", nil)
 	}
 

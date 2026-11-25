@@ -56,7 +56,7 @@ func TestCorruptVerifierRejectedWithoutOptIn(t *testing.T) {
 	pkce := mustPKCE(t)
 	m.AuthURL("state-corrupt", pkce.Challenge)
 	if _, err := m.ExchangeCode(context.Background(), "code-corrupt", pkce.Verifier); err == nil {
-		t.Fatal("tampered verifier accepted without SetRequireVerifier; want invalid_grant")
+		t.Fatal("tampered verifier accepted; want invalid_grant")
 	}
 }
 

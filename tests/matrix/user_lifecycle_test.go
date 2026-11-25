@@ -102,7 +102,7 @@ func TestMatrix_UserLifecycle(t *testing.T) {
 		}
 
 		// 4. Session Creation & Validation
-		sess, rawSessionToken, err := app.Session.CreateSession(ctx, user.ID, 0, db.SessionTypeBearer, "127.0.0.1", "MatrixUserAgent/1.0")
+		sess, rawSessionToken, err := app.Session.CreateSession(ctx, verifiedUser.ID, verifiedUser.CredentialVersion, db.SessionTypeBearer, "127.0.0.1", "MatrixUserAgent/1.0")
 		if err != nil {
 			t.Fatalf("CreateSession failed: %v", err)
 		}

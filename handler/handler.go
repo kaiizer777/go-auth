@@ -68,7 +68,9 @@ func WithSessionHandler(sh *SessionHandler) Option {
 	}
 }
 
-// WithOAuthService attaches the OAuth linking service and its providers.
+// WithOAuthService attaches the OAuth linking service. providers widens the
+// handler's provider gate: a slug reachable only through that map is no longer
+// rejected as unknown before the service sees it.
 func WithOAuthService(svc oauth.Service, providers map[string]oauth.Provider) Option {
 	return func(h *Handler) {
 		h.oauthSvc = svc
@@ -76,7 +78,8 @@ func WithOAuthService(svc oauth.Service, providers map[string]oauth.Provider) Op
 	}
 }
 
-// WithOAuthRegistry attaches the OAuth linking service and dynamic provider registry.
+// WithOAuthRegistry attaches the OAuth linking service and the registry that
+// resolves dynamic providers, so the handler's gate accepts them.
 func WithOAuthRegistry(svc oauth.Service, registry oauth.Registry) Option {
 	return func(h *Handler) {
 		h.oauthSvc = svc
@@ -327,7 +330,9 @@ func (h *Handler) registerRoutes() {
 		h.mux.Handle("POST /sessions/rotate", sessionWrap(h.sessHandler.RotateSession))
 	}
 
-	if h.oauthSvc != nil {
+	// An attached provider map or registry without a service still mounts the
+	// routes so the nil-service 500 reports the wiring bug instead of a 404.
+	if h.oauthSvc != nil || h.oauthProviders != nil || h.oauthRegistry != nil {
 		// Mounted RAW outside csrf.Middleware/PreAuthMiddleware: Apple
 		// form_post callbacks carry no CSRF cookie+header, and RFC 6749
 		// state validation in HandleCallback is the CSRF defense.
