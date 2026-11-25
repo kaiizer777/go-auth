@@ -445,10 +445,10 @@ func TestMigration000009_UpAndDown(t *testing.T) {
 	_ = testDB.Close()
 
 	m, sqlDB := newMigrator(t, dbURL)
-	defer func() {
+	t.Cleanup(func() {
 		_, _ = m.Close()
 		_ = sqlDB.Close()
-	}()
+	})
 
 	if err := m.Migrate(8); err != nil && err != migrate.ErrNoChange {
 		t.Fatalf("m.Migrate(8) failed: %v", err)
@@ -574,10 +574,10 @@ func TestMigration000010_UpAndDown(t *testing.T) {
 	_ = testDB.Close()
 
 	m, sqlDB := newMigrator(t, dbURL)
-	defer func() {
+	t.Cleanup(func() {
 		_, _ = m.Close()
 		_ = sqlDB.Close()
-	}()
+	})
 
 	if err := m.Migrate(9); err != nil && err != migrate.ErrNoChange {
 		t.Fatalf("m.Migrate(9) failed: %v", err)
