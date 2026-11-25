@@ -213,12 +213,9 @@ func TestUnverifiedLinkTakeoverDefense(t *testing.T) {
 		}
 	}
 
-	// A password signup over an existing unverified row proves nothing: the
-	// caller never demonstrated it reads the mailbox, and the same request is
-	// the squat itself. Purging there would let any unauthenticated squatter
-	// destroy the owner's pending link, so the link survives until the owner
-	// proves the address.
-	t.Run("password-only signup leaves the link usable", func(t *testing.T) {
+	// An unverified link must not survive a password claim. A password signup
+	// atomically purges any unverified OAuth links on the account.
+	t.Run("password-only signup purges the unverified link", func(t *testing.T) {
 		database, cfg, _, svc := setupServiceTest(t, unverified())
 		first, err := loginViaGoogle(t, svc, cfg)
 		if err != nil {
@@ -233,10 +230,10 @@ func TestUnverifiedLinkTakeoverDefense(t *testing.T) {
 		if owner.EmailVerified {
 			t.Fatal("password signup must not mark the address verified")
 		}
-		if _, err := loginViaGoogle(t, svc, cfg); err != nil {
-			t.Fatalf("unverified login after a password-only signup = %v; want the owner's link to keep working", err)
+		if _, err := loginViaGoogle(t, svc, cfg); err == nil {
+			t.Fatal("expected unverified login after a password-only signup to fail, got nil")
 		}
-		requireIdentityRows(t, database, 1, 1, 1)
+		requireLinkGone(t, database)
 	})
 
 	t.Run("verification claims the address and purges the link", func(t *testing.T) {

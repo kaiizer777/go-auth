@@ -472,6 +472,10 @@ func TestMigration000009_UpAndDown(t *testing.T) {
 			t.Fatalf("failed to seed link %s: %v", sub, err)
 		}
 	}
+	t.Cleanup(func() {
+		_, _ = sqlDB.Exec(`DELETE FROM oauth_accounts WHERE provider_user_id IN ('legacy-trusted-sub', 'legacy-untrusted-sub', 'legacy-password-only-sub')`)
+		_, _ = sqlDB.Exec(`DELETE FROM users WHERE email IN ('legacy-trusted@example.com', 'legacy-untrusted@example.com', 'legacy-password-only@example.com')`)
+	})
 
 	if err := m.Steps(1); err != nil {
 		t.Fatalf("000009 up migration failed: %v", err)
@@ -584,10 +588,18 @@ func TestMigration000010_UpAndDown(t *testing.T) {
 		('ms-dedup@example.com', 'hash', 1, true) RETURNING id`).Scan(&userID); err != nil {
 		t.Fatalf("failed to seed user: %v", err)
 	}
+	t.Cleanup(func() {
+		_, _ = sqlDB.Exec(`DELETE FROM oauth_accounts WHERE user_id = $1`, userID)
+		_, _ = sqlDB.Exec(`DELETE FROM users WHERE id = $1`, userID)
+	})
 
+	// Seed duplicate (provider_id, provider_user_id) with distinct emails and verified vs unverified
+	// Plus distinct identities on the same user to prove dedup never collapses on user_id
 	if _, err := sqlDB.Exec(`INSERT INTO oauth_accounts (user_id, provider_id, provider_user_id, email, verified, created_at) VALUES
-		($1, 'microsoft', 'ms-old-oid', 'ms-dedup@example.com', true, '2026-01-01 00:00:00Z'),
-		($1, 'microsoft', 'ms-new-sub', 'ms-dedup@example.com', true, '2026-02-01 00:00:00Z')`, userID); err != nil {
+		($1, 'microsoft', 'ms-dup-sub', 'ms-verified@example.com', true, '2026-01-01 00:00:00Z'),
+		($1, 'microsoft', 'ms-dup-sub', 'ms-unverified-diff@example.com', false, '2026-02-01 00:00:00Z'),
+		($1, 'microsoft', 'ms-work-sub', 'ms-work@example.com', true, '2026-01-01 00:00:00Z'),
+		($1, 'microsoft', 'ms-personal-sub', 'ms-personal@example.com', true, '2026-01-01 00:00:00Z')`, userID); err != nil {
 		t.Fatalf("failed to seed microsoft duplicate links: %v", err)
 	}
 
@@ -599,16 +611,17 @@ func TestMigration000010_UpAndDown(t *testing.T) {
 	if err := sqlDB.QueryRow(`SELECT COUNT(*) FROM oauth_accounts WHERE user_id = $1 AND provider_id = 'microsoft'`, userID).Scan(&remainingLinks); err != nil {
 		t.Fatalf("failed to count remaining links: %v", err)
 	}
-	if remainingLinks != 1 {
-		t.Fatalf("expected 1 remaining link after 000010 deduplication, got %d", remainingLinks)
+	if remainingLinks != 3 {
+		t.Fatalf("expected 3 remaining links (1 deduped + 2 distinct identities), got %d", remainingLinks)
 	}
 
-	var keptSub string
-	if err := sqlDB.QueryRow(`SELECT provider_user_id FROM oauth_accounts WHERE user_id = $1 AND provider_id = 'microsoft'`, userID).Scan(&keptSub); err != nil {
+	var keptVerified bool
+	var keptEmail string
+	if err := sqlDB.QueryRow(`SELECT verified, email FROM oauth_accounts WHERE user_id = $1 AND provider_id = 'microsoft' AND provider_user_id = 'ms-dup-sub'`, userID).Scan(&keptVerified, &keptEmail); err != nil {
 		t.Fatalf("failed to read retained link: %v", err)
 	}
-	if keptSub != "ms-new-sub" {
-		t.Fatalf("expected newer link 'ms-new-sub' retained, got %s", keptSub)
+	if !keptVerified || keptEmail != "ms-verified@example.com" {
+		t.Fatalf("expected verified link with email 'ms-verified@example.com' retained, got verified=%v email=%s", keptVerified, keptEmail)
 	}
 
 	// 000010 down is a no-op

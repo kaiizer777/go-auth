@@ -60,8 +60,10 @@ func TestE2E_SQLiteSchemaMatchesModels(t *testing.T) {
 	if len(tables) == 0 {
 		t.Fatal("schema_sqlite.sql declares no tables")
 	}
+	foundTables := make(map[string]bool, len(tables))
 	for _, match := range tables {
 		table, body := match[1], match[2]
+		foundTables[table] = true
 		model, known := expected[table]
 		if !known {
 			t.Errorf("table %q has no model in db/models.go", table)
@@ -69,6 +71,11 @@ func TestE2E_SQLiteSchemaMatchesModels(t *testing.T) {
 		}
 		if actual := sqliteColumns(body); !slices.Equal(actual, model) {
 			t.Errorf("table %q columns = %v; db/models.go declares %v", table, actual, model)
+		}
+	}
+	for table := range expected {
+		if !foundTables[table] {
+			t.Errorf("table %q from db/models.go is missing in schema_sqlite.sql", table)
 		}
 	}
 }

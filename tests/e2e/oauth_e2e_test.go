@@ -318,9 +318,10 @@ func TestE2E_FullBrowserOAuthJourneys(t *testing.T) {
 		msIdP.Email = "existing-user@example.com"
 
 		msProvider := oauth.NewMicrosoftProvider(config.MicrosoftConfig{
-			ClientID:     msIdP.ClientID,
-			ClientSecret: msIdP.ClientSecret,
-			RedirectURI:  cfg.BaseURL + "/auth/oauth/microsoft/callback",
+			ClientID:       msIdP.ClientID,
+			ClientSecret:   msIdP.ClientSecret,
+			RedirectURI:    cfg.BaseURL + "/auth/oauth/microsoft/callback",
+			TrustedTenants: []string{msIdP.TenantID},
 		}, oauth.WithEndpoints(microsoftEndpoints(msIdP)))
 
 		discordIdP := oauthmock.NewDiscordIdP(cfg.BaseURL + "/auth/oauth/discord/callback")
@@ -1045,9 +1046,7 @@ func TestE2E_FullBrowserOAuthJourneys(t *testing.T) {
 			t.Fatal("an unverified provider address must not verify the account")
 		}
 
-		// A password signup over the pending row proves nothing: the caller never
-		// demonstrated it reads the mailbox, and the same request is the squat.
-		// The link therefore keeps signing in until the address is proven.
+		// Once password signup claims the address, the unverified link is deleted.
 		authSvc, err := auth.New(cfg, dbConn, cfg.EmailHooks)
 		if err != nil {
 			t.Fatalf("auth.New: %v", err)
@@ -1055,9 +1054,17 @@ func TestE2E_FullBrowserOAuthJourneys(t *testing.T) {
 		if _, _, err := authSvc.Signup(context.Background(), db.SignupRequest{Email: addr, Password: "CorrectHorseBattery9!"}); err != nil {
 			t.Fatalf("password signup: %v", err)
 		}
-		if rec := login(); rec.Code != http.StatusFound {
-			t.Fatalf("login after a password-only signup = %d (%s); want 302", rec.Code, rec.Body.String())
+
+		var linkCount int64
+		if err := dbConn.Model(&db.OAuthAccount{}).Where("user_id = ?", user.ID).Count(&linkCount).Error; err != nil || linkCount != 0 {
+			t.Fatalf("expected unverified link to be deleted on password signup, got count=%d err=%v", linkCount, err)
 		}
+
+		rec := login()
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("login after password signup = %d (%s); want 400", rec.Code, rec.Body.String())
+		}
+		assertErrorCode(t, rec, "OAUTH_EMAIL_UNVERIFIED")
 
 		// The reset token is delivered to the mailbox, so consuming it proves the
 		// address: the account is claimed and the unverified link is deleted.
@@ -1071,12 +1078,11 @@ func TestE2E_FullBrowserOAuthJourneys(t *testing.T) {
 			t.Fatalf("ResetPassword: %v", err)
 		}
 
-		var linkCount int64
 		if err := dbConn.Model(&db.OAuthAccount{}).Where("user_id = ?", user.ID).Count(&linkCount).Error; err != nil || linkCount != 0 {
 			t.Fatalf("expected the spent link to be deleted, got count=%d err=%v", linkCount, err)
 		}
 
-		rec := login()
+		rec = login()
 		if rec.Code != http.StatusBadRequest {
 			t.Fatalf("login through a spent unverified link = %d (%s); want 400", rec.Code, rec.Body.String())
 		}

@@ -115,7 +115,7 @@ func NewMicrosoftIdP(redirectURI ...string) (*MicrosoftIdP, error) {
 	idp.codes.registerClient(
 		registeredRedirect(redirectURI),
 		[]string{"openid", "profile", "email", "offline_access"},
-		[]string{"email"},
+		[]string{"openid", "email"},
 	)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/authorize", func(w http.ResponseWriter, r *http.Request) {
@@ -515,6 +515,10 @@ func (i *XIdP) token(w http.ResponseWriter, r *http.Request) {
 		[]byte(url.QueryEscape(i.ClientID)+":"+url.QueryEscape(i.ClientSecret)))
 	if r.Header.Get("Authorization") != want || r.PostForm.Get("client_id") != "" {
 		writeOAuthError(w, "invalid_client")
+		return
+	}
+	if r.PostForm.Get("grant_type") != "authorization_code" {
+		writeOAuthError(w, "invalid_grant")
 		return
 	}
 	ac, ok := i.codes.complete(r.PostForm)

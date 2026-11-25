@@ -843,14 +843,54 @@ func TestBackfillMicrosoftOIDLinks(t *testing.T) {
 
 	ownerID := uuid.New().String()
 	links := database.Collection("oauth_accounts")
-	olderOIDLink := uuid.New().String()
-	newerSubLink := uuid.New().String()
 	now := time.Now().UTC()
+
+	// 1. Identity duplicate on (provider_id, provider_user_id): verified beats newer unverified, distinct emails
+	olderVerifiedID := uuid.New().String()
+	newerUnverifiedID := uuid.New().String()
+	sharedUID := "ms-shared-uid-123"
+
+	// 2. Different provider_user_id on same user_id: both must survive
+	workLinkID := uuid.New().String()
+	personalLinkID := uuid.New().String()
+
+	// 3. 3+ duplicate links for same provider_user_id: newest verified survives
+	tripleUID := "ms-triple-uid-456"
+	tripleOldUnverifiedID := uuid.New().String()
+	tripleOlderVerifiedID := uuid.New().String()
+	tripleNewestVerifiedID := uuid.New().String()
+
+	// 4. Missing created_at handled gracefully
+	missingCreatedAtUID := "ms-missing-created-789"
+	missingCreatedAtID := uuid.New().String()
+	validCreatedAtID := uuid.New().String()
+
 	if _, err := links.InsertMany(ctx, []any{
-		bson.M{"_id": olderOIDLink, "user_id": ownerID, "provider_id": "microsoft",
-			"provider_user_id": "oid-guid-123", "email": "ms@example.com", "created_at": now.Add(-10 * time.Minute)},
-		bson.M{"_id": newerSubLink, "user_id": ownerID, "provider_id": "microsoft",
-			"provider_user_id": "sub-pairwise-456", "email": "ms@example.com", "created_at": now},
+		// Pair 1
+		bson.M{"_id": olderVerifiedID, "user_id": ownerID, "provider_id": "microsoft",
+			"provider_user_id": sharedUID, "email": "older-verified@example.com", "verified": true, "created_at": now.Add(-10 * time.Minute)},
+		bson.M{"_id": newerUnverifiedID, "user_id": ownerID, "provider_id": "microsoft",
+			"provider_user_id": sharedUID, "email": "newer-unverified-diff@example.com", "verified": false, "created_at": now},
+
+		// Pair 2: distinct identities on same user
+		bson.M{"_id": workLinkID, "user_id": ownerID, "provider_id": "microsoft",
+			"provider_user_id": "ms-work-uid", "email": "work@example.com", "verified": true, "created_at": now},
+		bson.M{"_id": personalLinkID, "user_id": ownerID, "provider_id": "microsoft",
+			"provider_user_id": "ms-personal-uid", "email": "personal@example.com", "verified": true, "created_at": now},
+
+		// Triple group
+		bson.M{"_id": tripleOldUnverifiedID, "user_id": ownerID, "provider_id": "microsoft",
+			"provider_user_id": tripleUID, "email": "triple1@example.com", "verified": false, "created_at": now.Add(-20 * time.Minute)},
+		bson.M{"_id": tripleOlderVerifiedID, "user_id": ownerID, "provider_id": "microsoft",
+			"provider_user_id": tripleUID, "email": "triple2@example.com", "verified": true, "created_at": now.Add(-10 * time.Minute)},
+		bson.M{"_id": tripleNewestVerifiedID, "user_id": ownerID, "provider_id": "microsoft",
+			"provider_user_id": tripleUID, "email": "triple3@example.com", "verified": true, "created_at": now},
+
+		// Missing created_at
+		bson.M{"_id": missingCreatedAtID, "user_id": ownerID, "provider_id": "microsoft",
+			"provider_user_id": missingCreatedAtUID, "email": "nocreated@example.com", "verified": false},
+		bson.M{"_id": validCreatedAtID, "user_id": ownerID, "provider_id": "microsoft",
+			"provider_user_id": missingCreatedAtUID, "email": "validcreated@example.com", "verified": true, "created_at": now},
 	}); err != nil {
 		t.Fatalf("seed links: %v", err)
 	}
@@ -859,14 +899,41 @@ func TestBackfillMicrosoftOIDLinks(t *testing.T) {
 		if err := BackfillMicrosoftOIDLinks(ctx, database); err != nil {
 			t.Fatalf("run %d: %v", run, err)
 		}
-		// The older duplicate OID link should be removed, newer sub link preserved
-		var subDoc OAuthAccountDoc
-		if err := links.FindOne(ctx, bson.M{"_id": newerSubLink}).Decode(&subDoc); err != nil {
-			t.Fatalf("run %d: newer sub link missing: %v", run, err)
+
+		// Check Pair 1: verified survived, unverified deleted
+		var doc OAuthAccountDoc
+		if err := links.FindOne(ctx, bson.M{"_id": olderVerifiedID}).Decode(&doc); err != nil {
+			t.Fatalf("run %d: verified link should survive: %v", run, err)
 		}
-		var oidDoc OAuthAccountDoc
-		if err := links.FindOne(ctx, bson.M{"_id": olderOIDLink}).Decode(&oidDoc); !errors.Is(err, mongo.ErrNoDocuments) {
-			t.Fatalf("run %d: older oid link must be deleted, err=%v", run, err)
+		if err := links.FindOne(ctx, bson.M{"_id": newerUnverifiedID}).Decode(&doc); !errors.Is(err, mongo.ErrNoDocuments) {
+			t.Fatalf("run %d: unverified duplicate should be deleted, err=%v", run, err)
+		}
+
+		// Check Pair 2: distinct identities on same user both survived
+		if err := links.FindOne(ctx, bson.M{"_id": workLinkID}).Decode(&doc); err != nil {
+			t.Fatalf("run %d: work link should survive: %v", run, err)
+		}
+		if err := links.FindOne(ctx, bson.M{"_id": personalLinkID}).Decode(&doc); err != nil {
+			t.Fatalf("run %d: personal link should survive: %v", run, err)
+		}
+
+		// Check Triple group: only newest verified survived
+		if err := links.FindOne(ctx, bson.M{"_id": tripleNewestVerifiedID}).Decode(&doc); err != nil {
+			t.Fatalf("run %d: newest verified triple link should survive: %v", run, err)
+		}
+		if err := links.FindOne(ctx, bson.M{"_id": tripleOldUnverifiedID}).Decode(&doc); !errors.Is(err, mongo.ErrNoDocuments) {
+			t.Fatalf("run %d: old unverified triple duplicate should be deleted, err=%v", run, err)
+		}
+		if err := links.FindOne(ctx, bson.M{"_id": tripleOlderVerifiedID}).Decode(&doc); !errors.Is(err, mongo.ErrNoDocuments) {
+			t.Fatalf("run %d: older verified triple duplicate should be deleted, err=%v", run, err)
+		}
+
+		// Check Missing created_at: verified with created_at survived
+		if err := links.FindOne(ctx, bson.M{"_id": validCreatedAtID}).Decode(&doc); err != nil {
+			t.Fatalf("run %d: valid created_at link should survive: %v", run, err)
+		}
+		if err := links.FindOne(ctx, bson.M{"_id": missingCreatedAtID}).Decode(&doc); !errors.Is(err, mongo.ErrNoDocuments) {
+			t.Fatalf("run %d: duplicate missing created_at should be deleted, err=%v", run, err)
 		}
 	}
 	if n, err := database.Collection("schema_migrations").CountDocuments(ctx, bson.M{"_id": microsoftOIDBackfillID}); err != nil || n != 1 {
@@ -1089,11 +1156,11 @@ func TestMongoStore_CanceledContext_AllMethods(t *testing.T) {
 	acc := &db.OAuthAccount{
 		ID:             uuid.New(),
 		UserID:         uid,
-		ProviderID:     "gh",
-		ProviderUserID: "123",
+		ProviderID:     "github",
+		ProviderUserID: "gh_user_42",
 	}
 	assertCanceled("OAuthAccounts.Create", store.OAuthAccounts().Create(ctx, acc))
-	_, err = store.OAuthAccounts().GetByProvider(ctx, "gh", "123")
+	_, err = store.OAuthAccounts().GetByProvider(ctx, "github", "gh_user_42")
 	assertCanceled("OAuthAccounts.GetByProvider", err)
 	_, err = store.OAuthAccounts().GetByUserID(ctx, uid)
 	assertCanceled("OAuthAccounts.GetByUserID", err)

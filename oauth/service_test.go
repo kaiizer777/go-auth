@@ -637,7 +637,7 @@ func TestUnverifiedSignupLinkProvenance(t *testing.T) {
 		return sess, err
 	}
 
-	t.Run("unverified link outlives a password-only recovery signup", func(t *testing.T) {
+	t.Run("unverified link is purged by password-only recovery signup", func(t *testing.T) {
 		database, cfg, _, svc := setupServiceTest(t, unverified())
 		first, err := callback(t, svc, cfg)
 		if err != nil {
@@ -662,13 +662,14 @@ func TestUnverifiedSignupLinkProvenance(t *testing.T) {
 			t.Fatal("password signup must not prove the address")
 		}
 		sess, err := callback(t, svc, cfg)
-		if err != nil {
-			t.Fatalf("login through the unverified link = %v; want the owner's own link to keep working", err)
+		if err == nil || sess != nil {
+			t.Fatalf("login through unverified link should fail after password signup, got sess = %v", sess)
 		}
-		if sess.UserID != first.UserID {
-			t.Fatalf("session user = %v; want the link owner %v", sess.UserID, first.UserID)
+		var linkCount int64
+		database.Model(&db.OAuthAccount{}).Where("user_id = ?", first.UserID).Count(&linkCount)
+		if linkCount != 0 {
+			t.Fatalf("expected 0 links after password signup, got %d", linkCount)
 		}
-		requireIdentityRows(t, database, 1, 1, 1)
 	})
 
 	t.Run("password then oauth never binds", func(t *testing.T) {

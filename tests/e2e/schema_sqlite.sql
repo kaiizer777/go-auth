@@ -65,3 +65,32 @@ CREATE TABLE IF NOT EXISTS sessions (
     created_at DATETIME,
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 );
+
+CREATE TABLE IF NOT EXISTS totp_secrets (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL UNIQUE,
+    encrypted_secret BLOB NOT NULL,
+    backup_codes BLOB NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 0,
+    created_at DATETIME,
+    updated_at DATETIME,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS totp_used_codes (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    code_hash BLOB NOT NULL,
+    used_at DATETIME NOT NULL,
+    CONSTRAINT uq_totp_used_codes_user_code UNIQUE (user_id, code_hash),
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS two_factor_tokens (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    token_hash BLOB UNIQUE NOT NULL,
+    expires_at DATETIME NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);

@@ -97,6 +97,22 @@ func TestIdPRejectsScopeMissingEmail(t *testing.T) {
 	}
 }
 
+func TestIdPRejectsScopeMissingOpenID(t *testing.T) {
+	t.Parallel()
+	idp, err := NewMicrosoftIdP()
+	if err != nil {
+		t.Fatalf("NewMicrosoftIdP: %v", err)
+	}
+	t.Cleanup(idp.Close)
+
+	resp := idpAuthorizeRequest(t, idp.Server.URL+"/authorize", idp.ClientID,
+		idpTestRedirect, "email profile")
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("scope without openid status = %d; want 400", resp.StatusCode)
+	}
+}
+
 func idpPostForm(t *testing.T, endpoint string, form url.Values, header map[string]string) int {
 	t.Helper()
 	req, err := http.NewRequest(http.MethodPost, endpoint, strings.NewReader(form.Encode()))
