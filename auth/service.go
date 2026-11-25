@@ -145,6 +145,9 @@ func (s *authService) Signup(ctx context.Context, req db.SignupRequest) (*db.Use
 					if _, err := txStore.Users().IncrementCredentialVersion(ctx, user.ID); err != nil {
 						return err
 					}
+					if err := purgeUnverifiedLinks(ctx, txStore, user.ID); err != nil {
+						return err
+					}
 					if err := txStore.VerificationTokens().DeleteByUserID(ctx, user.ID); err != nil {
 						return err
 					}
@@ -302,6 +305,10 @@ func (s *authService) VerifyEmail(ctx context.Context, req db.VerifyEmailRequest
 			return err
 		}
 
+		if _, err := txStore.Users().GetByIDForUpdate(ctx, tok.UserID); err != nil {
+			return err
+		}
+
 		rows, err := txStore.VerificationTokens().Delete(ctx, tokenHash[:])
 		if err != nil {
 			return err
@@ -313,12 +320,24 @@ func (s *authService) VerifyEmail(ctx context.Context, req db.VerifyEmailRequest
 		if err := txStore.Users().SetEmailVerified(ctx, tok.UserID, true); err != nil {
 			return err
 		}
+		if _, err := txStore.Users().IncrementCredentialVersion(ctx, tok.UserID); err != nil {
+			return err
+		}
+		if err := purgeUnverifiedLinks(ctx, txStore, tok.UserID); err != nil {
+			return err
+		}
+		if err := txStore.VerificationTokens().DeleteByUserID(ctx, tok.UserID); err != nil {
+			return err
+		}
+		if err := txStore.Sessions().DeleteByUserID(ctx, tok.UserID); err != nil {
+			return err
+		}
 		u, uerr := txStore.Users().GetByID(ctx, tok.UserID)
 		if uerr != nil {
 			return uerr
 		}
 		verifiedUser = *u
-		return purgeUnverifiedLinks(ctx, txStore, tok.UserID)
+		return nil
 	})
 	if err != nil {
 		var appErr *errors.Error

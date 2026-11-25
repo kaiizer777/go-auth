@@ -615,6 +615,79 @@ func TestService_VerifyEmail(t *testing.T) {
 			t.Fatalf("expected CodeInvalidToken on replay, got %v", err)
 		}
 	})
+
+	t.Run("verifying email revokes sessions, increments credential version, and purges unverified links", func(t *testing.T) {
+		user, rawToken, err := svc.Signup(ctx, db.SignupRequest{Email: "revoke-on-verify@example.com", Password: "SecurePassword#2026!"})
+		if err != nil {
+			t.Fatalf("signup failed: %v", err)
+		}
+
+		sess := db.Session{
+			ID:                uuid.New(),
+			UserID:            user.ID,
+			IDHash:            "session_hash_verify_revocation_test_123456789012345678901234567890",
+			SessionType:       db.SessionTypeCookie,
+			CredentialVersion: user.CredentialVersion,
+			LastActiveAt:      time.Now().UTC(),
+			AbsoluteExpiresAt: time.Now().UTC().Add(24 * time.Hour),
+			CreatedAt:         time.Now().UTC(),
+		}
+		if err := database.Create(&sess).Error; err != nil {
+			t.Fatalf("failed to create session: %v", err)
+		}
+
+		unverifiedLink := db.OAuthAccount{
+			ID:             uuid.New(),
+			UserID:         user.ID,
+			ProviderID:     "google",
+			ProviderUserID: "unv-verify-uid",
+			Email:          "revoke-on-verify@example.com",
+			Verified:       false,
+			CreatedAt:      time.Now().UTC(),
+		}
+		if err := database.Create(&unverifiedLink).Error; err != nil {
+			t.Fatalf("failed to create unverified oauth account: %v", err)
+		}
+
+		verifiedLink := db.OAuthAccount{
+			ID:             uuid.New(),
+			UserID:         user.ID,
+			ProviderID:     "github",
+			ProviderUserID: "ver-verify-uid",
+			Email:          "revoke-on-verify@example.com",
+			Verified:       true,
+			CreatedAt:      time.Now().UTC(),
+		}
+		if err := database.Create(&verifiedLink).Error; err != nil {
+			t.Fatalf("failed to create verified oauth account: %v", err)
+		}
+
+		verified, err := svc.VerifyEmail(ctx, db.VerifyEmailRequest{Token: rawToken})
+		if err != nil {
+			t.Fatalf("unexpected verification error: %v", err)
+		}
+		if verified.CredentialVersion != user.CredentialVersion+1 {
+			t.Fatalf("credential version = %d; want %d", verified.CredentialVersion, user.CredentialVersion+1)
+		}
+
+		var sessCount int64
+		database.Model(&db.Session{}).Where("id = ?", sess.ID).Count(&sessCount)
+		if sessCount != 0 {
+			t.Fatalf("expected session to be deleted on email verification, count = %d", sessCount)
+		}
+
+		var unvCount int64
+		database.Model(&db.OAuthAccount{}).Where("id = ?", unverifiedLink.ID).Count(&unvCount)
+		if unvCount != 0 {
+			t.Fatalf("expected unverified oauth account to be deleted on email verification, count = %d", unvCount)
+		}
+
+		var verCount int64
+		database.Model(&db.OAuthAccount{}).Where("id = ?", verifiedLink.ID).Count(&verCount)
+		if verCount != 1 {
+			t.Fatalf("expected verified oauth account to survive email verification, count = %d", verCount)
+		}
+	})
 }
 
 func TestService_PasswordReset(t *testing.T) {
@@ -1424,6 +1497,19 @@ func TestService_Signup_UnverifiedAccountRecovery(t *testing.T) {
 		t.Fatalf("failed to seed session before recovery: %v", err)
 	}
 
+	unverifiedLink := db.OAuthAccount{
+		ID:             uuid.New(),
+		UserID:         user.ID,
+		ProviderID:     "google",
+		ProviderUserID: "unv-rec-uid",
+		Email:          "recover@example.com",
+		Verified:       false,
+		CreatedAt:      time.Now().UTC(),
+	}
+	if err := database.Create(&unverifiedLink).Error; err != nil {
+		t.Fatalf("failed to seed oauth account: %v", err)
+	}
+
 	newPass := "RecoveredPass#67890"
 	recUser, recToken, err := svc.Signup(ctx, db.SignupRequest{Email: "recover@example.com", Password: newPass})
 	if err != nil {
@@ -1481,6 +1567,12 @@ func TestService_Signup_UnverifiedAccountRecovery(t *testing.T) {
 	database.Model(&db.Session{}).Where("user_id = ?", user.ID).Count(&sessAfter)
 	if sessAfter != 0 {
 		t.Fatalf("expected 0 sessions after unverified recovery, got %d", sessAfter)
+	}
+
+	var linkCount int64
+	database.Model(&db.OAuthAccount{}).Where("id = ?", unverifiedLink.ID).Count(&linkCount)
+	if linkCount != 0 {
+		t.Fatalf("expected unverified oauth link to be deleted after recovery signup, count = %d", linkCount)
 	}
 
 	if _, err := svc.VerifyEmail(ctx, db.VerifyEmailRequest{Token: origToken}); err == nil {

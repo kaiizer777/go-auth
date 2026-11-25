@@ -21,9 +21,9 @@
 // Link trust: every oauth_accounts row records whether the provider attested the
 // address it carries. An unverified link may sign in the account it was created
 // on, and only while that account still holds no proven credential; once a
-// password signup or reset claims the address the link is deleted and refuses.
-// Unverified links never merge, recover, or resolve an account by email, and
-// ?link=true cannot persist an unattested address.
+// password signup, reset, or email verification claims the address the link is
+// deleted and refuses. Unverified links never merge, recover, or resolve an
+// account by email, and ?link=true cannot persist an unattested address.
 //
 // Facebook attestation: Graph returns a primary address when the email
 // permission is granted but documents no proof of ownership, so the adapter
