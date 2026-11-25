@@ -845,34 +845,34 @@ func TestBackfillMicrosoftOIDLinks(t *testing.T) {
 	links := database.Collection("oauth_accounts")
 	now := time.Now().UTC()
 
-	// 1. Identity duplicate on (provider_id, provider_user_id): verified beats newer unverified, distinct emails
+	// 1. Identity duplicate on (user_id, email): verified beats newer unverified
 	olderVerifiedID := uuid.New().String()
 	newerUnverifiedID := uuid.New().String()
-	sharedUID := "ms-shared-uid-123"
+	sharedEmail := "ms-shared@example.com"
 
-	// 2. Different provider_user_id on same user_id: both must survive
+	// 2. Different emails on same user_id: both must survive
 	workLinkID := uuid.New().String()
 	personalLinkID := uuid.New().String()
 
-	// 3. 3+ duplicate links for same provider_user_id: newest verified survives
-	tripleUID := "ms-triple-uid-456"
+	// 3. 3+ duplicate links for same user_id and email: newest verified survives
+	tripleEmail := "ms-triple@example.com"
 	tripleOldUnverifiedID := uuid.New().String()
 	tripleOlderVerifiedID := uuid.New().String()
 	tripleNewestVerifiedID := uuid.New().String()
 
 	// 4. Missing created_at handled gracefully
-	missingCreatedAtUID := "ms-missing-created-789"
+	missingCreatedAtEmail := "ms-missing-created@example.com"
 	missingCreatedAtID := uuid.New().String()
 	validCreatedAtID := uuid.New().String()
 
 	if _, err := links.InsertMany(ctx, []any{
 		// Pair 1
 		bson.M{"_id": olderVerifiedID, "user_id": ownerID, "provider_id": "microsoft",
-			"provider_user_id": sharedUID, "email": "older-verified@example.com", "verified": true, "created_at": now.Add(-10 * time.Minute)},
+			"provider_user_id": "ms-oid-1", "email": sharedEmail, "verified": true, "created_at": now.Add(-10 * time.Minute)},
 		bson.M{"_id": newerUnverifiedID, "user_id": ownerID, "provider_id": "microsoft",
-			"provider_user_id": sharedUID, "email": "newer-unverified-diff@example.com", "verified": false, "created_at": now},
+			"provider_user_id": "ms-sub-1", "email": sharedEmail, "verified": false, "created_at": now},
 
-		// Pair 2: distinct identities on same user
+		// Pair 2: distinct emails on same user
 		bson.M{"_id": workLinkID, "user_id": ownerID, "provider_id": "microsoft",
 			"provider_user_id": "ms-work-uid", "email": "work@example.com", "verified": true, "created_at": now},
 		bson.M{"_id": personalLinkID, "user_id": ownerID, "provider_id": "microsoft",
@@ -880,17 +880,17 @@ func TestBackfillMicrosoftOIDLinks(t *testing.T) {
 
 		// Triple group
 		bson.M{"_id": tripleOldUnverifiedID, "user_id": ownerID, "provider_id": "microsoft",
-			"provider_user_id": tripleUID, "email": "triple1@example.com", "verified": false, "created_at": now.Add(-20 * time.Minute)},
+			"provider_user_id": "ms-triple-1", "email": tripleEmail, "verified": false, "created_at": now.Add(-20 * time.Minute)},
 		bson.M{"_id": tripleOlderVerifiedID, "user_id": ownerID, "provider_id": "microsoft",
-			"provider_user_id": tripleUID, "email": "triple2@example.com", "verified": true, "created_at": now.Add(-10 * time.Minute)},
+			"provider_user_id": "ms-triple-2", "email": tripleEmail, "verified": true, "created_at": now.Add(-10 * time.Minute)},
 		bson.M{"_id": tripleNewestVerifiedID, "user_id": ownerID, "provider_id": "microsoft",
-			"provider_user_id": tripleUID, "email": "triple3@example.com", "verified": true, "created_at": now},
+			"provider_user_id": "ms-triple-3", "email": tripleEmail, "verified": true, "created_at": now},
 
 		// Missing created_at
 		bson.M{"_id": missingCreatedAtID, "user_id": ownerID, "provider_id": "microsoft",
-			"provider_user_id": missingCreatedAtUID, "email": "nocreated@example.com", "verified": false},
+			"provider_user_id": "ms-nocreated-sub", "email": missingCreatedAtEmail, "verified": false},
 		bson.M{"_id": validCreatedAtID, "user_id": ownerID, "provider_id": "microsoft",
-			"provider_user_id": missingCreatedAtUID, "email": "validcreated@example.com", "verified": true, "created_at": now},
+			"provider_user_id": "ms-validcreated-sub", "email": missingCreatedAtEmail, "verified": true, "created_at": now},
 	}); err != nil {
 		t.Fatalf("seed links: %v", err)
 	}

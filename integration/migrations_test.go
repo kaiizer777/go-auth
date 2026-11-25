@@ -593,11 +593,12 @@ func TestMigration000010_UpAndDown(t *testing.T) {
 		_, _ = sqlDB.Exec(`DELETE FROM users WHERE id = $1`, userID)
 	})
 
-	// Seed duplicate (provider_id, provider_user_id) with distinct emails and verified vs unverified
-	// Plus distinct identities on the same user to prove dedup never collapses on user_id
+	// Seed duplicate Microsoft links for the same user with matching email (e.g. legacy oid vs new sub)
+	// One verified and one unverified (survivor rule: verified wins)
+	// Plus distinct identities on the same user with different emails to prove dedup never collapses across distinct emails
 	if _, err := sqlDB.Exec(`INSERT INTO oauth_accounts (user_id, provider_id, provider_user_id, email, verified, created_at) VALUES
-		($1, 'microsoft', 'ms-dup-sub', 'ms-verified@example.com', true, '2026-01-01 00:00:00Z'),
-		($1, 'microsoft', 'ms-dup-sub', 'ms-unverified-diff@example.com', false, '2026-02-01 00:00:00Z'),
+		($1, 'microsoft', 'ms-old-oid', 'ms-dedup@example.com', false, '2026-01-01 00:00:00Z'),
+		($1, 'microsoft', 'ms-new-sub', 'ms-dedup@example.com', true, '2026-02-01 00:00:00Z'),
 		($1, 'microsoft', 'ms-work-sub', 'ms-work@example.com', true, '2026-01-01 00:00:00Z'),
 		($1, 'microsoft', 'ms-personal-sub', 'ms-personal@example.com', true, '2026-01-01 00:00:00Z')`, userID); err != nil {
 		t.Fatalf("failed to seed microsoft duplicate links: %v", err)
@@ -616,12 +617,12 @@ func TestMigration000010_UpAndDown(t *testing.T) {
 	}
 
 	var keptVerified bool
-	var keptEmail string
-	if err := sqlDB.QueryRow(`SELECT verified, email FROM oauth_accounts WHERE user_id = $1 AND provider_id = 'microsoft' AND provider_user_id = 'ms-dup-sub'`, userID).Scan(&keptVerified, &keptEmail); err != nil {
+	var keptSub string
+	if err := sqlDB.QueryRow(`SELECT verified, provider_user_id FROM oauth_accounts WHERE user_id = $1 AND provider_id = 'microsoft' AND email = 'ms-dedup@example.com'`, userID).Scan(&keptVerified, &keptSub); err != nil {
 		t.Fatalf("failed to read retained link: %v", err)
 	}
-	if !keptVerified || keptEmail != "ms-verified@example.com" {
-		t.Fatalf("expected verified link with email 'ms-verified@example.com' retained, got verified=%v email=%s", keptVerified, keptEmail)
+	if !keptVerified || keptSub != "ms-new-sub" {
+		t.Fatalf("expected verified link with sub 'ms-new-sub' retained, got verified=%v sub=%s", keptVerified, keptSub)
 	}
 
 	// 000010 down is a no-op
