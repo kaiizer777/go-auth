@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking Changes
 
-- `OAuthAccountStore.DeleteByUserID(ctx context.Context, userID uuid.UUID) error` was added to the `OAuthAccountStore` interface. External or custom implementations of `OAuthAccountStore` must implement this method to support account deletion and unverified link purges.
+- `OAuthAccountStore.UpdateProviderUserID(ctx context.Context, id uuid.UUID, providerUserID string) error` was added to the `OAuthAccountStore` interface. External or custom implementations of `OAuthAccountStore` must implement this method to support provider user ID updates (such as migrating legacy Microsoft OIDs to pairwise subjects).
 
 ### Added
 
@@ -32,6 +32,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`users.email_verified`). A password alone no longer qualifies: anyone can set
   one on an unverified address, and a link attached that way outlived the real
   owner's password recovery.
+- Setting a password via password-only signup deletes unverified OAuth links while
+  leaving the account's email unverified (`users.email_verified = false`), preventing
+  unverified third-party links from retaining access.
 - Once the address is proven — email verification or a completed password reset
   — the account's unverified OAuth links are deleted and any later callback
   through one is rejected. Attested links are kept. A password reset now also
@@ -41,6 +44,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   signing in its own account. Residual risk: an unverified link planted through
   the old unvalidated `?link=true` path on an address that was already verified
   locally is backfilled `TRUE` and trusted.
+- Microsoft OAuth multi-tenant mode (`Tenant: "common"` or `"organizations"`):
+  an empty `trusted_tenants` allowlist fails closed (denies all incoming tenants
+  as untrusted). Operators must explicitly specify permitted tenant IDs or domains.
 
 ### Upgrade notes
 

@@ -41,7 +41,10 @@ go-auth/
 `go-auth` exposes interfaces in `db/store.go` (`UserStore`, `SessionStore`, `OAuthAccountStore`, `VerificationTokenStore`, `PasswordResetTokenStore`, `TotpStore`).
 
 > [!NOTE]
-> **Breaking Change:** `OAuthAccountStore` includes `DeleteByUserID(ctx context.Context, userID uuid.UUID) error`. Custom `OAuthAccountStore` implementations must implement this method for atomic link revocation.
+> **Breaking Change:** `OAuthAccountStore` includes `UpdateProviderUserID(ctx context.Context, id uuid.UUID, providerUserID string) error`. Custom `OAuthAccountStore` implementations must implement this method to support provider user ID updates (such as migrating legacy Microsoft OIDs to pairwise subjects).
+
+> [!NOTE]
+> **Behavior Change:** For Microsoft OAuth in multi-tenant mode (`Tenant: "common"` or `"organizations"`), an empty `trusted_tenants` allowlist fails closed (denies all incoming tenants as untrusted). Operators must explicitly configure `trusted_tenants` with allowed tenant IDs or domains.
 
 ---
 
