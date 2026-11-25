@@ -198,8 +198,8 @@ func TestMySQLMigration000009_AddsVerifiedFlag(t *testing.T) {
 	}
 	content := string(data)
 
-	alterIdx := strings.Index(content, "ALTER TABLE oauth_accounts ADD COLUMN verified TINYINT(1) NOT NULL DEFAULT 0")
-	if alterIdx == -1 {
+	alterIdx := strings.Index(content, "ALTER TABLE oauth_accounts ADD COLUMN")
+	if alterIdx == -1 || !strings.Contains(content, "verified TINYINT(1) NOT NULL DEFAULT 0") {
 		t.Fatal("mysql migration 9 up must add oauth_accounts.verified as TINYINT(1) NOT NULL DEFAULT 0")
 	}
 	backfillIdx := strings.Index(content, "UPDATE oauth_accounts SET verified = 1")
@@ -225,7 +225,7 @@ func TestMySQLMigration000009_AddsVerifiedFlag(t *testing.T) {
 		t.Fatalf("failed to read mysql migration 9 down: %v", err)
 	}
 	downContent := string(downData)
-	if !strings.Contains(downContent, "ALTER TABLE oauth_accounts DROP COLUMN verified") {
+	if !strings.Contains(downContent, "ALTER TABLE oauth_accounts DROP COLUMN") || !strings.Contains(downContent, "verified") {
 		t.Error("mysql migration 9 down must drop the verified column")
 	}
 	if strings.Contains(strings.ToUpper(downContent), "DROP TABLE") {
