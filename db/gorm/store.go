@@ -252,9 +252,12 @@ func (s *oauthAccountStore) GetByUserID(ctx context.Context, userID uuid.UUID) (
 }
 
 func (s *oauthAccountStore) UpdateProviderUserID(ctx context.Context, id uuid.UUID, providerUserID string) error {
-	err := s.db.WithContext(ctx).Model(&db.OAuthAccount{}).Where("id = ?", id).Update("provider_user_id", providerUserID).Error
-	if err != nil {
+	res := s.db.WithContext(ctx).Model(&db.OAuthAccount{}).Where("id = ?", id).Update("provider_user_id", providerUserID)
+	if err := res.Error; err != nil {
 		return db.NormalizeMySQLError(err)
+	}
+	if res.RowsAffected == 0 {
+		return gorm.ErrRecordNotFound
 	}
 	return nil
 }

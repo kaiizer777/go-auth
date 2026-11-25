@@ -780,6 +780,17 @@ func TestBackfillOAuthAccountVerified_BatchingAndResumability(t *testing.T) {
 		}
 	}
 
+	// Verify links u1 and u2 were skipped (remain unverified)
+	for _, id := range []string{"u1", "u2"} {
+		var doc OAuthAccountDoc
+		if err := links.FindOne(ctx, bson.M{"_id": "link-" + id}).Decode(&doc); err != nil {
+			t.Fatalf("find link-%s: %v", id, err)
+		}
+		if doc.Verified {
+			t.Errorf("expected link-%s to remain unverified (skipped by resume)", id)
+		}
+	}
+
 	// Verify completion marker exists
 	var m bson.M
 	if err := markers.FindOne(ctx, bson.M{"_id": oauthVerifiedBackfillID}).Decode(&m); err != nil {

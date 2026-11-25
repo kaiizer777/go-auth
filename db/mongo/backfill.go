@@ -178,7 +178,10 @@ func BackfillMicrosoftOIDLinks(ctx context.Context, database *mongo.Database) er
 	links := database.Collection("oauth_accounts")
 	pipeline := mongo.Pipeline{
 		{{Key: "$match", Value: bson.M{"provider_id": "microsoft"}}},
-		{{Key: "$sort", Value: bson.M{"created_at": -1}}},
+		{{Key: "$sort", Value: bson.D{
+			{Key: "created_at", Value: -1},
+			{Key: "_id", Value: -1},
+		}}},
 		{{Key: "$group", Value: bson.M{
 			"_id":   "$user_id",
 			"count": bson.M{"$sum": 1},
@@ -193,6 +196,7 @@ func BackfillMicrosoftOIDLinks(ctx context.Context, database *mongo.Database) er
 	defer func() { _ = cursor.Close(ctx) }()
 
 	var toDelete []string
+	deleted := int64(0)
 	for cursor.Next(ctx) {
 		var res struct {
 			Docs []string `bson:"docs"`
@@ -203,18 +207,25 @@ func BackfillMicrosoftOIDLinks(ctx context.Context, database *mongo.Database) er
 		if len(res.Docs) > 1 {
 			toDelete = append(toDelete, res.Docs[1:]...)
 		}
+		if len(toDelete) >= 1000 {
+			dres, derr := links.DeleteMany(ctx, bson.M{"_id": bson.M{"$in": toDelete}})
+			if derr != nil {
+				return derr
+			}
+			deleted += dres.DeletedCount
+			toDelete = toDelete[:0]
+		}
 	}
 	if cerr := cursor.Err(); cerr != nil {
 		return cerr
 	}
 
-	deleted := int64(0)
 	if len(toDelete) > 0 {
 		dres, derr := links.DeleteMany(ctx, bson.M{"_id": bson.M{"$in": toDelete}})
 		if derr != nil {
 			return derr
 		}
-		deleted = dres.DeletedCount
+		deleted += dres.DeletedCount
 	}
 
 	if _, merr := markers.UpdateOne(ctx,

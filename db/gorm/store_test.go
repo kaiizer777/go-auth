@@ -700,8 +700,14 @@ func TestOAuthAccountStore_AllMethods(t *testing.T) {
 		t.Fatalf("UpdateProviderUserID failed: %v", err)
 	}
 	gotUpdated, err := oauth.GetByProvider(ctx, "github", "gh_456_updated")
-	if err != nil || gotUpdated == nil || gotUpdated.ProviderUserID != "gh_456_updated" {
+	if err != nil || gotUpdated == nil || gotUpdated.ProviderUserID != "gh_456_updated" || gotUpdated.ID != acc.ID {
 		t.Fatalf("expected updated provider_user_id, got %v, err=%v", gotUpdated, err)
+	}
+	if _, err := oauth.GetByProvider(ctx, "github", "gh_123"); !errors.Is(err, gormdriver.ErrRecordNotFound) {
+		t.Fatalf("expected old provider_user_id to not exist, got err=%v", err)
+	}
+	if err := oauth.UpdateProviderUserID(ctx, uuid.New(), "non_existent"); !errors.Is(err, gormdriver.ErrRecordNotFound) {
+		t.Fatalf("expected gormdriver.ErrRecordNotFound for non-existent link, got %v", err)
 	}
 
 	// 5. Delete
