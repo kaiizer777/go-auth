@@ -714,7 +714,7 @@ func (s *service) resolveLinkedUser(ctx context.Context, providerID string, info
 	}
 	legacyLink, legacyFound, lerr := s.findLink(ctx, providerID, oid)
 	if lerr != nil {
-		return db.User{}, db.OAuthAccount{}, false, lerr
+		return db.User{}, db.OAuthAccount{}, false, errors.New(errors.CodeInternalError, "failed to query oauth account", lerr)
 	}
 	if !legacyFound {
 		// Callback 1 may have migrated oid to sub concurrently between our

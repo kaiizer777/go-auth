@@ -2576,6 +2576,84 @@ func TestHandleCallback_MicrosoftLegacyOIDFallback(t *testing.T) {
 			t.Fatalf("expected 1 row (migrated, not duplicated), got %d", n)
 		}
 	})
+
+	t.Run("propagates 500 when legacy oid lookup fails with database error", func(t *testing.T) {
+		t.Parallel()
+		database, cfg, _, _ := setupServiceTest(t, verifiedInfo())
+		sessSvc := session.NewService(database, cfg)
+
+		user := db.User{
+			ID:            uuid.New(),
+			Email:         "ms-err@example.com",
+			EmailVerified: false,
+		}
+		if err := database.Create(&user).Error; err != nil {
+			t.Fatalf("create user: %v", err)
+		}
+
+		msInfo := &UserInfo{
+			ProviderID:     "microsoft",
+			ProviderUserID: "new-sub-err",
+			Email:          "ms-err@example.com",
+			EmailVerified:  false,
+			Name:           "MS Error User",
+			RawClaims: map[string]any{
+				"sub": "new-sub-err",
+				"oid": "faulty-oid-123",
+			},
+		}
+		mockMS := &stubProvider{id: "microsoft", info: msInfo}
+
+		baseStore := gormstore.New(database)
+		faultyAccounts := &faultyOAuthAccountStore{
+			OAuthAccountStore: baseStore.OAuthAccounts(),
+			errOnUID:          "faulty-oid-123",
+		}
+		faultyStore := &faultyStoreWrapper{
+			Store:    baseStore,
+			accounts: faultyAccounts,
+		}
+
+		svc := NewServiceWithStore(faultyStore, sessSvc, map[string]Provider{"microsoft": mockMS}, cfg)
+
+		state, cookie := mustInitiate(t, svc, cfg, "microsoft")
+		req := httptest.NewRequest(http.MethodGet, "/auth/oauth/microsoft/callback", nil)
+		req.AddCookie(cookie)
+		rec := httptest.NewRecorder()
+
+		_, _, _, err := svc.HandleCallback(context.Background(), rec, req, "microsoft", "code", state, db.SessionTypeCookie)
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+		var appErr *errors.Error
+		if !stderrors.As(err, &appErr) {
+			t.Fatalf("expected *errors.Error, got %T: %v", err, err)
+		}
+		if appErr.Code() != errors.CodeInternalError {
+			t.Fatalf("expected CodeInternalError (500), got %s", appErr.Code())
+		}
+	})
+}
+
+type faultyOAuthAccountStore struct {
+	db.OAuthAccountStore
+	errOnUID string
+}
+
+func (s *faultyOAuthAccountStore) GetByProvider(ctx context.Context, providerID, providerUserID string) (*db.OAuthAccount, error) {
+	if providerUserID == s.errOnUID {
+		return nil, stderrors.New("simulated database failure")
+	}
+	return s.OAuthAccountStore.GetByProvider(ctx, providerID, providerUserID)
+}
+
+type faultyStoreWrapper struct {
+	db.Store
+	accounts db.OAuthAccountStore
+}
+
+func (w *faultyStoreWrapper) OAuthAccounts() db.OAuthAccountStore {
+	return w.accounts
 }
 
 // TestFacebookFirstSignup drives the real Facebook adapter through the linking
