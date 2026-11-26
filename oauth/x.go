@@ -74,34 +74,74 @@ func (p *XProvider) AuthCodeURL(state, codeChallenge string, opts ...AuthCodeOpt
 	return p.authURL + "?" + q.Encode()
 }
 
-// parseXErrorWithHeader inspects HTTP status, body, and response headers for rate limit details or RFC 7807 problem details.
-func parseXErrorWithHeader(statusCode int, body []byte, header http.Header) error {
-	var retryAfterSec int
-	if header != nil {
-		if ra := header.Get("Retry-After"); ra != "" {
-			if sec, err := strconv.Atoi(strings.TrimSpace(ra)); err == nil && sec > 0 {
-				retryAfterSec = sec
-			}
-		}
-		if retryAfterSec == 0 {
-			if rst := header.Get("x-rate-limit-reset"); rst != "" {
-				if resetUnix, err := strconv.ParseInt(strings.TrimSpace(rst), 10, 64); err == nil {
-					diff := int(resetUnix - time.Now().Unix())
-					if diff > 0 {
-						retryAfterSec = diff
-					} else {
-						retryAfterSec = 1
-					}
-				}
-			}
+// RFC 9110 sets no upper bound on a retry hint, but it reaches the client as a
+// Retry-After header, so a hostile or misconfigured upstream must not escape it.
+const (
+	minRetryAfterSeconds = 1
+	maxRetryAfterSeconds = 24 * 60 * 60
+)
+
+// parseRetryAfterHeader resolves the retry delay in seconds. A valid
+// Retry-After (delay-seconds or HTTP-date per RFC 9110) wins over the
+// x-rate-limit-reset epoch. Zero means neither source was usable.
+func parseRetryAfterHeader(header http.Header) int {
+	if header == nil {
+		return 0
+	}
+	if sec, ok := parseRetryAfterValue(strings.TrimSpace(header.Get("Retry-After"))); ok {
+		return sec
+	}
+	if rst := strings.TrimSpace(header.Get("x-rate-limit-reset")); rst != "" {
+		if resetUnix, err := strconv.ParseInt(rst, 10, 64); err == nil {
+			return clampRetryAfterSeconds(resetUnix - time.Now().Unix())
 		}
 	}
+	return 0
+}
+
+// parseRetryAfterValue parses both RFC 9110 forms and clamps the result.
+func parseRetryAfterValue(raw string) (int, bool) {
+	if raw == "" {
+		return 0, false
+	}
+	sec, err := strconv.ParseInt(raw, 10, 64)
+	if err == nil {
+		return clampRetryAfterSeconds(sec), true
+	}
+	if numErr, ok := err.(*strconv.NumError); ok && numErr.Err == strconv.ErrRange {
+		// Magnitude beyond int64 still clamps; only the sign matters.
+		if strings.HasPrefix(raw, "-") {
+			return minRetryAfterSeconds, true
+		}
+		return maxRetryAfterSeconds, true
+	}
+	if at, err := http.ParseTime(raw); err == nil {
+		return clampRetryAfterSeconds(int64(time.Until(at) / time.Second)), true
+	}
+	return 0, false
+}
+
+// clampRetryAfterSeconds bounds sec to [minRetryAfterSeconds, maxRetryAfterSeconds].
+func clampRetryAfterSeconds(sec int64) int {
+	if sec < minRetryAfterSeconds {
+		return minRetryAfterSeconds
+	}
+	if sec > maxRetryAfterSeconds {
+		return maxRetryAfterSeconds
+	}
+	return int(sec)
+}
+
+func xRateLimitError(retryAfterSec int) error {
+	return &RateLimitError{RetryAfter: retryAfterSec, Err: errors.ErrOAuthRateLimitExceeded}
+}
+
+// parseXErrorWithHeader inspects HTTP status, body, and response headers for rate limit details or RFC 7807 problem details.
+func parseXErrorWithHeader(statusCode int, body []byte, header http.Header) error {
+	retryAfterSec := parseRetryAfterHeader(header)
 
 	if statusCode == http.StatusTooManyRequests {
-		if retryAfterSec > 0 {
-			return &RateLimitError{RetryAfter: retryAfterSec, Err: errors.ErrOAuthRateLimitExceeded}
-		}
-		return errors.ErrOAuthRateLimitExceeded
+		return xRateLimitError(retryAfterSec)
 	}
 
 	var problem struct {
