@@ -764,7 +764,7 @@ func TestUnverifiedSignupLinkProvenance(t *testing.T) {
 		if err := database.Create(&unverifiedLink).Error; err != nil {
 			t.Fatalf("seed unverified link: %v", err)
 		}
-		_, _, _, err := rawSvc.(*service).relinkExisting(context.Background(), "google", "sub-unverified-race")
+		_, _, _, err := rawSvc.(*service).relinkExisting(context.Background(), "google", "", "sub-unverified-race")
 		if !errors.Is(err, errors.ErrOAuthEmailUnverified) {
 			t.Fatalf("relinkExisting on unverified link for claimed account = %v; want ErrOAuthEmailUnverified", err)
 		}
@@ -1889,12 +1889,12 @@ func TestService_SubjectCaseSensitivity(t *testing.T) {
 	}
 
 	// Verify lookups resolve distinct accounts
-	l1, found1, err := svc.(*service).findLink(ctx, "google", "Subject_CASE_123")
+	l1, found1, err := svc.(*service).findLink(ctx, "google", "", "Subject_CASE_123")
 	if err != nil || !found1 || l1.UserID != u1.ID {
 		t.Fatalf("upper lookup mismatch: found=%v, err=%v, link=%+v", found1, err, l1)
 	}
 
-	l2, found2, err := svc.(*service).findLink(ctx, "google", "subject_case_123")
+	l2, found2, err := svc.(*service).findLink(ctx, "google", "", "subject_case_123")
 	if err != nil || !found2 || l2.UserID != u2.ID {
 		t.Fatalf("lower lookup mismatch: found=%v, err=%v, link=%+v", found2, err, l2)
 	}

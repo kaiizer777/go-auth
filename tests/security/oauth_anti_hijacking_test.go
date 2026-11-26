@@ -232,11 +232,12 @@ func TestSecurity_UntrustedTenantNotLinkedForActiveSession(t *testing.T) {
 	// Verified email, differing from the active user's: only the tenant marker
 	// may reject this flow, and email matching must not bind it either.
 	info := &oauth.UserInfo{
-		ProviderID:     "microsoft",
-		ProviderUserID: "ms-untrusted-active-sub",
-		Email:          "untrusted@external-tenant.example",
-		EmailVerified:  true,
-		RawClaims:      map[string]any{"untrusted_tenant": true},
+		ProviderID:       "microsoft",
+		ProviderTenantID: oauthmock.MicrosoftTenantID,
+		ProviderUserID:   "ms-untrusted-active-sub",
+		Email:            "untrusted@external-tenant.example",
+		EmailVerified:    true,
+		RawClaims:        map[string]any{"untrusted_tenant": true},
 	}
 	reg := oauth.NewRegistry()
 	_ = reg.Register(&untrustedTenantProvider{info: info})
@@ -276,17 +277,19 @@ func TestSecurity_UntrustedTenantEvictsAndGatesExistingLink(t *testing.T) {
 		t.Fatalf("create owner: %v", err)
 	}
 	link := db.OAuthAccount{ID: uuid.New(), UserID: owner.ID, ProviderID: "microsoft",
-		ProviderUserID: "ms-untrusted-linked-sub", Email: owner.Email, Verified: true}
+		ProviderTenantID: oauthmock.MicrosoftTenantID,
+		ProviderUserID:   "ms-untrusted-linked-sub", Email: owner.Email, Verified: true}
 	if err := database.Create(&link).Error; err != nil {
 		t.Fatalf("create link: %v", err)
 	}
 
 	info := &oauth.UserInfo{
-		ProviderID:     "microsoft",
-		ProviderUserID: "ms-untrusted-linked-sub",
-		Email:          "untrusted@external-tenant.example",
-		EmailVerified:  true,
-		RawClaims:      map[string]any{"untrusted_tenant": true},
+		ProviderID:       "microsoft",
+		ProviderTenantID: oauthmock.MicrosoftTenantID,
+		ProviderUserID:   "ms-untrusted-linked-sub",
+		Email:            "untrusted@external-tenant.example",
+		EmailVerified:    true,
+		RawClaims:        map[string]any{"untrusted_tenant": true},
 	}
 	reg := oauth.NewRegistry()
 	_ = reg.Register(&untrustedTenantProvider{info: info})

@@ -1071,7 +1071,7 @@ func TestMicrosoftProvider(t *testing.T) {
 			if got := user.RawClaims["preferred_username"]; got != "fallback.user@example.com" {
 				t.Errorf("RawClaims[preferred_username] = %v, want fallback.user@example.com", got)
 			}
-			if err := validateProviderIdentity(user); !errors.Is(err, errors.ErrOAuthEmailUnverified) {
+			if err := validateProviderIdentity(user, "microsoft"); !errors.Is(err, errors.ErrOAuthEmailUnverified) {
 				t.Errorf("validateProviderIdentity = %v, want ErrOAuthEmailUnverified", err)
 			}
 		})
@@ -1610,12 +1610,13 @@ func TestMicrosoftProvider_PinnedTenantEmptyAllowlistKeepsLink(t *testing.T) {
 		t.Fatalf("create owner: %v", err)
 	}
 	link := db.OAuthAccount{
-		ID:             uuid.New(),
-		UserID:         owner.ID,
-		ProviderID:     "microsoft",
-		ProviderUserID: info.ProviderUserID,
-		Email:          owner.Email,
-		Verified:       true,
+		ID:               uuid.New(),
+		UserID:           owner.ID,
+		ProviderID:       "microsoft",
+		ProviderTenantID: info.ProviderTenantID,
+		ProviderUserID:   info.ProviderUserID,
+		Email:            owner.Email,
+		Verified:         true,
 	}
 	if err := database.Create(&link).Error; err != nil {
 		t.Fatalf("create link: %v", err)

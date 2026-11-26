@@ -205,7 +205,7 @@ func TestNewProviderFacebookEmailAttestation(t *testing.T) {
 		if !user.EmailVerified {
 			t.Fatal("EmailVerified = false; want true under assert_email_verified")
 		}
-		if err := validateProviderIdentity(user); err != nil {
+		if err := validateProviderIdentity(user, "facebook"); err != nil {
 			t.Fatalf("validateProviderIdentity = %v; want the merge gate open", err)
 		}
 	})
@@ -216,7 +216,7 @@ func TestNewProviderFacebookEmailAttestation(t *testing.T) {
 		if user.EmailVerified {
 			t.Fatal("EmailVerified = true; a non-empty Graph email is not an attested claim")
 		}
-		if err := validateProviderIdentity(user); !errors.Is(err, errors.ErrOAuthEmailUnverified) {
+		if err := validateProviderIdentity(user, "facebook"); !errors.Is(err, errors.ErrOAuthEmailUnverified) {
 			t.Fatalf("validateProviderIdentity = %v; want ErrOAuthEmailUnverified", err)
 		}
 	})
@@ -227,7 +227,7 @@ func TestNewProviderFacebookEmailAttestation(t *testing.T) {
 		if user.EmailVerified {
 			t.Fatal("EmailVerified = true; want false when the operator does not assert it")
 		}
-		if err := validateProviderIdentity(user); !errors.Is(err, errors.ErrOAuthEmailUnverified) {
+		if err := validateProviderIdentity(user, "facebook"); !errors.Is(err, errors.ErrOAuthEmailUnverified) {
 			t.Fatalf("validateProviderIdentity = %v; want ErrOAuthEmailUnverified", err)
 		}
 	})
