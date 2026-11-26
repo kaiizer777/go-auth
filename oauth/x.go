@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -311,8 +312,37 @@ func (p *XProvider) ExchangeCode(ctx context.Context, code, codeVerifier string)
 		return nil, errors.New(errors.CodeOAuthProviderError, "oauth token exchange failed",
 			errors.New(errors.CodeOAuthProviderError, "upstream error: "+msg, nil))
 	}
+	// X can also report a failed exchange as a 2xx RFC 7807 problem document.
+	// It has no error field, so map it like the non-2xx path does.
+	if isXProblemResponse(resp.Header, raw) {
+		return nil, parseXErrorWithHeader(resp.StatusCode, bodyBytes, resp.Header)
+	}
 
-	return tokenFromRaw(raw), nil
+	tok := tokenFromRaw(raw)
+	if tok.AccessToken == "" {
+		return nil, errors.New(errors.CodeOAuthProviderError, "oauth provider returned no access token", nil)
+	}
+	return tok, nil
+}
+
+// isXProblemResponse reports whether a token response is an RFC 7807 problem
+// document: labelled application/problem+json, or carrying no access token
+// and the problem fields X uses (type, title, detail, errors).
+func isXProblemResponse(header http.Header, raw map[string]any) bool {
+	if mediaType, _, err := mime.ParseMediaType(header.Get("Content-Type")); err == nil &&
+		mediaType == "application/problem+json" {
+		return true
+	}
+	if _, ok := raw["access_token"]; ok {
+		return false
+	}
+	for _, key := range []string{"type", "title", "detail"} {
+		if s, _ := raw[key].(string); s != "" {
+			return true
+		}
+	}
+	errs, _ := raw["errors"].([]any)
+	return len(errs) > 0
 }
 
 // FetchUserInfo retrieves and normalizes user profile information from /2/users/me.

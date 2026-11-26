@@ -407,6 +407,28 @@ func TestXProvider_ExchangeCode(t *testing.T) {
 			})
 			return
 		}
+		if code == "problem-200-code" || code == "problem-200-json-code" {
+			// X can return an RFC 7807 problem document with a 2xx status.
+			contentType := "application/problem+json"
+			if code == "problem-200-json-code" {
+				contentType = "application/json; charset=utf-8"
+			}
+			w.Header().Set("Content-Type", contentType)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"type":   "https://api.twitter.com/2/problems/invalid-request",
+				"title":  "Invalid Request",
+				"detail": "Value passed for authorization code was invalid",
+			})
+			return
+		}
+		if code == "no-access-token-code" {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"token_type": "bearer",
+				"expires_in": 7200,
+			})
+			return
+		}
 		if code == "nested-error-code" {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusBadRequest)
@@ -795,6 +817,42 @@ func TestXProvider_ExchangeCode(t *testing.T) {
 		}
 		if !strings.Contains(err.Error(), "Value passed for authorization code was invalid") {
 			t.Fatalf("expected the provider text preserved in the cause chain, got %v", err)
+		}
+	})
+
+	for _, tc := range []struct{ name, code string }{
+		{"200 problem+json is a failed exchange", "problem-200-code"},
+		{"200 problem document labelled application/json is a failed exchange", "problem-200-json-code"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tok, err := p.ExchangeCode(context.Background(), tc.code, "test-code-verifier")
+			if err == nil {
+				t.Fatalf("expected error, got token %+v", tok)
+			}
+			if tok != nil {
+				t.Fatalf("expected nil token on failure, got %+v", tok)
+			}
+			var appErr *errors.Error
+			if !errors.As(err, &appErr) || appErr.Code() != errors.CodeOAuthProviderError {
+				t.Fatalf("expected CodeOAuthProviderError, got %v", err)
+			}
+			if appErr.Message() != "oauth provider request failed" {
+				t.Fatalf("message = %q; want the generic message", appErr.Message())
+			}
+			if !strings.Contains(err.Error(), "Value passed for authorization code was invalid") {
+				t.Fatalf("expected upstream detail preserved in cause chain, got %v", err)
+			}
+		})
+	}
+
+	t.Run("200 without an access token is a failed exchange", func(t *testing.T) {
+		tok, err := p.ExchangeCode(context.Background(), "no-access-token-code", "test-code-verifier")
+		if err == nil {
+			t.Fatalf("expected error, got token %+v", tok)
+		}
+		var appErr *errors.Error
+		if !errors.As(err, &appErr) || appErr.Code() != errors.CodeOAuthProviderError {
+			t.Fatalf("expected CodeOAuthProviderError, got %v", err)
 		}
 	})
 
