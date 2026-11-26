@@ -287,6 +287,18 @@ func TestXProvider_ExchangeCode(t *testing.T) {
 			writeProblem(w, http.StatusTooManyRequests, map[string]any{"status": 429})
 			return
 		}
+		if code == "rate-limited-body-status-code" {
+			w.Header().Set("Retry-After", "30")
+			writeProblem(w, http.StatusBadRequest, map[string]any{"status": 429})
+			return
+		}
+		if code == "rate-limited-body-nested-status-code" {
+			w.Header().Set("Retry-After", "20")
+			writeProblem(w, http.StatusBadRequest, map[string]any{
+				"errors": []map[string]any{{"status": 429}},
+			})
+			return
+		}
 		if code == "problem-multiple-errors-code" {
 			writeProblem(w, http.StatusBadRequest, map[string]any{
 				"type":   "https://api.twitter.com/2/problems/bad-request",
@@ -329,6 +341,14 @@ func TestXProvider_ExchangeCode(t *testing.T) {
 			w.Header().Set("Content-Type", "application/problem+json")
 			w.WriteHeader(http.StatusBadRequest)
 			_, _ = w.Write([]byte(`[{"detail":"array shaped"}]`))
+			return
+		}
+		if code == "problem-error-cap-code" {
+			errs := make([]map[string]any, 0, 9)
+			for i := 1; i <= 9; i++ {
+				errs = append(errs, map[string]any{"message": "cap entry " + strconv.Itoa(i)})
+			}
+			writeProblem(w, http.StatusBadRequest, map[string]any{"errors": errs})
 			return
 		}
 		if code == "problem-mixed-error-entry-code" {
@@ -548,6 +568,18 @@ func TestXProvider_ExchangeCode(t *testing.T) {
 		}
 	})
 
+	t.Run("body status 429 at HTTP 400 still maps to a rate limit error", func(t *testing.T) {
+		if got := xRetryAfterFor(t, p, "rate-limited-body-status-code"); got != 30 {
+			t.Fatalf("RetryAfter = %d; want 30", got)
+		}
+	})
+
+	t.Run("nested body status 429 at HTTP 400 still maps to a rate limit error", func(t *testing.T) {
+		if got := xRetryAfterFor(t, p, "rate-limited-body-nested-status-code"); got != 20 {
+			t.Fatalf("RetryAfter = %d; want 20", got)
+		}
+	})
+
 	t.Run("problem+json maps every field and error entry", func(t *testing.T) {
 		_, err := p.ExchangeCode(context.Background(), "problem-multiple-errors-code", "test-code-verifier")
 		if err == nil {
@@ -648,7 +680,29 @@ func TestXProvider_ExchangeCode(t *testing.T) {
 		}
 	})
 
-	t.Run("200 problem-shaped body maps fields without leaking", func(t *testing.T) {
+	t.Run("problem+json caps the cause at eight error entries", func(t *testing.T) {
+		_, err := p.ExchangeCode(context.Background(), "problem-error-cap-code", "test-code-verifier")
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+		appErr := xProviderError(t, err)
+		if appErr.Message() != "oauth provider request failed" {
+			t.Fatalf("message = %q; want the generic message", appErr.Message())
+		}
+		for i := 1; i <= 8; i++ {
+			if want := "upstream error message: cap entry " + strconv.Itoa(i); !strings.Contains(err.Error(), want) {
+				t.Errorf("cause missing %q in %v", want, err)
+			}
+		}
+		// The cap is silent: the ninth entry is dropped with no truncation marker.
+		if strings.Contains(err.Error(), "cap entry 9") {
+			t.Errorf("cause contains the entry beyond the cap: %v", err)
+		}
+	})
+
+	// Parser-level only: ExchangeCode never feeds a 2xx body to the parser
+	// (that gap is issue #78), so this pins parseXErrorWithHeader in isolation.
+	t.Run("parseXErrorWithHeader maps a problem body at 200", func(t *testing.T) {
 		body := []byte(`{"type":"https://api.twitter.com/2/problems/invalid-request","title":"Invalid Request","detail":"code already used","status":400}`)
 		appErr := xProviderError(t, parseXErrorWithHeader(http.StatusOK, body, nil))
 		if appErr.Message() != "oauth provider request failed" {
