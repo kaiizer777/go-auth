@@ -108,6 +108,40 @@ func TestFacebookProvider_AuthCodeURL(t *testing.T) {
 	}
 }
 
+func TestFacebookProvider_AuthCodeURL_GraphVersionPrefix(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name         string
+		graphVersion string
+		wantPath     string
+	}{
+		{name: "prefixed version unchanged", graphVersion: "v19.0", wantPath: "/v19.0/dialog/oauth"},
+		{name: "unprefixed version gets prefix", graphVersion: "19.0", wantPath: "/v19.0/dialog/oauth"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			cfg := config.FacebookConfig{
+				AppID:        "fb-app-123456",
+				AppSecret:    "fb-app-secret",
+				RedirectURI:  "https://myapp.com/fb/callback",
+				GraphVersion: tt.graphVersion,
+			}
+			parsed, err := url.Parse(NewFacebookProvider(cfg).AuthCodeURL("state", "challenge"))
+			if err != nil {
+				t.Fatalf("parse AuthCodeURL: %v", err)
+			}
+			got := parsed.Scheme + "://" + parsed.Host + parsed.Path
+			want := "https://www.facebook.com" + tt.wantPath
+			if got != want {
+				t.Fatalf("authorize URL = %q; want %q", got, want)
+			}
+		})
+	}
+}
+
 func TestGenerateAppSecretProof(t *testing.T) {
 	t.Parallel()
 
