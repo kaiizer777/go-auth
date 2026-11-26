@@ -56,9 +56,11 @@ type PasswordResetTokenStore interface {
 }
 
 // OAuthAccountStore defines storage operations for external identity provider links.
+// Identities are keyed by (provider, tenant, provider user id): a pairwise
+// subject is only unique within the tenant that issued it.
 type OAuthAccountStore interface {
 	Create(ctx context.Context, account *OAuthAccount) error
-	GetByProvider(ctx context.Context, providerID, providerUserID string) (*OAuthAccount, error)
+	GetByProvider(ctx context.Context, providerID, providerTenantID, providerUserID string) (*OAuthAccount, error)
 	GetByUserID(ctx context.Context, userID uuid.UUID) ([]*OAuthAccount, error)
 	UpdateProviderUserID(ctx context.Context, id uuid.UUID, providerUserID string) error
 	Delete(ctx context.Context, id uuid.UUID) error

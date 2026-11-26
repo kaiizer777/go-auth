@@ -25,7 +25,7 @@ func NormalizeMongoError(err error) error {
 		return errors.ErrTOTPCodeReplayed
 	case strings.Contains(msg, "uq_totp_secrets_user_id") || strings.Contains(msg, "totp_secrets"):
 		return errors.ErrTOTPAlreadyEnabled
-	case strings.Contains(msg, "uq_oauth_accounts_provider_uid") || strings.Contains(msg, "provider_user_id"):
+	case strings.Contains(msg, "uq_oauth_accounts_provider_tenant_uid") || strings.Contains(msg, "uq_oauth_accounts_provider_uid") || strings.Contains(msg, "provider_user_id"):
 		return errors.ErrOAuthAccountAlreadyLinked
 	default:
 		return err

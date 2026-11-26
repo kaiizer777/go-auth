@@ -2,6 +2,7 @@ package mongostore
 
 import (
 	"context"
+	"errors"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
@@ -65,9 +66,10 @@ func IndexSpecifications() map[string][]mongo.IndexModel {
 			{
 				Keys: bson.D{
 					{Key: "provider_id", Value: 1},
+					{Key: "provider_tenant_id", Value: 1},
 					{Key: "provider_user_id", Value: 1},
 				},
-				Options: options.Index().SetName("uq_oauth_accounts_provider_uid").SetUnique(true),
+				Options: options.Index().SetName("uq_oauth_accounts_provider_tenant_uid").SetUnique(true),
 			},
 			{
 				Keys:    bson.D{{Key: "user_id", Value: 1}},
@@ -117,6 +119,12 @@ func IndexSpecifications() map[string][]mongo.IndexModel {
 	}
 }
 
+// legacyOAuthUniqueIndex is the pre-000011 tenant-blind identity key. CreateMany
+// never drops an index, so it is removed explicitly after the tenant-qualified
+// index is built: leaving it in place keeps rejecting a pairwise subject that a
+// second tenant legitimately owns.
+const legacyOAuthUniqueIndex = "uq_oauth_accounts_provider_uid"
+
 // EnsureIndexes provisions all required collection indexes idempotently.
 func EnsureIndexes(ctx context.Context, database *mongo.Database) error {
 	if database == nil {
@@ -129,5 +137,29 @@ func EnsureIndexes(ctx context.Context, database *mongo.Database) error {
 			return err
 		}
 	}
-	return nil
+	return dropLegacyOAuthIndex(ctx, database.Collection("oauth_accounts"))
+}
+
+// dropLegacyOAuthIndex removes the tenant-blind oauth_accounts index. A missing
+// index is the steady state after the first run, not a failure.
+func dropLegacyOAuthIndex(ctx context.Context, col *mongo.Collection) error {
+	err := col.Indexes().DropOne(ctx, legacyOAuthUniqueIndex)
+	if err == nil || isMissingIndex(err) {
+		return nil
+	}
+	return err
+}
+
+// isMissingIndex reports the server codes for a collection or index that does
+// not exist, so an already-clean database stays a no-op.
+func isMissingIndex(err error) bool {
+	var cmdErr mongo.CommandError
+	if errors.As(err, &cmdErr) {
+		const (
+			namespaceNotFound = 26
+			indexNotFound     = 27
+		)
+		return cmdErr.Code == namespaceNotFound || cmdErr.Code == indexNotFound
+	}
+	return false
 }

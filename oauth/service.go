@@ -571,7 +571,7 @@ func validateIdentityFields(info *UserInfo) error {
 // findLink loads the oauth_accounts row for a provider identity. found=false
 // with a nil error is the normal no-link case; anything else is a query failure.
 func (s *service) findLink(ctx context.Context, providerID, providerUserID string) (db.OAuthAccount, bool, error) {
-	link, err := s.store.OAuthAccounts().GetByProvider(ctx, providerID, providerUserID)
+	link, err := s.store.OAuthAccounts().GetByProvider(ctx, providerID, "", providerUserID)
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return db.OAuthAccount{}, false, nil
 	}

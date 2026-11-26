@@ -678,13 +678,14 @@ func (s *oauthAccountStore) Create(ctx context.Context, account *db.OAuthAccount
 	return nil
 }
 
-func (s *oauthAccountStore) GetByProvider(ctx context.Context, providerID, providerUserID string) (*db.OAuthAccount, error) {
+func (s *oauthAccountStore) GetByProvider(ctx context.Context, providerID, providerTenantID, providerUserID string) (*db.OAuthAccount, error) {
 	filter := bson.M{
-		"provider_id":      providerID,
-		"provider_user_id": providerUserID,
+		"provider_id":        providerID,
+		"provider_tenant_id": providerTenantID,
+		"provider_user_id":   providerUserID,
 	}
 	var doc OAuthAccountDoc
-	// codeql[go/sql-injection] Safe: providerID and providerUserID are strictly-typed Go strings serialized as BSON string literals.
+	// codeql[go/sql-injection] Safe: providerID, providerTenantID and providerUserID are strictly-typed Go strings serialized as BSON string literals.
 	err := s.collection().FindOne(s.store.resolveCtx(ctx), filter).Decode(&doc)
 	if err != nil {
 		if errors.Is(err, mongo.ErrNoDocuments) {

@@ -57,8 +57,8 @@ func TestMySQLDefaultMigrationsEmbedded(t *testing.T) {
 		current = next
 	}
 
-	if count != 10 {
-		t.Fatalf("expected 10 mysql migration versions, found %d", count)
+	if count != 11 {
+		t.Fatalf("expected 11 mysql migration versions, found %d", count)
 	}
 }
 
@@ -527,5 +527,51 @@ func TestMySQLMigration000010_DeduplicatesMicrosoftOIDLinks(t *testing.T) {
 	}
 	if len(downData) == 0 {
 		t.Fatal("mysql migration 10 down file must exist")
+	}
+}
+
+// TestMySQLMigration000011_TenantQualifiesIdentityKey mirrors the Postgres
+// assertions on MySQL's non-transactional DDL.
+func TestMySQLMigration000011_TenantQualifiesIdentityKey(t *testing.T) {
+	data, err := defaultMigrationsFS.ReadFile("migrations/mysql/000011_add_oauth_account_tenant.up.sql")
+	if err != nil {
+		t.Fatalf("failed to read mysql migration 11 up: %v", err)
+	}
+	content := string(data)
+
+	columnIdx := strings.Index(content, "ADD COLUMN provider_tenant_id VARCHAR(64)")
+	if columnIdx == -1 {
+		t.Fatalf("mysql migration 11 up must add provider_tenant_id: %q", content)
+	}
+	columnStmt := upToSemicolon(content[columnIdx:])
+	if !strings.Contains(columnStmt, "NOT NULL") {
+		t.Fatal("mysql migration 11 up must require the tenant")
+	}
+	if strings.Contains(columnStmt, "DEFAULT") {
+		t.Fatalf("mysql migration 11 up must not default the tenant: %q", columnStmt)
+	}
+
+	newKeyIdx := strings.Index(content, "CREATE UNIQUE INDEX uq_oauth_accounts_provider_tenant_uid")
+	if newKeyIdx == -1 {
+		t.Fatal("mysql migration 11 up must create the tenant-qualified unique index")
+	}
+	if !strings.Contains(content[newKeyIdx:], "(provider_id, provider_tenant_id, provider_user_id)") {
+		t.Fatal("mysql migration 11 up must key uniqueness on provider, tenant and provider user id")
+	}
+
+	dropOldIdx := strings.Index(content, "DROP INDEX uq_oauth_accounts_provider_uid")
+	if dropOldIdx == -1 {
+		t.Fatal("mysql migration 11 up must drop the tenant-blind unique constraint")
+	}
+	if columnIdx > newKeyIdx || newKeyIdx > dropOldIdx {
+		t.Errorf("mysql migration 11 ordering must be column, new index, drop old constraint: column=%d new=%d drop=%d", columnIdx, newKeyIdx, dropOldIdx)
+	}
+
+	downData, err := defaultMigrationsFS.ReadFile("migrations/mysql/000011_add_oauth_account_tenant.down.sql")
+	if err != nil {
+		t.Fatalf("failed to read mysql migration 11 down: %v", err)
+	}
+	if !strings.Contains(string(downData), "DROP COLUMN provider_tenant_id") {
+		t.Fatal("mysql migration 11 down must drop the tenant column it added")
 	}
 }

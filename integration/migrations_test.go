@@ -245,8 +245,8 @@ func TestMigrations_DownRefusedOnSeededDB(t *testing.T) {
 	if _, err := sqlDB2.Exec(`DELETE FROM users WHERE email = 'down-rollback@example.com'`); err != nil {
 		t.Fatalf("failed to remove seed row: %v", err)
 	}
-	if verr, ddirty, verr2 := m2.Version(); verr2 != nil || verr != 10 || ddirty {
-		t.Fatalf("expected version 10 clean after re-up, got version=%d dirty=%v err=%v", verr, ddirty, verr2)
+	if verr, ddirty, verr2 := m2.Version(); verr2 != nil || verr != 11 || ddirty {
+		t.Fatalf("expected version 11 clean after re-up, got version=%d dirty=%v err=%v", verr, ddirty, verr2)
 	}
 }
 

@@ -116,12 +116,13 @@ func serviceTestDB(t *testing.T) *gorm.DB {
 		id TEXT PRIMARY KEY,
 		user_id TEXT NOT NULL,
 		provider_id VARCHAR(32) NOT NULL,
+		provider_tenant_id VARCHAR(64) NOT NULL,
 		provider_user_id VARCHAR(255) NOT NULL,
 		email VARCHAR(255) NOT NULL,
 		verified INTEGER NOT NULL DEFAULT 0,
 		created_at DATETIME,
 		updated_at DATETIME,
-		CONSTRAINT uq_oauth_accounts_provider_uid UNIQUE (provider_id, provider_user_id)
+		CONSTRAINT uq_oauth_accounts_provider_tenant_uid UNIQUE (provider_id, provider_tenant_id, provider_user_id)
 	);
 	CREATE TABLE IF NOT EXISTS sessions (
 		id TEXT PRIMARY KEY,
@@ -1301,9 +1302,9 @@ type gatedMissLinkStore struct {
 	gate *linkGate
 }
 
-func (g *gatedMissLinkStore) GetByProvider(ctx context.Context, providerID, providerUserID string) (*db.OAuthAccount, error) {
+func (g *gatedMissLinkStore) GetByProvider(ctx context.Context, providerID, providerTenantID, providerUserID string) (*db.OAuthAccount, error) {
 	if g.gate.remaining.Add(-1) < 0 {
-		return g.OAuthAccountStore.GetByProvider(ctx, providerID, providerUserID)
+		return g.OAuthAccountStore.GetByProvider(ctx, providerID, providerTenantID, providerUserID)
 	}
 	g.gate.arrived <- struct{}{}
 	<-g.gate.release
@@ -1325,12 +1326,12 @@ type hideFirstLinkStore struct {
 	hidden bool
 }
 
-func (h *hideFirstLinkStore) GetByProvider(ctx context.Context, providerID, providerUserID string) (*db.OAuthAccount, error) {
+func (h *hideFirstLinkStore) GetByProvider(ctx context.Context, providerID, providerTenantID, providerUserID string) (*db.OAuthAccount, error) {
 	if h.hidden {
 		h.hidden = false
 		return nil, gorm.ErrRecordNotFound
 	}
-	return h.OAuthAccountStore.GetByProvider(ctx, providerID, providerUserID)
+	return h.OAuthAccountStore.GetByProvider(ctx, providerID, providerTenantID, providerUserID)
 }
 
 func TestHandleCallbackLinkConflictForeignOwner(t *testing.T) {
@@ -2702,11 +2703,11 @@ type faultyOAuthAccountStore struct {
 	errOnUID string
 }
 
-func (s *faultyOAuthAccountStore) GetByProvider(ctx context.Context, providerID, providerUserID string) (*db.OAuthAccount, error) {
+func (s *faultyOAuthAccountStore) GetByProvider(ctx context.Context, providerID, providerTenantID, providerUserID string) (*db.OAuthAccount, error) {
 	if providerUserID == s.errOnUID {
 		return nil, stderrors.New("simulated database failure")
 	}
-	return s.OAuthAccountStore.GetByProvider(ctx, providerID, providerUserID)
+	return s.OAuthAccountStore.GetByProvider(ctx, providerID, providerTenantID, providerUserID)
 }
 
 type faultyStoreWrapper struct {

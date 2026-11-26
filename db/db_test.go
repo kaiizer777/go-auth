@@ -509,6 +509,8 @@ func TestMigrations_NoExplicitTransactionWrappers(t *testing.T) {
 		"migrations/000009_add_oauth_account_verified.down.sql",
 		"migrations/000010_resolve_microsoft_oid_links.up.sql",
 		"migrations/000010_resolve_microsoft_oid_links.down.sql",
+		"migrations/000011_add_oauth_account_tenant.up.sql",
+		"migrations/000011_add_oauth_account_tenant.down.sql",
 	}
 
 	for _, file := range files {
@@ -559,4 +561,57 @@ func TestMigration000010_DeduplicatesMicrosoftOIDLinks(t *testing.T) {
 	if len(downData) == 0 {
 		t.Fatal("migration 10 down file must exist")
 	}
+}
+
+// TestMigration000011_TenantQualifiesIdentityKey pins the schema half of the fix
+// for #72: the tenant joins the unique key, is required, and the tenant-blind
+// constraint is gone.
+func TestMigration000011_TenantQualifiesIdentityKey(t *testing.T) {
+	data, err := defaultMigrationsFS.ReadFile("migrations/000011_add_oauth_account_tenant.up.sql")
+	if err != nil {
+		t.Fatalf("failed to read migration 11 up: %v", err)
+	}
+	content := string(data)
+
+	column := "ADD COLUMN IF NOT EXISTS provider_tenant_id VARCHAR(64) NOT NULL"
+	columnIdx := strings.Index(content, column)
+	if columnIdx == -1 {
+		t.Fatalf("migration 11 up must add a required provider_tenant_id column: %q", content)
+	}
+	if columnStmt := upToSemicolon(content[columnIdx:]); strings.Contains(columnStmt, "DEFAULT") {
+		t.Fatalf("migration 11 up must not default the tenant: %q", columnStmt)
+	}
+
+	newKey := "CREATE UNIQUE INDEX IF NOT EXISTS uq_oauth_accounts_provider_tenant_uid"
+	newKeyIdx := strings.Index(content, newKey)
+	if newKeyIdx == -1 {
+		t.Fatal("migration 11 up must create the tenant-qualified unique index")
+	}
+	if !strings.Contains(content[newKeyIdx:], "provider_id, provider_tenant_id, provider_user_id") {
+		t.Fatal("migration 11 up must key uniqueness on provider, tenant and provider user id")
+	}
+
+	dropOldIdx := strings.Index(content, "DROP CONSTRAINT IF EXISTS uq_oauth_accounts_provider_uid")
+	if dropOldIdx == -1 {
+		t.Fatal("migration 11 up must drop the tenant-blind unique constraint")
+	}
+	if columnIdx > newKeyIdx || newKeyIdx > dropOldIdx {
+		t.Errorf("migration 11 ordering must be column, new index, drop old constraint: column=%d new=%d drop=%d", columnIdx, newKeyIdx, dropOldIdx)
+	}
+
+	downData, err := defaultMigrationsFS.ReadFile("migrations/000011_add_oauth_account_tenant.down.sql")
+	if err != nil {
+		t.Fatalf("failed to read migration 11 down: %v", err)
+	}
+	if !strings.Contains(string(downData), "DROP COLUMN IF EXISTS provider_tenant_id") {
+		t.Fatal("migration 11 down must drop the tenant column it added")
+	}
+}
+
+// upToSemicolon returns the statement starting at raw, without its terminator.
+func upToSemicolon(raw string) string {
+	if semi := strings.Index(raw, ";"); semi != -1 {
+		return raw[:semi]
+	}
+	return raw
 }

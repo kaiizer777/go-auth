@@ -235,9 +235,9 @@ func (s *oauthAccountStore) Create(ctx context.Context, account *db.OAuthAccount
 	return nil
 }
 
-func (s *oauthAccountStore) GetByProvider(ctx context.Context, providerID, providerUserID string) (*db.OAuthAccount, error) {
+func (s *oauthAccountStore) GetByProvider(ctx context.Context, providerID, providerTenantID, providerUserID string) (*db.OAuthAccount, error) {
 	var acc db.OAuthAccount
-	if err := s.db.WithContext(ctx).Where("provider_id = ? AND provider_user_id = ?", providerID, providerUserID).First(&acc).Error; err != nil {
+	if err := s.db.WithContext(ctx).Where("provider_id = ? AND provider_tenant_id = ? AND provider_user_id = ?", providerID, providerTenantID, providerUserID).First(&acc).Error; err != nil {
 		return nil, err
 	}
 	return &acc, nil

@@ -135,23 +135,26 @@ func (p PasswordResetToken) LogValue() slog.Value {
 }
 
 // OAuthAccount represents an external federated identity linked to a user.
-// Uniqueness of (provider_id, provider_user_id) is enforced by the
-// uq_oauth_accounts_provider_uid composite constraint (migration 000007),
-// not by the single-column indexes below.
+// Uniqueness of (provider_id, provider_tenant_id, provider_user_id) is enforced
+// by the uq_oauth_accounts_provider_tenant_uid composite constraint (migration
+// 000011), not by the single-column indexes below. ProviderTenantID scopes an
+// identity to the tenant that issued it: a pairwise subject is only unique
+// within its tenant. Providers without a tenant namespace store "".
 //
 // Verified records that the provider attested Email for this identity. An
 // unverified link may only sign in the account it was created on, and only
 // while that account still holds no proven credential; it can never merge,
 // recover, or resolve by email. Legacy rows decode as false (fail-closed).
 type OAuthAccount struct {
-	ID             uuid.UUID `gorm:"primaryKey;type:varchar(36)"`
-	UserID         uuid.UUID `gorm:"type:varchar(36);not null;index"`
-	ProviderID     string    `gorm:"type:varchar(32);not null"`
-	ProviderUserID string    `gorm:"type:varchar(255);not null"`
-	Email          string    `gorm:"type:varchar(255);not null;index"`
-	Verified       bool      `gorm:"not null;default:false"`
-	CreatedAt      time.Time
-	UpdatedAt      time.Time
+	ID               uuid.UUID `gorm:"primaryKey;type:varchar(36)"`
+	UserID           uuid.UUID `gorm:"type:varchar(36);not null;index"`
+	ProviderID       string    `gorm:"type:varchar(32);not null"`
+	ProviderTenantID string    `gorm:"type:varchar(64);not null"`
+	ProviderUserID   string    `gorm:"type:varchar(255);not null"`
+	Email            string    `gorm:"type:varchar(255);not null;index"`
+	Verified         bool      `gorm:"not null;default:false"`
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
 }
 
 // BeforeCreate hook generates a new UUID if none is set.
@@ -171,6 +174,7 @@ func (o OAuthAccount) LogValue() slog.Value {
 		slog.String("id", o.ID.String()),
 		slog.String("user_id", o.UserID.String()),
 		slog.String("provider_id", o.ProviderID),
+		slog.String("provider_tenant_id", o.ProviderTenantID),
 		slog.String("provider_user_id", "[REDACTED]"),
 		slog.String("email", o.Email),
 		slog.Bool("verified", o.Verified),
