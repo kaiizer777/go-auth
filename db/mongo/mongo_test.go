@@ -701,6 +701,33 @@ func TestVerifyOAuthAccountTenantScope(t *testing.T) {
 	if err := verifyOAuthAccountTenantScope(ctx, database); err == nil {
 		t.Fatal("a null provider_tenant_id must refuse startup")
 	}
+	if _, err := links.UpdateOne(ctx, bson.M{"_id": id}, bson.M{"$set": bson.M{"provider_tenant_id": []string{"tenant-a"}}}); err != nil {
+		t.Fatalf("array tenant: %v", err)
+	}
+	if err := verifyOAuthAccountTenantScope(ctx, database); err == nil {
+		t.Fatal("an array provider_tenant_id must refuse startup")
+	}
+}
+
+// TestTenantScopeViolationFilter_RejectsArrays pins the array clause: $type:
+// "string" matches an array containing a string, so {provider_tenant_id:
+// ["tenant-a"]} would otherwise pass a gate that requires a string.
+func TestTenantScopeViolationFilter_RejectsArrays(t *testing.T) {
+	or, ok := tenantScopeViolationFilter()["$or"].(bson.A)
+	if !ok || len(or) != 2 {
+		t.Fatalf("tenant scope filter must be a two-clause $or: %#v", tenantScopeViolationFilter())
+	}
+	nonString, ok := or[0].(bson.M)["provider_tenant_id"].(bson.M)
+	if !ok {
+		t.Fatalf("unexpected first clause: %#v", or[0])
+	}
+	if not, ok := nonString["$not"].(bson.M); !ok || not["$type"] != "string" {
+		t.Fatalf("first clause must exclude non-strings: %#v", or[0])
+	}
+	array, ok := or[1].(bson.M)["provider_tenant_id"].(bson.M)
+	if !ok || array["$type"] != "array" {
+		t.Fatalf("second clause must exclude arrays: %#v", or[1])
+	}
 }
 
 // TestVerifyOAuthAccountTenantScope_RunsOncePerSchemaVersion pins the one-shot

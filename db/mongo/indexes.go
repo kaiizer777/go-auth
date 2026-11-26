@@ -131,12 +131,11 @@ const legacyOAuthUniqueIndex = "uq_oauth_accounts_provider_uid"
 // document is indexed as null and is invisible to a tenant-qualified lookup,
 // unlike SQL where the write fails.
 func verifyOAuthAccountTenantScope(ctx context.Context, database *mongo.Database) error {
-	filter := bson.M{"provider_tenant_id": bson.M{"$not": bson.M{"$type": "string"}}}
 	var doc struct {
 		ID string `bson:"_id"`
 	}
 	err := database.Collection("oauth_accounts").
-		FindOne(ctx, filter, options.FindOne().SetProjection(bson.M{"_id": 1})).
+		FindOne(ctx, tenantScopeViolationFilter(), options.FindOne().SetProjection(bson.M{"_id": 1})).
 		Decode(&doc)
 	if errors.Is(err, mongo.ErrNoDocuments) {
 		return nil
@@ -145,6 +144,17 @@ func verifyOAuthAccountTenantScope(ctx context.Context, database *mongo.Database
 		return err
 	}
 	return fmt.Errorf("oauth_accounts document %q has no string provider_tenant_id", doc.ID)
+}
+
+// tenantScopeViolationFilter selects documents whose tenant cannot key a
+// tenant-qualified lookup. $type:"string" also matches an array that contains a
+// string, so arrays are excluded explicitly: Mongo indexes ["tenant-a"] as a
+// multi-key value no equality lookup with the tenant string reaches.
+func tenantScopeViolationFilter() bson.M {
+	return bson.M{"$or": bson.A{
+		bson.M{"provider_tenant_id": bson.M{"$not": bson.M{"$type": "string"}}},
+		bson.M{"provider_tenant_id": bson.M{"$type": "array"}},
+	}}
 }
 
 // EnsureIndexes provisions all required collection indexes idempotently.
