@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -429,6 +430,17 @@ func TestIndexSpecifications_Completeness(t *testing.T) {
 	if !slices.Equal(oauthKeys, wantKeys) {
 		t.Errorf("uq_oauth_accounts_provider_tenant_uid key = %v; want %v", oauthKeys, wantKeys)
 	}
+	bsonFields := make(map[string]bool)
+	docType := reflect.TypeOf(OAuthAccountDoc{})
+	for i := 0; i < docType.NumField(); i++ {
+		name, _, _ := strings.Cut(docType.Field(i).Tag.Get("bson"), ",")
+		bsonFields[name] = true
+	}
+	for _, key := range oauthKeys {
+		if !bsonFields[key] {
+			t.Errorf("oauth_accounts index key %q is not a bson field on OAuthAccountDoc", key)
+		}
+	}
 	if !oauthUnique {
 		t.Error("uq_oauth_accounts_provider_tenant_uid must be unique")
 	}
@@ -645,6 +657,48 @@ func TestEnsureIndexes_ReplacesTenantBlindOAuthIndex(t *testing.T) {
 		}); err != nil {
 			t.Fatalf("insert link for %s: %v", tenant, err)
 		}
+	}
+}
+
+// TestVerifyOAuthAccountTenantScope pins the Mongo analogue of SQL NOT NULL:
+// a document whose tenant is missing or null must refuse startup rather than
+// index as null and disappear from tenant-qualified lookups.
+func TestVerifyOAuthAccountTenantScope(t *testing.T) {
+	uri := os.Getenv("TEST_MONGO_URI")
+	if uri == "" {
+		t.Skip("TEST_MONGO_URI unset; skipping live MongoDB tenant scope test")
+	}
+	client, err := mongo.Connect(options.Client().ApplyURI(uri))
+	if err != nil {
+		t.Fatalf("mongo.Connect failed: %v", err)
+	}
+	database := client.Database(fmt.Sprintf("goauth_test_ms_tenant_scope_%s", strings.ReplaceAll(uuid.New().String(), "-", "")))
+	t.Cleanup(func() {
+		_ = database.Drop(context.Background())
+		_ = client.Disconnect(context.Background())
+	})
+	ctx := context.Background()
+	links := database.Collection("oauth_accounts")
+	id := uuid.New().String()
+	if _, err := links.InsertOne(ctx, bson.M{
+		"_id": id, "provider_id": "microsoft", "provider_user_id": "sub-1", "provider_tenant_id": "",
+	}); err != nil {
+		t.Fatalf("insert link: %v", err)
+	}
+	if err := verifyOAuthAccountTenantScope(ctx, database); err != nil {
+		t.Fatalf("an empty tenant is a valid non-Microsoft scope: %v", err)
+	}
+	if _, err := links.UpdateOne(ctx, bson.M{"_id": id}, bson.M{"$unset": bson.M{"provider_tenant_id": ""}}); err != nil {
+		t.Fatalf("unset tenant: %v", err)
+	}
+	if err := verifyOAuthAccountTenantScope(ctx, database); err == nil {
+		t.Fatal("a document without provider_tenant_id must refuse startup")
+	}
+	if _, err := links.UpdateOne(ctx, bson.M{"_id": id}, bson.M{"$set": bson.M{"provider_tenant_id": nil}}); err != nil {
+		t.Fatalf("null tenant: %v", err)
+	}
+	if err := verifyOAuthAccountTenantScope(ctx, database); err == nil {
+		t.Fatal("a null provider_tenant_id must refuse startup")
 	}
 }
 

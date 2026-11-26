@@ -3,6 +3,7 @@ package mongostore
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
@@ -124,6 +125,27 @@ func IndexSpecifications() map[string][]mongo.IndexModel {
 // index is built: leaving it in place keeps rejecting a pairwise subject that a
 // second tenant legitimately owns.
 const legacyOAuthUniqueIndex = "uq_oauth_accounts_provider_uid"
+
+// verifyOAuthAccountTenantScope refuses startup on an oauth_accounts document
+// whose tenant is missing or not a string. Mongo has no NOT NULL: such a
+// document is indexed as null and is invisible to a tenant-qualified lookup,
+// unlike SQL where the write fails.
+func verifyOAuthAccountTenantScope(ctx context.Context, database *mongo.Database) error {
+	filter := bson.M{"provider_tenant_id": bson.M{"$not": bson.M{"$type": "string"}}}
+	var doc struct {
+		ID string `bson:"_id"`
+	}
+	err := database.Collection("oauth_accounts").
+		FindOne(ctx, filter, options.FindOne().SetProjection(bson.M{"_id": 1})).
+		Decode(&doc)
+	if errors.Is(err, mongo.ErrNoDocuments) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	return fmt.Errorf("oauth_accounts document %q has no string provider_tenant_id", doc.ID)
+}
 
 // EnsureIndexes provisions all required collection indexes idempotently.
 func EnsureIndexes(ctx context.Context, database *mongo.Database) error {
