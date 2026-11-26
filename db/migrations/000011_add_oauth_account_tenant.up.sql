@@ -12,9 +12,12 @@
 -- backfill is needed; a link whose tenant was never recorded cannot be invented.
 ALTER TABLE oauth_accounts ADD COLUMN IF NOT EXISTS provider_tenant_id VARCHAR(64) NOT NULL;
 
--- Ordering: the replacement index exists before the tenant-blind constraint is
--- dropped, so uniqueness is never unenforced in between.
+-- Ordering: the replacement index exists before the tenant-blind key is dropped,
+-- so uniqueness is never unenforced in between. Both forms are dropped: 000007
+-- created a constraint (backed by an index), and the down migration restores a
+-- plain unique index, which DROP CONSTRAINT would leave behind.
 CREATE UNIQUE INDEX IF NOT EXISTS uq_oauth_accounts_provider_tenant_uid
     ON oauth_accounts(provider_id, provider_tenant_id, provider_user_id);
 
 ALTER TABLE oauth_accounts DROP CONSTRAINT IF EXISTS uq_oauth_accounts_provider_uid;
+DROP INDEX IF EXISTS uq_oauth_accounts_provider_uid;

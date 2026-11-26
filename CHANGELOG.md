@@ -9,10 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking Changes
 
+- `OAuthAccountStore.GetByProvider` now takes the identity's tenant:
+  `GetByProvider(ctx context.Context, providerID, providerTenantID, providerUserID string)`.
+  External or custom implementations must add the parameter and include
+  `provider_tenant_id` in the lookup. `oauth_accounts` is uniquely keyed on
+  `(provider_id, provider_tenant_id, provider_user_id)`; the old
+  `(provider_id, provider_user_id)` constraint and its Mongo index are removed.
 - `OAuthAccountStore.UpdateProviderUserID(ctx context.Context, id uuid.UUID, providerUserID string) error` was added to the `OAuthAccountStore` interface. External or custom implementations of `OAuthAccountStore` must implement this method to support provider user ID updates (such as migrating legacy Microsoft OIDs to pairwise subjects).
 
 ### Added
 
+- `oauth_accounts.provider_tenant_id` scopes OAuth identities to the tenant that
+  issued them, and migration 000011 makes it part of the unique key. A Microsoft
+  `sub` is pairwise: unique per user, per tenant, per application, not globally,
+  so the same `sub` in two tenants is now two distinct links instead of a
+  collision. MongoDB replaces the tenant-blind index at startup.
 - `oauth_accounts.verified` records whether the provider attested the linked
   identity. Migration 000009 backfills it `TRUE` where the owning account's
   email was already verified locally and `FALSE` everywhere else, so links on
@@ -49,9 +60,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A non-empty allowlist marks unlisted tenants untrusted: their existing
   Microsoft links are deleted on the next callback and the sign-in is refused
   with `OAUTH_TENANT_INVALID`.
+- Microsoft OAuth identities are keyed by their verified tenant. The tenant is
+  the issuer segment bound to the configured authority during `id_token`
+  verification; every link read, write, and legacy `oid` fallback is scoped to
+  it, so one tenant can no longer resolve or block another tenant's identity.
+- A Microsoft token without an `id_token` no longer signs in under the
+  multi-tenant `common` or `organizations` authorities, with or without an
+  allowlist: the unsigned `/userinfo` payload names no tenant, so no
+  tenant-qualified key can be formed. Such sign-ins fail before the userinfo
+  request. A pinned tenant (GUID or domain) and the `consumers` authority still
+  accept this path, keying the identity on the configured tenant.
 
 ### Upgrade notes
 
+- Migration 000011 adds `oauth_accounts.provider_tenant_id` as `NOT NULL`
+  without a default and rolls the unique key over to
+  `(provider_id, provider_tenant_id, provider_user_id)`. The column add assumes
+  an empty `oauth_accounts` table; it fails rather than inventing a tenant for a
+  pre-existing link whose tenant was never recorded. MySQL: if the migration
+  fails midway, do not re-run the `ALTER TABLE`; see the recovery note in the
+  up file.
 - MySQL only: if migration 000009 fails between `ALTER TABLE` and the backfill,
   version 9 is recorded dirty with the column present but every row still `0`.
   Do not re-run it. Inspect `oauth_accounts`, run the backfill `UPDATE` from the

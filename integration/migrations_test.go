@@ -641,3 +641,113 @@ func TestMigration000010_UpAndDown(t *testing.T) {
 		t.Fatalf("restoring head failed: %v", err)
 	}
 }
+
+// TestMigration000011_TenantQualifiesIdentityKey pins the schema rollover for
+// #72 against a live database: the tenant joins the unique key, the tenant-blind
+// constraint is removed, and the down migration restores it.
+func TestMigration000011_TenantQualifiesIdentityKey(t *testing.T) {
+	dbURL := resolveDatabaseURL()
+	testDB, err := sql.Open("pgx", dbURL)
+	if err != nil {
+		if os.Getenv("CI") != "" {
+			t.Fatalf("CI: failed to open postgres connection: %v", err)
+		}
+		t.Skipf("Postgres not available, skipping: %v", err)
+	}
+	pingCtx, pingCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer pingCancel()
+	if err := testDB.PingContext(pingCtx); err != nil {
+		_ = testDB.Close()
+		if os.Getenv("CI") != "" {
+			t.Fatalf("CI: PostgreSQL connection failed: %v", err)
+		}
+		t.Skipf("Postgres not available, skipping: %v", err)
+	}
+	_ = testDB.Close()
+
+	m, sqlDB := newMigrator(t, dbURL)
+	t.Cleanup(func() {
+		_, _ = m.Close()
+		_ = sqlDB.Close()
+	})
+
+	if err := m.Migrate(10); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("m.Migrate(10) failed: %v", err)
+	}
+	if !postgresIndexExists(t, sqlDB, "uq_oauth_accounts_provider_uid") {
+		t.Fatal("precondition: the tenant-blind unique index must exist before 000011")
+	}
+
+	if err := m.Steps(1); err != nil {
+		t.Fatalf("000011 up migration failed: %v", err)
+	}
+
+	var tenantNullable string
+	if err := sqlDB.QueryRow(`SELECT is_nullable FROM information_schema.columns WHERE table_name = 'oauth_accounts' AND column_name = 'provider_tenant_id'`).Scan(&tenantNullable); err != nil {
+		t.Fatalf("provider_tenant_id column missing after 000011: %v", err)
+	}
+	if tenantNullable != "NO" {
+		t.Fatalf("provider_tenant_id is_nullable = %q; want NO", tenantNullable)
+	}
+	if !postgresIndexExists(t, sqlDB, "uq_oauth_accounts_provider_tenant_uid") {
+		t.Fatal("000011 must create the tenant-qualified unique index")
+	}
+	if postgresIndexExists(t, sqlDB, "uq_oauth_accounts_provider_uid") {
+		t.Fatal("000011 must drop the tenant-blind unique index")
+	}
+
+	var userID string
+	if err := sqlDB.QueryRow(`INSERT INTO users (email, password_hash, credential_version, email_verified) VALUES
+		('ms-tenant-key@example.com', 'hash', 1, true) RETURNING id`).Scan(&userID); err != nil {
+		t.Fatalf("failed to seed user: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = sqlDB.Exec(`DELETE FROM oauth_accounts WHERE user_id = $1`, userID)
+		_, _ = sqlDB.Exec(`DELETE FROM users WHERE id = $1`, userID)
+	})
+
+	// The same pairwise subject in two tenants is two identities.
+	for _, tenant := range []string{"tenant-a", "tenant-b"} {
+		if _, err := sqlDB.Exec(`INSERT INTO oauth_accounts (user_id, provider_id, provider_tenant_id, provider_user_id, email)
+			VALUES ($1, 'microsoft', $2, 'shared-sub', $3)`, userID, tenant, tenant+"@example.com"); err != nil {
+			t.Fatalf("insert link for %s: %v", tenant, err)
+		}
+	}
+	// Within one tenant the subject stays unique.
+	if _, err := sqlDB.Exec(`INSERT INTO oauth_accounts (user_id, provider_id, provider_tenant_id, provider_user_id, email)
+		VALUES ($1, 'microsoft', 'tenant-a', 'shared-sub', 'duplicate@example.com')`, userID); err == nil {
+		t.Fatal("duplicate subject in one tenant was accepted")
+	}
+
+	if _, err := sqlDB.Exec(`DELETE FROM oauth_accounts WHERE user_id = $1`, userID); err != nil {
+		t.Fatalf("failed to cleanup links: %v", err)
+	}
+	if err := m.Steps(-1); err != nil {
+		t.Fatalf("000011 down migration failed: %v", err)
+	}
+	if postgresIndexExists(t, sqlDB, "uq_oauth_accounts_provider_tenant_uid") {
+		t.Fatal("000011 down must drop the tenant-qualified unique index")
+	}
+	if !postgresIndexExists(t, sqlDB, "uq_oauth_accounts_provider_uid") {
+		t.Fatal("000011 down must restore the tenant-blind unique index")
+	}
+
+	_, _ = sqlDB.Exec(`DELETE FROM users WHERE id = $1`, userID)
+	if err := m.Up(); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("restoring head failed: %v", err)
+	}
+}
+
+// postgresIndexExists reports whether the named index exists on oauth_accounts.
+func postgresIndexExists(t *testing.T, sqlDB *sql.DB, name string) bool {
+	t.Helper()
+	var exists bool
+	err := sqlDB.QueryRow(`SELECT EXISTS (
+		SELECT 1 FROM pg_indexes
+		WHERE schemaname = 'public' AND tablename = 'oauth_accounts' AND indexname = $1
+	)`, name).Scan(&exists)
+	if err != nil {
+		t.Fatalf("query index %s: %v", name, err)
+	}
+	return exists
+}

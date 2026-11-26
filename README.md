@@ -44,6 +44,12 @@ go-auth/
 > **Breaking Change:** `OAuthAccountStore` includes `UpdateProviderUserID(ctx context.Context, id uuid.UUID, providerUserID string) error`. Custom `OAuthAccountStore` implementations must implement this method to support provider user ID updates (such as migrating legacy Microsoft OIDs to pairwise subjects).
 
 > [!NOTE]
+> **Breaking Change:** `OAuthAccountStore.GetByProvider` takes the identity's tenant alongside the provider user ID: `GetByProvider(ctx context.Context, providerID, providerTenantID, providerUserID string)`. A pairwise subject is only unique within the tenant that issued it, so `oauth_accounts` is now uniquely keyed on `(provider_id, provider_tenant_id, provider_user_id)`. Custom implementations must update the signature and the lookup predicate; providers without a tenant namespace pass an empty tenant.
+
+> [!NOTE]
+> **Behavior Change:** Microsoft identities are stored with their verified tenant: the tenant segment of the `id_token` issuer, which is bound to the configured authority during verification. A token without an `id_token` can only be accepted under an authority that pins one tenant (a tenant GUID, domain, or `consumers`); the multi-tenant `common` and `organizations` authorities cannot prove a tenant from the unsigned `/userinfo` payload and reject the sign-in before the request.
+
+> [!NOTE]
 > **Behavior Change:** For Microsoft OAuth, an empty `trusted_tenants` allowlist means no tenant restriction: every tenant the configured authority admits stays trusted, including a pinned single-tenant authority. Configure `trusted_tenants` with tenant IDs or domains to restrict admission; a tenant missing from a non-empty allowlist is marked untrusted, its existing Microsoft link is deleted on its next callback, and the sign-in is refused with `OAUTH_TENANT_INVALID`.
 
 ---

@@ -240,11 +240,14 @@ func TestE2E_FullBrowserOAuthJourneys(t *testing.T) {
 		}
 
 		// Fails if the adapter stops verifying the id_token signature, keys
-		// the identity on oid instead of sub, or stops inheriting verification
-		// from the admitted tenant.
+		// the identity on oid instead of sub, drops the tenant scope, or stops
+		// inheriting verification from the admitted tenant.
 		info := probeIdentity(t, provider)
 		if info.ProviderUserID != "ms-user-sub-1" {
 			t.Fatalf("adapter ProviderUserID = %q; want %q", info.ProviderUserID, "ms-user-sub-1")
+		}
+		if info.ProviderTenantID != tenant {
+			t.Fatalf("adapter ProviderTenantID = %q; want %q", info.ProviderTenantID, tenant)
 		}
 		if !info.EmailVerified {
 			t.Fatal("adapter EmailVerified = false for a verified-tenant id_token")
@@ -300,6 +303,9 @@ func TestE2E_FullBrowserOAuthJourneys(t *testing.T) {
 		}
 		if link.ProviderUserID != "ms-user-sub-1" {
 			t.Fatalf("link provider_user_id = %q; want %q", link.ProviderUserID, "ms-user-sub-1")
+		}
+		if link.ProviderTenantID != tenant {
+			t.Fatalf("link provider_tenant_id = %q; want %q", link.ProviderTenantID, tenant)
 		}
 	})
 
@@ -377,11 +383,19 @@ func TestE2E_FullBrowserOAuthJourneys(t *testing.T) {
 			t.Fatalf("expected 2 linked identities (microsoft and discord), got %d", len(links))
 		}
 		gotKeys := map[string]string{}
+		gotTenants := map[string]string{}
 		for _, l := range links {
 			gotKeys[l.ProviderID] = l.ProviderUserID
+			gotTenants[l.ProviderID] = l.ProviderTenantID
 		}
 		if gotKeys["microsoft"] != "ms-user-sub-2" {
 			t.Fatalf("microsoft link provider_user_id = %q; want %q", gotKeys["microsoft"], "ms-user-sub-2")
+		}
+		if gotTenants["microsoft"] != oauth.MicrosoftConsumerTenantGUID {
+			t.Fatalf("microsoft link provider_tenant_id = %q; want the consumer tenant %q", gotTenants["microsoft"], oauth.MicrosoftConsumerTenantGUID)
+		}
+		if gotTenants["discord"] != "" {
+			t.Fatalf("discord link provider_tenant_id = %q; want no tenant scope", gotTenants["discord"])
 		}
 		if gotKeys["discord"] != "discord-snowflake-888" {
 			t.Fatalf("discord link provider_user_id = %q; want %q", gotKeys["discord"], "discord-snowflake-888")
@@ -632,6 +646,9 @@ func TestE2E_FullBrowserOAuthJourneys(t *testing.T) {
 		if info.ProviderUserID != "ms-attacker-sub-666" {
 			t.Fatalf("adapter ProviderUserID = %q; want %q", info.ProviderUserID, "ms-attacker-sub-666")
 		}
+		if info.ProviderTenantID != attackerTenant {
+			t.Fatalf("adapter ProviderTenantID = %q; want the token tenant %q", info.ProviderTenantID, attackerTenant)
+		}
 
 		authorizeURL, cookies := initiateOAuth(t, h, "microsoft", "")
 		cbRec := callbackOAuth(t, h, authorizeAtIdP(t, authorizeURL), cookies...)
@@ -839,6 +856,72 @@ func TestE2E_FullBrowserOAuthJourneys(t *testing.T) {
 		}
 		if err := dbConn.Model(&db.OAuthAccount{}).Count(&linkCount).Error; err != nil || linkCount != 0 {
 			t.Fatalf("expected no link for the rejected userinfo login, got count=%d err=%v", linkCount, err)
+		}
+	})
+
+	// 9b. Journey 9b: Microsoft userinfo-only under a pinned tenant
+	t.Run("journey 9b: microsoft userinfo-only uses the pinned tenant", func(t *testing.T) {
+		h, dbConn, pReg, cfg := setupOAuthE2EStack(t)
+
+		const tenant = "88888888-8888-8888-8888-888888888888"
+		idp, err := oauthmock.NewMicrosoftIdP(cfg.BaseURL + "/auth/oauth/microsoft/callback")
+		if err != nil {
+			t.Fatalf("NewMicrosoftIdP: %v", err)
+		}
+		defer idp.Close()
+		idp.OmitIDToken = true
+		idp.TenantID = tenant
+		idp.Subject = "ms-userinfo-sub-9b"
+		idp.OID = "ms-userinfo-oid-9b"
+		idp.Email = "userinfo-pinned@example.com"
+
+		// A pinned authority names the tenant in configuration, so the unsigned
+		// userinfo payload can still be keyed by it. Fails if the identity is
+		// stored without a tenant or if the /userinfo payload is trusted to name
+		// one.
+		provider := oauth.NewMicrosoftProvider(config.MicrosoftConfig{
+			ClientID:     idp.ClientID,
+			ClientSecret: idp.ClientSecret,
+			RedirectURI:  cfg.BaseURL + "/auth/oauth/microsoft/callback",
+			Tenant:       tenant,
+		}, oauth.WithEndpoints(microsoftEndpoints(idp)))
+		if err := (*pReg).Register(provider); err != nil {
+			t.Fatalf("register microsoft adapter: %v", err)
+		}
+
+		info := probeIdentity(t, provider)
+		if info.ProviderUserID != "ms-userinfo-sub-9b" {
+			t.Fatalf("userinfo ProviderUserID = %q; want the sub %q", info.ProviderUserID, "ms-userinfo-sub-9b")
+		}
+		if info.ProviderTenantID != tenant {
+			t.Fatalf("userinfo ProviderTenantID = %q; want the configured tenant %q", info.ProviderTenantID, tenant)
+		}
+		if info.EmailVerified {
+			t.Fatal("userinfo alone cannot attest nOauth domain ownership")
+		}
+
+		authorizeURL, cookies := initiateOAuth(t, h, "microsoft", "")
+		cbRec := callbackOAuth(t, h, authorizeAtIdP(t, authorizeURL), cookies...)
+		if cbRec.Code != http.StatusFound {
+			t.Fatalf("userinfo-only callback = %d (%s); want 302", cbRec.Code, cbRec.Body.String())
+		}
+		if responseCookie(t, cbRec, cfg.SessionCookieName) == nil {
+			t.Fatal("expected a session cookie for the pinned userinfo login")
+		}
+
+		var user db.User
+		if err := dbConn.Where("email = ?", "userinfo-pinned@example.com").First(&user).Error; err != nil {
+			t.Fatalf("load pinned userinfo user: %v", err)
+		}
+		if user.EmailVerified {
+			t.Fatal("userinfo-only login must not verify the address")
+		}
+		var link db.OAuthAccount
+		if err := dbConn.Where("provider_id = ? AND user_id = ?", "microsoft", user.ID).First(&link).Error; err != nil {
+			t.Fatalf("load pinned userinfo link: %v", err)
+		}
+		if link.ProviderUserID != "ms-userinfo-sub-9b" || link.ProviderTenantID != tenant {
+			t.Fatalf("link key = (%q, %q); want (%q, %q)", link.ProviderTenantID, link.ProviderUserID, tenant, "ms-userinfo-sub-9b")
 		}
 	})
 

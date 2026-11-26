@@ -595,6 +595,12 @@ func TestMigration000011_TenantQualifiesIdentityKey(t *testing.T) {
 	if dropOldIdx == -1 {
 		t.Fatal("migration 11 up must drop the tenant-blind unique constraint")
 	}
+	// The down migration restores the old key as a plain unique index, so the
+	// re-applied up must drop that form too or it keeps enforcing the old key.
+	dropOldIndex := strings.Index(content, "DROP INDEX IF EXISTS uq_oauth_accounts_provider_uid")
+	if dropOldIndex == -1 || dropOldIndex < dropOldIdx {
+		t.Fatal("migration 11 up must drop the tenant-blind unique index after the constraint")
+	}
 	if columnIdx > newKeyIdx || newKeyIdx > dropOldIdx {
 		t.Errorf("migration 11 ordering must be column, new index, drop old constraint: column=%d new=%d drop=%d", columnIdx, newKeyIdx, dropOldIdx)
 	}

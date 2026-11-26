@@ -2326,11 +2326,12 @@ func TestHandleCallbackUntrustedTenant(t *testing.T) {
 		sessSvc := session.NewService(database, cfg)
 		// Mock profile carrying untrusted_tenant claim
 		untrustedInfo := &UserInfo{
-			ProviderID:     "microsoft",
-			ProviderUserID: "ms-untrusted-sub",
-			Email:          "victim@example.com",
-			EmailVerified:  false,
-			Name:           "Untrusted Tenant User",
+			ProviderID:       "microsoft",
+			ProviderTenantID: "tenant-untrusted",
+			ProviderUserID:   "ms-untrusted-sub",
+			Email:            "victim@example.com",
+			EmailVerified:    false,
+			Name:             "Untrusted Tenant User",
 			RawClaims: map[string]any{
 				"untrusted_tenant": true,
 			},
@@ -2361,23 +2362,25 @@ func TestHandleCallbackUntrustedTenant(t *testing.T) {
 			t.Fatalf("create owner: %v", err)
 		}
 		link := db.OAuthAccount{
-			ID:             uuid.New(),
-			UserID:         owner.ID,
-			ProviderID:     "microsoft",
-			ProviderUserID: "ms-untrusted-returning-sub",
-			Email:          owner.Email,
-			Verified:       true,
+			ID:               uuid.New(),
+			UserID:           owner.ID,
+			ProviderID:       "microsoft",
+			ProviderTenantID: "tenant-untrusted",
+			ProviderUserID:   "ms-untrusted-returning-sub",
+			Email:            owner.Email,
+			Verified:         true,
 		}
 		if err := database.Create(&link).Error; err != nil {
 			t.Fatalf("create link: %v", err)
 		}
 
 		untrustedInfo := &UserInfo{
-			ProviderID:     "microsoft",
-			ProviderUserID: "ms-untrusted-returning-sub",
-			Email:          owner.Email,
-			EmailVerified:  true,
-			Name:           "Untrusted Returning User",
+			ProviderID:       "microsoft",
+			ProviderTenantID: "tenant-untrusted",
+			ProviderUserID:   "ms-untrusted-returning-sub",
+			Email:            owner.Email,
+			EmailVerified:    true,
+			Name:             "Untrusted Returning User",
 			RawClaims: map[string]any{
 				"untrusted_tenant": true,
 			},
@@ -2425,7 +2428,7 @@ func TestHandleCallbackActiveSessionUntrustedTenant(t *testing.T) {
 			t.Fatalf("create session: %v", err)
 		}
 		untrusted := &stubProvider{id: "microsoft", info: &UserInfo{
-			ProviderID: "microsoft", ProviderUserID: "ms-attacker-sub",
+			ProviderID: "microsoft", ProviderTenantID: "tenant-attacker", ProviderUserID: "ms-attacker-sub",
 			Email: "victim@example.com", EmailVerified: true, Name: "Attacker",
 			RawClaims: map[string]any{"untrusted_tenant": true},
 		}}
@@ -2480,23 +2483,25 @@ func TestHandleCallback_MicrosoftLegacyOIDFallback(t *testing.T) {
 			t.Fatalf("create user: %v", err)
 		}
 		legacyLink := db.OAuthAccount{
-			ID:             uuid.New(),
-			UserID:         user.ID,
-			ProviderID:     "microsoft",
-			ProviderUserID: "legacy-oid-guid-123",
-			Email:          user.Email,
-			Verified:       true,
+			ID:               uuid.New(),
+			UserID:           user.ID,
+			ProviderID:       "microsoft",
+			ProviderTenantID: "tenant-migration",
+			ProviderUserID:   "legacy-oid-guid-123",
+			Email:            user.Email,
+			Verified:         true,
 		}
 		if err := database.Create(&legacyLink).Error; err != nil {
 			t.Fatalf("create legacy link: %v", err)
 		}
 
 		msInfo := &UserInfo{
-			ProviderID:     "microsoft",
-			ProviderUserID: "new-pairwise-sub-456",
-			Email:          "ms-user@example.com",
-			EmailVerified:  false,
-			Name:           "MS User",
+			ProviderID:       "microsoft",
+			ProviderTenantID: "tenant-migration",
+			ProviderUserID:   "new-pairwise-sub-456",
+			Email:            "ms-user@example.com",
+			EmailVerified:    false,
+			Name:             "MS User",
 			RawClaims: map[string]any{
 				"sub": "new-pairwise-sub-456",
 				"oid": "legacy-oid-guid-123",
@@ -2544,23 +2549,25 @@ func TestHandleCallback_MicrosoftLegacyOIDFallback(t *testing.T) {
 			t.Fatalf("create user: %v", err)
 		}
 		link := db.OAuthAccount{
-			ID:             uuid.New(),
-			UserID:         user.ID,
-			ProviderID:     "microsoft",
-			ProviderUserID: "direct-sub-789",
-			Email:          user.Email,
-			Verified:       true,
+			ID:               uuid.New(),
+			UserID:           user.ID,
+			ProviderID:       "microsoft",
+			ProviderTenantID: "tenant-direct",
+			ProviderUserID:   "direct-sub-789",
+			Email:            user.Email,
+			Verified:         true,
 		}
 		if err := database.Create(&link).Error; err != nil {
 			t.Fatalf("create link: %v", err)
 		}
 
 		msInfo := &UserInfo{
-			ProviderID:     "microsoft",
-			ProviderUserID: "direct-sub-789",
-			Email:          "ms-sub@example.com",
-			EmailVerified:  true,
-			Name:           "MS Sub User",
+			ProviderID:       "microsoft",
+			ProviderTenantID: "tenant-direct",
+			ProviderUserID:   "direct-sub-789",
+			Email:            "ms-sub@example.com",
+			EmailVerified:    true,
+			Name:             "MS Sub User",
 			RawClaims: map[string]any{
 				"sub": "direct-sub-789",
 				"oid": "directory-oid-999",
@@ -2597,23 +2604,25 @@ func TestHandleCallback_MicrosoftLegacyOIDFallback(t *testing.T) {
 			t.Fatalf("create user: %v", err)
 		}
 		legacyLink := db.OAuthAccount{
-			ID:             uuid.New(),
-			UserID:         user.ID,
-			ProviderID:     "microsoft",
-			ProviderUserID: "legacy-oid-attested",
-			Email:          user.Email,
-			Verified:       true,
+			ID:               uuid.New(),
+			UserID:           user.ID,
+			ProviderID:       "microsoft",
+			ProviderTenantID: "tenant-attested",
+			ProviderUserID:   "legacy-oid-attested",
+			Email:            user.Email,
+			Verified:         true,
 		}
 		if err := database.Create(&legacyLink).Error; err != nil {
 			t.Fatalf("create legacy link: %v", err)
 		}
 
 		msInfo := &UserInfo{
-			ProviderID:     "microsoft",
-			ProviderUserID: "sub-attested-new",
-			Email:          "ms-attested@example.com",
-			EmailVerified:  true,
-			Name:           "MS Attested User",
+			ProviderID:       "microsoft",
+			ProviderTenantID: "tenant-attested",
+			ProviderUserID:   "sub-attested-new",
+			Email:            "ms-attested@example.com",
+			EmailVerified:    true,
+			Name:             "MS Attested User",
 			RawClaims: map[string]any{
 				"sub": "sub-attested-new",
 				"oid": "legacy-oid-attested",
