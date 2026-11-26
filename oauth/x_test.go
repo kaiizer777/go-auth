@@ -278,6 +278,17 @@ func TestXProvider_ExchangeCode(t *testing.T) {
 			writeProblem(w, http.StatusTooManyRequests, map[string]any{"status": 429})
 			return
 		}
+		if code == "rate-limited-overflow-suffix-code" {
+			w.Header().Set("Retry-After", "99999999999999999999seconds")
+			w.Header().Set("x-rate-limit-reset", strconv.FormatInt(time.Now().Add(75*time.Second).Unix(), 10))
+			writeProblem(w, http.StatusTooManyRequests, map[string]any{"status": 429})
+			return
+		}
+		if code == "rate-limited-overflow-suffix-no-fallback-code" {
+			w.Header().Set("Retry-After", "99999999999999999999seconds")
+			writeProblem(w, http.StatusTooManyRequests, map[string]any{"status": 429})
+			return
+		}
 		if code == "rate-limited-reset-far-code" {
 			w.Header().Set("x-rate-limit-reset", strconv.FormatInt(time.Now().Add(1000*time.Hour).Unix(), 10))
 			writeProblem(w, http.StatusTooManyRequests, map[string]any{"status": 429})
@@ -348,6 +359,15 @@ func TestXProvider_ExchangeCode(t *testing.T) {
 			for i := 1; i <= 9; i++ {
 				errs = append(errs, map[string]any{"message": "cap entry " + strconv.Itoa(i)})
 			}
+			writeProblem(w, http.StatusBadRequest, map[string]any{"errors": errs})
+			return
+		}
+		if code == "problem-null-error-cap-code" {
+			errs := make([]any, 0, xMaxProblemErrors+1)
+			for i := 0; i < xMaxProblemErrors; i++ {
+				errs = append(errs, nil)
+			}
+			errs = append(errs, map[string]any{"message": "survivor entry"})
 			writeProblem(w, http.StatusBadRequest, map[string]any{"errors": errs})
 			return
 		}
@@ -562,6 +582,18 @@ func TestXProvider_ExchangeCode(t *testing.T) {
 		}
 	})
 
+	t.Run("429 overflowing digits with non-digit suffix fall back to reset epoch", func(t *testing.T) {
+		// delay-seconds = 1*DIGIT: the overflow fires before ParseInt reaches the
+		// suffix, so the whole value is garbage rather than an oversized hint.
+		if got := xRetryAfterFor(t, p, "rate-limited-overflow-suffix-code"); got < 73 || got > 75 {
+			t.Fatalf("RetryAfter = %d; want ~75 from the reset epoch", got)
+		}
+	})
+
+	t.Run("429 overflowing digits with non-digit suffix without reset yield no retry hint", func(t *testing.T) {
+		xRetryAfterMissing(t, p, "rate-limited-overflow-suffix-no-fallback-code")
+	})
+
 	t.Run("429 far-future reset epoch caps at 24h", func(t *testing.T) {
 		if got := xRetryAfterFor(t, p, "rate-limited-reset-far-code"); got != 86400 {
 			t.Fatalf("RetryAfter = %d; want 86400", got)
@@ -697,6 +729,20 @@ func TestXProvider_ExchangeCode(t *testing.T) {
 		// The cap is silent: the ninth entry is dropped with no truncation marker.
 		if strings.Contains(err.Error(), "cap entry 9") {
 			t.Errorf("cause contains the entry beyond the cap: %v", err)
+		}
+	})
+
+	t.Run("problem+json null error entries do not consume the cause budget", func(t *testing.T) {
+		_, err := p.ExchangeCode(context.Background(), "problem-null-error-cap-code", "test-code-verifier")
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+		appErr := xProviderError(t, err)
+		if appErr.Message() != "oauth provider request failed" {
+			t.Fatalf("message = %q; want the generic message", appErr.Message())
+		}
+		if want := "upstream error message: survivor entry"; !strings.Contains(err.Error(), want) {
+			t.Errorf("cause missing %q in %v", want, err)
 		}
 	})
 

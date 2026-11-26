@@ -106,16 +106,34 @@ func parseRetryAfterValue(raw string) (int, bool) {
 	if raw == "" || strings.HasPrefix(raw, "-") {
 		return 0, false
 	}
+	if sec, ok := parseDelaySeconds(raw); ok {
+		return sec, true
+	}
+	if at, err := http.ParseTime(raw); err == nil {
+		return clampRetryAfterSeconds(int64(time.Until(at) / time.Second)), true
+	}
+	return 0, false
+}
+
+// parseDelaySeconds accepts delay-seconds (1*DIGIT) only. ParseInt reports an
+// over-int64 prefix as ErrRange before it reaches a non-digit suffix, so the
+// charset must be checked here: "99999999999999999999seconds" is invalid input,
+// not an oversized hint.
+func parseDelaySeconds(raw string) (int, bool) {
+	for _, r := range raw {
+		if r < '0' || r > '9' {
+			return 0, false
+		}
+	}
 	sec, err := strconv.ParseInt(raw, 10, 64)
 	if err == nil {
 		return clampRetryAfterSeconds(sec), true
 	}
+	// All digits: only a magnitude beyond int64 can fail, and that still clamps.
+	// ErrSyntax would mean non-digits slipped past the scan above, so it falls
+	// through as unusable input.
 	if numErr, ok := err.(*strconv.NumError); ok && numErr.Err == strconv.ErrRange {
-		// Magnitude beyond int64 still clamps; negatives were rejected above.
 		return maxRetryAfterSeconds, true
-	}
-	if at, err := http.ParseTime(raw); err == nil {
-		return clampRetryAfterSeconds(int64(time.Until(at) / time.Second)), true
 	}
 	return 0, false
 }
@@ -166,6 +184,11 @@ func (p xProblemDetails) problemErrors() []xProblemError {
 	for _, raw := range p.Errors {
 		var e xProblemError
 		if err := json.Unmarshal(raw, &e); err != nil {
+			continue
+		}
+		// null and {} decode cleanly but carry no diagnostic, so they must not
+		// consume the xMaxProblemErrors budget that real entries need.
+		if e == (xProblemError{}) {
 			continue
 		}
 		errs = append(errs, e)
