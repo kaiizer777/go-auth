@@ -647,6 +647,23 @@ func TestConfigValidate_OAuth(t *testing.T) {
 			wantErr: errors.ErrOAuthGraphVersionInvalid,
 		},
 		{
+			name:    "facebook graph version leading zero rejected",
+			mutate:  facebookVersion("v019.0"),
+			wantErr: errors.ErrOAuthGraphVersionInvalid,
+		},
+		{
+			name: "facebook map graph version leading zero rejected",
+			mutate: func(c *Config) {
+				c.OAuth.Providers = enabled("facebook", ProviderConfig{
+					ClientID:     "fb-app-id",
+					ClientSecret: "fb-app-secret",
+					RedirectURL:  "https://example.com/callback",
+					GraphVersion: "19.00",
+				})
+			},
+			wantErr: errors.ErrOAuthGraphVersionInvalid,
+		},
+		{
 			name: "facebook missing state secret rejected",
 			mutate: func(c *Config) {
 				c.OAuth.StateSecret = ""
@@ -834,6 +851,13 @@ func TestValidateGraphVersion(t *testing.T) {
 		{name: "trailing newline", version: "v19.0\n", wantErr: true},
 		{name: "double prefix", version: "vv19.0", wantErr: true},
 		{name: "range overflow", version: "v" + strings.Repeat("9", 400) + ".0", wantErr: true},
+		{name: "leading zero major", version: "v019.0", wantErr: true},
+		{name: "leading zero major no prefix", version: "019.0", wantErr: true},
+		{name: "multiple leading zeros major", version: "v00019.0", wantErr: true},
+		{name: "leading zero minor", version: "v19.00", wantErr: true},
+		{name: "leading zero second minor digit", version: "v19.010", wantErr: true},
+		{name: "zero version below floor", version: "v0.0", wantErr: true},
+		{name: "zero version below floor no prefix", version: "0.0", wantErr: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
