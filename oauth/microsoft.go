@@ -230,8 +230,9 @@ func (p *MicrosoftProvider) fetchTenantGUID(ctx context.Context, domain string) 
 
 // tenantTrusted reports whether the allowlist accepts the verified tenant.
 // Entries may be GUIDs or domains; a domain entry is resolved to its GUID so
-// it matches the GUID the token actually carries. An empty allowlist denies
-// all tenants (fail-closed).
+// it matches the GUID the token actually carries. An empty allowlist is
+// permissive: no allowlist means no tenant restriction, so every tenant the
+// configured authority admits is trusted.
 //
 // Entries are walked in sorted order, so the outcome never depends on map
 // iteration order. Only a domain entry can require discovery, and a resolution
@@ -241,7 +242,7 @@ func (p *MicrosoftProvider) fetchTenantGUID(ctx context.Context, domain string) 
 // than silently marking the tenant untrusted.
 func (p *MicrosoftProvider) tenantTrusted(ctx context.Context, tenantID, issuer string) (bool, error) {
 	if len(p.trustedTenants) == 0 {
-		return false, nil
+		return true, nil
 	}
 	ids := []string{normalizeTenant(tenantID), normalizeTenant(issuerTenant(issuer))}
 	matches := func(candidate string) bool {
