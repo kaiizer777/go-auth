@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -252,6 +253,83 @@ func TestBackfillOAuthAccountVerified(t *testing.T) {
 	}
 	if n, err := database.Collection("schema_migrations").CountDocuments(ctx, bson.M{"_id": oauthVerifiedProgressID}); err != nil || n != 0 {
 		t.Fatalf("progress marker rows = %d; want 0 (cleaned up)", n)
+	}
+}
+
+// TestBackfillOAuthAccountVerified_ConcurrentRuns pins the startup overlap: two
+// connect paths racing the one-shot marker must both succeed, promote exactly the
+// verified owner's link, and leave a single marker row.
+func TestBackfillOAuthAccountVerified_ConcurrentRuns(t *testing.T) {
+	uri := requireMongoURI(t)
+	client, err := mongo.Connect(options.Client().ApplyURI(uri))
+	if err != nil {
+		t.Fatalf("mongo.Connect failed: %v", err)
+	}
+	database := client.Database(fmt.Sprintf("goauth_test_bf_conc_%s", strings.ReplaceAll(uuid.New().String(), "-", "")))
+	t.Cleanup(func() {
+		_ = database.Drop(context.Background())
+		_ = client.Disconnect(context.Background())
+	})
+	ctx := context.Background()
+
+	verifiedOwner, unverifiedOwner := uuid.New(), uuid.New()
+	if _, err := database.Collection("users").InsertMany(ctx, []any{
+		bson.M{"_id": verifiedOwner.String(), "email": "verified@example.com", "email_verified": true},
+		bson.M{"_id": unverifiedOwner.String(), "email": "unverified@example.com", "email_verified": false},
+	}); err != nil {
+		t.Fatalf("seed users: %v", err)
+	}
+	links := database.Collection("oauth_accounts")
+	legacyVerified, legacyUnverified := uuid.New().String(), uuid.New().String()
+	if _, err := links.InsertMany(ctx, []any{
+		bson.M{"_id": legacyVerified, "user_id": verifiedOwner.String(), "provider_id": "google",
+			"provider_user_id": "sub-concurrent-verified", "email": "verified@example.com"},
+		bson.M{"_id": legacyUnverified, "user_id": unverifiedOwner.String(), "provider_id": "google",
+			"provider_user_id": "sub-concurrent-unverified", "email": "unverified@example.com"},
+	}); err != nil {
+		t.Fatalf("seed links: %v", err)
+	}
+
+	const runs = 2
+	start := make(chan struct{})
+	errs := make(chan error, runs)
+	var wg sync.WaitGroup
+	for range runs {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			errs <- BackfillOAuthAccountVerified(ctx, database)
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent run failed: %v", err)
+		}
+	}
+
+	readVerified := func(id string) bool {
+		t.Helper()
+		var doc OAuthAccountDoc
+		if err := links.FindOne(ctx, bson.M{"_id": id}).Decode(&doc); err != nil {
+			t.Fatalf("load link %s: %v", id, err)
+		}
+		return doc.Verified
+	}
+	if !readVerified(legacyVerified) {
+		t.Fatal("link on a verified owner stayed unverified under concurrent runs")
+	}
+	if readVerified(legacyUnverified) {
+		t.Fatal("link on an unverified owner must stay unverified under concurrent runs")
+	}
+	if n, err := database.Collection("schema_migrations").CountDocuments(ctx, bson.M{"_id": oauthVerifiedBackfillID}); err != nil || n != 1 {
+		t.Fatalf("migration marker rows = %d (err %v); want 1", n, err)
+	}
+	if n, err := database.Collection("schema_migrations").CountDocuments(ctx, bson.M{"_id": oauthVerifiedProgressID}); err != nil || n != 0 {
+		t.Fatalf("progress marker rows = %d (err %v); want 0", n, err)
 	}
 }
 
