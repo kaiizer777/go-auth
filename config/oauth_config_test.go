@@ -41,6 +41,16 @@ func TestConfigValidate_OAuth(t *testing.T) {
 		p.Enabled = true
 		return map[string]ProviderConfig{id: p}
 	}
+	facebookVersion := func(version string) func(*Config) {
+		return func(c *Config) {
+			c.OAuth.Facebook = &FacebookConfig{
+				AppID:        "fb-app-id",
+				AppSecret:    "fb-app-secret",
+				RedirectURI:  "https://example.com/callback",
+				GraphVersion: version,
+			}
+		}
+	}
 	appleKeys := ProviderConfig{
 		ClientID:    "apple-client",
 		RedirectURL: "https://example.com/auth/oauth/apple/callback",
@@ -480,16 +490,9 @@ func TestConfigValidate_OAuth(t *testing.T) {
 			wantErr: errors.ErrOAuthRedirectURLRequired,
 		},
 		{
-			name: "facebook invalid graph version missing v prefix rejected",
-			mutate: func(c *Config) {
-				c.OAuth.Facebook = &FacebookConfig{
-					AppID:        "fb-app-id",
-					AppSecret:    "fb-app-secret",
-					RedirectURI:  "https://example.com/callback",
-					GraphVersion: "19.0",
-				}
-			},
-			wantErr: errors.ErrOAuthGraphVersionInvalid,
+			name:    "facebook graph version without v prefix allowed",
+			mutate:  facebookVersion("19.0"),
+			wantErr: nil,
 		},
 		{
 			name: "facebook invalid graph version below 19 rejected",
@@ -516,13 +519,117 @@ func TestConfigValidate_OAuth(t *testing.T) {
 			wantErr: nil,
 		},
 		{
-			name: "facebook map graph version missing v prefix rejected",
+			name: "facebook map graph version below 19 without v rejected",
 			mutate: func(c *Config) {
 				c.OAuth.Providers = enabled("facebook", ProviderConfig{
 					ClientID:     "fb-app-id",
 					ClientSecret: "fb-app-secret",
 					RedirectURL:  "https://example.com/callback",
 					GraphVersion: "18.0",
+				})
+			},
+			wantErr: errors.ErrOAuthGraphVersionInvalid,
+		},
+		{
+			name: "facebook map graph version without v prefix allowed",
+			mutate: func(c *Config) {
+				c.OAuth.Providers = enabled("facebook", ProviderConfig{
+					ClientID:     "fb-app-id",
+					ClientSecret: "fb-app-secret",
+					RedirectURL:  "https://example.com/callback",
+					GraphVersion: "19.0",
+				})
+			},
+			wantErr: nil,
+		},
+		{
+			name:    "facebook graph version NaN rejected",
+			mutate:  facebookVersion("vNaN"),
+			wantErr: errors.ErrOAuthGraphVersionInvalid,
+		},
+		{
+			name:    "facebook graph version infinity rejected",
+			mutate:  facebookVersion("vInf"),
+			wantErr: errors.ErrOAuthGraphVersionInvalid,
+		},
+		{
+			name:    "facebook graph version signed infinity rejected",
+			mutate:  facebookVersion("v+Inf"),
+			wantErr: errors.ErrOAuthGraphVersionInvalid,
+		},
+		{
+			name:    "facebook graph version long infinity rejected",
+			mutate:  facebookVersion("vInfinity"),
+			wantErr: errors.ErrOAuthGraphVersionInvalid,
+		},
+		{
+			name:    "facebook graph version negative infinity rejected",
+			mutate:  facebookVersion("v-Inf"),
+			wantErr: errors.ErrOAuthGraphVersionInvalid,
+		},
+		{
+			name:    "facebook graph version exponent rejected",
+			mutate:  facebookVersion("v1e5"),
+			wantErr: errors.ErrOAuthGraphVersionInvalid,
+		},
+		{
+			name:    "facebook graph version hex float rejected",
+			mutate:  facebookVersion("v0x1p5"),
+			wantErr: errors.ErrOAuthGraphVersionInvalid,
+		},
+		{
+			name:    "facebook graph version underscore rejected",
+			mutate:  facebookVersion("v1_9.0"),
+			wantErr: errors.ErrOAuthGraphVersionInvalid,
+		},
+		{
+			name:    "facebook graph version trailing dot rejected",
+			mutate:  facebookVersion("v19."),
+			wantErr: errors.ErrOAuthGraphVersionInvalid,
+		},
+		{
+			name:    "facebook graph version leading dot rejected",
+			mutate:  facebookVersion("v.19"),
+			wantErr: errors.ErrOAuthGraphVersionInvalid,
+		},
+		{
+			name:    "facebook graph version signed rejected",
+			mutate:  facebookVersion("v+19.0"),
+			wantErr: errors.ErrOAuthGraphVersionInvalid,
+		},
+		{
+			name:    "facebook graph version missing minor rejected",
+			mutate:  facebookVersion("v19"),
+			wantErr: errors.ErrOAuthGraphVersionInvalid,
+		},
+		{
+			name:    "facebook graph version extra segment rejected",
+			mutate:  facebookVersion("v19.0.1"),
+			wantErr: errors.ErrOAuthGraphVersionInvalid,
+		},
+		{
+			name:    "facebook graph version uppercase prefix rejected",
+			mutate:  facebookVersion("V19.0"),
+			wantErr: errors.ErrOAuthGraphVersionInvalid,
+		},
+		{
+			name:    "facebook graph version leading whitespace rejected",
+			mutate:  facebookVersion(" v19.0"),
+			wantErr: errors.ErrOAuthGraphVersionInvalid,
+		},
+		{
+			name:    "facebook graph version trailing whitespace rejected",
+			mutate:  facebookVersion("v19.0 "),
+			wantErr: errors.ErrOAuthGraphVersionInvalid,
+		},
+		{
+			name: "facebook map graph version NaN rejected",
+			mutate: func(c *Config) {
+				c.OAuth.Providers = enabled("facebook", ProviderConfig{
+					ClientID:     "fb-app-id",
+					ClientSecret: "fb-app-secret",
+					RedirectURL:  "https://example.com/callback",
+					GraphVersion: "vNaN",
 				})
 			},
 			wantErr: errors.ErrOAuthGraphVersionInvalid,
@@ -685,6 +792,57 @@ func TestConfigValidate_OAuth(t *testing.T) {
 			var appErr *errors.Error
 			if !errors.As(err, &appErr) || appErr.Code() != errors.CodeInvalidConfig {
 				t.Fatalf("Validate code = %v; want CONFIG_INVALID", err)
+			}
+		})
+	}
+}
+
+func TestValidateGraphVersion(t *testing.T) {
+	tests := []struct {
+		name    string
+		version string
+		wantErr bool
+	}{
+		{name: "canonical", version: "v19.0"},
+		{name: "no prefix", version: "19.0"},
+		{name: "two digit minor", version: "v19.10"},
+		{name: "three digit major", version: "v100.1"},
+		{name: "empty", version: ""},
+		{name: "below floor", version: "v18.0", wantErr: true},
+		{name: "below floor no prefix", version: "18.0", wantErr: true},
+		{name: "missing minor", version: "v19", wantErr: true},
+		{name: "missing minor no prefix", version: "19", wantErr: true},
+		{name: "extra segment", version: "v19.0.1", wantErr: true},
+		{name: "NaN", version: "vNaN", wantErr: true},
+		{name: "lowercase NaN", version: "vnan", wantErr: true},
+		{name: "Inf", version: "vInf", wantErr: true},
+		{name: "signed Inf", version: "v+Inf", wantErr: true},
+		{name: "negative Inf", version: "v-Inf", wantErr: true},
+		{name: "Infinity", version: "vInfinity", wantErr: true},
+		{name: "exponent", version: "v1e5", wantErr: true},
+		{name: "uppercase exponent", version: "v1E5", wantErr: true},
+		{name: "hex float", version: "v0x1p5", wantErr: true},
+		{name: "underscore", version: "v1_9.0", wantErr: true},
+		{name: "trailing dot", version: "v19.", wantErr: true},
+		{name: "leading dot", version: "v.19", wantErr: true},
+		{name: "signed", version: "v+19.0", wantErr: true},
+		{name: "negative", version: "v-19.0", wantErr: true},
+		{name: "uppercase prefix", version: "V19.0", wantErr: true},
+		{name: "space after prefix", version: "v 19.0", wantErr: true},
+		{name: "leading whitespace", version: " v19.0", wantErr: true},
+		{name: "trailing whitespace", version: "v19.0 ", wantErr: true},
+		{name: "trailing newline", version: "v19.0\n", wantErr: true},
+		{name: "double prefix", version: "vv19.0", wantErr: true},
+		{name: "range overflow", version: "v" + strings.Repeat("9", 400) + ".0", wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateGraphVersion(tt.version)
+			if gotErr := err != nil; gotErr != tt.wantErr {
+				t.Fatalf("validateGraphVersion(%q) error = %v; wantErr %v", tt.version, err, tt.wantErr)
+			}
+			if tt.wantErr && !errors.Is(err, errors.ErrOAuthGraphVersionInvalid) {
+				t.Fatalf("validateGraphVersion(%q) error = %v; want ErrOAuthGraphVersionInvalid", tt.version, err)
 			}
 		})
 	}
