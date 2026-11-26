@@ -728,8 +728,8 @@ func TestMigration000011_TenantQualifiesIdentityKey(t *testing.T) {
 	if postgresIndexExists(t, sqlDB, "uq_oauth_accounts_provider_tenant_uid") {
 		t.Fatal("000011 down must drop the tenant-qualified unique index")
 	}
-	if !postgresIndexExists(t, sqlDB, "uq_oauth_accounts_provider_uid") {
-		t.Fatal("000011 down must restore the tenant-blind unique index")
+	if !postgresConstraintExists(t, sqlDB, "uq_oauth_accounts_provider_uid") {
+		t.Fatal("000011 down must restore the tenant-blind unique constraint, not a plain index")
 	}
 
 	_, _ = sqlDB.Exec(`DELETE FROM users WHERE id = $1`, userID)
@@ -748,6 +748,25 @@ func postgresIndexExists(t *testing.T, sqlDB *sql.DB, name string) bool {
 	)`, name).Scan(&exists)
 	if err != nil {
 		t.Fatalf("query index %s: %v", name, err)
+	}
+	return exists
+}
+
+// postgresConstraintExists reports whether the named unique constraint exists on
+// oauth_accounts. A constraint-owned index is also listed by pg_indexes, so only
+// pg_constraint distinguishes the restored form from a plain index.
+func postgresConstraintExists(t *testing.T, sqlDB *sql.DB, name string) bool {
+	t.Helper()
+	var exists bool
+	err := sqlDB.QueryRow(`SELECT EXISTS (
+		SELECT 1 FROM pg_constraint c
+		JOIN pg_class t ON t.oid = c.conrelid
+		JOIN pg_namespace n ON n.oid = t.relnamespace
+		WHERE n.nspname = 'public' AND t.relname = 'oauth_accounts'
+		  AND c.contype = 'u' AND c.conname = $1
+	)`, name).Scan(&exists)
+	if err != nil {
+		t.Fatalf("query constraint %s: %v", name, err)
 	}
 	return exists
 }
