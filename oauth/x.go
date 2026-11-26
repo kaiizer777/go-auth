@@ -136,6 +136,61 @@ func xRateLimitError(retryAfterSec int) error {
 	return &RateLimitError{RetryAfter: retryAfterSec, Err: errors.ErrOAuthRateLimitExceeded}
 }
 
+// xProblemDetails is the RFC 7807 failure body X returns.
+type xProblemDetails struct {
+	Type   string          `json:"type"`
+	Title  string          `json:"title"`
+	Detail string          `json:"detail"`
+	Status int             `json:"status"`
+	Errors []xProblemError `json:"errors"`
+}
+
+// xProblemError is one entry of an RFC 7807 errors array.
+type xProblemError struct {
+	Type    string `json:"type"`
+	Title   string `json:"title"`
+	Detail  string `json:"detail"`
+	Message string `json:"message"`
+	Status  int    `json:"status"`
+}
+
+// xMaxProblemErrors caps how many errors[] entries reach the cause so a hostile body cannot inflate it without limit.
+const xMaxProblemErrors = 8
+
+// xProblemCause flattens every non-empty provider diagnostic into one cause
+// string. Upstream text stays server-side; the caller-facing message is generic.
+func xProblemCause(problem xProblemDetails) string {
+	var b strings.Builder
+	add := func(label, value string) {
+		if value == "" {
+			return
+		}
+		if b.Len() > 0 {
+			b.WriteString("; ")
+		}
+		b.WriteString(label)
+		b.WriteString(": ")
+		b.WriteString(value)
+	}
+	add("upstream type", problem.Type)
+	add("upstream title", problem.Title)
+	add("upstream detail", problem.Detail)
+	for i, e := range problem.Errors {
+		if i == xMaxProblemErrors {
+			break
+		}
+		add("upstream error type", e.Type)
+		add("upstream error title", e.Title)
+		add("upstream error message", e.Message)
+		add("upstream error detail", e.Detail)
+	}
+	return b.String()
+}
+
+func isXRateLimited(status int, title string) bool {
+	return status == http.StatusTooManyRequests || strings.EqualFold(title, "Too Many Requests")
+}
+
 // parseXErrorWithHeader inspects HTTP status, body, and response headers for rate limit details or RFC 7807 problem details.
 func parseXErrorWithHeader(statusCode int, body []byte, header http.Header) error {
 	retryAfterSec := parseRetryAfterHeader(header)
@@ -144,54 +199,22 @@ func parseXErrorWithHeader(statusCode int, body []byte, header http.Header) erro
 		return xRateLimitError(retryAfterSec)
 	}
 
-	var problem struct {
-		Title  string `json:"title"`
-		Detail string `json:"detail"`
-		Type   string `json:"type"`
-		Status int    `json:"status"`
-		Errors []struct {
-			Title   string `json:"title"`
-			Detail  string `json:"detail"`
-			Message string `json:"message"`
-			Status  int    `json:"status"`
-		} `json:"errors"`
-	}
-
+	var problem xProblemDetails
 	if err := json.Unmarshal(body, &problem); err == nil {
-		if problem.Status == http.StatusTooManyRequests || strings.EqualFold(problem.Title, "Too Many Requests") {
-			if retryAfterSec > 0 {
-				return &RateLimitError{RetryAfter: retryAfterSec, Err: errors.ErrOAuthRateLimitExceeded}
-			}
-			return errors.ErrOAuthRateLimitExceeded
+		if isXRateLimited(problem.Status, problem.Title) {
+			return xRateLimitError(retryAfterSec)
 		}
 		for _, e := range problem.Errors {
-			if e.Status == http.StatusTooManyRequests || strings.EqualFold(e.Title, "Too Many Requests") {
-				if retryAfterSec > 0 {
-					return &RateLimitError{RetryAfter: retryAfterSec, Err: errors.ErrOAuthRateLimitExceeded}
-				}
-				return errors.ErrOAuthRateLimitExceeded
+			if isXRateLimited(e.Status, e.Title) {
+				return xRateLimitError(retryAfterSec)
 			}
 		}
 		// Upstream-controlled text must never become the caller-facing message:
 		// WriteJSON renders only Message on the wire, while the cause stays
-		// server-side for logs. Carry detail/title as the cause.
-		if problem.Detail != "" {
-			return errors.New(errors.CodeOAuthProviderError, "oauth provider request failed", errors.New(errors.CodeOAuthProviderError, "upstream detail: "+problem.Detail, nil))
-		}
-		if problem.Title != "" {
-			return errors.New(errors.CodeOAuthProviderError, "oauth provider request failed", errors.New(errors.CodeOAuthProviderError, "upstream title: "+problem.Title, nil))
-		}
-		// Some failures carry the only diagnostic in the nested error array,
-		// with no top-level title/detail. Keep it server-side on the cause.
-		for _, e := range problem.Errors {
-			detail := e.Message
-			if detail == "" {
-				detail = e.Detail
-			}
-			if detail != "" {
-				return errors.New(errors.CodeOAuthProviderError, "oauth provider request failed",
-					errors.New(errors.CodeOAuthProviderError, "upstream error: "+detail, nil))
-			}
+		// server-side for logs.
+		if cause := xProblemCause(problem); cause != "" {
+			return errors.New(errors.CodeOAuthProviderError, "oauth provider request failed",
+				errors.New(errors.CodeOAuthProviderError, cause, nil))
 		}
 	}
 
