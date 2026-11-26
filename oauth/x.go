@@ -101,7 +101,9 @@ func parseRetryAfterHeader(header http.Header) int {
 
 // parseRetryAfterValue parses both RFC 9110 forms and clamps the result.
 func parseRetryAfterValue(raw string) (int, bool) {
-	if raw == "" {
+	// RFC 9110 delay-seconds = 1*DIGIT, so a negative value is invalid input:
+	// treat it as garbage and let the caller fall back to the reset epoch.
+	if raw == "" || strings.HasPrefix(raw, "-") {
 		return 0, false
 	}
 	sec, err := strconv.ParseInt(raw, 10, 64)
@@ -109,10 +111,7 @@ func parseRetryAfterValue(raw string) (int, bool) {
 		return clampRetryAfterSeconds(sec), true
 	}
 	if numErr, ok := err.(*strconv.NumError); ok && numErr.Err == strconv.ErrRange {
-		// Magnitude beyond int64 still clamps; only the sign matters.
-		if strings.HasPrefix(raw, "-") {
-			return minRetryAfterSeconds, true
-		}
+		// Magnitude beyond int64 still clamps; negatives were rejected above.
 		return maxRetryAfterSeconds, true
 	}
 	if at, err := http.ParseTime(raw); err == nil {

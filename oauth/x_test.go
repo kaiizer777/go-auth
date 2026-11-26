@@ -257,8 +257,24 @@ func TestXProvider_ExchangeCode(t *testing.T) {
 			writeProblem(w, http.StatusTooManyRequests, map[string]any{"status": 429})
 			return
 		}
+		if code == "rate-limited-negative-no-fallback-code" {
+			w.Header().Set("Retry-After", "-5")
+			writeProblem(w, http.StatusTooManyRequests, map[string]any{"status": 429})
+			return
+		}
+		if code == "rate-limited-negative-overflow-code" {
+			w.Header().Set("Retry-After", "-99999999999999999999")
+			w.Header().Set("x-rate-limit-reset", strconv.FormatInt(time.Now().Add(300*time.Second).Unix(), 10))
+			writeProblem(w, http.StatusTooManyRequests, map[string]any{"status": 429})
+			return
+		}
 		if code == "rate-limited-oversized-code" {
 			w.Header().Set("Retry-After", "1000000000")
+			writeProblem(w, http.StatusTooManyRequests, map[string]any{"status": 429})
+			return
+		}
+		if code == "rate-limited-overflow-code" {
+			w.Header().Set("Retry-After", "99999999999999999999")
 			writeProblem(w, http.StatusTooManyRequests, map[string]any{"status": 429})
 			return
 		}
@@ -480,14 +496,32 @@ func TestXProvider_ExchangeCode(t *testing.T) {
 		}
 	})
 
-	t.Run("429 negative Retry-After clamps to one second", func(t *testing.T) {
-		if got := xRetryAfterFor(t, p, "rate-limited-negative-code"); got != 1 {
-			t.Fatalf("RetryAfter = %d; want 1", got)
+	t.Run("429 negative Retry-After falls back to reset epoch", func(t *testing.T) {
+		// RFC 9110 delay-seconds = 1*DIGIT: a negative value is invalid input and
+		// must not outrank the valid 600s reset epoch.
+		if got := xRetryAfterFor(t, p, "rate-limited-negative-code"); got < 598 || got > 600 {
+			t.Fatalf("RetryAfter = %d; want ~600 from the reset epoch", got)
+		}
+	})
+
+	t.Run("429 negative Retry-After without reset yields no retry hint", func(t *testing.T) {
+		xRetryAfterMissing(t, p, "rate-limited-negative-no-fallback-code")
+	})
+
+	t.Run("429 negative Retry-After beyond int64 falls back to reset epoch", func(t *testing.T) {
+		if got := xRetryAfterFor(t, p, "rate-limited-negative-overflow-code"); got < 298 || got > 300 {
+			t.Fatalf("RetryAfter = %d; want ~300 from the reset epoch", got)
 		}
 	})
 
 	t.Run("429 oversized Retry-After caps at 24h", func(t *testing.T) {
 		if got := xRetryAfterFor(t, p, "rate-limited-oversized-code"); got != 86400 {
+			t.Fatalf("RetryAfter = %d; want 86400", got)
+		}
+	})
+
+	t.Run("429 Retry-After beyond int64 caps at 24h", func(t *testing.T) {
+		if got := xRetryAfterFor(t, p, "rate-limited-overflow-code"); got != 86400 {
 			t.Fatalf("RetryAfter = %d; want 86400", got)
 		}
 	})
