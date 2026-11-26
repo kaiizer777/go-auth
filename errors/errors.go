@@ -367,7 +367,7 @@ var (
 	ErrOAuthStateSecretTooShort        = New(CodeInvalidConfig, "oauth state secret length too short", nil)
 	ErrOAuthStateSecretRequired        = New(CodeInvalidConfig, "oauth state secret is required when providers are configured", nil)
 	ErrOAuthStateCookieNameCollision   = New(CodeInvalidConfig, "oauth state cookie name must not match session or CSRF cookie name", nil)
-	ErrOAuthGraphVersionInvalid        = New(CodeInvalidConfig, "facebook graph version must use the form vNN.N (v optional) and be at least v19.0", nil)
+	ErrOAuthGraphVersionInvalid        = New(CodeInvalidConfig, "facebook graph version must be <major>.<minor> with an optional v prefix, no leading zeros, and at least 19.0", nil)
 	ErrTOTPEncryptionKeyInvalid        = New(CodeInvalidConfig, "totp encryption key must be 64 hex chars (32 bytes)", nil)
 	ErrTOTPChallengeTokenTTLInvalid    = New(CodeInvalidConfig, "totp challenge token TTL must be between 1m and 30m", nil)
 	ErrTOTPMaxAttemptsInvalid          = New(CodeInvalidConfig, "totp max attempts must be at least 1", nil)
