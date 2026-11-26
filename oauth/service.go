@@ -991,7 +991,7 @@ func (s *service) linkOrCreate(ctx context.Context, providerID string, info *Use
 		return user, linked, false, nil
 	}
 
-	// 4. Validate the identity fields for unauthenticated registration. A
+	// 3. Validate the identity fields for unauthenticated registration. A
 	// present-but-unverified address may register its own account: the link row
 	// is always inserted, and its verified flag carries the provider's
 	// attestation as-is, so the row grants no trust the claim did not have.
@@ -999,7 +999,7 @@ func (s *service) linkOrCreate(ctx context.Context, providerID string, info *Use
 		return db.User{}, false, false, gerr
 	}
 
-	// 5. Existing local user check by email. Merging stays fail-closed through
+	// 4. Existing local user check by email. Merging stays fail-closed through
 	// mergeOrConverge: an unverified provider claim never resolves to or attaches
 	// to an owner, only converging on the row a concurrent unverified signup left.
 	existing, err := s.findUserByEmail(ctx, info.Email)
