@@ -2,6 +2,7 @@ package mongostore
 
 import (
 	"context"
+	stderrors "errors"
 	"fmt"
 	"os"
 	"reflect"
@@ -699,6 +700,61 @@ func TestVerifyOAuthAccountTenantScope(t *testing.T) {
 	}
 	if err := verifyOAuthAccountTenantScope(ctx, database); err == nil {
 		t.Fatal("a null provider_tenant_id must refuse startup")
+	}
+}
+
+// TestVerifyOAuthAccountTenantScope_RunsOncePerSchemaVersion pins the one-shot
+// gate: a successful sweep records its schema_migrations marker and later boots
+// skip the scan, while a refused sweep leaves no marker so the next boot
+// re-checks.
+func TestVerifyOAuthAccountTenantScope_RunsOncePerSchemaVersion(t *testing.T) {
+	uri := os.Getenv("TEST_MONGO_URI")
+	if uri == "" {
+		t.Skip("TEST_MONGO_URI unset; skipping live MongoDB tenant scope test")
+	}
+	client, err := mongo.Connect(options.Client().ApplyURI(uri))
+	if err != nil {
+		t.Fatalf("mongo.Connect failed: %v", err)
+	}
+	database := client.Database(fmt.Sprintf("goauth_test_ms_tenant_once_%s", strings.ReplaceAll(uuid.New().String(), "-", "")))
+	t.Cleanup(func() {
+		_ = database.Drop(context.Background())
+		_ = client.Disconnect(context.Background())
+	})
+	ctx := context.Background()
+	links := database.Collection("oauth_accounts")
+	id := uuid.New().String()
+	if _, err := links.InsertOne(ctx, bson.M{
+		"_id": id, "provider_id": "microsoft", "provider_user_id": "sub-1",
+	}); err != nil {
+		t.Fatalf("insert link: %v", err)
+	}
+
+	if err := VerifyOAuthAccountTenantScope(ctx, database); err == nil {
+		t.Fatal("a document without provider_tenant_id must refuse startup")
+	}
+	var marker bson.M
+	err = database.Collection("schema_migrations").FindOne(ctx, bson.M{"_id": oauthTenantScopeCheckID}).Decode(&marker)
+	if !stderrors.Is(err, mongo.ErrNoDocuments) {
+		t.Fatalf("a refused sweep must not record its marker: %v", err)
+	}
+
+	if _, err := links.UpdateOne(ctx, bson.M{"_id": id}, bson.M{"$set": bson.M{"provider_tenant_id": ""}}); err != nil {
+		t.Fatalf("set tenant: %v", err)
+	}
+	if err := VerifyOAuthAccountTenantScope(ctx, database); err != nil {
+		t.Fatalf("a clean collection must pass: %v", err)
+	}
+	if err := database.Collection("schema_migrations").FindOne(ctx, bson.M{"_id": oauthTenantScopeCheckID}).Decode(&marker); err != nil {
+		t.Fatalf("a passing sweep must record its marker: %v", err)
+	}
+
+	// The marker is what keeps the unindexable scan off every later boot.
+	if _, err := links.UpdateOne(ctx, bson.M{"_id": id}, bson.M{"$unset": bson.M{"provider_tenant_id": ""}}); err != nil {
+		t.Fatalf("unset tenant: %v", err)
+	}
+	if err := VerifyOAuthAccountTenantScope(ctx, database); err != nil {
+		t.Fatalf("the sweep must not repeat after its marker is written: %v", err)
 	}
 }
 

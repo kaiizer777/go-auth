@@ -84,10 +84,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   migration that never ran); if it fails after the `ALTER`, do not re-run the
   `ALTER TABLE` — complete the remaining statements by hand and `migrate force
   11`. See the recovery note in the up file.
-- MongoDB has no schema migration: startup refuses an `oauth_accounts` document
-  whose `provider_tenant_id` is missing or not a string, because Mongo would
-  index it as `null` and no tenant-qualified lookup could reach it. Backfill or
-  remove such documents before upgrading.
+- MongoDB has no schema migration: on the first boot of a new schema version it
+  refuses an `oauth_accounts` document whose `provider_tenant_id` is missing or
+  not a string, because Mongo would index it as `null` and no tenant-qualified
+  lookup could reach it. The verdict is recorded in `schema_migrations`, so the
+  scan does not repeat on every start; backfill or remove such documents before
+  upgrading.
 - MySQL only: if migration 000009 fails between `ALTER TABLE` and the backfill,
   version 9 is recorded dirty with the column present but every row still `0`.
   Do not re-run it. Inspect `oauth_accounts`, run the backfill `UPDATE` from the

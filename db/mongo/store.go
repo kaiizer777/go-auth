@@ -164,8 +164,9 @@ func isStandaloneTransactionError(err error) bool {
 }
 
 // Connect establishes a connection to MongoDB, validates connectivity via ping,
-// refuses oauth_accounts documents without a string tenant, and idempotently
-// provisions native indexes and the oauth_accounts.verified data backfill.
+// refuses oauth_accounts documents without a string tenant (once per schema
+// version), and idempotently provisions native indexes and the
+// oauth_accounts.verified data backfill.
 func Connect(cfg config.Config) (*MongoStore, error) {
 	opts := options.Client().ApplyURI(cfg.DatabaseURL)
 
@@ -222,7 +223,7 @@ func Connect(cfg config.Config) (*MongoStore, error) {
 		return nil
 	}
 
-	if err := initOp(verifyOAuthAccountTenantScope, "failed to verify oauth account tenant scope"); err != nil {
+	if err := initOp(VerifyOAuthAccountTenantScope, "failed to verify oauth account tenant scope"); err != nil {
 		return nil, err
 	}
 	if err := initOp(EnsureIndexes, "failed to provision mongodb indexes"); err != nil {
