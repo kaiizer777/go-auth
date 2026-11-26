@@ -2316,8 +2316,12 @@ func TestOAuthService_X_MissingEmail(t *testing.T) {
 			t.Fatalf("expected link user %v, got %v", user.ID, link.UserID)
 		}
 	})
+}
 
+func TestHandleCallbackUntrustedTenant(t *testing.T) {
 	t.Run("untrusted tenant token is rejected with ErrOAuthTenantInvalid", func(t *testing.T) {
+		database := serviceTestDB(t)
+		cfg := serviceTestConfig()
 		sessSvc := session.NewService(database, cfg)
 		// Mock profile carrying untrusted_tenant claim
 		untrustedInfo := &UserInfo{
@@ -2344,6 +2348,64 @@ func TestOAuthService_X_MissingEmail(t *testing.T) {
 		_, _, _, err := msSvc.HandleCallback(context.Background(), rec, req, "microsoft", "code", state, db.SessionTypeCookie)
 		if !errors.Is(err, errors.ErrOAuthTenantInvalid) {
 			t.Fatalf("expected ErrOAuthTenantInvalid, got %v", err)
+		}
+	})
+
+	t.Run("untrusted tenant evicts existing oauth link and rejects callback", func(t *testing.T) {
+		database := serviceTestDB(t)
+		cfg := serviceTestConfig()
+		sessSvc := session.NewService(database, cfg)
+		owner := db.User{ID: uuid.New(), Email: "victim@example.com", PasswordHash: "hash", EmailVerified: true}
+		if err := database.Create(&owner).Error; err != nil {
+			t.Fatalf("create owner: %v", err)
+		}
+		link := db.OAuthAccount{
+			ID:             uuid.New(),
+			UserID:         owner.ID,
+			ProviderID:     "microsoft",
+			ProviderUserID: "ms-untrusted-returning-sub",
+			Email:          owner.Email,
+			Verified:       true,
+		}
+		if err := database.Create(&link).Error; err != nil {
+			t.Fatalf("create link: %v", err)
+		}
+
+		untrustedInfo := &UserInfo{
+			ProviderID:     "microsoft",
+			ProviderUserID: "ms-untrusted-returning-sub",
+			Email:          owner.Email,
+			EmailVerified:  true,
+			Name:           "Untrusted Returning User",
+			RawClaims: map[string]any{
+				"untrusted_tenant": true,
+			},
+		}
+		mockMS := &stubProvider{
+			id:   "microsoft",
+			info: untrustedInfo,
+		}
+		msSvc := NewService(database, sessSvc, map[string]Provider{"microsoft": mockMS}, cfg)
+
+		state, cookie := mustInitiate(t, msSvc, cfg, "microsoft")
+		req := httptest.NewRequest(http.MethodGet, "/auth/oauth/microsoft/callback", nil)
+		req.AddCookie(cookie)
+		rec := httptest.NewRecorder()
+
+		sess, _, _, err := msSvc.HandleCallback(context.Background(), rec, req, "microsoft", "code", state, db.SessionTypeCookie)
+		if !errors.Is(err, errors.ErrOAuthTenantInvalid) {
+			t.Fatalf("expected ErrOAuthTenantInvalid, got %v", err)
+		}
+		if sess != nil {
+			t.Fatalf("expected nil session, got %+v", sess)
+		}
+
+		var count int64
+		if err := database.Model(&db.OAuthAccount{}).Where("provider_id = ? AND provider_user_id = ?", "microsoft", "ms-untrusted-returning-sub").Count(&count).Error; err != nil {
+			t.Fatalf("count oauth links: %v", err)
+		}
+		if count != 0 {
+			t.Fatalf("expected 0 oauth links, got %d", count)
 		}
 	})
 }

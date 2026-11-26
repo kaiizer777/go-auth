@@ -19,8 +19,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/kaiizer777/go-auth/config"
+	"github.com/kaiizer777/go-auth/db"
 	"github.com/kaiizer777/go-auth/errors"
+	"github.com/kaiizer777/go-auth/session"
 )
 
 // helper to mint a valid test RSA key and generate RS256 JWTs
@@ -1153,12 +1156,12 @@ func TestMicrosoftProvider_DomainOwnershipAttestation(t *testing.T) {
 		wantVerified  bool
 		wantUntrusted bool
 	}{
-		{name: "no allowlist string one", tenant: unlistedTenant, edov: "1", setEdov: true, wantVerified: true, wantUntrusted: true},
-		{name: "no allowlist string true", tenant: unlistedTenant, edov: "true", setEdov: true, wantVerified: true, wantUntrusted: true},
-		{name: "no allowlist bool true", tenant: unlistedTenant, edov: true, setEdov: true, wantVerified: true, wantUntrusted: true},
-		{name: "no allowlist string zero", tenant: unlistedTenant, edov: "0", setEdov: true, wantUntrusted: true},
-		{name: "no allowlist bool false", tenant: unlistedTenant, edov: false, setEdov: true, wantUntrusted: true},
-		{name: "no allowlist missing claim", tenant: unlistedTenant, wantUntrusted: true},
+		{name: "empty allowlist string one", tenant: unlistedTenant, edov: "1", setEdov: true, wantVerified: true},
+		{name: "empty allowlist string true", tenant: unlistedTenant, edov: "true", setEdov: true, wantVerified: true},
+		{name: "empty allowlist bool true", tenant: unlistedTenant, edov: true, setEdov: true, wantVerified: true},
+		{name: "empty allowlist string zero", tenant: unlistedTenant, edov: "0", setEdov: true},
+		{name: "empty allowlist bool false", tenant: unlistedTenant, edov: false, setEdov: true},
+		{name: "empty allowlist missing claim", tenant: unlistedTenant},
 		// The allowlist bounds tenant admission; domain attestation
 		// independently decides whether the email is verified.
 		{name: "allowlist listed tenant unattested", trusted: allowlist, tenant: listedTenant},
@@ -1295,24 +1298,26 @@ func TestMicrosoftProvider_TenantAllowlist(t *testing.T) {
 	}
 
 	tests := []struct {
-		name         string
-		tenantCfg    string
-		trusted      []string
-		tid          string
-		issuer       string
-		wantTrusted  bool
-		wantVerified bool
+		name          string
+		tenantCfg     string
+		trusted       []string
+		tid           string
+		issuer        string
+		wantUntrusted bool
+		wantVerified  bool
 	}{
-		{name: "no allowlist denies any tenant (fail-closed)", tid: "tenant-a", wantTrusted: false, wantVerified: true},
-		{name: "listed guid", trusted: []string{"tenant-a"}, tid: "tenant-a", wantTrusted: true, wantVerified: true},
-		{name: "listed guid uppercase entry", trusted: []string{"TENANT-A"}, tid: "tenant-a", wantTrusted: true, wantVerified: true},
-		{name: "listed guid uppercase tid", trusted: []string{"tenant-a"}, tid: "TENANT-A", wantTrusted: true, wantVerified: true},
-		{name: "listed domain resolves to guid", trusted: []string{"contoso.onmicrosoft.com"}, tid: contosoTenantGUID, wantTrusted: true, wantVerified: true},
-		{name: "listed domain uppercase entry", trusted: []string{"Contoso.OnMicrosoft.com"}, tid: contosoTenantGUID, wantTrusted: true, wantVerified: true},
-		{name: "domain tenant and domain allowlist", tenantCfg: "contoso.onmicrosoft.com", trusted: []string{"contoso.onmicrosoft.com"}, tid: contosoTenantGUID, wantTrusted: true, wantVerified: true},
-		{name: "allowlist domain does not match", trusted: []string{"contoso.onmicrosoft.com"}, tid: otherTenantGUID, wantVerified: true},
-		{name: "unlisted tenant rejected despite attestation", trusted: []string{"tenant-a"}, tid: "tenant-b", wantVerified: true},
-		{name: "unlisted domain rejected", trusted: []string{"tenant-a"}, tid: "evil.example.com", wantVerified: true},
+		{name: "empty allowlist admits any tenant", tid: "tenant-a", wantVerified: true},
+		{name: "empty allowlist admits any tenant under organizations", tenantCfg: "organizations", tid: "tenant-a", wantVerified: true},
+		{name: "empty allowlist admits the pinned tenant", tenantCfg: "tenant-a", tid: "tenant-a", wantVerified: true},
+		{name: "listed guid", trusted: []string{"tenant-a"}, tid: "tenant-a", wantVerified: true},
+		{name: "listed guid uppercase entry", trusted: []string{"TENANT-A"}, tid: "tenant-a", wantVerified: true},
+		{name: "listed guid uppercase tid", trusted: []string{"tenant-a"}, tid: "TENANT-A", wantVerified: true},
+		{name: "listed domain resolves to guid", trusted: []string{"contoso.onmicrosoft.com"}, tid: contosoTenantGUID, wantVerified: true},
+		{name: "listed domain uppercase entry", trusted: []string{"Contoso.OnMicrosoft.com"}, tid: contosoTenantGUID, wantVerified: true},
+		{name: "domain tenant and domain allowlist", tenantCfg: "contoso.onmicrosoft.com", trusted: []string{"contoso.onmicrosoft.com"}, tid: contosoTenantGUID, wantVerified: true},
+		{name: "allowlist domain does not match", trusted: []string{"contoso.onmicrosoft.com"}, tid: otherTenantGUID, wantUntrusted: true, wantVerified: true},
+		{name: "unlisted tenant rejected despite attestation", trusted: []string{"tenant-a"}, tid: "tenant-b", wantUntrusted: true, wantVerified: true},
+		{name: "unlisted domain rejected", trusted: []string{"tenant-a"}, tid: "evil.example.com", wantUntrusted: true, wantVerified: true},
 	}
 
 	for _, tt := range tests {
@@ -1337,8 +1342,8 @@ func TestMicrosoftProvider_TenantAllowlist(t *testing.T) {
 			if err != nil {
 				t.Fatalf("VerifyIDToken = %v", err)
 			}
-			if c.UntrustedTenant == tt.wantTrusted {
-				t.Errorf("UntrustedTenant = %v; want trusted = %v", c.UntrustedTenant, tt.wantTrusted)
+			if c.UntrustedTenant != tt.wantUntrusted {
+				t.Errorf("UntrustedTenant = %v; want %v", c.UntrustedTenant, tt.wantUntrusted)
 			}
 			if c.EmailVerified != tt.wantVerified {
 				t.Errorf("EmailVerified = %v; want %v", c.EmailVerified, tt.wantVerified)
@@ -1554,7 +1559,90 @@ func TestMicrosoftProvider_SingleTenantVerification(t *testing.T) {
 			if c.EmailVerified != tt.wantVerified {
 				t.Errorf("EmailVerified = %v; want %v", c.EmailVerified, tt.wantVerified)
 			}
+			if c.UntrustedTenant {
+				t.Error("a pinned single-tenant authority with an empty allowlist must stay trusted")
+			}
 		})
+	}
+}
+
+// TestMicrosoftProvider_PinnedTenantEmptyAllowlistKeepsLink pins the permissive
+// contract through the linking gate: the pinned authority's identity carries no
+// untrusted marker, so the existing link survives and the callback mints a session.
+func TestMicrosoftProvider_PinnedTenantEmptyAllowlistKeepsLink(t *testing.T) {
+	privKey, nRaw, eRaw := generateTestRSAKey(t)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(JWKDoc{Keys: []JWKKey{{
+			Kty: "RSA", Use: "sig", Kid: "ms-key-1", Alg: "RS256", N: nRaw, E: eRaw,
+		}}})
+	}))
+	defer server.Close()
+
+	p := NewMicrosoftProvider(config.MicrosoftConfig{
+		ClientID:    "client-test-id",
+		Tenant:      contosoTenantGUID,
+		RedirectURI: "https://example.com/callback",
+	})
+	p.client = server.Client()
+	p.jwksMgr = NewJWKSManager(server.URL, p.client, time.Hour)
+	p.jwksRetriever = p.jwksMgr
+
+	tok := signRS256JWT(t, privKey, "ms-key-1", map[string]any{
+		"iss":   "https://login.microsoftonline.com/" + contosoTenantGUID + "/v2.0",
+		"sub":   "pinned-sub",
+		"aud":   "client-test-id",
+		"exp":   time.Now().Add(10 * time.Minute).Unix(),
+		"email": "pinned@contoso.com",
+		"tid":   contosoTenantGUID,
+	})
+	info, err := p.FetchUserInfo(context.Background(), &OAuthToken{IDToken: tok})
+	if err != nil {
+		t.Fatalf("FetchUserInfo = %v", err)
+	}
+	if _, ok := info.RawClaims["untrusted_tenant"]; ok {
+		t.Fatal("pinned single-tenant authority with an empty allowlist must not be marked untrusted")
+	}
+
+	database, cfg, _, _ := setupServiceTest(t, info)
+	owner := db.User{ID: uuid.New(), Email: "pinned@contoso.com", PasswordHash: "hash", EmailVerified: true}
+	if err := database.Create(&owner).Error; err != nil {
+		t.Fatalf("create owner: %v", err)
+	}
+	link := db.OAuthAccount{
+		ID:             uuid.New(),
+		UserID:         owner.ID,
+		ProviderID:     "microsoft",
+		ProviderUserID: info.ProviderUserID,
+		Email:          owner.Email,
+		Verified:       true,
+	}
+	if err := database.Create(&link).Error; err != nil {
+		t.Fatalf("create link: %v", err)
+	}
+
+	svc := NewService(database, session.NewService(database, cfg),
+		map[string]Provider{"microsoft": &stubProvider{id: "microsoft", info: info}}, cfg)
+	state, cookie := mustInitiate(t, svc, cfg, "microsoft")
+	req := httptest.NewRequest(http.MethodGet, "/auth/oauth/microsoft/callback", nil)
+	req.AddCookie(cookie)
+
+	sess, _, _, err := svc.HandleCallback(context.Background(), httptest.NewRecorder(), req, "microsoft", "code", state, db.SessionTypeCookie)
+	if err != nil {
+		t.Fatalf("HandleCallback = %v", err)
+	}
+	if sess == nil || sess.UserID != owner.ID {
+		t.Fatalf("session = %+v; want a session for user %v", sess, owner.ID)
+	}
+
+	var count int64
+	if err := database.Model(&db.OAuthAccount{}).
+		Where("provider_id = ? AND provider_user_id = ?", "microsoft", info.ProviderUserID).
+		Count(&count).Error; err != nil {
+		t.Fatalf("count oauth links: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("oauth links = %d; want the existing link preserved", count)
 	}
 }
 
@@ -1567,7 +1655,9 @@ func TestMicrosoftProvider_UserInfoTenantGate(t *testing.T) {
 	defer discovery.Close()
 
 	var userinfoClaims atomic.Value
+	var userinfoRequests atomic.Int32
 	userinfo := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		userinfoRequests.Add(1)
 		_ = json.NewEncoder(w).Encode(userinfoClaims.Load())
 	}))
 	defer userinfo.Close()
@@ -1602,7 +1692,11 @@ func TestMicrosoftProvider_UserInfoTenantGate(t *testing.T) {
 	for _, tt := range scoped {
 		t.Run("tenant constraint fails closed: "+tt.name, func(t *testing.T) {
 			userinfoClaims.Store(map[string]any{"sub": "sub-1", "email": "user@example.com"})
+			before := userinfoRequests.Load()
 			_, err := newProvider(t, tt.tenant, tt.trusted).FetchUserInfo(context.Background(), &OAuthToken{AccessToken: "access-token"})
+			if got := userinfoRequests.Load() - before; got != 0 {
+				t.Errorf("userinfo requests = %d; a tenant-constrained deployment must reject before the request", got)
+			}
 			if err == nil {
 				t.Fatal("expected a fail-closed error for a tenant-scoped deployment")
 			}
@@ -1616,6 +1710,9 @@ func TestMicrosoftProvider_UserInfoTenantGate(t *testing.T) {
 		t.Errorf("discovery requests = %d; the gate must not resolve tenants to enforce them", got)
 	}
 
+	// No allowlist and the common authority is the permissive default: there is
+	// no tenant restriction to enforce, so the userinfo identity is admitted
+	// without a marker.
 	t.Run("multi-tenant deployment accepts a documented userinfo payload", func(t *testing.T) {
 		userinfoClaims.Store(map[string]any{
 			"sub":         "sub-1",
@@ -1624,9 +1721,13 @@ func TestMicrosoftProvider_UserInfoTenantGate(t *testing.T) {
 			"given_name":  "User",
 			"email":       "user@example.com",
 		})
+		before := userinfoRequests.Load()
 		user, err := newProvider(t, "common", nil).FetchUserInfo(context.Background(), &OAuthToken{AccessToken: "access-token"})
 		if err != nil {
 			t.Fatalf("FetchUserInfo = %v", err)
+		}
+		if got := userinfoRequests.Load() - before; got != 1 {
+			t.Errorf("userinfo requests = %d; want 1", got)
 		}
 		if user.EmailVerified {
 			t.Error("userinfo alone must never verify the email")
@@ -1635,7 +1736,7 @@ func TestMicrosoftProvider_UserInfoTenantGate(t *testing.T) {
 			t.Errorf("ProviderUserID = %q; want sub-1", user.ProviderUserID)
 		}
 		if _, ok := user.RawClaims["untrusted_tenant"]; ok {
-			t.Error("multi-tenant userinfo must not carry a tenant marker it cannot evaluate")
+			t.Error("a permissive deployment must not carry a tenant marker it does not evaluate")
 		}
 	})
 }

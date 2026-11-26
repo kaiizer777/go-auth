@@ -230,8 +230,9 @@ func (p *MicrosoftProvider) fetchTenantGUID(ctx context.Context, domain string) 
 
 // tenantTrusted reports whether the allowlist accepts the verified tenant.
 // Entries may be GUIDs or domains; a domain entry is resolved to its GUID so
-// it matches the GUID the token actually carries. An empty allowlist denies
-// all tenants (fail-closed).
+// it matches the GUID the token actually carries. An empty allowlist is
+// permissive: no allowlist means no tenant restriction, so every tenant the
+// configured authority admits is trusted.
 //
 // Entries are walked in sorted order, so the outcome never depends on map
 // iteration order. Only a domain entry can require discovery, and a resolution
@@ -241,7 +242,7 @@ func (p *MicrosoftProvider) fetchTenantGUID(ctx context.Context, domain string) 
 // than silently marking the tenant untrusted.
 func (p *MicrosoftProvider) tenantTrusted(ctx context.Context, tenantID, issuer string) (bool, error) {
 	if len(p.trustedTenants) == 0 {
-		return false, nil
+		return true, nil
 	}
 	ids := []string{normalizeTenant(tenantID), normalizeTenant(issuerTenant(issuer))}
 	matches := func(candidate string) bool {
@@ -577,9 +578,10 @@ func (p *MicrosoftProvider) FetchUserInfo(ctx context.Context, token *OAuthToken
 		return nil, errors.New(errors.CodeOAuthProviderError, "token has neither id_token nor access_token", nil)
 	}
 
-	// /oidc/userinfo carries no tenant and no signed issuer, so an authority
-	// narrower than common or an allowlist cannot be enforced on this path.
-	// Fail closed with a configuration error instead of trusting the token.
+	// /oidc/userinfo carries no tenant and no signed issuer, so a configured
+	// allowlist or an authority narrower than common cannot be enforced on this
+	// path. Reject with a configuration error before the request: common with an
+	// empty allowlist is the only permissive case, and it has nothing to enforce.
 	if p.tenantScoped() {
 		return nil, errors.New(errors.CodeInvalidConfig,
 			"microsoft userinfo cannot validate the token tenant without a verified id_token", nil)

@@ -261,7 +261,7 @@ func TestSecurity_UntrustedTenantNotLinkedForActiveSession(t *testing.T) {
 	}
 }
 
-func TestSecurity_UntrustedTenantKeepsExistingLink(t *testing.T) {
+func TestSecurity_UntrustedTenantEvictsAndGatesExistingLink(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	database, store := setupAntiHijackingDB(t)
@@ -295,11 +295,19 @@ func TestSecurity_UntrustedTenantKeepsExistingLink(t *testing.T) {
 	cbReq := httptest.NewRequest(http.MethodGet, "/auth/oauth/microsoft/callback?state="+state, nil)
 	cbReq.AddCookie(stateCookie)
 	sess, _, _, err := svc.HandleCallback(ctx, httptest.NewRecorder(), cbReq, "microsoft", "code-ms", state, db.SessionTypeCookie)
-	if err != nil {
-		t.Fatalf("existing link must keep signing in, got %v", err)
+	if sess != nil {
+		t.Fatalf("session issued for %v; want none", sess.UserID)
 	}
-	if sess.UserID != owner.ID {
-		t.Fatalf("session user = %v; want %v", sess.UserID, owner.ID)
+	if !errors.Is(err, errors.ErrOAuthTenantInvalid) {
+		t.Fatalf("expected ErrOAuthTenantInvalid, got %v", err)
+	}
+
+	var remainingLinks int64
+	if err := database.Model(&db.OAuthAccount{}).Where("provider_id = ? AND provider_user_id = ?", "microsoft", "ms-untrusted-linked-sub").Count(&remainingLinks).Error; err != nil {
+		t.Fatalf("count oauth links: %v", err)
+	}
+	if remainingLinks != 0 {
+		t.Fatalf("expected 0 oauth links for untrusted tenant, got %d", remainingLinks)
 	}
 }
 

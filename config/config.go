@@ -45,8 +45,10 @@ type ProviderConfig struct {
 
 	// Authority settings shared across adapters; currently consumed only by
 	// Microsoft Entra ID. Empty Tenant and non-positive JWKSCacheTTL fall back
-	// to provider defaults ("common" / 24h); empty TrustedTenants means no
-	// allowlist, not deny-all.
+	// to provider defaults ("common" / 24h). Empty TrustedTenants means no
+	// allowlist: every tenant the configured authority admits stays trusted. A
+	// non-empty allowlist marks unlisted tenants untrusted and evicts their
+	// existing links on the next callback.
 	Tenant         string        `json:"tenant,omitempty"`
 	TrustedTenants []string      `json:"trusted_tenants,omitempty"`
 	JWKSCacheTTL   time.Duration `json:"jwks_cache_ttl,omitempty"`

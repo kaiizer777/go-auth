@@ -846,10 +846,11 @@ func isClaimedAccount(u db.User) bool {
 	return u.EmailVerified
 }
 
-// invalidateLink deletes a spent unverified link. The delete is best-effort by
-// design: the refusal does not depend on it because link trust is re-derived
-// from the owner on every callback, so a store failure is logged rather than
-// turning a rejected login into a 500.
+// invalidateLink deletes a link that must never sign in again: a spent
+// unverified link, or a verified one whose tenant dropped out of the allowlist.
+// The delete is best-effort by design: the refusal does not depend on it because
+// link trust is re-derived from the owner and the tenant on every callback, so a
+// store failure is logged rather than turning a rejected login into a 500.
 func (s *service) invalidateLink(ctx context.Context, link db.OAuthAccount) {
 	if err := s.store.OAuthAccounts().Delete(ctx, link.ID); err != nil {
 		slog.WarnContext(ctx, "oauth_link_invalidate_failed",
@@ -921,6 +922,18 @@ func (s *service) linkOrCreate(ctx context.Context, providerID string, info *Use
 	if err != nil {
 		return db.User{}, false, false, err
 	}
+
+	var isUntrusted bool
+	if info != nil && info.RawClaims != nil {
+		isUntrusted, _ = info.RawClaims["untrusted_tenant"].(bool)
+	}
+	if isUntrusted {
+		if found {
+			s.invalidateLink(ctx, link)
+		}
+		return db.User{}, false, false, errors.ErrOAuthTenantInvalid
+	}
+
 	if found {
 		if activeUserID != "" && user.ID.String() != activeUserID {
 			return db.User{}, false, false, errors.ErrOAuthAccountAlreadyLinked
@@ -932,16 +945,7 @@ func (s *service) linkOrCreate(ctx context.Context, providerID string, info *Use
 		return user, false, false, nil
 	}
 
-	// 2. Microsoft "nOauth" defense: fail closed on untrusted external tenants.
-	// Runs before the active-session branch so a signed-in callback cannot
-	// persist an attacker-tenant identity onto the victim's account, while
-	// identities linked before this guard existed (step 1) keep signing in
-	// instead of being locked out.
-	if isUntrusted, _ := info.RawClaims["untrusted_tenant"].(bool); isUntrusted {
-		return db.User{}, false, false, errors.ErrOAuthTenantInvalid
-	}
-
-	// 3. Active session explicit linking: link provider to currently authenticated session user.
+	// 2. Active session explicit linking: link provider to currently authenticated session user.
 	// Fail closed: an unresolvable link owner never falls through to registration.
 	if activeUserID != "" {
 		uid, parseErr := uuid.Parse(activeUserID)
@@ -988,7 +992,7 @@ func (s *service) linkOrCreate(ctx context.Context, providerID string, info *Use
 		return user, linked, false, nil
 	}
 
-	// 4. Validate the identity fields for unauthenticated registration. A
+	// 3. Validate the identity fields for unauthenticated registration. A
 	// present-but-unverified address may register its own account: the link row
 	// is always inserted, and its verified flag carries the provider's
 	// attestation as-is, so the row grants no trust the claim did not have.
@@ -996,7 +1000,7 @@ func (s *service) linkOrCreate(ctx context.Context, providerID string, info *Use
 		return db.User{}, false, false, gerr
 	}
 
-	// 5. Existing local user check by email. Merging stays fail-closed through
+	// 4. Existing local user check by email. Merging stays fail-closed through
 	// mergeOrConverge: an unverified provider claim never resolves to or attaches
 	// to an owner, only converging on the row a concurrent unverified signup left.
 	existing, err := s.findUserByEmail(ctx, info.Email)
