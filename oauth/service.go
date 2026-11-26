@@ -792,8 +792,9 @@ func (s *service) linkRacedUser(ctx context.Context, providerID string, info *Us
 // mergeOrConverge decides what an address collision with a live local account
 // may do. An unverified provider claim never merges into an established
 // account and never resolves an account by email alone. It may only converge
-// on an existing row if the provider identity (provider_id + provider_user_id)
-// already matches that row, ensuring an unattested email cannot take over an
+// on an existing row if the provider identity
+// (provider_id, provider_tenant_id, provider_user_id) already matches that row,
+// ensuring an unattested email cannot take over an
 // unclaimed account. The create-race path and the pre-existing-owner path share
 // this rule so the outcome cannot depend on which goroutine observes the winner's
 // commit first.

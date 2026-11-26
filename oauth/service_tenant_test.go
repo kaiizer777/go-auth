@@ -183,6 +183,22 @@ func TestUntrustedTenantEvictionIsTenantScoped(t *testing.T) {
 	if err := database.Create(&trusted).Error; err != nil {
 		t.Fatalf("create link: %v", err)
 	}
+	tenantBOwner := db.User{ID: uuid.New(), Email: "tenant-b@example.com", EmailVerified: true}
+	if err := database.Create(&tenantBOwner).Error; err != nil {
+		t.Fatalf("create tenant B owner: %v", err)
+	}
+	untrustedRow := db.OAuthAccount{
+		ID:               uuid.New(),
+		UserID:           tenantBOwner.ID,
+		ProviderID:       "microsoft",
+		ProviderTenantID: "tenant-b",
+		ProviderUserID:   sharedSub,
+		Email:            tenantBOwner.Email,
+		Verified:         true,
+	}
+	if err := database.Create(&untrustedRow).Error; err != nil {
+		t.Fatalf("create tenant B link: %v", err)
+	}
 
 	svc := NewService(database, session.NewService(database, cfg), map[string]Provider{"microsoft": &stubProvider{
 		id: "microsoft",
@@ -205,6 +221,16 @@ func TestUntrustedTenantEvictionIsTenantScoped(t *testing.T) {
 	}
 	if !errors.Is(err, errors.ErrOAuthTenantInvalid) {
 		t.Fatalf("expected ErrOAuthTenantInvalid, got %v", err)
+	}
+
+	var evicted int64
+	if err := database.Model(&db.OAuthAccount{}).
+		Where("provider_tenant_id = ? AND provider_user_id = ?", "tenant-b", sharedSub).
+		Count(&evicted).Error; err != nil {
+		t.Fatalf("count tenant B links: %v", err)
+	}
+	if evicted != 0 {
+		t.Fatalf("tenant B links = %d; an untrusted tenant must lose the row it owns", evicted)
 	}
 
 	var survived int64

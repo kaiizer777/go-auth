@@ -1649,11 +1649,22 @@ func TestMicrosoftProvider_PinnedTenantEmptyAllowlistKeepsLink(t *testing.T) {
 
 func TestMicrosoftProvider_UserInfoTenantGate(t *testing.T) {
 	var discoveryRequests atomic.Int32
-	discovery := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	var discoveryURL string
+	discovery := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		discoveryRequests.Add(1)
-		http.NotFound(w, nil)
+		if strings.HasSuffix(r.URL.Path, "/contoso.onmicrosoft.com/v2.0/.well-known/openid-configuration") {
+			_ = json.NewEncoder(w).Encode(OIDCDiscovery{
+				Issuer:                discoveryURL + "/" + contosoTenantGUID + "/v2.0",
+				AuthorizationEndpoint: discoveryURL + "/authorize",
+				TokenEndpoint:         discoveryURL + "/token",
+				JWKSURI:               discoveryURL + "/keys",
+			})
+			return
+		}
+		http.NotFound(w, r)
 	}))
 	defer discovery.Close()
+	discoveryURL = discovery.URL
 
 	var userinfoClaims atomic.Value
 	var userinfoRequests atomic.Int32
@@ -1717,6 +1728,7 @@ func TestMicrosoftProvider_UserInfoTenantGate(t *testing.T) {
 		wantTenant string
 	}{
 		{name: "pinned guid", tenant: contosoTenantGUID, wantTenant: contosoTenantGUID},
+		{name: "pinned domain", tenant: "contoso.onmicrosoft.com", wantTenant: contosoTenantGUID},
 		{name: "pinned guid on its allowlist", tenant: contosoTenantGUID, trusted: []string{contosoTenantGUID}, wantTenant: contosoTenantGUID},
 		{name: "consumers authority", tenant: "consumers", wantTenant: MicrosoftConsumerTenantGUID},
 	}
@@ -1761,8 +1773,8 @@ func TestMicrosoftProvider_UserInfoTenantGate(t *testing.T) {
 		}
 	})
 
-	if got := discoveryRequests.Load(); got != 0 {
-		t.Errorf("discovery requests = %d; a named authority needs no discovery", got)
+	if got := discoveryRequests.Load(); got != 1 {
+		t.Errorf("discovery requests = %d; only the domain-pinned authority needs one", got)
 	}
 }
 

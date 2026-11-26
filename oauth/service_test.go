@@ -604,6 +604,37 @@ func TestHandleCallbackEmailGate(t *testing.T) {
 		requireCode(t, err, errors.CodeOAuthProviderError, http.StatusBadGateway)
 		requireIdentityRows(t, database, 0, 0, 0)
 	})
+
+	microsoftCallback := func(t *testing.T, info *UserInfo) (*gorm.DB, error) {
+		t.Helper()
+		database := serviceTestDB(t)
+		cfg := serviceTestConfig()
+		svc := NewService(database, session.NewService(database, cfg),
+			map[string]Provider{"microsoft": &stubProvider{id: "microsoft", info: info}}, cfg)
+		state, cookie := mustInitiate(t, svc, cfg, "microsoft")
+		req := httptest.NewRequest(http.MethodGet, "/auth/oauth/microsoft/callback", nil)
+		req.AddCookie(cookie)
+		_, _, _, err := svc.HandleCallback(req.Context(), httptest.NewRecorder(), req, "microsoft", "code-1", state, db.SessionTypeCookie)
+		return database, err
+	}
+
+	t.Run("microsoft identity without tenant rejected as provider error", func(t *testing.T) {
+		database, err := microsoftCallback(t, &UserInfo{
+			ProviderID: "microsoft", ProviderUserID: "sub-no-tenant",
+			Email: "jane@example.com", EmailVerified: true,
+		})
+		requireCode(t, err, errors.CodeOAuthProviderError, http.StatusBadGateway)
+		requireIdentityRows(t, database, 0, 0, 0)
+	})
+
+	t.Run("oversized microsoft tenant rejected as provider error", func(t *testing.T) {
+		database, err := microsoftCallback(t, &UserInfo{
+			ProviderID: "microsoft", ProviderTenantID: strings.Repeat("t", providerTenantMaxLen+1),
+			ProviderUserID: "sub-long-tenant", Email: "jane@example.com", EmailVerified: true,
+		})
+		requireCode(t, err, errors.CodeOAuthProviderError, http.StatusBadGateway)
+		requireIdentityRows(t, database, 0, 0, 0)
+	})
 }
 
 // TestUnverifiedSignupLinkProvenance pins what an unverified provider claim
