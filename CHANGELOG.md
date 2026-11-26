@@ -78,8 +78,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `(provider_id, provider_tenant_id, provider_user_id)`. The column add requires
   an empty `oauth_accounts` table: Postgres rejects a non-empty table because the
   `NOT NULL` column has no default, and MySQL aborts before the `ALTER` rather
-  than backfilling the implicit `''` scope. MySQL: if the migration fails midway,
-  do not re-run the `ALTER TABLE`; see the recovery note in the up file.
+  than backfilling the implicit `''` scope. MySQL, two branches: if the
+  empty-table guard trips, nothing has been changed — empty the table, then
+  `migrate force 10` and re-run 000011 (never force 11, which would record a
+  migration that never ran); if it fails after the `ALTER`, do not re-run the
+  `ALTER TABLE` — complete the remaining statements by hand and `migrate force
+  11`. See the recovery note in the up file.
 - MongoDB has no schema migration: startup refuses an `oauth_accounts` document
   whose `provider_tenant_id` is missing or not a string, because Mongo would
   index it as `null` and no tenant-qualified lookup could reach it. Backfill or

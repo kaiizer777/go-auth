@@ -13,21 +13,24 @@
 -- before the ALTER instead of backfilling the '' scope. A link whose tenant was
 -- never recorded cannot be invented.
 --
--- MySQL DDL is not transactional and ADD COLUMN has no IF NOT EXISTS here, so a
--- failure after the ALTER records version 11 dirty with the column present but
--- the old constraint still enforcing. Recovery: do NOT re-run the ALTER.
--- Check information_schema for oauth_accounts.provider_tenant_id, then run the
--- CREATE INDEX and DROP INDEX below by hand, then force version 11
--- (migrate force 11) so the migrator stops retrying the ALTER.
-DROP PROCEDURE IF EXISTS fail_if_oauth_accounts_not_empty;
-CREATE PROCEDURE fail_if_oauth_accounts_not_empty() BEGIN
-    IF EXISTS (SELECT 1 FROM oauth_accounts LIMIT 1) THEN
-        SIGNAL SQLSTATE '45000'
-            SET MESSAGE_TEXT = '000011 refused: oauth_accounts is not empty; provider_tenant_id cannot be invented for existing links';
-    END IF;
-END;
-CALL fail_if_oauth_accounts_not_empty();
-DROP PROCEDURE IF EXISTS fail_if_oauth_accounts_not_empty;
+-- Guard: copying one existing link back into the table collides with the primary
+-- key, so it aborts (1062) exactly when the table holds a row and inserts nothing
+-- when it is empty. It needs only SELECT and INSERT on oauth_accounts — DML this
+-- migration set already runs on the table — so no stored routine, temporary
+-- table, or additional grant is required.
+--
+-- MySQL DDL is not transactional, so the two failure branches recover differently:
+--   * Guard aborted (Duplicate entry ... for key 'oauth_accounts.PRIMARY'):
+--     nothing was changed; the column is absent and the schema is still 000010.
+--     The links block the upgrade by design — their tenant was never recorded.
+--     Delete or archive them (owners re-link after the upgrade), then
+--     `migrate force 10` and re-run 000011. Do not force 11: 000011 never ran.
+--   * Failed after the ALTER (column present): do NOT re-run the ALTER. Check
+--     information_schema for oauth_accounts.provider_tenant_id, run the CREATE
+--     INDEX and DROP INDEX below by hand, then `migrate force 11`.
+INSERT INTO oauth_accounts (id, user_id, provider_id, provider_user_id, email, created_at, updated_at, verified)
+SELECT id, user_id, provider_id, provider_user_id, email, created_at, updated_at, verified
+FROM oauth_accounts LIMIT 1;
 
 ALTER TABLE oauth_accounts ADD COLUMN provider_tenant_id VARCHAR(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL;
 
