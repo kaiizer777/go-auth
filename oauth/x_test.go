@@ -77,6 +77,56 @@ func TestXProvider_AuthCodeURL(t *testing.T) {
 	}
 }
 
+// xRetryAfterFor asserts code maps to a *RateLimitError carrying a usable retry hint and returns it.
+func xRetryAfterFor(t *testing.T, p *XProvider, code string) int {
+	t.Helper()
+	_, err := p.ExchangeCode(context.Background(), code, "test-code-verifier")
+	if err == nil {
+		t.Fatalf("ExchangeCode(%q) error = nil; want rate limit", code)
+	}
+	if !errors.Is(err, errors.ErrOAuthRateLimitExceeded) {
+		t.Fatalf("ExchangeCode(%q) error = %v; want ErrOAuthRateLimitExceeded", code, err)
+	}
+	var rle *RateLimitError
+	if !errors.As(err, &rle) {
+		t.Fatalf("ExchangeCode(%q) error type = %T; want *RateLimitError", code, err)
+	}
+	retryAfter, ok := RetryAfterFromError(err)
+	if !ok {
+		t.Fatalf("ExchangeCode(%q) retry hint missing in %v", code, err)
+	}
+	if retryAfter != rle.RetryAfter {
+		t.Fatalf("RetryAfterFromError = %d; RateLimitError.RetryAfter = %d", retryAfter, rle.RetryAfter)
+	}
+	return retryAfter
+}
+
+// xRetryAfterMissing asserts code maps to a *RateLimitError without a usable retry hint.
+func xRetryAfterMissing(t *testing.T, p *XProvider, code string) {
+	t.Helper()
+	_, err := p.ExchangeCode(context.Background(), code, "test-code-verifier")
+	if err == nil || !errors.Is(err, errors.ErrOAuthRateLimitExceeded) {
+		t.Fatalf("ExchangeCode(%q) error = %v; want ErrOAuthRateLimitExceeded", code, err)
+	}
+	var rle *RateLimitError
+	if !errors.As(err, &rle) {
+		t.Fatalf("ExchangeCode(%q) error type = %T; want *RateLimitError", code, err)
+	}
+	if retryAfter, ok := RetryAfterFromError(err); ok {
+		t.Fatalf("ExchangeCode(%q) RetryAfterFromError = (%d, true); want (0, false)", code, retryAfter)
+	}
+}
+
+// xProviderError asserts err is a provider error and returns it.
+func xProviderError(t *testing.T, err error) *errors.Error {
+	t.Helper()
+	var appErr *errors.Error
+	if !errors.As(err, &appErr) || appErr.Code() != errors.CodeOAuthProviderError {
+		t.Fatalf("error = %v; want CodeOAuthProviderError", err)
+	}
+	return appErr
+}
+
 func TestXProvider_ExchangeCode(t *testing.T) {
 	t.Parallel()
 
@@ -127,6 +177,11 @@ func TestXProvider_ExchangeCode(t *testing.T) {
 		}
 
 		code := r.FormValue("code")
+		writeProblem := func(w http.ResponseWriter, status int, body any) {
+			w.Header().Set("Content-Type", "application/problem+json")
+			w.WriteHeader(status)
+			_ = json.NewEncoder(w).Encode(body)
+		}
 		if code == "rate-limited-code" {
 			w.Header().Set("x-rate-limit-reset", strconv.FormatInt(time.Now().Add(90*time.Second).Unix(), 10))
 			w.Header().Set("Content-Type", "application/json")
@@ -161,6 +216,103 @@ func TestXProvider_ExchangeCode(t *testing.T) {
 				"type":   "about:blank",
 				"status": 429,
 			})
+			return
+		}
+		if code == "rate-limited-http-date-code" {
+			w.Header().Set("Retry-After", time.Now().Add(90*time.Second).UTC().Format(http.TimeFormat))
+			w.Header().Set("x-rate-limit-reset", strconv.FormatInt(time.Now().Add(600*time.Second).Unix(), 10))
+			writeProblem(w, http.StatusTooManyRequests, map[string]any{"status": 429})
+			return
+		}
+		if code == "rate-limited-http-date-past-code" {
+			w.Header().Set("Retry-After", time.Now().Add(-60*time.Second).UTC().Format(http.TimeFormat))
+			writeProblem(w, http.StatusTooManyRequests, map[string]any{"status": 429})
+			return
+		}
+		if code == "rate-limited-http-date-far-code" {
+			w.Header().Set("Retry-After", time.Date(3000, time.January, 1, 0, 0, 0, 0, time.UTC).Format(http.TimeFormat))
+			writeProblem(w, http.StatusTooManyRequests, map[string]any{"status": 429})
+			return
+		}
+		if code == "rate-limited-garbage-code" {
+			w.Header().Set("Retry-After", "soon")
+			w.Header().Set("x-rate-limit-reset", strconv.FormatInt(time.Now().Add(75*time.Second).Unix(), 10))
+			writeProblem(w, http.StatusTooManyRequests, map[string]any{"status": 429})
+			return
+		}
+		if code == "rate-limited-garbage-no-fallback-code" {
+			w.Header().Set("Retry-After", "soon")
+			writeProblem(w, http.StatusTooManyRequests, map[string]any{"status": 429})
+			return
+		}
+		if code == "rate-limited-zero-code" {
+			w.Header().Set("Retry-After", "0")
+			w.Header().Set("x-rate-limit-reset", strconv.FormatInt(time.Now().Add(600*time.Second).Unix(), 10))
+			writeProblem(w, http.StatusTooManyRequests, map[string]any{"status": 429})
+			return
+		}
+		if code == "rate-limited-negative-code" {
+			w.Header().Set("Retry-After", "-5")
+			w.Header().Set("x-rate-limit-reset", strconv.FormatInt(time.Now().Add(600*time.Second).Unix(), 10))
+			writeProblem(w, http.StatusTooManyRequests, map[string]any{"status": 429})
+			return
+		}
+		if code == "rate-limited-oversized-code" {
+			w.Header().Set("Retry-After", "1000000000")
+			writeProblem(w, http.StatusTooManyRequests, map[string]any{"status": 429})
+			return
+		}
+		if code == "rate-limited-reset-far-code" {
+			w.Header().Set("x-rate-limit-reset", strconv.FormatInt(time.Now().Add(1000*time.Hour).Unix(), 10))
+			writeProblem(w, http.StatusTooManyRequests, map[string]any{"status": 429})
+			return
+		}
+		if code == "rate-limited-headerless-code" {
+			writeProblem(w, http.StatusTooManyRequests, map[string]any{"status": 429})
+			return
+		}
+		if code == "problem-multiple-errors-code" {
+			writeProblem(w, http.StatusBadRequest, map[string]any{
+				"type":   "https://api.twitter.com/2/problems/bad-request",
+				"title":  "Invalid Request",
+				"detail": "top-level detail",
+				"status": 400,
+				"errors": []map[string]any{
+					{
+						"type":    "https://api.twitter.com/2/problems/first",
+						"title":   "First Title",
+						"message": "first message",
+						"status":  400,
+					},
+					{
+						"type":   "https://api.twitter.com/2/problems/second",
+						"title":  "Second Title",
+						"detail": "second detail",
+						"status": 400,
+					},
+				},
+			})
+			return
+		}
+		if code == "problem-type-only-code" {
+			writeProblem(w, http.StatusBadRequest, map[string]any{
+				"type": "https://api.twitter.com/2/problems/type-only",
+			})
+			return
+		}
+		if code == "problem-nested-title-code" {
+			writeProblem(w, http.StatusBadRequest, map[string]any{
+				"errors": []map[string]any{{
+					"type":  "https://api.twitter.com/2/problems/nested",
+					"title": "Nested Title",
+				}},
+			})
+			return
+		}
+		if code == "problem-array-body-code" {
+			w.Header().Set("Content-Type", "application/problem+json")
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`[{"detail":"array shaped"}]`))
 			return
 		}
 		if code == "rfc7807-error" {
@@ -287,6 +439,153 @@ func TestXProvider_ExchangeCode(t *testing.T) {
 		retryAfter, ok := RetryAfterFromError(err)
 		if !ok || retryAfter != 1 {
 			t.Fatalf("RetryAfter = %d, ok = %v; want 1, true", retryAfter, ok)
+		}
+	})
+
+	t.Run("429 HTTP-date Retry-After wins over reset epoch", func(t *testing.T) {
+		if got := xRetryAfterFor(t, p, "rate-limited-http-date-code"); got < 88 || got > 90 {
+			t.Fatalf("RetryAfter = %d; want ~90 for a 90s future HTTP-date", got)
+		}
+	})
+
+	t.Run("429 past HTTP-date Retry-After clamps to one second", func(t *testing.T) {
+		if got := xRetryAfterFor(t, p, "rate-limited-http-date-past-code"); got != 1 {
+			t.Fatalf("RetryAfter = %d; want 1", got)
+		}
+	})
+
+	t.Run("429 far-future HTTP-date Retry-After caps at 24h", func(t *testing.T) {
+		if got := xRetryAfterFor(t, p, "rate-limited-http-date-far-code"); got != 86400 {
+			t.Fatalf("RetryAfter = %d; want 86400", got)
+		}
+	})
+
+	t.Run("429 garbage Retry-After falls back to reset epoch", func(t *testing.T) {
+		if got := xRetryAfterFor(t, p, "rate-limited-garbage-code"); got < 73 || got > 75 {
+			t.Fatalf("RetryAfter = %d; want ~75 from the reset epoch", got)
+		}
+	})
+
+	t.Run("429 garbage Retry-After without reset yields no retry hint", func(t *testing.T) {
+		xRetryAfterMissing(t, p, "rate-limited-garbage-no-fallback-code")
+	})
+
+	t.Run("429 headerless response yields no retry hint", func(t *testing.T) {
+		xRetryAfterMissing(t, p, "rate-limited-headerless-code")
+	})
+
+	t.Run("429 zero Retry-After clamps to one second", func(t *testing.T) {
+		if got := xRetryAfterFor(t, p, "rate-limited-zero-code"); got != 1 {
+			t.Fatalf("RetryAfter = %d; want 1", got)
+		}
+	})
+
+	t.Run("429 negative Retry-After clamps to one second", func(t *testing.T) {
+		if got := xRetryAfterFor(t, p, "rate-limited-negative-code"); got != 1 {
+			t.Fatalf("RetryAfter = %d; want 1", got)
+		}
+	})
+
+	t.Run("429 oversized Retry-After caps at 24h", func(t *testing.T) {
+		if got := xRetryAfterFor(t, p, "rate-limited-oversized-code"); got != 86400 {
+			t.Fatalf("RetryAfter = %d; want 86400", got)
+		}
+	})
+
+	t.Run("429 far-future reset epoch caps at 24h", func(t *testing.T) {
+		if got := xRetryAfterFor(t, p, "rate-limited-reset-far-code"); got != 86400 {
+			t.Fatalf("RetryAfter = %d; want 86400", got)
+		}
+	})
+
+	t.Run("problem+json maps every field and error entry", func(t *testing.T) {
+		_, err := p.ExchangeCode(context.Background(), "problem-multiple-errors-code", "test-code-verifier")
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+		appErr := xProviderError(t, err)
+		if appErr.Message() != "oauth provider request failed" {
+			t.Fatalf("message = %q; want the generic message", appErr.Message())
+		}
+		for _, want := range []string{
+			"upstream type: https://api.twitter.com/2/problems/bad-request",
+			"upstream title: Invalid Request",
+			"upstream detail: top-level detail",
+			"upstream error type: https://api.twitter.com/2/problems/first",
+			"upstream error title: First Title",
+			"upstream error message: first message",
+			"upstream error type: https://api.twitter.com/2/problems/second",
+			"upstream error title: Second Title",
+			"upstream error detail: second detail",
+		} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("cause missing %q in %v", want, err)
+			}
+		}
+		for _, leak := range []string{"top-level detail", "first message", "second detail", "problems/bad-request"} {
+			if strings.Contains(appErr.Message(), leak) {
+				t.Errorf("upstream text %q reflected in wire message %q", leak, appErr.Message())
+			}
+		}
+	})
+
+	t.Run("problem+json type-only body maps the type", func(t *testing.T) {
+		_, err := p.ExchangeCode(context.Background(), "problem-type-only-code", "test-code-verifier")
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+		appErr := xProviderError(t, err)
+		if appErr.Message() != "oauth provider request failed" {
+			t.Fatalf("message = %q; want the generic message", appErr.Message())
+		}
+		if want := "upstream type: https://api.twitter.com/2/problems/type-only"; !strings.Contains(err.Error(), want) {
+			t.Errorf("cause missing %q in %v", want, err)
+		}
+	})
+
+	t.Run("problem+json nested title and type preserved", func(t *testing.T) {
+		_, err := p.ExchangeCode(context.Background(), "problem-nested-title-code", "test-code-verifier")
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+		appErr := xProviderError(t, err)
+		if appErr.Message() != "oauth provider request failed" {
+			t.Fatalf("message = %q; want the generic message", appErr.Message())
+		}
+		for _, want := range []string{
+			"upstream error type: https://api.twitter.com/2/problems/nested",
+			"upstream error title: Nested Title",
+		} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("cause missing %q in %v", want, err)
+			}
+		}
+	})
+
+	t.Run("problem+json non-object body degrades to status message", func(t *testing.T) {
+		_, err := p.ExchangeCode(context.Background(), "problem-array-body-code", "test-code-verifier")
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+		appErr := xProviderError(t, err)
+		if want := "oauth provider responded with status 400"; appErr.Message() != want {
+			t.Fatalf("message = %q; want %q", appErr.Message(), want)
+		}
+		if strings.Contains(err.Error(), "array shaped") {
+			t.Errorf("unparsed body leaked into the cause: %v", err)
+		}
+	})
+
+	t.Run("200 problem-shaped body maps fields without leaking", func(t *testing.T) {
+		body := []byte(`{"type":"https://api.twitter.com/2/problems/invalid-request","title":"Invalid Request","detail":"code already used","status":400}`)
+		appErr := xProviderError(t, parseXErrorWithHeader(http.StatusOK, body, nil))
+		if appErr.Message() != "oauth provider request failed" {
+			t.Fatalf("message = %q; want the generic message", appErr.Message())
+		}
+		for _, want := range []string{"upstream detail: code already used", "upstream type: https://api.twitter.com/2/problems/invalid-request"} {
+			if !strings.Contains(appErr.Error(), want) {
+				t.Errorf("cause missing %q in %v", want, appErr)
+			}
 		}
 	})
 
