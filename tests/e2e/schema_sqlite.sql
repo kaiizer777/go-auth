@@ -5,8 +5,9 @@
 -- to uuid_generate_v4(), timestamps are TIMESTAMPTZ, and 000005/000009 rely on
 -- ALTER TABLE ... ADD COLUMN IF NOT EXISTS. db.Connect has no sqlite migration
 -- branch, so these files cannot be executed by glebarez/sqlite. This file is the
--- single sqlite DDL source for this suite; 000009's oauth_accounts.verified is
--- mirrored here and the Postgres e2e journey exercises the real migration.
+-- single sqlite DDL source for this suite; 000009's oauth_accounts.verified and
+-- 000011's oauth_accounts.provider_tenant_id are mirrored here and the Postgres
+-- e2e journey exercises the real migration.
 --
 -- Drift here is silent on its own: a column missing from this file makes
 -- SELECT * decode it as a zero value instead of failing, so
@@ -27,12 +28,13 @@ CREATE TABLE IF NOT EXISTS oauth_accounts (
     id TEXT PRIMARY KEY,
     user_id TEXT NOT NULL,
     provider_id VARCHAR(32) NOT NULL,
+    provider_tenant_id VARCHAR(64) NOT NULL,
     provider_user_id VARCHAR(255) NOT NULL,
     email VARCHAR(255) NOT NULL,
     verified INTEGER NOT NULL DEFAULT 0,
     created_at DATETIME,
     updated_at DATETIME,
-    CONSTRAINT uq_oauth_accounts_provider_uid UNIQUE (provider_id, provider_user_id),
+    CONSTRAINT uq_oauth_accounts_provider_tenant_uid UNIQUE (provider_id, provider_tenant_id, provider_user_id),
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 );
 

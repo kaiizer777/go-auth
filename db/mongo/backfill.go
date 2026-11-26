@@ -158,6 +158,44 @@ func BackfillOAuthAccountVerified(ctx context.Context, database *mongo.Database)
 // that mirrors SQL migration 000010 for MongoDB.
 const microsoftOIDBackfillID = "000010_resolve_microsoft_oid_links"
 
+// oauthTenantScopeCheckID is the schema_migrations marker of the one-shot
+// oauth_accounts tenant-scope sweep that mirrors SQL migration 000011.
+const oauthTenantScopeCheckID = "000011_oauth_account_tenant_scope"
+
+// VerifyOAuthAccountTenantScope refuses startup on a tenant-less
+// oauth_accounts document once per database, not once per process. The
+// predicate cannot be served by an index, so repeating it on every boot is a
+// full collection scan inside the connect budget when nothing is wrong. It runs
+// before index provisioning, so the first deploy is still refused rather than
+// indexed. Trade-off: a tenant-less document written after the sweep completed
+// is not caught here; writers take the field from the verified token, and the
+// unique key still rejects a colliding identity.
+func VerifyOAuthAccountTenantScope(ctx context.Context, database *mongo.Database) error {
+	if database == nil {
+		return nil
+	}
+	markers := database.Collection("schema_migrations")
+	var marker bson.M
+	err := markers.FindOne(ctx, bson.M{"_id": oauthTenantScopeCheckID}).Decode(&marker)
+	if err == nil {
+		return nil
+	}
+	if !stderrors.Is(err, mongo.ErrNoDocuments) {
+		return err
+	}
+
+	if err := verifyOAuthAccountTenantScope(ctx, database); err != nil {
+		return err
+	}
+
+	_, err = markers.UpdateOne(ctx,
+		bson.M{"_id": oauthTenantScopeCheckID},
+		bson.M{"$setOnInsert": bson.M{"applied_at": time.Now().UTC()}},
+		options.UpdateOne().SetUpsert(true),
+	)
+	return err
+}
+
 // BackfillMicrosoftOIDLinks deduplicates pre-switch Microsoft links where both
 // an oid-keyed row and a sub-keyed row exist for the same user, mirroring SQL
 // migration 000010.

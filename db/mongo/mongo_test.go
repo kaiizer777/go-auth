@@ -2,8 +2,11 @@ package mongostore
 
 import (
 	"context"
+	stderrors "errors"
 	"fmt"
 	"os"
+	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -173,14 +176,15 @@ func TestDocumentSerialization_RoundTrip(t *testing.T) {
 		id := uuid.New()
 		userID := uuid.New()
 		acc := &db.OAuthAccount{
-			ID:             id,
-			UserID:         userID,
-			ProviderID:     "google",
-			ProviderUserID: "google-uid-123",
-			Email:          "user@example.com",
-			Verified:       true,
-			CreatedAt:      now,
-			UpdatedAt:      now,
+			ID:               id,
+			UserID:           userID,
+			ProviderID:       "google",
+			ProviderTenantID: "tenant-a",
+			ProviderUserID:   "google-uid-123",
+			Email:            "user@example.com",
+			Verified:         true,
+			CreatedAt:        now,
+			UpdatedAt:        now,
 		}
 
 		doc := oauthAccountDocFromDomain(acc)
@@ -197,6 +201,7 @@ func TestDocumentSerialization_RoundTrip(t *testing.T) {
 		roundTripped := unmarshaled.toDomain()
 		if roundTripped.ID != acc.ID || roundTripped.UserID != acc.UserID ||
 			roundTripped.ProviderID != acc.ProviderID ||
+			roundTripped.ProviderTenantID != acc.ProviderTenantID ||
 			roundTripped.ProviderUserID != acc.ProviderUserID ||
 			roundTripped.Email != acc.Email ||
 			!roundTripped.Verified {
@@ -387,7 +392,7 @@ func TestIndexSpecifications_Completeness(t *testing.T) {
 		{"verification_tokens", "ttl_verification_tokens_expiry"},
 		{"password_reset_tokens", "idx_password_reset_tokens_user_id"},
 		{"password_reset_tokens", "ttl_password_reset_tokens_expiry"},
-		{"oauth_accounts", "uq_oauth_accounts_provider_uid"},
+		{"oauth_accounts", "uq_oauth_accounts_provider_tenant_uid"},
 		{"oauth_accounts", "idx_oauth_accounts_user_id"},
 		{"totp_secrets", "uq_totp_secrets_user_id"},
 		{"totp_used_codes", "uq_totp_used_codes_user_code"},
@@ -402,6 +407,46 @@ func TestIndexSpecifications_Completeness(t *testing.T) {
 		if !indexNames[c.col][c.name] {
 			t.Errorf("expected index %q on collection %q, not found", c.name, c.col)
 		}
+	}
+
+	// The tenant must be part of the key, not a filter around the old one:
+	// otherwise two tenants still cannot hold the same pairwise subject.
+	wantKeys := []string{"provider_id", "provider_tenant_id", "provider_user_id"}
+	var oauthKeys []string
+	var oauthUnique bool
+	for _, m := range specs["oauth_accounts"] {
+		opts := &options.IndexOptions{}
+		for _, fn := range m.Options.List() {
+			_ = fn(opts)
+		}
+		if opts.Name == nil || *opts.Name != "uq_oauth_accounts_provider_tenant_uid" {
+			continue
+		}
+		keys, _ := m.Keys.(bson.D)
+		for _, key := range keys {
+			oauthKeys = append(oauthKeys, key.Key)
+		}
+		oauthUnique = opts.Unique != nil && *opts.Unique
+	}
+	if !slices.Equal(oauthKeys, wantKeys) {
+		t.Errorf("uq_oauth_accounts_provider_tenant_uid key = %v; want %v", oauthKeys, wantKeys)
+	}
+	bsonFields := make(map[string]bool)
+	docType := reflect.TypeOf(OAuthAccountDoc{})
+	for i := 0; i < docType.NumField(); i++ {
+		name, _, _ := strings.Cut(docType.Field(i).Tag.Get("bson"), ",")
+		bsonFields[name] = true
+	}
+	for _, key := range oauthKeys {
+		if !bsonFields[key] {
+			t.Errorf("oauth_accounts index key %q is not a bson field on OAuthAccountDoc", key)
+		}
+	}
+	if !oauthUnique {
+		t.Error("uq_oauth_accounts_provider_tenant_uid must be unique")
+	}
+	if indexNames["oauth_accounts"][legacyOAuthUniqueIndex] {
+		t.Error("the tenant-blind oauth_accounts index must not be provisioned")
 	}
 }
 
@@ -550,6 +595,209 @@ func TestEnsureIndexes_ModelsAndNilDatabase(t *testing.T) {
 		if !ok || len(models) == 0 {
 			t.Errorf("expected non-empty index models for collection %s", col)
 		}
+	}
+}
+
+// TestEnsureIndexes_ReplacesTenantBlindOAuthIndex pins the index replacement:
+// the pre-000011 index survives CreateMany forever unless it is dropped, and it
+// keeps rejecting a pairwise subject a second tenant legitimately owns.
+func TestEnsureIndexes_ReplacesTenantBlindOAuthIndex(t *testing.T) {
+	uri := os.Getenv("TEST_MONGO_URI")
+	if uri == "" {
+		t.Skip("TEST_MONGO_URI unset; skipping live MongoDB index test")
+	}
+	client, err := mongo.Connect(options.Client().ApplyURI(uri))
+	if err != nil {
+		t.Fatalf("mongo.Connect failed: %v", err)
+	}
+	database := client.Database(fmt.Sprintf("goauth_test_ms_tenant_index_%s", strings.ReplaceAll(uuid.New().String(), "-", "")))
+	t.Cleanup(func() {
+		_ = database.Drop(context.Background())
+		_ = client.Disconnect(context.Background())
+	})
+	ctx := context.Background()
+	links := database.Collection("oauth_accounts")
+
+	// Reproduce the tenant-blind schema the migration has to replace.
+	if _, err := links.Indexes().CreateOne(ctx, mongo.IndexModel{
+		Keys:    bson.D{{Key: "provider_id", Value: 1}, {Key: "provider_user_id", Value: 1}},
+		Options: options.Index().SetName(legacyOAuthUniqueIndex).SetUnique(true),
+	}); err != nil {
+		t.Fatalf("seed legacy index: %v", err)
+	}
+
+	if err := EnsureIndexes(ctx, database); err != nil {
+		t.Fatalf("EnsureIndexes failed: %v", err)
+	}
+
+	names := map[string]bool{}
+	cursor, err := links.Indexes().List(ctx)
+	if err != nil {
+		t.Fatalf("list indexes: %v", err)
+	}
+	for cursor.Next(ctx) {
+		var idx struct {
+			Name string `bson:"name"`
+		}
+		if err := cursor.Decode(&idx); err == nil {
+			names[idx.Name] = true
+		}
+	}
+	if names[legacyOAuthUniqueIndex] {
+		t.Fatal("EnsureIndexes left the tenant-blind unique index in place")
+	}
+	if !names["uq_oauth_accounts_provider_tenant_uid"] {
+		t.Fatal("EnsureIndexes did not create the tenant-qualified unique index")
+	}
+
+	// The same pairwise subject in two tenants is two identities, not a conflict.
+	for _, tenant := range []string{"tenant-a", "tenant-b"} {
+		if _, err := links.InsertOne(ctx, bson.M{
+			"_id": uuid.New().String(), "user_id": uuid.New().String(), "provider_id": "microsoft",
+			"provider_tenant_id": tenant, "provider_user_id": "shared-sub", "email": tenant + "@example.com",
+		}); err != nil {
+			t.Fatalf("insert link for %s: %v", tenant, err)
+		}
+	}
+}
+
+// TestVerifyOAuthAccountTenantScope pins the Mongo analogue of SQL NOT NULL:
+// a document whose tenant is missing or null must refuse startup rather than
+// index as null and disappear from tenant-qualified lookups.
+func TestVerifyOAuthAccountTenantScope(t *testing.T) {
+	uri := os.Getenv("TEST_MONGO_URI")
+	if uri == "" {
+		t.Skip("TEST_MONGO_URI unset; skipping live MongoDB tenant scope test")
+	}
+	client, err := mongo.Connect(options.Client().ApplyURI(uri))
+	if err != nil {
+		t.Fatalf("mongo.Connect failed: %v", err)
+	}
+	database := client.Database(fmt.Sprintf("goauth_test_ms_tenant_scope_%s", strings.ReplaceAll(uuid.New().String(), "-", "")))
+	t.Cleanup(func() {
+		_ = database.Drop(context.Background())
+		_ = client.Disconnect(context.Background())
+	})
+	ctx := context.Background()
+	links := database.Collection("oauth_accounts")
+	id := uuid.New().String()
+	if _, err := links.InsertOne(ctx, bson.M{
+		"_id": id, "provider_id": "microsoft", "provider_user_id": "sub-1", "provider_tenant_id": "",
+	}); err != nil {
+		t.Fatalf("insert link: %v", err)
+	}
+	if err := verifyOAuthAccountTenantScope(ctx, database); err != nil {
+		t.Fatalf("an empty tenant is a valid non-Microsoft scope: %v", err)
+	}
+	if _, err := links.UpdateOne(ctx, bson.M{"_id": id}, bson.M{"$unset": bson.M{"provider_tenant_id": ""}}); err != nil {
+		t.Fatalf("unset tenant: %v", err)
+	}
+	if err := verifyOAuthAccountTenantScope(ctx, database); err == nil {
+		t.Fatal("a document without provider_tenant_id must refuse startup")
+	}
+	if _, err := links.UpdateOne(ctx, bson.M{"_id": id}, bson.M{"$set": bson.M{"provider_tenant_id": nil}}); err != nil {
+		t.Fatalf("null tenant: %v", err)
+	}
+	if err := verifyOAuthAccountTenantScope(ctx, database); err == nil {
+		t.Fatal("a null provider_tenant_id must refuse startup")
+	}
+	if _, err := links.UpdateOne(ctx, bson.M{"_id": id}, bson.M{"$set": bson.M{"provider_tenant_id": []string{"tenant-a"}}}); err != nil {
+		t.Fatalf("array tenant: %v", err)
+	}
+	if err := verifyOAuthAccountTenantScope(ctx, database); err == nil {
+		t.Fatal("an array provider_tenant_id must refuse startup")
+	}
+}
+
+// TestTenantScopeViolationFilter_RejectsArrays pins the array clause: $type:
+// "string" matches an array containing a string, so {provider_tenant_id:
+// ["tenant-a"]} would otherwise pass a gate that requires a string.
+func TestTenantScopeViolationFilter_RejectsArrays(t *testing.T) {
+	or, ok := tenantScopeViolationFilter()["$or"].(bson.A)
+	if !ok || len(or) != 2 {
+		t.Fatalf("tenant scope filter must be a two-clause $or: %#v", tenantScopeViolationFilter())
+	}
+	nonString, ok := or[0].(bson.M)["provider_tenant_id"].(bson.M)
+	if !ok {
+		t.Fatalf("unexpected first clause: %#v", or[0])
+	}
+	if not, ok := nonString["$not"].(bson.M); !ok || not["$type"] != "string" {
+		t.Fatalf("first clause must exclude non-strings: %#v", or[0])
+	}
+	array, ok := or[1].(bson.M)["provider_tenant_id"].(bson.M)
+	if !ok || array["$type"] != "array" {
+		t.Fatalf("second clause must exclude arrays: %#v", or[1])
+	}
+}
+
+// TestVerifyOAuthAccountTenantScope_RunsOncePerSchemaVersion pins the one-shot
+// gate: a successful sweep records its schema_migrations marker and later boots
+// skip the scan, while a refused sweep leaves no marker so the next boot
+// re-checks.
+func TestVerifyOAuthAccountTenantScope_RunsOncePerSchemaVersion(t *testing.T) {
+	uri := os.Getenv("TEST_MONGO_URI")
+	if uri == "" {
+		t.Skip("TEST_MONGO_URI unset; skipping live MongoDB tenant scope test")
+	}
+	client, err := mongo.Connect(options.Client().ApplyURI(uri))
+	if err != nil {
+		t.Fatalf("mongo.Connect failed: %v", err)
+	}
+	database := client.Database(fmt.Sprintf("goauth_test_ms_tenant_once_%s", strings.ReplaceAll(uuid.New().String(), "-", "")))
+	t.Cleanup(func() {
+		_ = database.Drop(context.Background())
+		_ = client.Disconnect(context.Background())
+	})
+	ctx := context.Background()
+	links := database.Collection("oauth_accounts")
+	id := uuid.New().String()
+	if _, err := links.InsertOne(ctx, bson.M{
+		"_id": id, "provider_id": "microsoft", "provider_user_id": "sub-1",
+	}); err != nil {
+		t.Fatalf("insert link: %v", err)
+	}
+
+	if err := VerifyOAuthAccountTenantScope(ctx, database); err == nil {
+		t.Fatal("a document without provider_tenant_id must refuse startup")
+	}
+	var marker bson.M
+	err = database.Collection("schema_migrations").FindOne(ctx, bson.M{"_id": oauthTenantScopeCheckID}).Decode(&marker)
+	if !stderrors.Is(err, mongo.ErrNoDocuments) {
+		t.Fatalf("a refused sweep must not record its marker: %v", err)
+	}
+
+	if _, err := links.UpdateOne(ctx, bson.M{"_id": id}, bson.M{"$set": bson.M{"provider_tenant_id": ""}}); err != nil {
+		t.Fatalf("set tenant: %v", err)
+	}
+	if err := VerifyOAuthAccountTenantScope(ctx, database); err != nil {
+		t.Fatalf("a clean collection must pass: %v", err)
+	}
+	if err := database.Collection("schema_migrations").FindOne(ctx, bson.M{"_id": oauthTenantScopeCheckID}).Decode(&marker); err != nil {
+		t.Fatalf("a passing sweep must record its marker: %v", err)
+	}
+
+	// The marker is what keeps the unindexable scan off every later boot.
+	if _, err := links.UpdateOne(ctx, bson.M{"_id": id}, bson.M{"$unset": bson.M{"provider_tenant_id": ""}}); err != nil {
+		t.Fatalf("unset tenant: %v", err)
+	}
+	if err := VerifyOAuthAccountTenantScope(ctx, database); err != nil {
+		t.Fatalf("the sweep must not repeat after its marker is written: %v", err)
+	}
+}
+
+// TestIsMissingIndex pins the not-found classification that keeps a repeated
+// startup from failing on an index the previous run already dropped.
+func TestIsMissingIndex(t *testing.T) {
+	for _, code := range []int32{26, 27} {
+		if !isMissingIndex(mongo.CommandError{Code: code}) {
+			t.Errorf("code %d must count as a missing index", code)
+		}
+	}
+	if isMissingIndex(mongo.CommandError{Code: 11000}) {
+		t.Error("duplicate key must not count as a missing index")
+	}
+	if isMissingIndex(fmt.Errorf("connection refused")) {
+		t.Error("an unrelated error must not count as a missing index")
 	}
 }
 
@@ -1160,7 +1408,7 @@ func TestMongoStore_CanceledContext_AllMethods(t *testing.T) {
 		ProviderUserID: "gh_user_42",
 	}
 	assertCanceled("OAuthAccounts.Create", store.OAuthAccounts().Create(ctx, acc))
-	_, err = store.OAuthAccounts().GetByProvider(ctx, "github", "gh_user_42")
+	_, err = store.OAuthAccounts().GetByProvider(ctx, "github", "", "gh_user_42")
 	assertCanceled("OAuthAccounts.GetByProvider", err)
 	_, err = store.OAuthAccounts().GetByUserID(ctx, uid)
 	assertCanceled("OAuthAccounts.GetByUserID", err)

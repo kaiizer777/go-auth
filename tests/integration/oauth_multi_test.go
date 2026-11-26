@@ -44,10 +44,11 @@ func setupMultiOAuthDB(t *testing.T) (*gorm.DB, db.Store) {
 	);
 	CREATE TABLE IF NOT EXISTS oauth_accounts (
 		id TEXT PRIMARY KEY, user_id TEXT NOT NULL, provider_id VARCHAR(32) NOT NULL,
+		provider_tenant_id VARCHAR(64) NOT NULL,
 		provider_user_id VARCHAR(255) NOT NULL, email VARCHAR(255) NOT NULL,
 		verified INTEGER NOT NULL DEFAULT 0,
 		created_at DATETIME, updated_at DATETIME,
-		CONSTRAINT uq_oauth_accounts_provider_uid UNIQUE (provider_id, provider_user_id),
+		CONSTRAINT uq_oauth_accounts_provider_tenant_uid UNIQUE (provider_id, provider_tenant_id, provider_user_id),
 		FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 	);
 	CREATE TABLE IF NOT EXISTS verification_tokens (
@@ -121,7 +122,7 @@ func TestIntegration_MultiProviderLinkageAndHardDeleteCascade(t *testing.T) {
 	// 3. Verify all 7 providers resolve back to the same user
 	for i, p := range providers {
 		uid := fmt.Sprintf("%s-uid-%d", p, 1000+i)
-		fetched, err := store.OAuthAccounts().GetByProvider(ctx, p, uid)
+		fetched, err := store.OAuthAccounts().GetByProvider(ctx, p, "", uid)
 		if err != nil {
 			t.Fatalf("GetByProvider(%q) failed: %v", p, err)
 		}
@@ -133,7 +134,7 @@ func TestIntegration_MultiProviderLinkageAndHardDeleteCascade(t *testing.T) {
 	// Cross-provider isolation: a provider_user_id from one provider must not
 	// resolve under a different provider_id (guards a provider_id-blind lookup).
 	crossUID := fmt.Sprintf("%s-uid-%d", providers[1], 1000+1)
-	if _, err := store.OAuthAccounts().GetByProvider(ctx, providers[0], crossUID); !errors.Is(err, gorm.ErrRecordNotFound) {
+	if _, err := store.OAuthAccounts().GetByProvider(ctx, providers[0], "", crossUID); !errors.Is(err, gorm.ErrRecordNotFound) {
 		t.Fatalf("GetByProvider(%q, %q) = mismatched provider pair must not resolve, got err=%v", providers[0], crossUID, err)
 	}
 

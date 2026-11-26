@@ -116,12 +116,13 @@ func serviceTestDB(t *testing.T) *gorm.DB {
 		id TEXT PRIMARY KEY,
 		user_id TEXT NOT NULL,
 		provider_id VARCHAR(32) NOT NULL,
+		provider_tenant_id VARCHAR(64) NOT NULL,
 		provider_user_id VARCHAR(255) NOT NULL,
 		email VARCHAR(255) NOT NULL,
 		verified INTEGER NOT NULL DEFAULT 0,
 		created_at DATETIME,
 		updated_at DATETIME,
-		CONSTRAINT uq_oauth_accounts_provider_uid UNIQUE (provider_id, provider_user_id)
+		CONSTRAINT uq_oauth_accounts_provider_tenant_uid UNIQUE (provider_id, provider_tenant_id, provider_user_id)
 	);
 	CREATE TABLE IF NOT EXISTS sessions (
 		id TEXT PRIMARY KEY,
@@ -603,6 +604,37 @@ func TestHandleCallbackEmailGate(t *testing.T) {
 		requireCode(t, err, errors.CodeOAuthProviderError, http.StatusBadGateway)
 		requireIdentityRows(t, database, 0, 0, 0)
 	})
+
+	microsoftCallback := func(t *testing.T, info *UserInfo) (*gorm.DB, error) {
+		t.Helper()
+		database := serviceTestDB(t)
+		cfg := serviceTestConfig()
+		svc := NewService(database, session.NewService(database, cfg),
+			map[string]Provider{"microsoft": &stubProvider{id: "microsoft", info: info}}, cfg)
+		state, cookie := mustInitiate(t, svc, cfg, "microsoft")
+		req := httptest.NewRequest(http.MethodGet, "/auth/oauth/microsoft/callback", nil)
+		req.AddCookie(cookie)
+		_, _, _, err := svc.HandleCallback(req.Context(), httptest.NewRecorder(), req, "microsoft", "code-1", state, db.SessionTypeCookie)
+		return database, err
+	}
+
+	t.Run("microsoft identity without tenant rejected as provider error", func(t *testing.T) {
+		database, err := microsoftCallback(t, &UserInfo{
+			ProviderID: "microsoft", ProviderUserID: "sub-no-tenant",
+			Email: "jane@example.com", EmailVerified: true,
+		})
+		requireCode(t, err, errors.CodeOAuthProviderError, http.StatusBadGateway)
+		requireIdentityRows(t, database, 0, 0, 0)
+	})
+
+	t.Run("oversized microsoft tenant rejected as provider error", func(t *testing.T) {
+		database, err := microsoftCallback(t, &UserInfo{
+			ProviderID: "microsoft", ProviderTenantID: strings.Repeat("t", providerTenantMaxLen+1),
+			ProviderUserID: "sub-long-tenant", Email: "jane@example.com", EmailVerified: true,
+		})
+		requireCode(t, err, errors.CodeOAuthProviderError, http.StatusBadGateway)
+		requireIdentityRows(t, database, 0, 0, 0)
+	})
 }
 
 // TestUnverifiedSignupLinkProvenance pins what an unverified provider claim
@@ -763,7 +795,7 @@ func TestUnverifiedSignupLinkProvenance(t *testing.T) {
 		if err := database.Create(&unverifiedLink).Error; err != nil {
 			t.Fatalf("seed unverified link: %v", err)
 		}
-		_, _, _, err := rawSvc.(*service).relinkExisting(context.Background(), "google", "sub-unverified-race")
+		_, _, _, err := rawSvc.(*service).relinkExisting(context.Background(), "google", "", "sub-unverified-race")
 		if !errors.Is(err, errors.ErrOAuthEmailUnverified) {
 			t.Fatalf("relinkExisting on unverified link for claimed account = %v; want ErrOAuthEmailUnverified", err)
 		}
@@ -1301,9 +1333,9 @@ type gatedMissLinkStore struct {
 	gate *linkGate
 }
 
-func (g *gatedMissLinkStore) GetByProvider(ctx context.Context, providerID, providerUserID string) (*db.OAuthAccount, error) {
+func (g *gatedMissLinkStore) GetByProvider(ctx context.Context, providerID, providerTenantID, providerUserID string) (*db.OAuthAccount, error) {
 	if g.gate.remaining.Add(-1) < 0 {
-		return g.OAuthAccountStore.GetByProvider(ctx, providerID, providerUserID)
+		return g.OAuthAccountStore.GetByProvider(ctx, providerID, providerTenantID, providerUserID)
 	}
 	g.gate.arrived <- struct{}{}
 	<-g.gate.release
@@ -1325,12 +1357,12 @@ type hideFirstLinkStore struct {
 	hidden bool
 }
 
-func (h *hideFirstLinkStore) GetByProvider(ctx context.Context, providerID, providerUserID string) (*db.OAuthAccount, error) {
+func (h *hideFirstLinkStore) GetByProvider(ctx context.Context, providerID, providerTenantID, providerUserID string) (*db.OAuthAccount, error) {
 	if h.hidden {
 		h.hidden = false
 		return nil, gorm.ErrRecordNotFound
 	}
-	return h.OAuthAccountStore.GetByProvider(ctx, providerID, providerUserID)
+	return h.OAuthAccountStore.GetByProvider(ctx, providerID, providerTenantID, providerUserID)
 }
 
 func TestHandleCallbackLinkConflictForeignOwner(t *testing.T) {
@@ -1888,12 +1920,12 @@ func TestService_SubjectCaseSensitivity(t *testing.T) {
 	}
 
 	// Verify lookups resolve distinct accounts
-	l1, found1, err := svc.(*service).findLink(ctx, "google", "Subject_CASE_123")
+	l1, found1, err := svc.(*service).findLink(ctx, "google", "", "Subject_CASE_123")
 	if err != nil || !found1 || l1.UserID != u1.ID {
 		t.Fatalf("upper lookup mismatch: found=%v, err=%v, link=%+v", found1, err, l1)
 	}
 
-	l2, found2, err := svc.(*service).findLink(ctx, "google", "subject_case_123")
+	l2, found2, err := svc.(*service).findLink(ctx, "google", "", "subject_case_123")
 	if err != nil || !found2 || l2.UserID != u2.ID {
 		t.Fatalf("lower lookup mismatch: found=%v, err=%v, link=%+v", found2, err, l2)
 	}
@@ -2325,11 +2357,12 @@ func TestHandleCallbackUntrustedTenant(t *testing.T) {
 		sessSvc := session.NewService(database, cfg)
 		// Mock profile carrying untrusted_tenant claim
 		untrustedInfo := &UserInfo{
-			ProviderID:     "microsoft",
-			ProviderUserID: "ms-untrusted-sub",
-			Email:          "victim@example.com",
-			EmailVerified:  false,
-			Name:           "Untrusted Tenant User",
+			ProviderID:       "microsoft",
+			ProviderTenantID: "tenant-untrusted",
+			ProviderUserID:   "ms-untrusted-sub",
+			Email:            "victim@example.com",
+			EmailVerified:    false,
+			Name:             "Untrusted Tenant User",
 			RawClaims: map[string]any{
 				"untrusted_tenant": true,
 			},
@@ -2360,23 +2393,25 @@ func TestHandleCallbackUntrustedTenant(t *testing.T) {
 			t.Fatalf("create owner: %v", err)
 		}
 		link := db.OAuthAccount{
-			ID:             uuid.New(),
-			UserID:         owner.ID,
-			ProviderID:     "microsoft",
-			ProviderUserID: "ms-untrusted-returning-sub",
-			Email:          owner.Email,
-			Verified:       true,
+			ID:               uuid.New(),
+			UserID:           owner.ID,
+			ProviderID:       "microsoft",
+			ProviderTenantID: "tenant-untrusted",
+			ProviderUserID:   "ms-untrusted-returning-sub",
+			Email:            owner.Email,
+			Verified:         true,
 		}
 		if err := database.Create(&link).Error; err != nil {
 			t.Fatalf("create link: %v", err)
 		}
 
 		untrustedInfo := &UserInfo{
-			ProviderID:     "microsoft",
-			ProviderUserID: "ms-untrusted-returning-sub",
-			Email:          owner.Email,
-			EmailVerified:  true,
-			Name:           "Untrusted Returning User",
+			ProviderID:       "microsoft",
+			ProviderTenantID: "tenant-untrusted",
+			ProviderUserID:   "ms-untrusted-returning-sub",
+			Email:            owner.Email,
+			EmailVerified:    true,
+			Name:             "Untrusted Returning User",
 			RawClaims: map[string]any{
 				"untrusted_tenant": true,
 			},
@@ -2424,7 +2459,7 @@ func TestHandleCallbackActiveSessionUntrustedTenant(t *testing.T) {
 			t.Fatalf("create session: %v", err)
 		}
 		untrusted := &stubProvider{id: "microsoft", info: &UserInfo{
-			ProviderID: "microsoft", ProviderUserID: "ms-attacker-sub",
+			ProviderID: "microsoft", ProviderTenantID: "tenant-attacker", ProviderUserID: "ms-attacker-sub",
 			Email: "victim@example.com", EmailVerified: true, Name: "Attacker",
 			RawClaims: map[string]any{"untrusted_tenant": true},
 		}}
@@ -2479,23 +2514,25 @@ func TestHandleCallback_MicrosoftLegacyOIDFallback(t *testing.T) {
 			t.Fatalf("create user: %v", err)
 		}
 		legacyLink := db.OAuthAccount{
-			ID:             uuid.New(),
-			UserID:         user.ID,
-			ProviderID:     "microsoft",
-			ProviderUserID: "legacy-oid-guid-123",
-			Email:          user.Email,
-			Verified:       true,
+			ID:               uuid.New(),
+			UserID:           user.ID,
+			ProviderID:       "microsoft",
+			ProviderTenantID: "tenant-migration",
+			ProviderUserID:   "legacy-oid-guid-123",
+			Email:            user.Email,
+			Verified:         true,
 		}
 		if err := database.Create(&legacyLink).Error; err != nil {
 			t.Fatalf("create legacy link: %v", err)
 		}
 
 		msInfo := &UserInfo{
-			ProviderID:     "microsoft",
-			ProviderUserID: "new-pairwise-sub-456",
-			Email:          "ms-user@example.com",
-			EmailVerified:  false,
-			Name:           "MS User",
+			ProviderID:       "microsoft",
+			ProviderTenantID: "tenant-migration",
+			ProviderUserID:   "new-pairwise-sub-456",
+			Email:            "ms-user@example.com",
+			EmailVerified:    false,
+			Name:             "MS User",
 			RawClaims: map[string]any{
 				"sub": "new-pairwise-sub-456",
 				"oid": "legacy-oid-guid-123",
@@ -2543,23 +2580,25 @@ func TestHandleCallback_MicrosoftLegacyOIDFallback(t *testing.T) {
 			t.Fatalf("create user: %v", err)
 		}
 		link := db.OAuthAccount{
-			ID:             uuid.New(),
-			UserID:         user.ID,
-			ProviderID:     "microsoft",
-			ProviderUserID: "direct-sub-789",
-			Email:          user.Email,
-			Verified:       true,
+			ID:               uuid.New(),
+			UserID:           user.ID,
+			ProviderID:       "microsoft",
+			ProviderTenantID: "tenant-direct",
+			ProviderUserID:   "direct-sub-789",
+			Email:            user.Email,
+			Verified:         true,
 		}
 		if err := database.Create(&link).Error; err != nil {
 			t.Fatalf("create link: %v", err)
 		}
 
 		msInfo := &UserInfo{
-			ProviderID:     "microsoft",
-			ProviderUserID: "direct-sub-789",
-			Email:          "ms-sub@example.com",
-			EmailVerified:  true,
-			Name:           "MS Sub User",
+			ProviderID:       "microsoft",
+			ProviderTenantID: "tenant-direct",
+			ProviderUserID:   "direct-sub-789",
+			Email:            "ms-sub@example.com",
+			EmailVerified:    true,
+			Name:             "MS Sub User",
 			RawClaims: map[string]any{
 				"sub": "direct-sub-789",
 				"oid": "directory-oid-999",
@@ -2596,23 +2635,25 @@ func TestHandleCallback_MicrosoftLegacyOIDFallback(t *testing.T) {
 			t.Fatalf("create user: %v", err)
 		}
 		legacyLink := db.OAuthAccount{
-			ID:             uuid.New(),
-			UserID:         user.ID,
-			ProviderID:     "microsoft",
-			ProviderUserID: "legacy-oid-attested",
-			Email:          user.Email,
-			Verified:       true,
+			ID:               uuid.New(),
+			UserID:           user.ID,
+			ProviderID:       "microsoft",
+			ProviderTenantID: "tenant-attested",
+			ProviderUserID:   "legacy-oid-attested",
+			Email:            user.Email,
+			Verified:         true,
 		}
 		if err := database.Create(&legacyLink).Error; err != nil {
 			t.Fatalf("create legacy link: %v", err)
 		}
 
 		msInfo := &UserInfo{
-			ProviderID:     "microsoft",
-			ProviderUserID: "sub-attested-new",
-			Email:          "ms-attested@example.com",
-			EmailVerified:  true,
-			Name:           "MS Attested User",
+			ProviderID:       "microsoft",
+			ProviderTenantID: "tenant-attested",
+			ProviderUserID:   "sub-attested-new",
+			Email:            "ms-attested@example.com",
+			EmailVerified:    true,
+			Name:             "MS Attested User",
 			RawClaims: map[string]any{
 				"sub": "sub-attested-new",
 				"oid": "legacy-oid-attested",
@@ -2702,11 +2743,11 @@ type faultyOAuthAccountStore struct {
 	errOnUID string
 }
 
-func (s *faultyOAuthAccountStore) GetByProvider(ctx context.Context, providerID, providerUserID string) (*db.OAuthAccount, error) {
+func (s *faultyOAuthAccountStore) GetByProvider(ctx context.Context, providerID, providerTenantID, providerUserID string) (*db.OAuthAccount, error) {
 	if providerUserID == s.errOnUID {
 		return nil, stderrors.New("simulated database failure")
 	}
-	return s.OAuthAccountStore.GetByProvider(ctx, providerID, providerUserID)
+	return s.OAuthAccountStore.GetByProvider(ctx, providerID, providerTenantID, providerUserID)
 }
 
 type faultyStoreWrapper struct {

@@ -164,8 +164,9 @@ func isStandaloneTransactionError(err error) bool {
 }
 
 // Connect establishes a connection to MongoDB, validates connectivity via ping,
-// and idempotently provisions native indexes and the oauth_accounts.verified
-// data backfill.
+// refuses oauth_accounts documents without a string tenant (once per schema
+// version), and idempotently provisions native indexes and the
+// oauth_accounts.verified data backfill.
 func Connect(cfg config.Config) (*MongoStore, error) {
 	opts := options.Client().ApplyURI(cfg.DatabaseURL)
 
@@ -222,6 +223,9 @@ func Connect(cfg config.Config) (*MongoStore, error) {
 		return nil
 	}
 
+	if err := initOp(VerifyOAuthAccountTenantScope, "failed to verify oauth account tenant scope"); err != nil {
+		return nil, err
+	}
 	if err := initOp(EnsureIndexes, "failed to provision mongodb indexes"); err != nil {
 		return nil, err
 	}
@@ -678,13 +682,14 @@ func (s *oauthAccountStore) Create(ctx context.Context, account *db.OAuthAccount
 	return nil
 }
 
-func (s *oauthAccountStore) GetByProvider(ctx context.Context, providerID, providerUserID string) (*db.OAuthAccount, error) {
+func (s *oauthAccountStore) GetByProvider(ctx context.Context, providerID, providerTenantID, providerUserID string) (*db.OAuthAccount, error) {
 	filter := bson.M{
-		"provider_id":      providerID,
-		"provider_user_id": providerUserID,
+		"provider_id":        providerID,
+		"provider_tenant_id": providerTenantID,
+		"provider_user_id":   providerUserID,
 	}
 	var doc OAuthAccountDoc
-	// codeql[go/sql-injection] Safe: providerID and providerUserID are strictly-typed Go strings serialized as BSON string literals.
+	// codeql[go/sql-injection] Safe: providerID, providerTenantID and providerUserID are strictly-typed Go strings serialized as BSON string literals.
 	err := s.collection().FindOne(s.store.resolveCtx(ctx), filter).Decode(&doc)
 	if err != nil {
 		if errors.Is(err, mongo.ErrNoDocuments) {

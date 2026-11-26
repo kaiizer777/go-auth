@@ -75,13 +75,17 @@ type TokenResponse = OAuthToken
 
 // OAuthUser represents normalized profile data retrieved from an OAuth provider.
 type OAuthUser struct {
-	ProviderID     string         `json:"provider_id"`
-	ProviderUserID string         `json:"provider_user_id"`
-	Email          string         `json:"email"`
-	EmailVerified  bool           `json:"email_verified"`
-	Name           string         `json:"name"`
-	AvatarURL      string         `json:"avatar_url"`
-	RawClaims      map[string]any `json:"raw_claims,omitempty"`
+	ProviderID string `json:"provider_id"`
+	// ProviderTenantID scopes the identity to the tenant that issued it. It is
+	// empty for providers without a tenant namespace, and required for a
+	// tenant-scoped identity: a pairwise subject is only unique within its tenant.
+	ProviderTenantID string         `json:"provider_tenant_id,omitempty"`
+	ProviderUserID   string         `json:"provider_user_id"`
+	Email            string         `json:"email"`
+	EmailVerified    bool           `json:"email_verified"`
+	Name             string         `json:"name"`
+	AvatarURL        string         `json:"avatar_url"`
+	RawClaims        map[string]any `json:"raw_claims,omitempty"`
 }
 
 // UserInfo is a backward-compatible alias for OAuthUser.

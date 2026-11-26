@@ -681,12 +681,16 @@ func TestOAuthAccountStore_AllMethods(t *testing.T) {
 	}
 
 	// 2. GetByProvider
-	got, err := oauth.GetByProvider(ctx, "github", "gh_user_42")
+	got, err := oauth.GetByProvider(ctx, "github", "", "gh_user_42")
 	if err != nil || got.ID != acc.ID {
 		t.Fatalf("GetByProvider mismatch: %v, %v", got, err)
 	}
-	if _, err := oauth.GetByProvider(ctx, "github", "missing"); !errors.Is(err, gormdriver.ErrRecordNotFound) {
+	if _, err := oauth.GetByProvider(ctx, "github", "", "missing"); !errors.Is(err, gormdriver.ErrRecordNotFound) {
 		t.Fatalf("expected ErrRecordNotFound, got %v", err)
+	}
+	// A tenant-qualified probe must not resolve a link stored without a tenant.
+	if _, err := oauth.GetByProvider(ctx, "github", "tenant-a", "gh_user_42"); !errors.Is(err, gormdriver.ErrRecordNotFound) {
+		t.Fatalf("expected ErrRecordNotFound for a tenant-qualified probe, got %v", err)
 	}
 
 	// 3. GetByUserID
@@ -699,11 +703,11 @@ func TestOAuthAccountStore_AllMethods(t *testing.T) {
 	if err := oauth.UpdateProviderUserID(ctx, acc.ID, "gh_456_updated"); err != nil {
 		t.Fatalf("UpdateProviderUserID failed: %v", err)
 	}
-	gotUpdated, err := oauth.GetByProvider(ctx, "github", "gh_456_updated")
+	gotUpdated, err := oauth.GetByProvider(ctx, "github", "", "gh_456_updated")
 	if err != nil || gotUpdated == nil || gotUpdated.ProviderUserID != "gh_456_updated" || gotUpdated.ID != acc.ID {
 		t.Fatalf("expected updated provider_user_id, got %v, err=%v", gotUpdated, err)
 	}
-	if _, err := oauth.GetByProvider(ctx, "github", "gh_user_42"); !errors.Is(err, gormdriver.ErrRecordNotFound) {
+	if _, err := oauth.GetByProvider(ctx, "github", "", "gh_user_42"); !errors.Is(err, gormdriver.ErrRecordNotFound) {
 		t.Fatalf("expected old provider_user_id to not exist, got err=%v", err)
 	}
 	if err := oauth.UpdateProviderUserID(ctx, uuid.New(), "non_existent"); !errors.Is(err, gormdriver.ErrRecordNotFound) {
@@ -729,6 +733,43 @@ func TestOAuthAccountStore_AllMethods(t *testing.T) {
 	listAfter, _ := oauth.GetByUserID(ctx, userID)
 	if len(listAfter) != 0 {
 		t.Fatalf("expected 0 accounts after DeleteByUserID, got %d", len(listAfter))
+	}
+}
+
+// TestOAuthAccountStore_TenantScopedKey pins #72 at the storage boundary: one
+// pairwise subject in two tenants is two identities, and a lookup only resolves
+// the tenant it names.
+func TestOAuthAccountStore_TenantScopedKey(t *testing.T) {
+	_, store := setupTestDB(t)
+	ctx := context.Background()
+	oauth := store.OAuthAccounts()
+	userID := uuid.New()
+
+	tenants := []string{"tenant-a", "tenant-b"}
+	for _, tenant := range tenants {
+		err := oauth.Create(ctx, &db.OAuthAccount{
+			UserID:           userID,
+			ProviderID:       "microsoft",
+			ProviderTenantID: tenant,
+			ProviderUserID:   "shared-sub",
+			Email:            tenant + "@example.com",
+		})
+		if err != nil {
+			t.Fatalf("create link for %s: %v", tenant, err)
+		}
+	}
+
+	for _, tenant := range tenants {
+		got, err := oauth.GetByProvider(ctx, "microsoft", tenant, "shared-sub")
+		if err != nil {
+			t.Fatalf("GetByProvider(%s) failed: %v", tenant, err)
+		}
+		if got.ProviderTenantID != tenant {
+			t.Fatalf("resolved tenant = %q; want %q", got.ProviderTenantID, tenant)
+		}
+	}
+	if _, err := oauth.GetByProvider(ctx, "microsoft", "tenant-c", "shared-sub"); !errors.Is(err, gormdriver.ErrRecordNotFound) {
+		t.Fatalf("expected ErrRecordNotFound for an unlinked tenant, got %v", err)
 	}
 }
 

@@ -49,6 +49,20 @@ type Mock struct {
 	ClientSecret string
 }
 
+// MicrosoftTenantID is the tenant the Microsoft mock reports. The production
+// adapter always names a verified tenant, so a Microsoft mock without one could
+// not form a storable identity.
+const MicrosoftTenantID = "33333333-3333-3333-3333-333333333333"
+
+// mockTenant returns the tenant a mocked provider's identity is scoped to.
+// Only Microsoft is tenant-scoped; every other provider has no tenant namespace.
+func mockTenant(providerID string) string {
+	if providerID == "microsoft" {
+		return MicrosoftTenantID
+	}
+	return ""
+}
+
 // New returns a Mock serving fixed tokens and the given profile.
 func New(id, sub, email string, verified bool) *Mock {
 	m := &Mock{
@@ -61,7 +75,7 @@ func New(id, sub, email string, verified bool) *Mock {
 		IDToken:      "mock-id-" + id + "-7f3a9c1e",
 		ClientSecret: "mock-client-secret-7f3a9c1e",
 		profile: &oauth.UserInfo{
-			ProviderID: id, ProviderUserID: sub,
+			ProviderID: id, ProviderTenantID: mockTenant(id), ProviderUserID: sub,
 			Email: email, EmailVerified: verified, Name: "OAuth User",
 		},
 	}
@@ -231,7 +245,7 @@ func (m *Mock) FetchUserInfo(ctx context.Context, tokens *oauth.TokenResponse) (
 		}
 	}
 	return &oauth.UserInfo{
-		ProviderID: m.id, ProviderUserID: raw.Sub,
+		ProviderID: m.id, ProviderTenantID: m.profile.ProviderTenantID, ProviderUserID: raw.Sub,
 		Email: raw.Email, EmailVerified: verified || m.profile.EmailVerified,
 		Name: raw.Name, RawClaims: claims,
 	}, nil

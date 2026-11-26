@@ -207,15 +207,19 @@ func (d *PasswordResetTokenDoc) toDomain() *db.PasswordResetToken {
 // fields land on the Go zero value, which is the fail-closed default. Startup
 // re-derives the flag from the owning user (BackfillOAuthAccountVerified), so a
 // legacy link on a locally verified account keeps signing in.
+//
+// provider_tenant_id scopes the identity to the tenant that issued it; it is
+// part of the unique index, so a pairwise subject can exist once per tenant.
 type OAuthAccountDoc struct {
-	ID             string    `bson:"_id"`
-	UserID         string    `bson:"user_id"`
-	ProviderID     string    `bson:"provider_id"`
-	ProviderUserID string    `bson:"provider_user_id"`
-	Email          string    `bson:"email"`
-	Verified       bool      `bson:"verified"`
-	CreatedAt      time.Time `bson:"created_at"`
-	UpdatedAt      time.Time `bson:"updated_at"`
+	ID               string    `bson:"_id"`
+	UserID           string    `bson:"user_id"`
+	ProviderID       string    `bson:"provider_id"`
+	ProviderTenantID string    `bson:"provider_tenant_id"`
+	ProviderUserID   string    `bson:"provider_user_id"`
+	Email            string    `bson:"email"`
+	Verified         bool      `bson:"verified"`
+	CreatedAt        time.Time `bson:"created_at"`
+	UpdatedAt        time.Time `bson:"updated_at"`
 }
 
 func oauthAccountDocFromDomain(o *db.OAuthAccount) *OAuthAccountDoc {
@@ -238,14 +242,15 @@ func oauthAccountDocFromDomain(o *db.OAuthAccount) *OAuthAccountDoc {
 		o.UpdatedAt = updatedAt
 	}
 	return &OAuthAccountDoc{
-		ID:             id.String(),
-		UserID:         o.UserID.String(),
-		ProviderID:     o.ProviderID,
-		ProviderUserID: o.ProviderUserID,
-		Email:          o.Email,
-		Verified:       o.Verified,
-		CreatedAt:      createdAt,
-		UpdatedAt:      updatedAt,
+		ID:               id.String(),
+		UserID:           o.UserID.String(),
+		ProviderID:       o.ProviderID,
+		ProviderTenantID: o.ProviderTenantID,
+		ProviderUserID:   o.ProviderUserID,
+		Email:            o.Email,
+		Verified:         o.Verified,
+		CreatedAt:        createdAt,
+		UpdatedAt:        updatedAt,
 	}
 }
 
@@ -256,14 +261,15 @@ func (d *OAuthAccountDoc) toDomain() *db.OAuthAccount {
 	id, _ := uuid.Parse(d.ID)
 	userID, _ := uuid.Parse(d.UserID)
 	return &db.OAuthAccount{
-		ID:             id,
-		UserID:         userID,
-		ProviderID:     d.ProviderID,
-		ProviderUserID: d.ProviderUserID,
-		Email:          d.Email,
-		Verified:       d.Verified,
-		CreatedAt:      d.CreatedAt.UTC(),
-		UpdatedAt:      d.UpdatedAt.UTC(),
+		ID:               id,
+		UserID:           userID,
+		ProviderID:       d.ProviderID,
+		ProviderTenantID: d.ProviderTenantID,
+		ProviderUserID:   d.ProviderUserID,
+		Email:            d.Email,
+		Verified:         d.Verified,
+		CreatedAt:        d.CreatedAt.UTC(),
+		UpdatedAt:        d.UpdatedAt.UTC(),
 	}
 }
 
