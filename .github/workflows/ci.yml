@@ -178,7 +178,14 @@ jobs:
         shell: bash
         env:
           TEST_MONGO_URI: mongodb://localhost:27017
-        run: go test -v -race -tags=mongodb -shuffle=on -count=1 -timeout=10m ./db/mongo/...
+        run: |
+          set -o pipefail
+          go test -v -race -tags=mongodb -shuffle=on -count=1 -timeout=10m ./db/mongo/... | tee mongo-test.log
+          # Untagged tests pass with the tag dropped, so require live-test evidence.
+          if ! grep -q '^--- PASS: TestBackfillOAuthAccountVerified (' mongo-test.log; then
+            echo "live MongoDB tests did not run: expected TestBackfillOAuthAccountVerified to pass"
+            exit 1
+          fi
 
   quality:
     name: Format, Module & Lint
