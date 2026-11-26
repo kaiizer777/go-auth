@@ -1003,13 +1003,14 @@ func isToken(s string) bool {
 }
 
 // validateGraphVersion accepts an empty value (defaulted after the merge) and
-// requires the "v" prefix with a numeric part of at least 19.0, below which
-// Facebook no longer serves the OAuth dialog.
+// requires "vNN.N" with the "v" optional. Facebook serves no OAuth dialog below
+// 19.0, and the raw value is interpolated into URL paths, so shapes such as
+// NaN, Inf, exponents, hex floats or a missing minor version must not pass.
 func validateGraphVersion(version string) error {
 	if version == "" {
 		return nil
 	}
-	if !strings.HasPrefix(version, "v") {
+	if !graphVersionRegex.MatchString(version) {
 		return errors.ErrOAuthGraphVersionInvalid
 	}
 	ver, err := strconv.ParseFloat(strings.TrimPrefix(version, "v"), 64)
@@ -1051,6 +1052,7 @@ func isCookieDomain(s string) bool {
 
 var (
 	dsnParamRegex        = regexp.MustCompile(`(?i)\b(host|dbname)\b\s*=\s*(?:'(?:\\.|[^'\\])*'|"(?:\\.|[^"\\])*"|\S+)`)
+	graphVersionRegex    = regexp.MustCompile(`^v?[0-9]+\.[0-9]+$`)
 	urlSchemePrefixRegex = regexp.MustCompile(`^(?:[a-zA-Z][a-zA-Z0-9+.-]*:)?//`)
 	dsnSecretRegex       = regexp.MustCompile(`(?i)\b(password|pass|token|secret|api_key|apikey|sslpassword)\b(\s*=\s*)(?:'(?:\\.|[^'\\])*'|"(?:\\.|[^"\\])*"|\S+)`)
 	userinfoRegex        = regexp.MustCompile(`://([^:]+):([^@]+)@`)
