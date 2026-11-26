@@ -74,84 +74,187 @@ func (p *XProvider) AuthCodeURL(state, codeChallenge string, opts ...AuthCodeOpt
 	return p.authURL + "?" + q.Encode()
 }
 
+// RFC 9110 sets no upper bound on a retry hint, but it reaches the client as a
+// Retry-After header, so a hostile or misconfigured upstream must not escape it.
+const (
+	minRetryAfterSeconds = 1
+	maxRetryAfterSeconds = 24 * 60 * 60
+)
+
+// parseRetryAfterHeader resolves the retry delay in seconds. A valid
+// Retry-After (delay-seconds or HTTP-date per RFC 9110) wins over the
+// x-rate-limit-reset epoch. Zero means neither source was usable.
+func parseRetryAfterHeader(header http.Header) int {
+	if header == nil {
+		return 0
+	}
+	if sec, ok := parseRetryAfterValue(strings.TrimSpace(header.Get("Retry-After"))); ok {
+		return sec
+	}
+	if rst := strings.TrimSpace(header.Get("x-rate-limit-reset")); rst != "" {
+		if resetUnix, err := strconv.ParseInt(rst, 10, 64); err == nil {
+			return clampRetryAfterSeconds(resetUnix - time.Now().Unix())
+		}
+	}
+	return 0
+}
+
+// parseRetryAfterValue parses both RFC 9110 forms and clamps the result.
+func parseRetryAfterValue(raw string) (int, bool) {
+	// RFC 9110 delay-seconds = 1*DIGIT, so a negative value is invalid input:
+	// treat it as garbage and let the caller fall back to the reset epoch.
+	if raw == "" || strings.HasPrefix(raw, "-") {
+		return 0, false
+	}
+	if sec, ok := parseDelaySeconds(raw); ok {
+		return sec, true
+	}
+	if at, err := http.ParseTime(raw); err == nil {
+		return clampRetryAfterSeconds(int64(time.Until(at) / time.Second)), true
+	}
+	return 0, false
+}
+
+// parseDelaySeconds accepts delay-seconds (1*DIGIT) only. ParseInt reports an
+// over-int64 prefix as ErrRange before it reaches a non-digit suffix, so the
+// charset must be checked here: "99999999999999999999seconds" is invalid input,
+// not an oversized hint.
+func parseDelaySeconds(raw string) (int, bool) {
+	for _, r := range raw {
+		if r < '0' || r > '9' {
+			return 0, false
+		}
+	}
+	sec, err := strconv.ParseInt(raw, 10, 64)
+	if err == nil {
+		return clampRetryAfterSeconds(sec), true
+	}
+	// All digits: only a magnitude beyond int64 can fail, and that still clamps.
+	// ErrSyntax would mean non-digits slipped past the scan above, so it falls
+	// through as unusable input.
+	if numErr, ok := err.(*strconv.NumError); ok && numErr.Err == strconv.ErrRange {
+		return maxRetryAfterSeconds, true
+	}
+	return 0, false
+}
+
+// clampRetryAfterSeconds bounds sec to [minRetryAfterSeconds, maxRetryAfterSeconds].
+func clampRetryAfterSeconds(sec int64) int {
+	if sec < minRetryAfterSeconds {
+		return minRetryAfterSeconds
+	}
+	if sec > maxRetryAfterSeconds {
+		return maxRetryAfterSeconds
+	}
+	return int(sec)
+}
+
+func xRateLimitError(retryAfterSec int) error {
+	return &RateLimitError{RetryAfter: retryAfterSec, Err: errors.ErrOAuthRateLimitExceeded}
+}
+
+// xProblemDetails is the RFC 7807 failure body X returns.
+type xProblemDetails struct {
+	Type   string            `json:"type"`
+	Title  string            `json:"title"`
+	Detail string            `json:"detail"`
+	Status int               `json:"status"`
+	Errors []json.RawMessage `json:"errors"`
+}
+
+// xProblemError is one entry of an RFC 7807 errors array.
+type xProblemError struct {
+	Type    string `json:"type"`
+	Title   string `json:"title"`
+	Detail  string `json:"detail"`
+	Message string `json:"message"`
+	Status  int    `json:"status"`
+}
+
+// xMaxProblemErrors caps how many errors[] entries reach the cause so a hostile body cannot inflate it without limit.
+const xMaxProblemErrors = 8
+
+// problemErrors decodes errors[] one entry at a time, so a single malformed
+// entry drops only itself instead of the whole problem document.
+func (p xProblemDetails) problemErrors() []xProblemError {
+	if len(p.Errors) == 0 {
+		return nil
+	}
+	errs := make([]xProblemError, 0, len(p.Errors))
+	for _, raw := range p.Errors {
+		var e xProblemError
+		if err := json.Unmarshal(raw, &e); err != nil {
+			continue
+		}
+		// null and {} decode cleanly but carry no diagnostic, so they must not
+		// consume the xMaxProblemErrors budget that real entries need.
+		if e == (xProblemError{}) {
+			continue
+		}
+		errs = append(errs, e)
+	}
+	return errs
+}
+
+// xProblemCause flattens every non-empty provider diagnostic into one cause
+// string. Upstream text stays server-side; the caller-facing message is generic.
+func xProblemCause(problem xProblemDetails, errs []xProblemError) string {
+	var b strings.Builder
+	add := func(label, value string) {
+		if value == "" {
+			return
+		}
+		if b.Len() > 0 {
+			b.WriteString("; ")
+		}
+		b.WriteString(label)
+		b.WriteString(": ")
+		b.WriteString(value)
+	}
+	add("upstream type", problem.Type)
+	add("upstream title", problem.Title)
+	add("upstream detail", problem.Detail)
+	for i, e := range errs {
+		if i == xMaxProblemErrors {
+			break
+		}
+		add("upstream error type", e.Type)
+		add("upstream error title", e.Title)
+		add("upstream error message", e.Message)
+		add("upstream error detail", e.Detail)
+	}
+	return b.String()
+}
+
+func isXRateLimited(status int, title string) bool {
+	return status == http.StatusTooManyRequests || strings.EqualFold(title, "Too Many Requests")
+}
+
 // parseXErrorWithHeader inspects HTTP status, body, and response headers for rate limit details or RFC 7807 problem details.
 func parseXErrorWithHeader(statusCode int, body []byte, header http.Header) error {
-	var retryAfterSec int
-	if header != nil {
-		if ra := header.Get("Retry-After"); ra != "" {
-			if sec, err := strconv.Atoi(strings.TrimSpace(ra)); err == nil && sec > 0 {
-				retryAfterSec = sec
-			}
-		}
-		if retryAfterSec == 0 {
-			if rst := header.Get("x-rate-limit-reset"); rst != "" {
-				if resetUnix, err := strconv.ParseInt(strings.TrimSpace(rst), 10, 64); err == nil {
-					diff := int(resetUnix - time.Now().Unix())
-					if diff > 0 {
-						retryAfterSec = diff
-					} else {
-						retryAfterSec = 1
-					}
-				}
-			}
-		}
-	}
+	retryAfterSec := parseRetryAfterHeader(header)
 
 	if statusCode == http.StatusTooManyRequests {
-		if retryAfterSec > 0 {
-			return &RateLimitError{RetryAfter: retryAfterSec, Err: errors.ErrOAuthRateLimitExceeded}
-		}
-		return errors.ErrOAuthRateLimitExceeded
+		return xRateLimitError(retryAfterSec)
 	}
 
-	var problem struct {
-		Title  string `json:"title"`
-		Detail string `json:"detail"`
-		Type   string `json:"type"`
-		Status int    `json:"status"`
-		Errors []struct {
-			Title   string `json:"title"`
-			Detail  string `json:"detail"`
-			Message string `json:"message"`
-			Status  int    `json:"status"`
-		} `json:"errors"`
-	}
-
+	var problem xProblemDetails
 	if err := json.Unmarshal(body, &problem); err == nil {
-		if problem.Status == http.StatusTooManyRequests || strings.EqualFold(problem.Title, "Too Many Requests") {
-			if retryAfterSec > 0 {
-				return &RateLimitError{RetryAfter: retryAfterSec, Err: errors.ErrOAuthRateLimitExceeded}
-			}
-			return errors.ErrOAuthRateLimitExceeded
+		if isXRateLimited(problem.Status, problem.Title) {
+			return xRateLimitError(retryAfterSec)
 		}
-		for _, e := range problem.Errors {
-			if e.Status == http.StatusTooManyRequests || strings.EqualFold(e.Title, "Too Many Requests") {
-				if retryAfterSec > 0 {
-					return &RateLimitError{RetryAfter: retryAfterSec, Err: errors.ErrOAuthRateLimitExceeded}
-				}
-				return errors.ErrOAuthRateLimitExceeded
+		problemErrs := problem.problemErrors()
+		for _, e := range problemErrs {
+			if isXRateLimited(e.Status, e.Title) {
+				return xRateLimitError(retryAfterSec)
 			}
 		}
 		// Upstream-controlled text must never become the caller-facing message:
 		// WriteJSON renders only Message on the wire, while the cause stays
-		// server-side for logs. Carry detail/title as the cause.
-		if problem.Detail != "" {
-			return errors.New(errors.CodeOAuthProviderError, "oauth provider request failed", errors.New(errors.CodeOAuthProviderError, "upstream detail: "+problem.Detail, nil))
-		}
-		if problem.Title != "" {
-			return errors.New(errors.CodeOAuthProviderError, "oauth provider request failed", errors.New(errors.CodeOAuthProviderError, "upstream title: "+problem.Title, nil))
-		}
-		// Some failures carry the only diagnostic in the nested error array,
-		// with no top-level title/detail. Keep it server-side on the cause.
-		for _, e := range problem.Errors {
-			detail := e.Message
-			if detail == "" {
-				detail = e.Detail
-			}
-			if detail != "" {
-				return errors.New(errors.CodeOAuthProviderError, "oauth provider request failed",
-					errors.New(errors.CodeOAuthProviderError, "upstream error: "+detail, nil))
-			}
+		// server-side for logs.
+		if cause := xProblemCause(problem, problemErrs); cause != "" {
+			return errors.New(errors.CodeOAuthProviderError, "oauth provider request failed",
+				errors.New(errors.CodeOAuthProviderError, cause, nil))
 		}
 	}
 
