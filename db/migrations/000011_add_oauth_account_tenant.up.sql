@@ -14,8 +14,8 @@ ALTER TABLE oauth_accounts ADD COLUMN IF NOT EXISTS provider_tenant_id VARCHAR(6
 
 -- Ordering: the replacement index exists before the tenant-blind key is dropped,
 -- so uniqueness is never unenforced in between. Both forms are dropped: 000007
--- created a constraint (backed by an index), and the down migration restores a
--- plain unique index, which DROP CONSTRAINT would leave behind.
+-- created a constraint (backed by an index), and a database recovered from an
+-- earlier index-restoring down may carry the equivalent plain index.
 CREATE UNIQUE INDEX IF NOT EXISTS uq_oauth_accounts_provider_tenant_uid
     ON oauth_accounts(provider_id, provider_tenant_id, provider_user_id);
 

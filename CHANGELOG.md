@@ -75,11 +75,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Migration 000011 adds `oauth_accounts.provider_tenant_id` as `NOT NULL`
   without a default and rolls the unique key over to
-  `(provider_id, provider_tenant_id, provider_user_id)`. The column add assumes
-  an empty `oauth_accounts` table; it fails rather than inventing a tenant for a
-  pre-existing link whose tenant was never recorded. MySQL: if the migration
-  fails midway, do not re-run the `ALTER TABLE`; see the recovery note in the
-  up file.
+  `(provider_id, provider_tenant_id, provider_user_id)`. The column add requires
+  an empty `oauth_accounts` table: Postgres rejects a non-empty table because the
+  `NOT NULL` column has no default, and MySQL aborts before the `ALTER` rather
+  than backfilling the implicit `''` scope. MySQL: if the migration fails midway,
+  do not re-run the `ALTER TABLE`; see the recovery note in the up file.
 - MySQL only: if migration 000009 fails between `ALTER TABLE` and the backfill,
   version 9 is recorded dirty with the column present but every row still `0`.
   Do not re-run it. Inspect `oauth_accounts`, run the backfill `UPDATE` from the

@@ -551,6 +551,14 @@ func TestMySQLMigration000011_TenantQualifiesIdentityKey(t *testing.T) {
 		t.Fatalf("mysql migration 11 up must not default the tenant: %q", columnStmt)
 	}
 
+	guardIdx := strings.Index(content, "SIGNAL SQLSTATE '45000'")
+	if guardIdx == -1 {
+		t.Fatal("mysql migration 11 up must refuse a non-empty oauth_accounts table")
+	}
+	if guardIdx > columnIdx {
+		t.Errorf("mysql migration 11 empty-table guard must run before the column add: guard=%d column=%d", guardIdx, columnIdx)
+	}
+
 	newKeyIdx := strings.Index(content, "CREATE UNIQUE INDEX uq_oauth_accounts_provider_tenant_uid")
 	if newKeyIdx == -1 {
 		t.Fatal("mysql migration 11 up must create the tenant-qualified unique index")

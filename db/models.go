@@ -136,7 +136,7 @@ func (p PasswordResetToken) LogValue() slog.Value {
 
 // OAuthAccount represents an external federated identity linked to a user.
 // Uniqueness of (provider_id, provider_tenant_id, provider_user_id) is enforced
-// by the uq_oauth_accounts_provider_tenant_uid composite constraint (migration
+// by the uq_oauth_accounts_provider_tenant_uid composite unique index (migration
 // 000011), not by the single-column indexes below. ProviderTenantID scopes an
 // identity to the tenant that issued it: a pairwise subject is only unique
 // within its tenant. Providers without a tenant namespace store "".
