@@ -71,6 +71,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   request. A pinned tenant (GUID or domain) and the `consumers` authority still
   accept this path, keying the identity on the configured tenant.
 
+### Fixed
+
+- X `ExchangeCode` no longer reports success for a 2xx response whose body is an
+  RFC 7807 problem document (`application/problem+json`, or a `type`/`title`/
+  `detail`/`errors` body with no `access_token`). It returns
+  `OAUTH_PROVIDER_ERROR` like the non-2xx path, keeping the upstream detail in
+  the cause, and a 2xx body without an `access_token` is now an error instead of
+  an empty token (#78).
+
 ### Upgrade notes
 
 - Migration 000011 adds `oauth_accounts.provider_tenant_id` as `NOT NULL`
