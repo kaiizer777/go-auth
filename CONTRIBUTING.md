@@ -36,7 +36,11 @@ Thank you for contributing to `go-auth`!
    - The live MongoDB tests are compiled only under the `mongodb` build tag and
      need a running server:
      ```bash
+     # POSIX shells
      TEST_MONGO_URI=mongodb://localhost:27017 go test -tags=mongodb ./db/mongo/...
+
+     # PowerShell (Windows)
+     $env:TEST_MONGO_URI = "mongodb://localhost:27017"; go test -tags=mongodb ./db/mongo/...
      ```
      That build fails when `TEST_MONGO_URI` is unset instead of skipping. CI runs
      it against a `mongo:7` service.
