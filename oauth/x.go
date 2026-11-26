@@ -137,11 +137,11 @@ func xRateLimitError(retryAfterSec int) error {
 
 // xProblemDetails is the RFC 7807 failure body X returns.
 type xProblemDetails struct {
-	Type   string          `json:"type"`
-	Title  string          `json:"title"`
-	Detail string          `json:"detail"`
-	Status int             `json:"status"`
-	Errors []xProblemError `json:"errors"`
+	Type   string            `json:"type"`
+	Title  string            `json:"title"`
+	Detail string            `json:"detail"`
+	Status int               `json:"status"`
+	Errors []json.RawMessage `json:"errors"`
 }
 
 // xProblemError is one entry of an RFC 7807 errors array.
@@ -156,9 +156,26 @@ type xProblemError struct {
 // xMaxProblemErrors caps how many errors[] entries reach the cause so a hostile body cannot inflate it without limit.
 const xMaxProblemErrors = 8
 
+// problemErrors decodes errors[] one entry at a time, so a single malformed
+// entry drops only itself instead of the whole problem document.
+func (p xProblemDetails) problemErrors() []xProblemError {
+	if len(p.Errors) == 0 {
+		return nil
+	}
+	errs := make([]xProblemError, 0, len(p.Errors))
+	for _, raw := range p.Errors {
+		var e xProblemError
+		if err := json.Unmarshal(raw, &e); err != nil {
+			continue
+		}
+		errs = append(errs, e)
+	}
+	return errs
+}
+
 // xProblemCause flattens every non-empty provider diagnostic into one cause
 // string. Upstream text stays server-side; the caller-facing message is generic.
-func xProblemCause(problem xProblemDetails) string {
+func xProblemCause(problem xProblemDetails, errs []xProblemError) string {
 	var b strings.Builder
 	add := func(label, value string) {
 		if value == "" {
@@ -174,7 +191,7 @@ func xProblemCause(problem xProblemDetails) string {
 	add("upstream type", problem.Type)
 	add("upstream title", problem.Title)
 	add("upstream detail", problem.Detail)
-	for i, e := range problem.Errors {
+	for i, e := range errs {
 		if i == xMaxProblemErrors {
 			break
 		}
@@ -203,7 +220,8 @@ func parseXErrorWithHeader(statusCode int, body []byte, header http.Header) erro
 		if isXRateLimited(problem.Status, problem.Title) {
 			return xRateLimitError(retryAfterSec)
 		}
-		for _, e := range problem.Errors {
+		problemErrs := problem.problemErrors()
+		for _, e := range problemErrs {
 			if isXRateLimited(e.Status, e.Title) {
 				return xRateLimitError(retryAfterSec)
 			}
@@ -211,7 +229,7 @@ func parseXErrorWithHeader(statusCode int, body []byte, header http.Header) erro
 		// Upstream-controlled text must never become the caller-facing message:
 		// WriteJSON renders only Message on the wire, while the cause stays
 		// server-side for logs.
-		if cause := xProblemCause(problem); cause != "" {
+		if cause := xProblemCause(problem, problemErrs); cause != "" {
 			return errors.New(errors.CodeOAuthProviderError, "oauth provider request failed",
 				errors.New(errors.CodeOAuthProviderError, cause, nil))
 		}

@@ -331,6 +331,22 @@ func TestXProvider_ExchangeCode(t *testing.T) {
 			_, _ = w.Write([]byte(`[{"detail":"array shaped"}]`))
 			return
 		}
+		if code == "problem-mixed-error-entry-code" {
+			writeProblem(w, http.StatusBadRequest, map[string]any{
+				"type":   "https://api.twitter.com/2/problems/mixed",
+				"title":  "Mixed Errors",
+				"detail": "top-level detail survives",
+				"status": 400,
+				"errors": []any{
+					"not-an-object",
+					map[string]any{
+						"type":    "https://api.twitter.com/2/problems/valid-entry",
+						"message": "valid entry message",
+					},
+				},
+			})
+			return
+		}
 		if code == "rfc7807-error" {
 			w.Header().Set("Content-Type", "application/problem+json")
 			w.WriteHeader(http.StatusBadRequest)
@@ -607,6 +623,28 @@ func TestXProvider_ExchangeCode(t *testing.T) {
 		}
 		if strings.Contains(err.Error(), "array shaped") {
 			t.Errorf("unparsed body leaked into the cause: %v", err)
+		}
+	})
+
+	t.Run("problem+json malformed error entry drops only itself", func(t *testing.T) {
+		_, err := p.ExchangeCode(context.Background(), "problem-mixed-error-entry-code", "test-code-verifier")
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+		appErr := xProviderError(t, err)
+		if appErr.Message() != "oauth provider request failed" {
+			t.Fatalf("message = %q; want the generic message", appErr.Message())
+		}
+		for _, want := range []string{
+			"upstream type: https://api.twitter.com/2/problems/mixed",
+			"upstream title: Mixed Errors",
+			"upstream detail: top-level detail survives",
+			"upstream error type: https://api.twitter.com/2/problems/valid-entry",
+			"upstream error message: valid entry message",
+		} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("cause missing %q in %v", want, err)
+			}
 		}
 	})
 
