@@ -1567,7 +1567,9 @@ func TestMicrosoftProvider_UserInfoTenantGate(t *testing.T) {
 	defer discovery.Close()
 
 	var userinfoClaims atomic.Value
+	var userinfoRequests atomic.Int32
 	userinfo := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		userinfoRequests.Add(1)
 		_ = json.NewEncoder(w).Encode(userinfoClaims.Load())
 	}))
 	defer userinfo.Close()
@@ -1615,7 +1617,13 @@ func TestMicrosoftProvider_UserInfoTenantGate(t *testing.T) {
 	if got := discoveryRequests.Load(); got != 0 {
 		t.Errorf("discovery requests = %d; the gate must not resolve tenants to enforce them", got)
 	}
+	if got := userinfoRequests.Load(); got != 0 {
+		t.Errorf("userinfo requests = %d; a tenant-constrained deployment must reject before the request", got)
+	}
 
+	// No allowlist and the common authority is the permissive default: there is
+	// no tenant restriction to enforce, so the userinfo identity is admitted
+	// without a marker.
 	t.Run("multi-tenant deployment accepts a documented userinfo payload", func(t *testing.T) {
 		userinfoClaims.Store(map[string]any{
 			"sub":         "sub-1",
@@ -1628,6 +1636,9 @@ func TestMicrosoftProvider_UserInfoTenantGate(t *testing.T) {
 		if err != nil {
 			t.Fatalf("FetchUserInfo = %v", err)
 		}
+		if got := userinfoRequests.Load(); got != 1 {
+			t.Errorf("userinfo requests = %d; want 1", got)
+		}
 		if user.EmailVerified {
 			t.Error("userinfo alone must never verify the email")
 		}
@@ -1635,7 +1646,7 @@ func TestMicrosoftProvider_UserInfoTenantGate(t *testing.T) {
 			t.Errorf("ProviderUserID = %q; want sub-1", user.ProviderUserID)
 		}
 		if _, ok := user.RawClaims["untrusted_tenant"]; ok {
-			t.Error("multi-tenant userinfo must not carry a tenant marker it cannot evaluate")
+			t.Error("a permissive deployment must not carry a tenant marker it does not evaluate")
 		}
 	})
 }

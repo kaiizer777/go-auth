@@ -577,9 +577,10 @@ func (p *MicrosoftProvider) FetchUserInfo(ctx context.Context, token *OAuthToken
 		return nil, errors.New(errors.CodeOAuthProviderError, "token has neither id_token nor access_token", nil)
 	}
 
-	// /oidc/userinfo carries no tenant and no signed issuer, so an authority
-	// narrower than common or an allowlist cannot be enforced on this path.
-	// Fail closed with a configuration error instead of trusting the token.
+	// /oidc/userinfo carries no tenant and no signed issuer, so a configured
+	// allowlist or an authority narrower than common cannot be enforced on this
+	// path. Reject with a configuration error before the request: common with an
+	// empty allowlist is the only permissive case, and it has nothing to enforce.
 	if p.tenantScoped() {
 		return nil, errors.New(errors.CodeInvalidConfig,
 			"microsoft userinfo cannot validate the token tenant without a verified id_token", nil)
