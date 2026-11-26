@@ -1014,8 +1014,12 @@ func validateGraphVersion(version string) error {
 	if !graphVersionRegex.MatchString(version) {
 		return errors.ErrOAuthGraphVersionInvalid
 	}
-	ver, err := strconv.ParseFloat(strings.TrimPrefix(version, "v"), 64)
-	if err != nil || ver < 19.0 {
+	// Compare integers, not floats: float64 rounds a long fractional minor such as
+	// 18.9999999999999999 up to 19.0. The minor never lifts the floor (it is always
+	// >= 0) and is left unparsed, so an oversized minor cannot overflow into an accept.
+	major, _, _ := strings.Cut(strings.TrimPrefix(version, "v"), ".")
+	n, err := strconv.Atoi(major)
+	if err != nil || n < 19 {
 		return errors.ErrOAuthGraphVersionInvalid
 	}
 	return nil
