@@ -46,8 +46,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   locally is backfilled `TRUE` and trusted.
 - Microsoft OAuth `trusted_tenants`: an empty allowlist means no tenant
   restriction, so every tenant the configured authority admits stays trusted.
-  A non-empty allowlist marks unlisted tenants untrusted, and their existing
-  Microsoft links are deleted on the next callback.
+  A non-empty allowlist marks unlisted tenants untrusted: their existing
+  Microsoft links are deleted on the next callback and the sign-in is refused
+  with `OAUTH_TENANT_INVALID`.
 
 ### Upgrade notes
 

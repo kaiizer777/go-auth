@@ -44,7 +44,7 @@ go-auth/
 > **Breaking Change:** `OAuthAccountStore` includes `UpdateProviderUserID(ctx context.Context, id uuid.UUID, providerUserID string) error`. Custom `OAuthAccountStore` implementations must implement this method to support provider user ID updates (such as migrating legacy Microsoft OIDs to pairwise subjects).
 
 > [!NOTE]
-> **Behavior Change:** For Microsoft OAuth, an empty `trusted_tenants` allowlist means no tenant restriction: every tenant the configured authority admits stays trusted, including a pinned single-tenant authority. Configure `trusted_tenants` with tenant IDs or domains to restrict admission; a tenant missing from a non-empty allowlist is marked untrusted, and its existing Microsoft link is deleted on its next callback.
+> **Behavior Change:** For Microsoft OAuth, an empty `trusted_tenants` allowlist means no tenant restriction: every tenant the configured authority admits stays trusted, including a pinned single-tenant authority. Configure `trusted_tenants` with tenant IDs or domains to restrict admission; a tenant missing from a non-empty allowlist is marked untrusted, its existing Microsoft link is deleted on its next callback, and the sign-in is refused with `OAUTH_TENANT_INVALID`.
 
 ---
 

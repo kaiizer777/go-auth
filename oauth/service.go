@@ -846,10 +846,11 @@ func isClaimedAccount(u db.User) bool {
 	return u.EmailVerified
 }
 
-// invalidateLink deletes a spent unverified link. The delete is best-effort by
-// design: the refusal does not depend on it because link trust is re-derived
-// from the owner on every callback, so a store failure is logged rather than
-// turning a rejected login into a 500.
+// invalidateLink deletes a link that must never sign in again: a spent
+// unverified link, or a verified one whose tenant dropped out of the allowlist.
+// The delete is best-effort by design: the refusal does not depend on it because
+// link trust is re-derived from the owner and the tenant on every callback, so a
+// store failure is logged rather than turning a rejected login into a 500.
 func (s *service) invalidateLink(ctx context.Context, link db.OAuthAccount) {
 	if err := s.store.OAuthAccounts().Delete(ctx, link.ID); err != nil {
 		slog.WarnContext(ctx, "oauth_link_invalidate_failed",
