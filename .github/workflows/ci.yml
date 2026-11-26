@@ -179,7 +179,7 @@ jobs:
         env:
           TEST_MONGO_URI: mongodb://localhost:27017
         run: |
-          set -o pipefail
+          set -eo pipefail
           go test -v -race -tags=mongodb -shuffle=on -count=1 -timeout=10m ./db/mongo/... | tee mongo-test.log
           # Untagged tests pass with the tag dropped, so require live-test evidence.
           if ! grep -q '^--- PASS: TestBackfillOAuthAccountVerified (' mongo-test.log; then
