@@ -2316,8 +2316,12 @@ func TestOAuthService_X_MissingEmail(t *testing.T) {
 			t.Fatalf("expected link user %v, got %v", user.ID, link.UserID)
 		}
 	})
+}
 
+func TestHandleCallbackUntrustedTenant(t *testing.T) {
 	t.Run("untrusted tenant token is rejected with ErrOAuthTenantInvalid", func(t *testing.T) {
+		database := serviceTestDB(t)
+		cfg := serviceTestConfig()
 		sessSvc := session.NewService(database, cfg)
 		// Mock profile carrying untrusted_tenant claim
 		untrustedInfo := &UserInfo{
@@ -2348,6 +2352,8 @@ func TestOAuthService_X_MissingEmail(t *testing.T) {
 	})
 
 	t.Run("untrusted tenant evicts existing oauth link and rejects callback", func(t *testing.T) {
+		database := serviceTestDB(t)
+		cfg := serviceTestConfig()
 		sessSvc := session.NewService(database, cfg)
 		owner := db.User{ID: uuid.New(), Email: "victim@example.com", PasswordHash: "hash", EmailVerified: true}
 		if err := database.Create(&owner).Error; err != nil {

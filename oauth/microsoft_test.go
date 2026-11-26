@@ -1298,26 +1298,26 @@ func TestMicrosoftProvider_TenantAllowlist(t *testing.T) {
 	}
 
 	tests := []struct {
-		name         string
-		tenantCfg    string
-		trusted      []string
-		tid          string
-		issuer       string
-		wantTrusted  bool
-		wantVerified bool
+		name          string
+		tenantCfg     string
+		trusted       []string
+		tid           string
+		issuer        string
+		wantUntrusted bool
+		wantVerified  bool
 	}{
-		{name: "empty allowlist admits any tenant", tid: "tenant-a", wantTrusted: true, wantVerified: true},
-		{name: "empty allowlist admits any tenant under organizations", tenantCfg: "organizations", tid: "tenant-a", wantTrusted: true, wantVerified: true},
-		{name: "empty allowlist admits the pinned tenant", tenantCfg: "tenant-a", tid: "tenant-a", wantTrusted: true, wantVerified: true},
-		{name: "listed guid", trusted: []string{"tenant-a"}, tid: "tenant-a", wantTrusted: true, wantVerified: true},
-		{name: "listed guid uppercase entry", trusted: []string{"TENANT-A"}, tid: "tenant-a", wantTrusted: true, wantVerified: true},
-		{name: "listed guid uppercase tid", trusted: []string{"tenant-a"}, tid: "TENANT-A", wantTrusted: true, wantVerified: true},
-		{name: "listed domain resolves to guid", trusted: []string{"contoso.onmicrosoft.com"}, tid: contosoTenantGUID, wantTrusted: true, wantVerified: true},
-		{name: "listed domain uppercase entry", trusted: []string{"Contoso.OnMicrosoft.com"}, tid: contosoTenantGUID, wantTrusted: true, wantVerified: true},
-		{name: "domain tenant and domain allowlist", tenantCfg: "contoso.onmicrosoft.com", trusted: []string{"contoso.onmicrosoft.com"}, tid: contosoTenantGUID, wantTrusted: true, wantVerified: true},
-		{name: "allowlist domain does not match", trusted: []string{"contoso.onmicrosoft.com"}, tid: otherTenantGUID, wantVerified: true},
-		{name: "unlisted tenant rejected despite attestation", trusted: []string{"tenant-a"}, tid: "tenant-b", wantVerified: true},
-		{name: "unlisted domain rejected", trusted: []string{"tenant-a"}, tid: "evil.example.com", wantVerified: true},
+		{name: "empty allowlist admits any tenant", tid: "tenant-a", wantVerified: true},
+		{name: "empty allowlist admits any tenant under organizations", tenantCfg: "organizations", tid: "tenant-a", wantVerified: true},
+		{name: "empty allowlist admits the pinned tenant", tenantCfg: "tenant-a", tid: "tenant-a", wantVerified: true},
+		{name: "listed guid", trusted: []string{"tenant-a"}, tid: "tenant-a", wantVerified: true},
+		{name: "listed guid uppercase entry", trusted: []string{"TENANT-A"}, tid: "tenant-a", wantVerified: true},
+		{name: "listed guid uppercase tid", trusted: []string{"tenant-a"}, tid: "TENANT-A", wantVerified: true},
+		{name: "listed domain resolves to guid", trusted: []string{"contoso.onmicrosoft.com"}, tid: contosoTenantGUID, wantVerified: true},
+		{name: "listed domain uppercase entry", trusted: []string{"Contoso.OnMicrosoft.com"}, tid: contosoTenantGUID, wantVerified: true},
+		{name: "domain tenant and domain allowlist", tenantCfg: "contoso.onmicrosoft.com", trusted: []string{"contoso.onmicrosoft.com"}, tid: contosoTenantGUID, wantVerified: true},
+		{name: "allowlist domain does not match", trusted: []string{"contoso.onmicrosoft.com"}, tid: otherTenantGUID, wantUntrusted: true, wantVerified: true},
+		{name: "unlisted tenant rejected despite attestation", trusted: []string{"tenant-a"}, tid: "tenant-b", wantUntrusted: true, wantVerified: true},
+		{name: "unlisted domain rejected", trusted: []string{"tenant-a"}, tid: "evil.example.com", wantUntrusted: true, wantVerified: true},
 	}
 
 	for _, tt := range tests {
@@ -1342,8 +1342,8 @@ func TestMicrosoftProvider_TenantAllowlist(t *testing.T) {
 			if err != nil {
 				t.Fatalf("VerifyIDToken = %v", err)
 			}
-			if c.UntrustedTenant == tt.wantTrusted {
-				t.Errorf("UntrustedTenant = %v; want trusted = %v", c.UntrustedTenant, tt.wantTrusted)
+			if c.UntrustedTenant != tt.wantUntrusted {
+				t.Errorf("UntrustedTenant = %v; want %v", c.UntrustedTenant, tt.wantUntrusted)
 			}
 			if c.EmailVerified != tt.wantVerified {
 				t.Errorf("EmailVerified = %v; want %v", c.EmailVerified, tt.wantVerified)
@@ -1692,7 +1692,11 @@ func TestMicrosoftProvider_UserInfoTenantGate(t *testing.T) {
 	for _, tt := range scoped {
 		t.Run("tenant constraint fails closed: "+tt.name, func(t *testing.T) {
 			userinfoClaims.Store(map[string]any{"sub": "sub-1", "email": "user@example.com"})
+			before := userinfoRequests.Load()
 			_, err := newProvider(t, tt.tenant, tt.trusted).FetchUserInfo(context.Background(), &OAuthToken{AccessToken: "access-token"})
+			if got := userinfoRequests.Load() - before; got != 0 {
+				t.Errorf("userinfo requests = %d; a tenant-constrained deployment must reject before the request", got)
+			}
 			if err == nil {
 				t.Fatal("expected a fail-closed error for a tenant-scoped deployment")
 			}
@@ -1704,9 +1708,6 @@ func TestMicrosoftProvider_UserInfoTenantGate(t *testing.T) {
 	}
 	if got := discoveryRequests.Load(); got != 0 {
 		t.Errorf("discovery requests = %d; the gate must not resolve tenants to enforce them", got)
-	}
-	if got := userinfoRequests.Load(); got != 0 {
-		t.Errorf("userinfo requests = %d; a tenant-constrained deployment must reject before the request", got)
 	}
 
 	// No allowlist and the common authority is the permissive default: there is
@@ -1720,11 +1721,12 @@ func TestMicrosoftProvider_UserInfoTenantGate(t *testing.T) {
 			"given_name":  "User",
 			"email":       "user@example.com",
 		})
+		before := userinfoRequests.Load()
 		user, err := newProvider(t, "common", nil).FetchUserInfo(context.Background(), &OAuthToken{AccessToken: "access-token"})
 		if err != nil {
 			t.Fatalf("FetchUserInfo = %v", err)
 		}
-		if got := userinfoRequests.Load(); got != 1 {
+		if got := userinfoRequests.Load() - before; got != 1 {
 			t.Errorf("userinfo requests = %d; want 1", got)
 		}
 		if user.EmailVerified {
