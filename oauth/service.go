@@ -921,6 +921,18 @@ func (s *service) linkOrCreate(ctx context.Context, providerID string, info *Use
 	if err != nil {
 		return db.User{}, false, false, err
 	}
+
+	var isUntrusted bool
+	if info != nil && info.RawClaims != nil {
+		isUntrusted, _ = info.RawClaims["untrusted_tenant"].(bool)
+	}
+	if isUntrusted {
+		if found {
+			s.invalidateLink(ctx, link)
+		}
+		return db.User{}, false, false, errors.ErrOAuthTenantInvalid
+	}
+
 	if found {
 		if activeUserID != "" && user.ID.String() != activeUserID {
 			return db.User{}, false, false, errors.ErrOAuthAccountAlreadyLinked
@@ -932,16 +944,7 @@ func (s *service) linkOrCreate(ctx context.Context, providerID string, info *Use
 		return user, false, false, nil
 	}
 
-	// 2. Microsoft "nOauth" defense: fail closed on untrusted external tenants.
-	// Runs before the active-session branch so a signed-in callback cannot
-	// persist an attacker-tenant identity onto the victim's account, while
-	// identities linked before this guard existed (step 1) keep signing in
-	// instead of being locked out.
-	if isUntrusted, _ := info.RawClaims["untrusted_tenant"].(bool); isUntrusted {
-		return db.User{}, false, false, errors.ErrOAuthTenantInvalid
-	}
-
-	// 3. Active session explicit linking: link provider to currently authenticated session user.
+	// 2. Active session explicit linking: link provider to currently authenticated session user.
 	// Fail closed: an unresolvable link owner never falls through to registration.
 	if activeUserID != "" {
 		uid, parseErr := uuid.Parse(activeUserID)
