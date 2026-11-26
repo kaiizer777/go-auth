@@ -44,9 +44,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   signing in its own account. Residual risk: an unverified link planted through
   the old unvalidated `?link=true` path on an address that was already verified
   locally is backfilled `TRUE` and trusted.
-- Microsoft OAuth multi-tenant mode (`Tenant: "common"` or `"organizations"`):
-  an empty `trusted_tenants` allowlist fails closed (denies all incoming tenants
-  as untrusted). Operators must explicitly specify permitted tenant IDs or domains.
+- Microsoft OAuth `trusted_tenants`: an empty allowlist means no tenant
+  restriction, so every tenant the configured authority admits stays trusted.
+  A non-empty allowlist marks unlisted tenants untrusted, and their existing
+  Microsoft links are deleted on the next callback.
 
 ### Upgrade notes
 
