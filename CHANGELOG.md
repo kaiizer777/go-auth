@@ -84,6 +84,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   migration that never ran); if it fails after the `ALTER`, do not re-run the
   `ALTER TABLE` — complete the remaining statements by hand and `migrate force
   11`. See the recovery note in the up file.
+- Rolling 000011 back splits the same way: if the restored tenant-blind index
+  clashes, nothing was changed, so the schema is untouched at 000011 while
+  version 10 is recorded dirty — resolve the duplicate identities, then `migrate
+  force 11` and re-run the down; if a later statement fails, the rollback is
+  nearly complete — finish it by hand and `migrate force 10`. See the recovery
+  note in the down file.
 - MongoDB has no schema migration: on the first boot of a new schema version it
   refuses an `oauth_accounts` document whose `provider_tenant_id` is missing,
   null, or not a single string (an array that contains a string included),
