@@ -798,8 +798,8 @@ func TestE2E_FullBrowserOAuthJourneys(t *testing.T) {
 		}
 	})
 
-	// 9. Journey 9: Microsoft token without id_token, identity from /userinfo
-	t.Run("journey 9: microsoft userinfo-only identity", func(t *testing.T) {
+	// 9. Journey 9: Microsoft token without id_token under the multi-tenant default
+	t.Run("journey 9: microsoft userinfo-only rejected without a pinned tenant", func(t *testing.T) {
 		h, dbConn, pReg, cfg := setupOAuthE2EStack(t)
 
 		idp, err := oauthmock.NewMicrosoftIdP(cfg.BaseURL + "/auth/oauth/microsoft/callback")
@@ -812,8 +812,11 @@ func TestE2E_FullBrowserOAuthJourneys(t *testing.T) {
 		idp.OID = "ms-userinfo-oid-9"
 		idp.Email = "userinfo-only@example.com"
 
-		// /oidc/userinfo carries neither tid nor a signed issuer, so only an
-		// unscoped authority can serve it; no allowlist here on purpose.
+		// The default authority is common. /oidc/userinfo is unsigned and names
+		// no tenant, so no tenant-qualified key can be formed: the adapter fails
+		// before the request instead of storing a tenant-blind identity. The
+		// envelope masks CodeInvalidConfig to INTERNAL_ERROR, so the 500 plus the
+		// zero rows below are the observable fail-closed signal.
 		provider := oauth.NewMicrosoftProvider(config.MicrosoftConfig{
 			ClientID:     idp.ClientID,
 			ClientSecret: idp.ClientSecret,
@@ -823,37 +826,19 @@ func TestE2E_FullBrowserOAuthJourneys(t *testing.T) {
 			t.Fatalf("register microsoft adapter: %v", err)
 		}
 
-		// Fails if the fallback keys on oid (the payload never carries one) or
-		// reports the unsigned address as attested.
-		info := probeIdentity(t, provider)
-		if info.ProviderUserID != "ms-userinfo-sub-9" {
-			t.Fatalf("userinfo ProviderUserID = %q; want the sub %q", info.ProviderUserID, "ms-userinfo-sub-9")
-		}
-		if info.EmailVerified {
-			t.Fatal("userinfo alone cannot attest nOauth domain ownership")
-		}
-
 		authorizeURL, cookies := initiateOAuth(t, h, "microsoft", "")
 		cbRec := callbackOAuth(t, h, authorizeAtIdP(t, authorizeURL), cookies...)
-		if cbRec.Code != http.StatusFound {
-			t.Fatalf("userinfo-only callback = %d (%s); want 302", cbRec.Code, cbRec.Body.String())
+		if cbRec.Code != http.StatusInternalServerError {
+			t.Fatalf("userinfo-only callback = %d (%s); want 500", cbRec.Code, cbRec.Body.String())
 		}
-		if responseCookie(t, cbRec, cfg.SessionCookieName) == nil {
-			t.Fatal("expected a session cookie for the userinfo-only login")
+		assertErrorCode(t, cbRec, "INTERNAL_ERROR")
+
+		var userCount, linkCount int64
+		if err := dbConn.Model(&db.User{}).Count(&userCount).Error; err != nil || userCount != 0 {
+			t.Fatalf("expected no user for the rejected userinfo login, got count=%d err=%v", userCount, err)
 		}
-		var user db.User
-		if err := dbConn.Where("email = ?", "userinfo-only@example.com").First(&user).Error; err != nil {
-			t.Fatalf("load userinfo-only user: %v", err)
-		}
-		if user.EmailVerified {
-			t.Fatal("userinfo-only login must not verify the address")
-		}
-		var link db.OAuthAccount
-		if err := dbConn.Where("provider_id = ? AND user_id = ?", "microsoft", user.ID).First(&link).Error; err != nil {
-			t.Fatalf("load userinfo-only link: %v", err)
-		}
-		if link.ProviderUserID != "ms-userinfo-sub-9" {
-			t.Fatalf("link provider_user_id = %q; want the sub %q", link.ProviderUserID, "ms-userinfo-sub-9")
+		if err := dbConn.Model(&db.OAuthAccount{}).Count(&linkCount).Error; err != nil || linkCount != 0 {
+			t.Fatalf("expected no link for the rejected userinfo login, got count=%d err=%v", linkCount, err)
 		}
 	})
 

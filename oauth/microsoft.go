@@ -540,11 +540,20 @@ func (p *MicrosoftProvider) FetchUserInfo(ctx context.Context, token *OAuthToken
 			return nil, err
 		}
 
+		// The tenant segment of the verified issuer is the scope that issued
+		// this identity: verifyIssuer has already bound it to the configured
+		// authority (and to tid in the multi-tenant modes).
+		tenantID := normalizeTenant(issuerTenant(claims.Issuer))
+		if tenantID == "" {
+			return nil, errors.New(errors.CodeOAuthIDTokenInvalid, "id_token issuer names no tenant", nil)
+		}
+
 		user := &OAuthUser{
-			ProviderID:    "microsoft",
-			Email:         strings.ToLower(claims.Email),
-			EmailVerified: claims.EmailVerified,
-			Name:          claims.Name,
+			ProviderID:       "microsoft",
+			ProviderTenantID: tenantID,
+			Email:            strings.ToLower(claims.Email),
+			EmailVerified:    claims.EmailVerified,
+			Name:             claims.Name,
 			RawClaims: map[string]any{
 				"sub":  claims.Subject,
 				"tid":  claims.TenantID,
@@ -561,7 +570,6 @@ func (p *MicrosoftProvider) FetchUserInfo(ctx context.Context, token *OAuthToken
 			user.RawClaims["preferred_username"] = claims.PreferredUsername
 		}
 
-		// ProviderUserID: sub is the key both token paths share, oid the fallback
 		user.ProviderUserID = identityKey(claims.Subject, claims.OID)
 
 		// Fallback from admin-mutable UPN never verifies the address.
@@ -578,13 +586,13 @@ func (p *MicrosoftProvider) FetchUserInfo(ctx context.Context, token *OAuthToken
 		return nil, errors.New(errors.CodeOAuthProviderError, "token has neither id_token nor access_token", nil)
 	}
 
-	// /oidc/userinfo carries no tenant and no signed issuer, so a configured
-	// allowlist or an authority narrower than common cannot be enforced on this
-	// path. Reject with a configuration error before the request: common with an
-	// empty allowlist is the only permissive case, and it has nothing to enforce.
-	if p.tenantScoped() {
-		return nil, errors.New(errors.CodeInvalidConfig,
-			"microsoft userinfo cannot validate the token tenant without a verified id_token", nil)
+	// /oidc/userinfo is unsigned and carries no tid, so the tenant can only come
+	// from an authority that pins one. Resolving it happens before the request:
+	// a multi-tenant authority cannot key the identity at all, so it must fail
+	// without spending an outbound call.
+	tenantID, err := p.userinfoTenant(ctx)
+	if err != nil {
+		return nil, err
 	}
 
 	userinfoEndpoint := p.userinfoURL
@@ -603,31 +611,52 @@ func (p *MicrosoftProvider) FetchUserInfo(ctx context.Context, token *OAuthToken
 	name, _ := raw["name"].(string)
 	picture, _ := raw["picture"].(string)
 
-	return &OAuthUser{
-		ProviderID:     "microsoft",
-		ProviderUserID: identityKey(sub, oid),
-		Email:          strings.ToLower(email),
-		EmailVerified:  false, // Userinfo alone cannot attest nOauth domain ownership
-		Name:           name,
-		AvatarURL:      picture,
-		RawClaims:      raw,
-	}, nil
-}
-
-// tenantScoped reports whether the deployment constrains tenants beyond
-// Microsoft's multi-tenant "common" authority.
-func (p *MicrosoftProvider) tenantScoped() bool {
-	if len(p.trustedTenants) > 0 {
-		return true
+	user := &OAuthUser{
+		ProviderID:       "microsoft",
+		ProviderTenantID: tenantID,
+		ProviderUserID:   identityKey(sub, oid),
+		Email:            strings.ToLower(email),
+		EmailVerified:    false, // Userinfo alone cannot attest nOauth domain ownership
+		Name:             name,
+		AvatarURL:        picture,
+		RawClaims:        raw,
 	}
-	authority := normalizeTenant(p.cfg.Tenant)
-	return authority != "" && authority != "common"
+	// The tenant is the configured pin, so the allowlist can still refuse it;
+	// the service owns the eviction and the rejection.
+	trusted, err := p.tenantTrusted(ctx, tenantID, "")
+	if err != nil {
+		return nil, err
+	}
+	if !trusted {
+		user.RawClaims["untrusted_tenant"] = true
+	}
+	return user, nil
 }
 
-// identityKey keys the principal on sub, the claim both the id_token and
-// /oidc/userinfo return, and falls back to oid only when sub is absent. Keying
-// on oid first splits one principal into two provider_user_id values: the
-// userinfo payload never carries oid.
+// userinfoTenant returns the tenant an /oidc/userinfo identity belongs to. The
+// payload is unsigned and names no tenant, so only an authority that pins
+// exactly one can key it: common and organizations admit many tenants, and an
+// identity without a provable tenant must not be stored at all.
+func (p *MicrosoftProvider) userinfoTenant(ctx context.Context) (string, error) {
+	authority, err := p.tenantAuthority(ctx)
+	if err != nil {
+		return "", err
+	}
+	switch authority {
+	case "common", "organizations":
+		return "", errors.New(errors.CodeInvalidConfig,
+			"microsoft userinfo cannot prove the token tenant without a verified id_token", nil)
+	case "consumers":
+		return MicrosoftConsumerTenantGUID, nil
+	default:
+		return authority, nil
+	}
+}
+
+// identityKey keys the principal on sub, and falls back to oid only when sub is
+// absent. The tenant is carried separately: sub is pairwise per tenant, so the
+// pair — not the subject alone — identifies the principal. Preferring oid would
+// still split one principal into two keys, because userinfo never returns it.
 func identityKey(sub, oid string) string {
 	if sub != "" {
 		return sub

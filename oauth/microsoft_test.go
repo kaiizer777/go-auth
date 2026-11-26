@@ -1675,30 +1675,30 @@ func TestMicrosoftProvider_UserInfoTenantGate(t *testing.T) {
 		return p
 	}
 
-	// /oidc/userinfo returns no tid and no signed issuer, so any tenant
-	// constraint is unenforceable on this path: the adapter must reject the
-	// token instead of accepting the unvalidated identity.
-	scoped := []struct {
+	// /oidc/userinfo returns no tid and no signed issuer, so a multi-tenant
+	// authority cannot name the tenant that owns the identity. No key can be
+	// formed, so the adapter must reject before the request — an allowlist does
+	// not help, because the payload does not even claim a tenant to check.
+	multiTenant := []struct {
 		name    string
 		tenant  string
 		trusted []string
 	}{
-		{name: "allowlist", tenant: "common", trusted: []string{"tenant-a"}},
-		{name: "specific guid tenant", tenant: "tenant-a"},
-		{name: "domain tenant", tenant: "contoso.onmicrosoft.com"},
-		{name: "consumers authority", tenant: "consumers"},
+		{name: "common", tenant: "common"},
+		{name: "default authority", tenant: ""},
+		{name: "common with allowlist", tenant: "common", trusted: []string{"tenant-a"}},
 		{name: "organizations authority", tenant: "organizations"},
 	}
-	for _, tt := range scoped {
-		t.Run("tenant constraint fails closed: "+tt.name, func(t *testing.T) {
+	for _, tt := range multiTenant {
+		t.Run("multi-tenant authority fails closed: "+tt.name, func(t *testing.T) {
 			userinfoClaims.Store(map[string]any{"sub": "sub-1", "email": "user@example.com"})
 			before := userinfoRequests.Load()
 			_, err := newProvider(t, tt.tenant, tt.trusted).FetchUserInfo(context.Background(), &OAuthToken{AccessToken: "access-token"})
 			if got := userinfoRequests.Load() - before; got != 0 {
-				t.Errorf("userinfo requests = %d; a tenant-constrained deployment must reject before the request", got)
+				t.Errorf("userinfo requests = %d; the tenant gate must reject before the request", got)
 			}
 			if err == nil {
-				t.Fatal("expected a fail-closed error for a tenant-scoped deployment")
+				t.Fatal("expected a fail-closed error for a multi-tenant authority")
 			}
 			var appErr *errors.Error
 			if !errors.As(err, &appErr) || appErr.Code() != errors.CodeInvalidConfig {
@@ -1706,39 +1706,63 @@ func TestMicrosoftProvider_UserInfoTenantGate(t *testing.T) {
 			}
 		})
 	}
-	if got := discoveryRequests.Load(); got != 0 {
-		t.Errorf("discovery requests = %d; the gate must not resolve tenants to enforce them", got)
+
+	// An authority that pins one tenant names it in configuration, so the
+	// identity can be keyed without the payload proving it.
+	accepted := []struct {
+		name       string
+		tenant     string
+		trusted    []string
+		wantTenant string
+	}{
+		{name: "pinned guid", tenant: contosoTenantGUID, wantTenant: contosoTenantGUID},
+		{name: "pinned guid on its allowlist", tenant: contosoTenantGUID, trusted: []string{contosoTenantGUID}, wantTenant: contosoTenantGUID},
+		{name: "consumers authority", tenant: "consumers", wantTenant: MicrosoftConsumerTenantGUID},
+	}
+	for _, tt := range accepted {
+		t.Run("single-tenant authority keys the identity: "+tt.name, func(t *testing.T) {
+			userinfoClaims.Store(map[string]any{"sub": "sub-1", "email": "user@example.com"})
+			before := userinfoRequests.Load()
+			user, err := newProvider(t, tt.tenant, tt.trusted).FetchUserInfo(context.Background(), &OAuthToken{AccessToken: "access-token"})
+			if err != nil {
+				t.Fatalf("FetchUserInfo = %v", err)
+			}
+			if got := userinfoRequests.Load() - before; got != 1 {
+				t.Errorf("userinfo requests = %d; want 1", got)
+			}
+			if user.ProviderTenantID != tt.wantTenant {
+				t.Errorf("ProviderTenantID = %q; want %q", user.ProviderTenantID, tt.wantTenant)
+			}
+			if user.ProviderUserID != "sub-1" {
+				t.Errorf("ProviderUserID = %q; want sub-1", user.ProviderUserID)
+			}
+			if user.EmailVerified {
+				t.Error("userinfo alone must never verify the email")
+			}
+			if _, ok := user.RawClaims["untrusted_tenant"]; ok {
+				t.Error("an admitted pinned tenant must not carry a tenant marker")
+			}
+		})
 	}
 
-	// No allowlist and the common authority is the permissive default: there is
-	// no tenant restriction to enforce, so the userinfo identity is admitted
-	// without a marker.
-	t.Run("multi-tenant deployment accepts a documented userinfo payload", func(t *testing.T) {
-		userinfoClaims.Store(map[string]any{
-			"sub":         "sub-1",
-			"name":        "User One",
-			"family_name": "One",
-			"given_name":  "User",
-			"email":       "user@example.com",
-		})
-		before := userinfoRequests.Load()
-		user, err := newProvider(t, "common", nil).FetchUserInfo(context.Background(), &OAuthToken{AccessToken: "access-token"})
+	// The allowlist still applies to the configured tenant: a pin the operator
+	// excluded from their own allowlist stays untrusted, so the service evicts
+	// and rejects it instead of admitting it by default.
+	t.Run("pinned tenant outside the allowlist is untrusted", func(t *testing.T) {
+		userinfoClaims.Store(map[string]any{"sub": "sub-1", "email": "user@example.com"})
+		user, err := newProvider(t, contosoTenantGUID, []string{otherTenantGUID}).
+			FetchUserInfo(context.Background(), &OAuthToken{AccessToken: "access-token"})
 		if err != nil {
 			t.Fatalf("FetchUserInfo = %v", err)
 		}
-		if got := userinfoRequests.Load() - before; got != 1 {
-			t.Errorf("userinfo requests = %d; want 1", got)
-		}
-		if user.EmailVerified {
-			t.Error("userinfo alone must never verify the email")
-		}
-		if user.ProviderUserID != "sub-1" {
-			t.Errorf("ProviderUserID = %q; want sub-1", user.ProviderUserID)
-		}
-		if _, ok := user.RawClaims["untrusted_tenant"]; ok {
-			t.Error("a permissive deployment must not carry a tenant marker it does not evaluate")
+		if untrusted, _ := user.RawClaims["untrusted_tenant"].(bool); !untrusted {
+			t.Fatal("a pinned tenant outside the allowlist must be marked untrusted")
 		}
 	})
+
+	if got := discoveryRequests.Load(); got != 0 {
+		t.Errorf("discovery requests = %d; a named authority needs no discovery", got)
+	}
 }
 
 func TestMicrosoftProvider_FetchUserInfoCarriesRawClaims(t *testing.T) {
@@ -1788,6 +1812,9 @@ func TestMicrosoftProvider_FetchUserInfoCarriesRawClaims(t *testing.T) {
 	if got := user.RawClaims["tid"]; got != "tenant-b" {
 		t.Errorf("RawClaims[tid] = %v; want tenant-b", got)
 	}
+	if user.ProviderTenantID != "tenant-b" {
+		t.Errorf("ProviderTenantID = %q; want the verified issuer tenant %q", user.ProviderTenantID, "tenant-b")
+	}
 }
 
 func TestMicrosoftProvider_ProviderUserIDConsistency(t *testing.T) {
@@ -1806,11 +1833,11 @@ func TestMicrosoftProvider_ProviderUserIDConsistency(t *testing.T) {
 	}))
 	defer userinfo.Close()
 
-	newProvider := func(t *testing.T) *MicrosoftProvider {
+	newProvider := func(t *testing.T, tenant string) *MicrosoftProvider {
 		t.Helper()
 		p := NewMicrosoftProvider(config.MicrosoftConfig{
 			ClientID:    "client-test-id",
-			Tenant:      "common",
+			Tenant:      tenant,
 			RedirectURI: "https://example.com/callback",
 		})
 		p.client = jwks.Client()
@@ -1850,12 +1877,15 @@ func TestMicrosoftProvider_ProviderUserIDConsistency(t *testing.T) {
 				if tt.oid != "" {
 					claims["oid"] = tt.oid
 				}
-				user, err := newProvider(t).FetchUserInfo(context.Background(), &OAuthToken{IDToken: idToken(t, claims)})
+				user, err := newProvider(t, "common").FetchUserInfo(context.Background(), &OAuthToken{IDToken: idToken(t, claims)})
 				if err != nil {
 					t.Fatalf("FetchUserInfo = %v", err)
 				}
 				if user.ProviderUserID != tt.want {
 					t.Errorf("ProviderUserID = %q; want %q", user.ProviderUserID, tt.want)
+				}
+				if user.ProviderTenantID != "tid-1" {
+					t.Errorf("ProviderTenantID = %q; want the verified issuer tenant %q", user.ProviderTenantID, "tid-1")
 				}
 			})
 		}
@@ -1874,19 +1904,22 @@ func TestMicrosoftProvider_ProviderUserIDConsistency(t *testing.T) {
 		for _, tt := range tests {
 			t.Run(tt.name, func(t *testing.T) {
 				userinfoClaims.Store(tt.claims)
-				user, err := newProvider(t).FetchUserInfo(context.Background(), &OAuthToken{AccessToken: "access-token"})
+				user, err := newProvider(t, contosoTenantGUID).FetchUserInfo(context.Background(), &OAuthToken{AccessToken: "access-token"})
 				if err != nil {
 					t.Fatalf("FetchUserInfo = %v", err)
 				}
 				if user.ProviderUserID != tt.want {
 					t.Errorf("ProviderUserID = %q; want %q", user.ProviderUserID, tt.want)
 				}
+				if user.ProviderTenantID != contosoTenantGUID {
+					t.Errorf("ProviderTenantID = %q; want the configured tenant %q", user.ProviderTenantID, contosoTenantGUID)
+				}
 			})
 		}
 
 		t.Run("rejects missing oid and sub", func(t *testing.T) {
 			userinfoClaims.Store(map[string]any{"email": "user@example.com"})
-			_, err := newProvider(t).FetchUserInfo(context.Background(), &OAuthToken{AccessToken: "access-token"})
+			_, err := newProvider(t, contosoTenantGUID).FetchUserInfo(context.Background(), &OAuthToken{AccessToken: "access-token"})
 			if err == nil {
 				t.Fatal("expected rejection for userinfo without a subject identifier")
 			}
@@ -1899,8 +1932,9 @@ func TestMicrosoftProvider_ProviderUserIDConsistency(t *testing.T) {
 }
 
 // TestMicrosoftProvider_UserInfoIdentityKey pins the identity claim set to what
-// /oidc/userinfo actually returns: sub is the key, and oid never outranks it.
-// A payload with neither key is the only userinfo shape that may fail, so
+// /oidc/userinfo actually returns: sub is the key, oid never outranks it, and the
+// tenant comes from configuration because the payload cannot carry one. A
+// payload with neither key is the only userinfo shape that may fail, so
 // re-adding a claim the endpoint does not send breaks these assertions.
 func TestMicrosoftProvider_UserInfoIdentityKey(t *testing.T) {
 	var payload atomic.Value
@@ -1911,6 +1945,7 @@ func TestMicrosoftProvider_UserInfoIdentityKey(t *testing.T) {
 
 	p := NewMicrosoftProvider(config.MicrosoftConfig{
 		ClientID:    "client-test-id",
+		Tenant:      contosoTenantGUID,
 		RedirectURI: "https://example.com/callback",
 	})
 	p.client = userinfo.Client()
@@ -1941,6 +1976,9 @@ func TestMicrosoftProvider_UserInfoIdentityKey(t *testing.T) {
 			if _, ok := user.RawClaims[claim]; ok {
 				t.Errorf("RawClaims carries %q, which /oidc/userinfo never returns", claim)
 			}
+		}
+		if user.ProviderTenantID != contosoTenantGUID {
+			t.Errorf("ProviderTenantID = %q; want the configured tenant %q", user.ProviderTenantID, contosoTenantGUID)
 		}
 		if user.EmailVerified {
 			t.Error("userinfo alone must never verify the email")
