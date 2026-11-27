@@ -1029,6 +1029,13 @@ func isUniqueViolation(err error) bool {
 // createUserAndLink's transaction it also rolls the freshly created user back.
 var errLinkConflict = errors.New(errors.CodeInternalError, "oauth link conflict", nil)
 
+// errLinkEmailOwnedByAnother rejects a link whose provider-attested address
+// already belongs to a different local account: persisting it would let the
+// linker occupy the address's owner's identity. It is a distinct value so it
+// never converges through errLinkConflict's relink path, and it carries the
+// documented link-conflict wire code.
+var errLinkEmailOwnedByAnother = errors.New(errors.CodeOAuthAccountLinkConflict, "oauth identity email is owned by another account", nil)
+
 // errOAuthProviderIdentityInvalid rejects identity fields that cannot be stored.
 // It is a distinct sentinel so HandleCallback logs the literal "userinfo_invalid"
 // reason instead of the derived OAUTH_PROVIDER_ERROR.
@@ -1259,6 +1266,19 @@ func (s *service) attachLink(ctx context.Context, ownerID uuid.UUID, providerID 
 			// an authenticated owner carries no email and is trusted.
 			verified = true
 		}
+		if strings.TrimSpace(email) != "" {
+			emailOwner, emailErr := txStore.Users().GetByEmail(ctx, email)
+			switch {
+			case errors.Is(emailErr, gorm.ErrRecordNotFound), errors.Is(emailErr, errors.ErrUserNotFound):
+				// The address has no local owner yet.
+			case emailErr != nil:
+				return errors.New(errors.CodeInternalError, "failed to resolve link email owner", emailErr)
+			case emailOwner != nil && emailOwner.ID != owner.ID:
+				// Writing this address would squat an account the linker does
+				// not own, permanently claiming its provider identity.
+				return errLinkEmailOwnedByAnother
+			}
+		}
 		if ierr := s.insertLink(ctx, txStore.OAuthAccounts(), owner.ID, providerID, info.ProviderTenantID, info.ProviderUserID, email, verified, tokens); ierr != nil {
 			return ierr
 		}
@@ -1270,7 +1290,7 @@ func (s *service) attachLink(ctx context.Context, ownerID uuid.UUID, providerID 
 			user, _, _, rerr := s.relinkExisting(ctx, providerID, info.ProviderTenantID, info.ProviderUserID)
 			return user, false, rerr
 		}
-		if errors.Is(err, errors.ErrOAuthAccountNotLinked) || errors.Is(err, errors.ErrOAuthAccountLinkConflict) {
+		if errors.Is(err, errors.ErrOAuthAccountNotLinked) || errors.Is(err, errors.ErrOAuthAccountLinkConflict) || errors.Is(err, errLinkEmailOwnedByAnother) {
 			return db.User{}, false, err
 		}
 		return db.User{}, false, errors.New(errors.CodeInternalError, "failed to link oauth account", err)
