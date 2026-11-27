@@ -387,8 +387,9 @@ func TestE2E_FullBrowserOAuthJourneys(t *testing.T) {
 		}
 
 		// Explicit link intent: the state carries the signed-in user and the
-		// callback must resolve the same live session.
-		linkAuthorizeURL, linkCookies := initiateOAuth(t, h, "discord", "?link=true", sessionCookie)
+		// callback must resolve the same live session. The caller-supplied
+		// redirect must survive into the success Location.
+		linkAuthorizeURL, linkCookies := initiateOAuth(t, h, "discord", "?link=true&redirect_url=/settings/links", sessionCookie)
 		if linkAuthorizeURL.Host != discordIdP.Server.Listener.Addr().String() {
 			t.Fatalf("discord authorize host = %q; want loopback IdP %q", linkAuthorizeURL.Host, discordIdP.Server.Listener.Addr())
 		}
@@ -396,6 +397,9 @@ func TestE2E_FullBrowserOAuthJourneys(t *testing.T) {
 		linkRec := callbackOAuth(t, h, linkCallback, append(linkCookies, sessionCookie)...)
 		if linkRec.Code != http.StatusFound {
 			t.Fatalf("discord link callback = %d (%s); want 302", linkRec.Code, linkRec.Body.String())
+		}
+		if got := linkRec.Header().Get("Location"); got != "/settings/links" {
+			t.Fatalf("discord link redirect = %q; want %q", got, "/settings/links")
 		}
 		if responseCookie(t, linkRec, cfg.SessionCookieName) == nil {
 			t.Fatal("expected session cookie set on the discord link callback")

@@ -330,9 +330,8 @@ func TestLinkEmailOwnershipRelinkIsIdempotent(t *testing.T) {
 	}
 }
 
-// TestLinkEmailOwnershipNewUserCallback pins that the ownership probe is
-// confined to the explicit-link path: an unauthenticated first login still
-// creates the account and its link.
+// TestLinkEmailOwnershipNewUserCallback pins the unclaimed-address first
+// login: an unauthenticated callback creates the account and its link.
 func TestLinkEmailOwnershipNewUserCallback(t *testing.T) {
 	const addr = "fresh-user@example.test"
 	database, cfg, _, svc := setupServiceTest(t, &UserInfo{
@@ -393,6 +392,7 @@ func TestLinkEmailOwnershipStoreFaults(t *testing.T) {
 	}{
 		{name: "store failure is internal", storeErr: gorm.ErrInvalidDB, wantCode: errors.CodeInternalError},
 		{name: "record not found is a miss", storeErr: gorm.ErrRecordNotFound, wantLinks: 1},
+		{name: "user not found is a miss", storeErr: errors.ErrUserNotFound, wantLinks: 1},
 		{name: "nil owner without error is a miss", wantLinks: 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
