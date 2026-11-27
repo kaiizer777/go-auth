@@ -282,6 +282,11 @@ func (s *service) LinkedAccountToken(ctx context.Context, userID uuid.UUID, prov
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	// No keyring means no stored grant can be opened: refuse with the same
+	// configuration sentinel the login entry points report, before any read.
+	if s.sealer == nil {
+		return nil, errors.ErrOAuthTokenKEKMissing
+	}
 	link, err := s.linkedAccountFor(ctx, userID, CanonicalProviderSlug(providerID))
 	if err != nil {
 		return nil, err
@@ -364,6 +369,8 @@ func isMalformedEnvelope(err error) bool {
 // server-side failure and leave the stored grant untouched.
 func (s *service) decryptFailure(ctx context.Context, link db.OAuthAccount, err error) error {
 	switch {
+	case errors.Is(err, crypto.ErrSealerUnconfigured):
+		return errors.ErrOAuthTokenKEKMissing
 	case errors.Is(err, crypto.ErrUnknownKeyID):
 		return errors.ErrOAuthTokenKeyNotFound
 	case errors.Is(err, crypto.ErrAuthenticationFailed):

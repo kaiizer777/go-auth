@@ -79,6 +79,14 @@ func tokenAccessEnv(t *testing.T, provider Provider, grant *OAuthToken, expiresA
 	return database, svc, link, owner
 }
 
+// keyringlessService builds a service over store with no token keyring: the
+// shape an embedder gets when OAuth.TokenKEK is unset.
+func keyringlessService(store db.Store, provider Provider) Service {
+	cfg := serviceTestConfig()
+	cfg.OAuth.TokenKEK = ""
+	return NewServiceWithStore(store, nil, map[string]Provider{"google": provider}, cfg)
+}
+
 func reloadTokenLink(t *testing.T, database *gorm.DB, id uuid.UUID) db.OAuthAccount {
 	t.Helper()
 	var link db.OAuthAccount
@@ -259,6 +267,35 @@ func TestLinkedAccountToken_ReadPath(t *testing.T) {
 		}
 		if token.AccessToken != tokenTestAccess {
 			t.Fatalf("AccessToken = %q; want %q", token.AccessToken, tokenTestAccess)
+		}
+	})
+
+	t.Run("nil keyring reports KEK missing and never mutates", func(t *testing.T) {
+		provider := &stubRefreshProvider{stubProvider: &stubProvider{id: "google"}}
+		expiresAt := time.Now().UTC().Add(time.Hour)
+		database, svc, link, owner := tokenAccessEnv(t, provider, tokenTestGrant(), &expiresAt)
+		before := reloadTokenLink(t, database, link.ID)
+
+		_, err := keyringlessService(svc.store, provider).LinkedAccountToken(ctx, owner.ID, "google")
+		requireCode(t, err, errors.CodeInvalidConfig, http.StatusInternalServerError)
+		if !stderrors.Is(err, errors.ErrOAuthTokenKEKMissing) {
+			t.Fatalf("err = %v; want ErrOAuthTokenKEKMissing", err)
+		}
+		requireSameGrant(t, before, reloadTokenLink(t, database, link.ID))
+	})
+
+	t.Run("nil keyring refuses an expired grant before the exchange", func(t *testing.T) {
+		provider := &stubRefreshProvider{stubProvider: &stubProvider{id: "google"}}
+		database, svc, link, owner := tokenAccessEnv(t, provider, tokenTestGrant(), staleExpiry())
+		before := reloadTokenLink(t, database, link.ID)
+
+		_, err := keyringlessService(svc.store, provider).LinkedAccountToken(ctx, owner.ID, "google")
+		if !stderrors.Is(err, errors.ErrOAuthTokenKEKMissing) {
+			t.Fatalf("err = %v; want ErrOAuthTokenKEKMissing", err)
+		}
+		requireSameGrant(t, before, reloadTokenLink(t, database, link.ID))
+		if provider.calls() != 0 {
+			t.Fatalf("refresh calls = %d; want 0", provider.calls())
 		}
 	})
 
