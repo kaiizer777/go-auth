@@ -365,19 +365,29 @@ func (s *service) readStoredAccess(ctx context.Context, link db.OAuthAccount, no
 
 // openAccessToken decrypts the stored access envelope and projects it onto the
 // caller-facing value. Expiry is recomputed from the row, never from the
-// adapter's unset field, and every credential the accessor must withhold is
-// left zero: Raw holds the provider's whole token body, refresh token included.
+// adapter's unset field, and the reported lifetime is bounded on every call: a
+// read recomputes it from the stored expiry, so an uncapped projection here
+// would undo the cap applied to the response that rotated the token. Every
+// credential the accessor must withhold is left zero: Raw holds the provider's
+// whole token body, refresh token included.
 func (s *service) openAccessToken(link db.OAuthAccount, now time.Time) (*OAuthToken, error) {
 	access, err := s.sealer.OpenAccessToken(link.ProviderID, link.ID.String(), link.AccessTokenCiphertext)
 	if err != nil {
 		return nil, err
 	}
 	token := &OAuthToken{AccessToken: access, TokenType: tokenTypeBearer}
-	if link.TokenExpiresAt != nil {
-		token.ExpiresAt = link.TokenExpiresAt.UTC()
-		if remaining := token.ExpiresAt.Sub(now); remaining > 0 {
-			token.ExpiresIn = int(remaining / time.Second)
-		}
+	if link.TokenExpiresAt == nil {
+		return token, nil
+	}
+	expiresAt := link.TokenExpiresAt.UTC()
+	remaining := expiresAt.Sub(now)
+	if remaining > maxRefreshedLifetime {
+		remaining = maxRefreshedLifetime
+		expiresAt = now.Add(remaining)
+	}
+	token.ExpiresAt = expiresAt
+	if remaining > 0 {
+		token.ExpiresIn = int(remaining / time.Second)
 	}
 	return token, nil
 }
@@ -669,12 +679,13 @@ func (s *service) refreshFailure(ctx context.Context, link db.OAuthAccount, err 
 	return nil, errors.ErrOAuthTokenExchangeFailed
 }
 
-// maxRefreshedLifetime is the longest lifetime reported for a renewed access
-// token. A provider answering an absurd expires_in would otherwise hand the
-// caller a credential it caches past any real expiry, so the reported lifetime
-// is capped at 24h — the ceiling the Retry-After parsing already uses. The
-// stored expiry keeps the provider's own value, which is what schedules the next
-// renewal.
+// maxRefreshedLifetime is the longest lifetime reported for an access token. A
+// provider answering an absurd expires_in would otherwise hand the caller a
+// credential it caches past any real expiry, so the reported lifetime is capped
+// at 24h — the ceiling the Retry-After parsing already uses. The cap bounds
+// every projection, not only the response that rotated the token, because the
+// next read recomputes the lifetime from the row. The stored expiry keeps the
+// provider's own value, which is what schedules the next renewal.
 const maxRefreshedLifetime = 24 * time.Hour
 
 // refreshedAccess projects a renewed grant onto the caller-facing value. Raw is

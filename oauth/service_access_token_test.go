@@ -585,22 +585,51 @@ func TestLinkedAccountToken_Refresh(t *testing.T) {
 	// credential it caches past any real expiry.
 	t.Run("reported lifetime is capped at 24h", func(t *testing.T) {
 		provider := &stubRefreshProvider{stubProvider: &stubProvider{id: "google"}}
-		_, svc, _, owner := tokenAccessEnv(t, provider, tokenTestGrant(), staleExpiry())
+		database, svc, link, owner := tokenAccessEnv(t, provider, tokenTestGrant(), staleExpiry())
+		const providerLifetime = 10 * 365 * 24 * 60 * 60
 		provider.refreshFn = func(context.Context, string) (*OAuthToken, error) {
-			return &OAuthToken{AccessToken: "long-access", RefreshToken: "long-refresh", ExpiresIn: 10 * 365 * 24 * 60 * 60}, nil
+			return &OAuthToken{AccessToken: "long-access", RefreshToken: "long-refresh", ExpiresIn: providerLifetime}, nil
 		}
+		wantLifetime := int(maxRefreshedLifetime / time.Second)
 
 		before := time.Now().UTC()
 		token, err := svc.LinkedAccountToken(ctx, owner.ID, "google")
 		if err != nil {
 			t.Fatalf("LinkedAccountToken = %v", err)
 		}
-		if token.ExpiresIn != int(maxRefreshedLifetime/time.Second) {
-			t.Fatalf("ExpiresIn = %d; want %d", token.ExpiresIn, int(maxRefreshedLifetime/time.Second))
+		if token.ExpiresIn != wantLifetime {
+			t.Fatalf("ExpiresIn = %d; want %d", token.ExpiresIn, wantLifetime)
 		}
 		if token.ExpiresAt.Before(before.Add(maxRefreshedLifetime)) ||
 			token.ExpiresAt.After(time.Now().UTC().Add(maxRefreshedLifetime)) {
 			t.Fatalf("ExpiresAt = %v; want now+%v", token.ExpiresAt, maxRefreshedLifetime)
+		}
+
+		// The stored expiry keeps the provider's value: it schedules the next
+		// renewal, so the cap must never reach the column.
+		stored := reloadTokenLink(t, database, link.ID)
+		if stored.TokenExpiresAt == nil {
+			t.Fatal("stored expiry = nil; want the provider's value")
+		}
+		if got := stored.TokenExpiresAt.Sub(before); got < time.Duration(providerLifetime)*time.Second-time.Second ||
+			got > time.Duration(providerLifetime)*time.Second+5*time.Second {
+			t.Fatalf("stored lifetime = %v; want the provider's %ds", got, providerLifetime)
+		}
+
+		// The next read projects the uncapped stored expiry again, so the cap has
+		// to be applied to the read path as well, not only to the rotation.
+		again, err := svc.LinkedAccountToken(ctx, owner.ID, "google")
+		if err != nil {
+			t.Fatalf("second LinkedAccountToken = %v", err)
+		}
+		if again.AccessToken != "long-access" || again.ExpiresIn != wantLifetime {
+			t.Fatalf("second token = %+v; want the same access token capped at %ds", again, wantLifetime)
+		}
+		if again.ExpiresAt.After(time.Now().UTC().Add(maxRefreshedLifetime)) {
+			t.Fatalf("second ExpiresAt = %v; want it capped at now+%v", again.ExpiresAt, maxRefreshedLifetime)
+		}
+		if provider.calls() != 1 {
+			t.Fatalf("refresh calls = %d; want 1", provider.calls())
 		}
 	})
 
