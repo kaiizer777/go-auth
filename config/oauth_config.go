@@ -348,7 +348,7 @@ func applyProviderDefaults(id string, p *ProviderConfig) {
 		}
 	case "x":
 		if len(p.Scopes) == 0 {
-			p.Scopes = []string{"tweet.read", "users.read", "offline.access"}
+			p.Scopes = []string{"users.read", "offline.access"}
 		}
 	}
 }

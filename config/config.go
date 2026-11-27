@@ -868,7 +868,7 @@ func (c *Config) validate() error {
 		// entry carries explicit scopes.
 		_, xMapEntry := c.OAuth.Providers["x"]
 		if len(c.OAuth.X.Scopes) == 0 && !xMapEntry {
-			c.OAuth.X.Scopes = []string{"users.read"}
+			c.OAuth.X.Scopes = []string{"users.read", "offline.access"}
 		}
 	}
 

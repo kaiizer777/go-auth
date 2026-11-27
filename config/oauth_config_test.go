@@ -1396,15 +1396,34 @@ func TestProviderConfigLogValue(t *testing.T) {
 		if err := cfg.Validate(); err != nil {
 			t.Fatalf("Validate = %v", err)
 		}
-		if len(cfg.OAuth.X.Scopes) != 1 || cfg.OAuth.X.Scopes[0] != "users.read" {
-			t.Fatalf("Scopes = %v; want [users.read]", cfg.OAuth.X.Scopes)
+		if len(cfg.OAuth.X.Scopes) != 2 || cfg.OAuth.X.Scopes[0] != "users.read" || cfg.OAuth.X.Scopes[1] != "offline.access" {
+			t.Fatalf("Scopes = %v; want [users.read offline.access]", cfg.OAuth.X.Scopes)
 		}
-		// Merge premise (oauth sync): the typed X default is least-privilege
-		// [users.read] and wins the resolveProviders merge, so the merged map
-		// entry carries it rather than the broader remote default.
+		// Merge premise (oauth sync): the typed X default is
+		// [users.read offline.access] and wins the resolveProviders merge, so the
+		// merged map entry carries it rather than the map-surface default.
 		scopes := cfg.OAuth.Providers["x"].Scopes
-		if len(scopes) != 1 || scopes[0] != "users.read" {
-			t.Fatalf("Scopes = %v; want [users.read]", scopes)
+		if len(scopes) != 2 || scopes[0] != "users.read" || scopes[1] != "offline.access" {
+			t.Fatalf("Scopes = %v; want [users.read offline.access]", scopes)
+		}
+	})
+
+	t.Run("X map-only provider defaults scopes", func(t *testing.T) {
+		cfg := validOAuthBase()
+		cfg.OAuth.Providers = map[string]ProviderConfig{
+			"x": {
+				ClientID:     "x-id",
+				ClientSecret: "x-secret",
+				RedirectURL:  "https://example.com/callback",
+				Enabled:      true,
+			},
+		}
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("Validate = %v", err)
+		}
+		scopes := cfg.OAuth.Providers["x"].Scopes
+		if len(scopes) != 2 || scopes[0] != "users.read" || scopes[1] != "offline.access" {
+			t.Fatalf("Scopes = %v; want [users.read offline.access]", scopes)
 		}
 	})
 
