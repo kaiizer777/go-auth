@@ -49,9 +49,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fingerprint, and concurrent renewals of one account within a process collapse
   into a single provider request.
 - X renews a stored grant through `POST /2/oauth2/token` with
-  `grant_type=refresh_token` and treats `invalid_grant`/`invalid_request` as a
-  dead grant. Providers without refresh support report
-  `OAUTH_REFRESH_UNSUPPORTED`.
+  `grant_type=refresh_token` and treats `invalid_grant` as a dead grant. Other
+  provider errors keep the stored grant. Providers without refresh support
+  report `OAUTH_REFRESH_UNSUPPORTED`.
 
 ### Changed
 
