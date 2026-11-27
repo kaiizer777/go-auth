@@ -101,6 +101,9 @@ func (p ProviderConfig) String() string {
 	return fmt.Sprintf("ProviderConfig{ClientID: %s, ClientSecret: %s, RedirectURL: %s}", p.ClientID, secret, p.RedirectURL)
 }
 
+// GoString implements fmt.GoStringer so %#v masks ClientSecret and PrivateKey.
+func (p ProviderConfig) GoString() string { return "config." + p.String() }
+
 // OAuthConfig groups configurations for all external identity providers.
 type OAuthConfig struct {
 	// Providers maps provider ID ("google", "github", "apple", "microsoft") to provider configuration.
@@ -182,6 +185,10 @@ func (o OAuthConfig) String() string {
 		o.Providers, o.Microsoft, o.Facebook, o.Discord, o.X, secret, kek, o.CallbackBaseURL)
 }
 
+// GoString implements fmt.GoStringer so %#v masks StateSecret, TokenKEK and the
+// nested provider credentials.
+func (o OAuthConfig) GoString() string { return "config." + o.String() }
+
 // SecurityHeadersConfig groups HTTP security header policies.
 // Struct fields are ordered largest-to-smallest to eliminate memory alignment padding.
 type SecurityHeadersConfig struct {
@@ -227,6 +234,9 @@ func (t TOTPConfig) String() string {
 	return fmt.Sprintf("TOTPConfig{EncryptionKey: %s, Issuer: %s, ChallengeTokenTTL: %v, AttemptWindow: %v, MaxAttemptsPerWindow: %d}",
 		keyMasked, t.Issuer, t.ChallengeTokenTTL, t.AttemptWindow, t.MaxAttemptsPerWindow)
 }
+
+// GoString implements fmt.GoStringer so %#v masks EncryptionKey.
+func (t TOTPConfig) GoString() string { return "config." + t.String() }
 
 // DefaultTOTPConfig returns safe production defaults for TOTP configuration.
 func DefaultTOTPConfig() TOTPConfig {
@@ -1201,3 +1211,7 @@ func (c Config) String() string {
 	return fmt.Sprintf("Config{DatabaseURL: %s, BaseURL: %s, MigrationsPath: %s, MaxOpenConns: %d, MaxIdleConns: %d}",
 		RedactURL(c.DatabaseURL), c.BaseURL, c.MigrationsPath, c.MaxOpenConns, c.MaxIdleConns)
 }
+
+// GoString implements fmt.GoStringer so %#v masks DatabaseURL and every nested
+// secret-bearing section.
+func (c Config) GoString() string { return "config." + c.String() }

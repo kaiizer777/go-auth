@@ -1509,6 +1509,73 @@ func TestConfig_SecretRedaction_LogValue_String(t *testing.T) {
 		}
 	})
 }
+func TestConfigSecretsMaskedUnderFormatVerbs(t *testing.T) {
+	const (
+		dbPassword    = "db-super-secret"
+		stateSecret   = "state-super-secret"
+		tokenKEK      = "kek-super-secret"
+		clientSecret  = "provider-super-secret"
+		privateKey    = "private-key-super-secret"
+		totpKey       = "totp-super-secret"
+		msSecret      = "microsoft-super-secret"
+		fbSecret      = "facebook-super-secret"
+		discordSecret = "discord-super-secret"
+		xSecret       = "x-super-secret"
+	)
+
+	provider := ProviderConfig{ClientID: "id", ClientSecret: clientSecret, PrivateKey: privateKey}
+	oauthCfg := OAuthConfig{
+		Providers: map[string]ProviderConfig{"google": provider},
+		Microsoft: &MicrosoftConfig{
+			ClientID:     "ms-id",
+			ClientSecret: msSecret,
+		},
+		Facebook: &FacebookConfig{
+			AppID:     "fb-id",
+			AppSecret: fbSecret,
+		},
+		Discord: &DiscordConfig{
+			ClientID:     "discord-id",
+			ClientSecret: discordSecret,
+		},
+		X: &XConfig{
+			ClientID:     "x-id",
+			ClientSecret: xSecret,
+		},
+		StateSecret: stateSecret,
+		TokenKEK:    tokenKEK,
+	}
+	cfg := Config{
+		DatabaseURL: "postgres://admin:" + dbPassword + "@localhost:5432/auth",
+		OAuth:       oauthCfg,
+		TOTP:        TOTPConfig{EncryptionKey: totpKey},
+	}
+
+	cases := []struct {
+		name    string
+		value   any
+		secrets []string
+	}{
+		{"Config", cfg, []string{dbPassword, stateSecret, tokenKEK, clientSecret, privateKey, totpKey}},
+		{"OAuthConfig", oauthCfg, []string{stateSecret, tokenKEK, clientSecret, privateKey, msSecret, fbSecret, discordSecret, xSecret}},
+		{"ProviderConfig", provider, []string{clientSecret, privateKey}},
+		{"TOTPConfig", cfg.TOTP, []string{totpKey}},
+		{"MicrosoftConfig", *oauthCfg.Microsoft, []string{msSecret}},
+		{"FacebookConfig", *oauthCfg.Facebook, []string{fbSecret}},
+		{"DiscordConfig", *oauthCfg.Discord, []string{discordSecret}},
+		{"XConfig", *oauthCfg.X, []string{xSecret}},
+	}
+	for _, tc := range cases {
+		for _, verb := range []string{"%v", "%+v", "%#v", "%s"} {
+			out := fmt.Sprintf(verb, tc.value)
+			for _, secret := range tc.secrets {
+				if strings.Contains(out, secret) {
+					t.Errorf("%s under %s leaked %q: %s", tc.name, verb, secret, out)
+				}
+			}
+		}
+	}
+}
 func TestConfigValidate_SecurityHeaders(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
