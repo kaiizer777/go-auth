@@ -171,7 +171,7 @@ func New(db *gorm.DB, cfg config.Config, authSvc auth.Service, opts ...Option) h
 		h.totpLimiter = ratelimit.NewLimiter(window, h.cfg.TOTP.MaxAttemptsPerWindow)
 	}
 
-	if h.totpSvc == nil && cfg.TOTP.EncryptionKey != "" {
+	if h.totpSvc == nil && (cfg.TOTP.EncryptionKey != "" || cfg.TOTP.Keyring != "") {
 		if h.store != nil {
 			h.totpSvc = totp.NewServiceWithStore(h.store, cfg.TOTP, h.totpLimiter, slog.Default())
 		} else if db != nil {

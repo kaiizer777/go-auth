@@ -4,6 +4,8 @@ package e2e
 
 import (
 	"bytes"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -428,5 +430,65 @@ func TestE2E_TOTPCSRFAndAliasEnforcement(t *testing.T) {
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("%s: expected 200, got %d: %v", statusPath, resp.StatusCode, data)
 		}
+	}
+}
+
+// e2eTOTPKeyring is the same 32-byte key as e2eTOTPEncryptionKey, expressed in
+// the kid:base64 ring grammar a rotated deployment uses.
+var e2eTOTPKeyring = func() string {
+	raw, err := hex.DecodeString(e2eTOTPEncryptionKey)
+	if err != nil {
+		panic(err)
+	}
+	return "primary:" + base64.StdEncoding.EncodeToString(raw)
+}()
+
+// TestE2E_TOTPJourney_KeyringOnly proves a keyring-only deployment is not a
+// silent 2FA bypass: the server enables TOTP, enrollment writes an envelope, and
+// a live code confirms it.
+func TestE2E_TOTPJourney_KeyringOnly(t *testing.T) {
+	server, client, capture, _ := setupE2EServerWithConfig(t, func(cfg *config.Config) {
+		cfg.RequireEmailVerification = true
+		cfg.TOTP.EncryptionKey = ""
+		cfg.TOTP.Keyring = e2eTOTPKeyring
+		cfg.TOTP.Issuer = "GoAuthE2E"
+		cfg.TOTP.ChallengeTokenTTL = 5 * time.Minute
+	})
+
+	email := "e2e_totp_keyring@example.com"
+	password := "SecureE2EPassword#2026!"
+	createAndVerifyUser(t, client, server.URL, capture, email, password)
+
+	resp, body := postJSON(t, client, server.URL+"/auth/login", map[string]string{
+		"email":    email,
+		"password": password,
+	})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("login expected 200, got %d: %v", resp.StatusCode, body)
+	}
+
+	resp, body = postJSON(t, client, server.URL+"/auth/totp/enroll", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("enroll expected 200 with a keyring-only config, got %d: %v", resp.StatusCode, body)
+	}
+	secret, ok := body["secret"].(string)
+	if !ok || secret == "" {
+		t.Fatalf("enroll response missing secret: %v", body)
+	}
+
+	setupCode, err := ptotp.GenerateCode(secret, time.Now().UTC().Add(-30*time.Second))
+	if err != nil {
+		t.Fatalf("generate setup code: %v", err)
+	}
+	resp, body = postJSON(t, client, server.URL+"/auth/totp/confirm", map[string]string{
+		"code": setupCode,
+	})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("confirm expected 200, got %d: %v", resp.StatusCode, body)
+	}
+
+	resp, body = getJSON(t, client, server.URL+"/auth/totp/status")
+	if resp.StatusCode != http.StatusOK || body["enabled"] != true {
+		t.Fatalf("expected enabled=true after confirm, got %d: %v", resp.StatusCode, body)
 	}
 }

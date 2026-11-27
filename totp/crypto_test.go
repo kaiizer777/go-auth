@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"go/build"
 	"os"
 	"path/filepath"
 	"strings"
@@ -362,6 +363,20 @@ func TestEncryptRejectsOversizedPlaintext(t *testing.T) {
 	c := newTestTOTPCrypto(t, config.TOTPConfig{EncryptionKey: validTestHexKey()})
 	if _, err := c.Encrypt(uuid.New(), bytes.Repeat([]byte("A"), 1025)); !errors.Is(err, crypto.ErrPlaintextTooLarge) {
 		t.Fatalf("Encrypt over cap error = %v, want ErrPlaintextTooLarge", err)
+	}
+}
+
+func TestPackageBuildsNoAEAD(t *testing.T) {
+	t.Parallel()
+
+	pkg, err := build.ImportDir(".", 0)
+	if err != nil {
+		t.Fatalf("inspect package imports: %v", err)
+	}
+	for _, path := range pkg.Imports {
+		if path == "crypto/aes" || path == "crypto/cipher" {
+			t.Errorf("totp must delegate sealing to package crypto; it imports %s", path)
+		}
 	}
 }
 
