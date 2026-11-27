@@ -63,13 +63,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   report `OAUTH_REFRESH_UNSUPPORTED`.
 - TOTP secrets are sealed through the same envelope as OAuth tokens, under a
   distinct AAD label and bound to the owning user id plus the
-  `encrypted_secret` field, so a stored secret cannot be transplanted onto
-  another user's row or another column. `TOTP.Keyring` adds an optional
-  `kid:base64key[,…]` ring; `TOTP.EncryptionKey` is appended to it as a
-  decryption-only `legacy` entry, so an unchanged deployment keeps reading its
-  rows and rotation only needs a new ring head. Either surface enables TOTP. The
-  `legacy` kid is reserved: a keyring that already defines it is rejected by
-  configuration validation at startup instead of failing every TOTP operation.
+  `encrypted_secret` field, so a sealed envelope cannot be transplanted onto
+  another user's row or another column. Rows still in the pre-envelope
+  `nonce||ciphertext||tag` layout carry neither binding and keep opening for any
+  owner until `totp.RewrapSecrets` replaces them. `TOTP.Keyring` adds an optional
+  `kid:base64key[,…]` ring; `TOTP.EncryptionKey` joins it under the fixed kid
+  `legacy`, so an unchanged deployment keeps reading its rows and a rotation only
+  needs a new ring head. With no `Keyring` set, the hex key is the ring's only
+  entry and encrypts. Either surface enables TOTP. That composition reserves
+  `legacy`: a `Keyring` that already defines it together with a non-empty
+  `EncryptionKey` is rejected by configuration validation at startup instead of
+  failing every TOTP operation at runtime.
 - `totp.RewrapSecrets` rewrites stored secrets onto the active key: keyset-batched,
   idempotent, resumable, one CAS-guarded `UPDATE` per row that writes ciphertext
   and the new `totp_secrets.secret_kid` hint together. It is an explicit call,

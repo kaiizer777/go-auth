@@ -35,8 +35,9 @@ operation unusable. Give the pre-existing key a different kid and list it in
 
 A configured-but-unusable key surface is never a silent "2FA off": the service
 is wired, startup logs `totp_crypto_config_invalid`, and every TOTP operation
-fails closed. A keyring that does not parse, or that collides with `legacy`, is
-rejected by configuration validation before the service starts.
+fails closed. A composed ring that does not parse, or that defines `legacy`
+while a non-empty `EncryptionKey` also joins the ring under that kid, fails
+`Validate` (`ErrTOTPKeyringInvalid`) before a config-built service starts.
 
 ## Stored format and the legacy read path
 
