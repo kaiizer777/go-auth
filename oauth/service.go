@@ -13,6 +13,7 @@ import (
 
 	"github.com/go-sql-driver/mysql"
 	"github.com/google/uuid"
+	"golang.org/x/sync/singleflight"
 	"gorm.io/gorm"
 
 	"github.com/kaiizer777/go-auth/config"
@@ -79,6 +80,11 @@ type service struct {
 	providers  map[string]Provider
 	cfg        *config.Config
 	sealer     *crypto.TokenSealer
+
+	// refreshFlight collapses concurrent renewals of one account. It is an
+	// optimisation only: the CAS on the stored fingerprint is what keeps
+	// writers safe across instances.
+	refreshFlight singleflight.Group
 }
 
 // newTokenSealer builds the immutable token sealer from cfg.OAuth.TokenKEK. A
@@ -410,9 +416,109 @@ func (s *service) converge(ctx context.Context, stale db.OAuthAccount) (*OAuthTo
 	return token, nil
 }
 
-// refreshAccessToken renews an expired grant on demand.
+// refreshAccessToken renews an expired grant on demand. Concurrent callers for
+// one account share a single exchange; the shared result is copied so no two
+// callers receive the same mutable value.
 func (s *service) refreshAccessToken(ctx context.Context, link db.OAuthAccount) (*OAuthToken, error) {
+	value, err, _ := s.refreshFlight.Do(link.ID.String(), func() (any, error) {
+		return s.exchangeRefreshToken(ctx, link)
+	})
+	if err != nil {
+		return nil, err
+	}
+	token, ok := value.(*OAuthToken)
+	if !ok || token == nil {
+		return nil, errors.New(errors.CodeInternalError, "oauth token refresh produced no token", nil)
+	}
+	view := *token
+	return &view, nil
+}
+
+// exchangeRefreshToken renews a grant against the provider. The request runs
+// with no database transaction held, and the rotated pair is persisted with a
+// CAS keyed on the fingerprint that was read: a concurrent rotation is never
+// overwritten, and losing that CAS serves the winner instead.
+func (s *service) exchangeRefreshToken(ctx context.Context, link db.OAuthAccount) (*OAuthToken, error) {
+	if link.RefreshTokenCiphertext == "" || link.RefreshTokenFingerprint == "" {
+		return nil, errors.ErrOAuthReauthRequired
+	}
+	provider, err := s.providerFor(link.ProviderID)
+	if err != nil {
+		return nil, err
+	}
+	refresher, ok := provider.(TokenRefresher)
+	if !ok {
+		// Re-authentication cannot install a capability the deployment lacks.
+		return nil, errors.ErrOAuthRefreshUnsupported
+	}
+	refreshToken, err := s.sealer.OpenRefreshToken(link.ProviderID, link.ID.String(), link.RefreshTokenCiphertext)
+	if err != nil {
+		if isMalformedEnvelope(err) {
+			return s.discardGrant(ctx, link)
+		}
+		return nil, s.decryptFailure(ctx, link, err)
+	}
+
+	refreshed, err := refresher.RefreshToken(ctx, refreshToken)
+	if err != nil {
+		return s.refreshFailure(ctx, link, err)
+	}
+	if refreshed == nil || refreshed.AccessToken == "" {
+		return nil, errors.ErrOAuthTokenExchangeFailed
+	}
+	if refreshed.RefreshToken == "" {
+		// Keeping the presented token is what lets the row renew again; a
+		// provider that does not rotate must not erase the only credential.
+		refreshed.RefreshToken = refreshToken
+	}
+	rec, err := s.sealedTokens(link.ProviderID, link.ID.String(), refreshed)
+	if err != nil {
+		return nil, err
+	}
+	won, err := s.store.OAuthAccounts().SaveOAuthTokensCAS(ctx, link.ID, link.RefreshTokenFingerprint, rec)
+	if err != nil {
+		logTokenEvent(ctx, "oauth_token_refresh_persist_failed", link)
+		return nil, errors.ErrOAuthTokenExchangeFailed
+	}
+	if !won {
+		return s.converge(ctx, link)
+	}
+	return refreshedAccess(refreshed), nil
+}
+
+// refreshFailure maps a failed exchange. Only the provider's own grant
+// rejection may destroy a stored token set: a transport fault, a 5xx, a 429, or
+// a bad client credential leaves the grant for the next attempt. A rejected
+// client credential is not separable from a transport fault at this boundary, so
+// both report the retryable exchange failure rather than a dead grant.
+func (s *service) refreshFailure(ctx context.Context, link db.OAuthAccount, err error) (*OAuthToken, error) {
+	if errors.Is(err, errors.ErrOAuthGrantRejected) {
+		return s.discardGrant(ctx, link)
+	}
+	if _, ok := RetryAfterFromError(err); ok || errors.Is(err, errors.ErrOAuthRateLimitExceeded) {
+		return nil, err
+	}
 	return nil, errors.ErrOAuthTokenExchangeFailed
+}
+
+// refreshedAccess projects a renewed grant onto the caller-facing value. Raw is
+// the provider's whole response body, which carries the refresh token, so it is
+// dropped along with every other credential the caller must not receive.
+func refreshedAccess(tokens *OAuthToken) *OAuthToken {
+	token := &OAuthToken{
+		AccessToken: tokens.AccessToken,
+		TokenType:   tokens.TokenType,
+	}
+	if token.TokenType == "" {
+		token.TokenType = tokenTypeBearer
+	}
+	if tokens.ExpiresIn > 0 {
+		token.ExpiresIn = tokens.ExpiresIn
+	}
+	if expiresAt := tokenExpiry(tokens); expiresAt != nil {
+		token.ExpiresAt = *expiresAt
+	}
+	return token
 }
 
 // logTokenEvent records a failure on the token path. Identity only: the record,
