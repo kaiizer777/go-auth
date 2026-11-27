@@ -144,6 +144,75 @@ func TestNewProvider(t *testing.T) {
 	})
 }
 
+func TestNewProviderFacebookGraphVersion(t *testing.T) {
+	t.Parallel()
+
+	cfg := config.ProviderConfig{
+		ClientID:     "fb-id",
+		ClientSecret: "fb-secret",
+		RedirectURL:  "https://app.example.com/cb",
+	}
+
+	tests := []struct {
+		name        string
+		generic     string
+		typed       *config.OAuthConfig
+		wantVersion string
+		wantErr     bool
+	}{
+		{name: "empty defaults", generic: "", wantVersion: "v19.0"},
+		{name: "accepted version", generic: "v19.0", wantVersion: "v19.0"},
+		{name: "rejects unprefixed", generic: "19.0", wantErr: true},
+		{name: "rejects path traversal", generic: "../x", wantErr: true},
+		{name: "rejects old major", generic: "v18.9", wantErr: true},
+		{
+			name:        "typed version overrides an invalid generic one",
+			generic:     "19.0",
+			typed:       &config.OAuthConfig{Facebook: &config.FacebookConfig{GraphVersion: "v20.0"}},
+			wantVersion: "v20.0",
+		},
+		{
+			name:    "typed version overrides a valid generic one",
+			generic: "v20.0",
+			typed:   &config.OAuthConfig{Facebook: &config.FacebookConfig{GraphVersion: "19.0"}},
+			wantErr: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			in := cfg
+			in.GraphVersion = tt.generic
+			p, err := NewProvider("facebook", in, tt.typed)
+			if tt.wantErr {
+				// A typed nil *FacebookProvider wrapped in the interface is the
+				// regression this guards: it is non-nil here and panics on use.
+				if p != nil {
+					t.Fatalf("provider type = %T; want a nil interface", p)
+				}
+				if !errors.Is(err, errors.ErrOAuthGraphVersionInvalid) {
+					t.Fatalf("error = %v; want ErrOAuthGraphVersionInvalid", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("NewProvider(facebook) error = %v; want nil", err)
+			}
+			if p == nil {
+				t.Fatal("provider = nil; want non-nil")
+			}
+			fp, ok := p.(*FacebookProvider)
+			if !ok {
+				t.Fatalf("provider type = %T; want *FacebookProvider", p)
+			}
+			if want := "https://www.facebook.com/" + tt.wantVersion + "/dialog/oauth"; fp.authURL != want {
+				t.Fatalf("authURL = %q; want %q", fp.authURL, want)
+			}
+		})
+	}
+}
+
 func TestNewProviderFacebookEmailAttestation(t *testing.T) {
 	t.Parallel()
 
