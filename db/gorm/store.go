@@ -245,7 +245,9 @@ func (s *oauthAccountStore) GetByProvider(ctx context.Context, providerID, provi
 
 func (s *oauthAccountStore) GetByUserID(ctx context.Context, userID uuid.UUID) ([]*db.OAuthAccount, error) {
 	var accounts []*db.OAuthAccount
-	if err := s.db.WithContext(ctx).Where("user_id = ?", userID).Find(&accounts).Error; err != nil {
+	// Most recently updated first: a user can hold two links for one provider
+	// and the newest is the one a single-row lookup must resolve.
+	if err := s.db.WithContext(ctx).Where("user_id = ?", userID).Order("updated_at DESC").Find(&accounts).Error; err != nil {
 		return nil, err
 	}
 	return accounts, nil
@@ -268,6 +270,170 @@ func (s *oauthAccountStore) Delete(ctx context.Context, id uuid.UUID) error {
 
 func (s *oauthAccountStore) DeleteByUserID(ctx context.Context, userID uuid.UUID) error {
 	return s.db.WithContext(ctx).Where("user_id = ?", userID).Delete(&db.OAuthAccount{}).Error
+}
+
+// oauthTokenUpdates builds the column payload both write paths share. updated_at
+// is always restamped, so the row changes unless a retry lands inside the same
+// timestamp precision with an identical record.
+func oauthTokenUpdates(rec db.OAuthTokenRecord) map[string]any {
+	return map[string]any{
+		"access_token_ciphertext":   rec.AccessTokenCiphertext,
+		"refresh_token_ciphertext":  rec.RefreshTokenCiphertext,
+		"refresh_token_fingerprint": rec.RefreshTokenFingerprint,
+		"token_scope":               rec.TokenScope,
+		"token_expires_at":          rec.TokenExpiresAt,
+		"updated_at":                time.Now().UTC(),
+	}
+}
+
+func (s *oauthAccountStore) SaveOAuthTokens(ctx context.Context, id uuid.UUID, rec db.OAuthTokenRecord) error {
+	res := s.db.WithContext(ctx).Model(&db.OAuthAccount{}).Where("id = ?", id).Updates(oauthTokenUpdates(rec))
+	if err := res.Error; err != nil {
+		return db.NormalizeMySQLError(err)
+	}
+	if res.RowsAffected > 0 {
+		return nil
+	}
+	// MySQL reports 0 affected rows for an UPDATE that changes nothing (identical
+	// tokens saved inside the same microsecond), so zero rows alone cannot prove
+	// the account is missing. CAS needs no equivalent: there a no-op reports a
+	// miss and the caller re-reads the winner's token, which is the same outcome.
+	var exists int64
+	if err := s.db.WithContext(ctx).Model(&db.OAuthAccount{}).Where("id = ?", id).Count(&exists).Error; err != nil {
+		return db.NormalizeMySQLError(err)
+	}
+	if exists == 0 {
+		return gorm.ErrRecordNotFound
+	}
+	return nil
+}
+
+func (s *oauthAccountStore) SaveOAuthTokensCAS(ctx context.Context, id uuid.UUID, expectedFingerprint string, rec db.OAuthTokenRecord) (bool, error) {
+	if expectedFingerprint == "" {
+		return false, nil
+	}
+	res := s.db.WithContext(ctx).Model(&db.OAuthAccount{}).
+		Where("id = ? AND refresh_token_fingerprint = ?", id, expectedFingerprint).
+		Updates(oauthTokenUpdates(rec))
+	if err := res.Error; err != nil {
+		return false, db.NormalizeMySQLError(err)
+	}
+	return res.RowsAffected > 0, nil
+}
+
+func (s *oauthAccountStore) SaveOAuthTokensIfUnset(ctx context.Context, id uuid.UUID, rec db.OAuthTokenRecord) (bool, error) {
+	res := s.db.WithContext(ctx).Model(&db.OAuthAccount{}).
+		Where("id = ? AND refresh_token_fingerprint = ?", id, "").
+		Updates(oauthTokenUpdates(rec))
+	if err := res.Error; err != nil {
+		return false, db.NormalizeMySQLError(err)
+	}
+	return res.RowsAffected > 0, nil
+}
+
+// oauthAccessUpdates is the column payload for an access-only write: the refresh
+// columns are deliberately absent so a tokenless grant cannot erase them.
+func oauthAccessUpdates(rec db.OAuthTokenRecord) map[string]any {
+	return map[string]any{
+		"access_token_ciphertext": rec.AccessTokenCiphertext,
+		"token_scope":             rec.TokenScope,
+		"token_expires_at":        rec.TokenExpiresAt,
+		"updated_at":              time.Now().UTC(),
+	}
+}
+
+func (s *oauthAccountStore) SaveOAuthAccess(ctx context.Context, id uuid.UUID, rec db.OAuthTokenRecord) error {
+	res := s.db.WithContext(ctx).Model(&db.OAuthAccount{}).Where("id = ?", id).Updates(oauthAccessUpdates(rec))
+	if err := res.Error; err != nil {
+		return db.NormalizeMySQLError(err)
+	}
+	if res.RowsAffected > 0 {
+		return nil
+	}
+	// Same MySQL no-op caveat as SaveOAuthTokens: zero affected rows alone does
+	// not prove the account is missing.
+	var exists int64
+	if err := s.db.WithContext(ctx).Model(&db.OAuthAccount{}).Where("id = ?", id).Count(&exists).Error; err != nil {
+		return db.NormalizeMySQLError(err)
+	}
+	if exists == 0 {
+		return gorm.ErrRecordNotFound
+	}
+	return nil
+}
+
+// SaveOAuthAccessCAS writes the access columns only while the stored access
+// ciphertext still matches the value the caller read. A miss reports false: a
+// newer access envelope is stored, and MySQL would also report one for a write
+// that changed nothing, which is the same outcome.
+func (s *oauthAccountStore) SaveOAuthAccessCAS(ctx context.Context, id uuid.UUID, expectedCiphertext string, rec db.OAuthTokenRecord) (bool, error) {
+	res := s.db.WithContext(ctx).Model(&db.OAuthAccount{}).
+		Where("id = ? AND access_token_ciphertext = ?", id, expectedCiphertext).
+		Updates(oauthAccessUpdates(rec))
+	if err := res.Error; err != nil {
+		return false, db.NormalizeMySQLError(err)
+	}
+	return res.RowsAffected > 0, nil
+}
+
+// ClearOAuthRefresh empties the refresh columns only, guarded on the fingerprint
+// the caller read: the access envelope has its own writers and is never touched.
+func (s *oauthAccountStore) ClearOAuthRefresh(ctx context.Context, id uuid.UUID, expectedFingerprint string) (bool, error) {
+	if expectedFingerprint == "" {
+		return false, nil
+	}
+	res := s.db.WithContext(ctx).Model(&db.OAuthAccount{}).
+		Where("id = ? AND refresh_token_fingerprint = ?", id, expectedFingerprint).
+		Updates(map[string]any{
+			"refresh_token_ciphertext":  "",
+			"refresh_token_fingerprint": "",
+			"updated_at":                time.Now().UTC(),
+		})
+	if err := res.Error; err != nil {
+		return false, db.NormalizeMySQLError(err)
+	}
+	return res.RowsAffected > 0, nil
+}
+
+// SaveOAuthRefreshIfUnset stores a rotated refresh pair over a row holding none,
+// then fills the access columns only while the row still holds no access
+// envelope, so a concurrent access-only winner keeps its own. Each guard lives
+// in its own WHERE clause, which every backend evaluates against the original
+// row: no assignment may read a column the same statement writes, because MySQL
+// applies single-table SET assignments left to right against already-updated
+// values.
+//
+// The two statements run sequentially, so the access write is skipped when the
+// refresh guard misses — a stored refresh grant owns the row and the caller lost
+// — and a failed access write reports (true, error): the refresh pair landed and
+// the row keeps a usable grant.
+func (s *oauthAccountStore) SaveOAuthRefreshIfUnset(ctx context.Context, id uuid.UUID, rec db.OAuthTokenRecord) (bool, error) {
+	if rec.RefreshTokenFingerprint == "" {
+		return false, nil
+	}
+	res := s.db.WithContext(ctx).Model(&db.OAuthAccount{}).
+		Where("id = ? AND refresh_token_fingerprint = ?", id, "").
+		Updates(map[string]any{
+			"refresh_token_ciphertext":  rec.RefreshTokenCiphertext,
+			"refresh_token_fingerprint": rec.RefreshTokenFingerprint,
+			"updated_at":                time.Now().UTC(),
+		})
+	if err := res.Error; err != nil {
+		return false, db.NormalizeMySQLError(err)
+	}
+	if res.RowsAffected == 0 {
+		return false, nil
+	}
+	if rec.AccessTokenCiphertext == "" {
+		return true, nil
+	}
+	access := s.db.WithContext(ctx).Model(&db.OAuthAccount{}).
+		Where("id = ? AND access_token_ciphertext = ?", id, "").
+		Updates(oauthAccessUpdates(rec))
+	if err := access.Error; err != nil {
+		return true, db.NormalizeMySQLError(err)
+	}
+	return true, nil
 }
 
 type totpStore struct {

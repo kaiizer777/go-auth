@@ -124,7 +124,7 @@ func TestLinkOrCreateFailClosed(t *testing.T) {
 		if !ok {
 			t.Fatal("NewService did not return *service")
 		}
-		_, _, _, err := inner.linkOrCreate(context.Background(), "google", verifiedInfo(), "not-a-uuid")
+		_, _, _, err := inner.linkOrCreate(context.Background(), "google", verifiedInfo(), "not-a-uuid", nil)
 		requireCode(t, err, errors.CodeOAuthAccountNotLinked, http.StatusNotFound)
 		requireIdentityRows(t, database, 0, 0, 0)
 	})
@@ -136,7 +136,7 @@ func TestLinkOrCreateFailClosed(t *testing.T) {
 		if !ok {
 			t.Fatal("NewService did not return *service")
 		}
-		_, _, _, err := inner.linkOrCreate(context.Background(), "google", verifiedInfo(), uuid.New().String())
+		_, _, _, err := inner.linkOrCreate(context.Background(), "google", verifiedInfo(), uuid.New().String(), nil)
 		requireCode(t, err, errors.CodeOAuthAccountNotLinked, http.StatusNotFound)
 		requireIdentityRows(t, database, 0, 0, 0)
 	})

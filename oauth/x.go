@@ -28,12 +28,14 @@ type XProvider struct {
 
 var _ Provider = (*XProvider)(nil)
 
+var _ TokenRefresher = (*XProvider)(nil)
+
 // NewXProvider constructs a new X (Twitter) OAuth 2.0 provider adapter.
 func NewXProvider(cfg config.XConfig, opts ...EndpointOption) *XProvider {
-	// Login needs only users.read (/2/users/me); tweet.read and
-	// offline.access are opt-in via config when the feature needs them.
+	// Login baseline: /2/users/me is scoped with both users.read and tweet.read,
+	// plus offline.access so the code exchange can issue a refresh token.
 	if len(cfg.Scopes) == 0 {
-		cfg.Scopes = []string{"users.read"}
+		cfg.Scopes = []string{"tweet.read", "users.read", "offline.access"}
 	}
 	ep := resolveEndpoints(EndpointOverride{
 		AuthorizeURL: "https://twitter.com/i/oauth2/authorize",
@@ -65,7 +67,7 @@ func (p *XProvider) AuthCodeURL(state, codeChallenge string, opts ...AuthCodeOpt
 	q.Set("response_type", "code")
 	q.Set("client_id", p.cfg.ClientID)
 	q.Set("redirect_uri", p.cfg.RedirectURI)
-	q.Set("scope", scopesOrDefault(p.cfg.Scopes, "users.read"))
+	q.Set("scope", scopesOrDefault(p.cfg.Scopes, "tweet.read", "users.read", "offline.access"))
 	q.Set("state", state)
 	q.Set("code_challenge", codeChallenge)
 	q.Set("code_challenge_method", "S256")
@@ -262,24 +264,38 @@ func parseXErrorWithHeader(statusCode int, body []byte, header http.Header) erro
 	return errors.New(errors.CodeOAuthProviderError, fmt.Sprintf("oauth provider responded with status %d", statusCode), nil)
 }
 
-// ExchangeCode exchanges an authorization code and PKCE code verifier for tokens via POST /2/oauth2/token.
-// It authenticates using HTTP Basic Auth per RFC 6749 §2.3.1. client_id MUST NOT be in the body.
-func (p *XProvider) ExchangeCode(ctx context.Context, code, codeVerifier string) (*OAuthToken, error) {
+// tokenErrorPolicy is the caller-specific error policy for postTokenRequest.
+type tokenErrorPolicy struct {
+	// grantRejected classifies an upstream `error` value as a rejected grant.
+	// Returning nil means the value is not a grant rejection; the code exchange
+	// passes a nil func because it cannot tell the service to re-login.
+	grantRejected func(errorValue string) error
+	// failureMsg labels the caller-facing error for an unclassified error body.
+	failureMsg string
+}
+
+// classifyGrantError reports the grant rejection for errorValue, if the policy
+// recognises one.
+func (pol tokenErrorPolicy) classifyGrantError(errorValue string) error {
+	if pol.grantRejected == nil || errorValue == "" {
+		return nil
+	}
+	return pol.grantRejected(errorValue)
+}
+
+// postTokenRequest POSTs a form to the token endpoint, authenticates with HTTP
+// Basic per RFC 6749 §2.3.1 (client_id MUST NOT be in the body), and decodes the
+// bounded JSON response. Shared by the code exchange and the refresh grant so
+// request building, auth, body handling, and error mapping stay in one place.
+func (p *XProvider) postTokenRequest(ctx context.Context, form url.Values, pol tokenErrorPolicy) (*OAuthToken, error) {
 	ctx, cancel := context.WithTimeout(ctx, oauthHTTPTimeout)
 	defer cancel()
-
-	form := url.Values{}
-	form.Set("code", code)
-	form.Set("grant_type", "authorization_code")
-	form.Set("redirect_uri", p.cfg.RedirectURI)
-	form.Set("code_verifier", codeVerifier)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.tokenURL, strings.NewReader(form.Encode()))
 	if err != nil {
 		return nil, errors.New(errors.CodeOAuthProviderError, "oauth token request failed", err)
 	}
 
-	// RFC 6749 §2.3.1 Client Authentication via Basic Auth:
 	// Authorization: Basic base64(url.QueryEscape(ClientID) + ":" + url.QueryEscape(ClientSecret))
 	credentials := url.QueryEscape(p.cfg.ClientID) + ":" + url.QueryEscape(p.cfg.ClientSecret)
 	encodedAuth := base64.StdEncoding.EncodeToString([]byte(credentials))
@@ -299,6 +315,13 @@ func (p *XProvider) ExchangeCode(ctx context.Context, code, codeVerifier string)
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		// RFC 6749 §5.2 reports a rejected grant in an `error` field, so a dead
+		// refresh token must not collapse into a generic provider error.
+		if msg := xErrorValue(bodyBytes); msg != "" {
+			if err := pol.classifyGrantError(msg); err != nil {
+				return nil, err
+			}
+		}
 		return nil, parseXErrorWithHeader(resp.StatusCode, bodyBytes, resp.Header)
 	}
 
@@ -307,12 +330,15 @@ func (p *XProvider) ExchangeCode(ctx context.Context, code, codeVerifier string)
 		return nil, errors.New(errors.CodeOAuthProviderError, "oauth provider returned invalid response", err)
 	}
 	if msg, _ := raw["error"].(string); msg != "" {
+		if err := pol.classifyGrantError(msg); err != nil {
+			return nil, err
+		}
 		// Same invariant as parseXErrorWithHeader: upstream text never becomes
 		// the caller-facing message, so it rides the cause for server-side logs.
-		return nil, errors.New(errors.CodeOAuthProviderError, "oauth token exchange failed",
+		return nil, errors.New(errors.CodeOAuthProviderError, pol.failureMsg,
 			errors.New(errors.CodeOAuthProviderError, "upstream error: "+msg, nil))
 	}
-	// X can also report a failed exchange as a 2xx RFC 7807 problem document.
+	// X can also report a failed grant as a 2xx RFC 7807 problem document.
 	// It has no error field, so map it like the non-2xx path does.
 	if isXProblemResponse(resp.Header, raw) {
 		return nil, parseXErrorWithHeader(resp.StatusCode, bodyBytes, resp.Header)
@@ -321,6 +347,67 @@ func (p *XProvider) ExchangeCode(ctx context.Context, code, codeVerifier string)
 	tok := tokenFromRaw(raw)
 	if tok.AccessToken == "" {
 		return nil, errors.New(errors.CodeOAuthProviderError, "oauth provider returned no access token", nil)
+	}
+	return tok, nil
+}
+
+// xErrorValue extracts the RFC 6749 §5.2 `error` value from a token error body.
+// A body that is not a JSON object carries no usable value.
+func xErrorValue(body []byte) string {
+	var raw map[string]any
+	if json.Unmarshal(body, &raw) != nil {
+		return ""
+	}
+	msg, _ := raw["error"].(string)
+	return msg
+}
+
+// ExchangeCode exchanges an authorization code and PKCE code verifier for tokens via POST /2/oauth2/token.
+// It authenticates using HTTP Basic Auth per RFC 6749 §2.3.1. client_id MUST NOT be in the body.
+func (p *XProvider) ExchangeCode(ctx context.Context, code, codeVerifier string) (*OAuthToken, error) {
+	form := url.Values{}
+	form.Set("code", code)
+	form.Set("grant_type", "authorization_code")
+	form.Set("redirect_uri", p.cfg.RedirectURI)
+	form.Set("code_verifier", codeVerifier)
+
+	return p.postTokenRequest(ctx, form, tokenErrorPolicy{failureMsg: "oauth token exchange failed"})
+}
+
+// refreshGrantError classifies X's `error` value for a refresh request. Only
+// invalid_grant means the presented token is dead, and only that code lets the
+// service clear a stored grant (RFC 6749 §5.2). invalid_request describes the
+// request — our parameters or an upstream contract change — and invalid_client a
+// deployment credential, so neither may destroy every user's stored token.
+func refreshGrantError(errorValue string) error {
+	if errorValue == "invalid_grant" {
+		return errors.ErrOAuthGrantRejected
+	}
+	return nil
+}
+
+// RefreshToken renews a token pair via POST /2/oauth2/token.
+// X rotates the refresh token on every use and invalidates the presented one, so
+// the response value is authoritative; the presented token survives only when the
+// response omits a replacement.
+func (p *XProvider) RefreshToken(ctx context.Context, refreshToken string) (*OAuthToken, error) {
+	if refreshToken == "" {
+		return nil, errors.New(errors.CodeOAuthProviderError, "refresh token required", nil)
+	}
+
+	form := url.Values{}
+	form.Set("grant_type", "refresh_token")
+	form.Set("refresh_token", refreshToken)
+
+	tok, err := p.postTokenRequest(ctx, form, tokenErrorPolicy{
+		grantRejected: refreshGrantError,
+		failureMsg:    "oauth token refresh failed",
+	})
+	if err != nil {
+		return nil, err
+	}
+	if tok.RefreshToken == "" {
+		tok.RefreshToken = refreshToken
 	}
 	return tok, nil
 }

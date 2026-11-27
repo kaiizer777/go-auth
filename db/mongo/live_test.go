@@ -657,3 +657,188 @@ func TestUserStore_Delete_Cascade(t *testing.T) {
 		t.Fatal("expected verification token to be deleted by cascade, but found it")
 	}
 }
+
+// TestOAuthAccountStore_SaveOAuthTokens pins both token write paths against a
+// live MongoDB: the CAS filter must carry the stored fingerprint, an empty or
+// stale expectation must miss without mutating, and a nil expiry must stay nil.
+func TestOAuthAccountStore_SaveOAuthTokens(t *testing.T) {
+	uri := requireMongoURI(t)
+	client, err := mongo.Connect(options.Client().ApplyURI(uri))
+	if err != nil {
+		t.Fatalf("mongo.Connect failed: %v", err)
+	}
+	database := client.Database(fmt.Sprintf("goauth_test_ms_oauth_tokens_%s", strings.ReplaceAll(uuid.New().String(), "-", "")))
+	t.Cleanup(func() {
+		_ = database.Drop(context.Background())
+		_ = client.Disconnect(context.Background())
+	})
+	ctx := context.Background()
+	store := New(client, database, false)
+	oauth := store.OAuthAccounts()
+	links := database.Collection("oauth_accounts")
+
+	// A legacy link: the token columns predate this document.
+	id := uuid.New()
+	if _, err := links.InsertOne(ctx, bson.M{
+		"_id": id.String(), "user_id": uuid.New().String(), "provider_id": "github",
+		"provider_tenant_id": "", "provider_user_id": "gh-tokens", "email": "tokens@example.com",
+	}); err != nil {
+		t.Fatalf("insert link: %v", err)
+	}
+	reload := func() *db.OAuthAccount {
+		t.Helper()
+		acc, err := oauth.GetByProvider(ctx, "github", "", "gh-tokens")
+		if err != nil {
+			t.Fatalf("reload link: %v", err)
+		}
+		return acc
+	}
+
+	// A nil expiry stays nil across the write.
+	if err := oauth.SaveOAuthTokens(ctx, id, db.OAuthTokenRecord{
+		AccessTokenCiphertext:   "sealed-access",
+		RefreshTokenCiphertext:  "sealed-refresh",
+		RefreshTokenFingerprint: strings.Repeat("a", 64),
+		TokenScope:              "offline_access",
+	}); err != nil {
+		t.Fatalf("SaveOAuthTokens failed: %v", err)
+	}
+	stored := reload()
+	if stored.AccessTokenCiphertext != "sealed-access" || stored.RefreshTokenCiphertext != "sealed-refresh" ||
+		stored.RefreshTokenFingerprint != strings.Repeat("a", 64) || stored.TokenScope != "offline_access" {
+		t.Fatalf("stored tokens = %+v", stored)
+	}
+	if stored.TokenExpiresAt != nil {
+		t.Fatalf("nil expiry stored as %v; want nil", stored.TokenExpiresAt)
+	}
+
+	// An empty expectation never matches, even against a non-empty fingerprint.
+	if won, err := oauth.SaveOAuthTokensCAS(ctx, id, "", db.OAuthTokenRecord{RefreshTokenCiphertext: "attacker"}); err != nil || won {
+		t.Fatalf("empty expectation CAS = (%v, %v); want (false, nil)", won, err)
+	}
+	// A stale expectation misses without mutating.
+	if won, err := oauth.SaveOAuthTokensCAS(ctx, id, strings.Repeat("b", 64), db.OAuthTokenRecord{RefreshTokenCiphertext: "stale"}); err != nil || won {
+		t.Fatalf("stale expectation CAS = (%v, %v); want (false, nil)", won, err)
+	}
+	if got := reload(); got.RefreshTokenCiphertext != "sealed-refresh" {
+		t.Fatalf("missed CAS mutated the row: %+v", got)
+	}
+
+	// A matching expectation wins and rotates every field.
+	expiresAt := time.Now().UTC().Truncate(time.Millisecond)
+	winner := strings.Repeat("c", 64)
+	if won, err := oauth.SaveOAuthTokensCAS(ctx, id, strings.Repeat("a", 64), db.OAuthTokenRecord{
+		AccessTokenCiphertext:   "rotated-access",
+		RefreshTokenCiphertext:  "rotated-refresh",
+		RefreshTokenFingerprint: winner,
+		TokenScope:              "read:user",
+		TokenExpiresAt:          &expiresAt,
+	}); err != nil || !won {
+		t.Fatalf("matching expectation CAS = (%v, %v); want (true, nil)", won, err)
+	}
+	rotated := reload()
+	if rotated.AccessTokenCiphertext != "rotated-access" || rotated.RefreshTokenCiphertext != "rotated-refresh" ||
+		rotated.RefreshTokenFingerprint != winner || rotated.TokenScope != "read:user" {
+		t.Fatalf("rotated tokens = %+v", rotated)
+	}
+	if rotated.TokenExpiresAt == nil || !rotated.TokenExpiresAt.Equal(expiresAt) {
+		t.Fatalf("rotated expiry = %v; want %v", rotated.TokenExpiresAt, expiresAt)
+	}
+	// Replaying the losing fingerprint must miss.
+	if won, err := oauth.SaveOAuthTokensCAS(ctx, id, strings.Repeat("a", 64), db.OAuthTokenRecord{RefreshTokenFingerprint: "loser"}); err != nil || won {
+		t.Fatalf("replayed expectation CAS = (%v, %v); want (false, nil)", won, err)
+	}
+
+	// A document that never carried the columns clears them and stays expired-nil.
+	if _, err := links.InsertOne(ctx, bson.M{
+		"_id": uuid.New().String(), "user_id": uuid.New().String(), "provider_id": "google",
+		"provider_tenant_id": "", "provider_user_id": "goog-tokenless", "email": "tokenless@example.com",
+	}); err != nil {
+		t.Fatalf("insert tokenless link: %v", err)
+	}
+	tokenless, err := oauth.GetByProvider(ctx, "google", "", "goog-tokenless")
+	if err != nil {
+		t.Fatalf("load tokenless link: %v", err)
+	}
+	if won, err := oauth.SaveOAuthTokensCAS(ctx, tokenless.ID, "", db.OAuthTokenRecord{AccessTokenCiphertext: "unproven"}); err != nil || won {
+		t.Fatalf("empty expectation against columnless row CAS = (%v, %v); want (false, nil)", won, err)
+	}
+	if err := oauth.SaveOAuthTokens(ctx, tokenless.ID, db.OAuthTokenRecord{}); err != nil {
+		t.Fatalf("clear tokenless link failed: %v", err)
+	}
+	if got, err := oauth.GetByProvider(ctx, "google", "", "goog-tokenless"); err != nil {
+		t.Fatalf("reload cleared link: %v", err)
+	} else if got.TokenExpiresAt != nil || got.AccessTokenCiphertext != "" ||
+		got.RefreshTokenCiphertext != "" || got.RefreshTokenFingerprint != "" || got.TokenScope != "" {
+		t.Fatalf("cleared tokens = %+v", got)
+	}
+
+	// Missing accounts: the unconditional path reports not-found, CAS misses.
+	if err := oauth.SaveOAuthTokens(ctx, uuid.New(), db.OAuthTokenRecord{AccessTokenCiphertext: "ghost"}); !stderrors.Is(err, gorm.ErrRecordNotFound) {
+		t.Fatalf("missing-account SaveOAuthTokens = %v; want ErrRecordNotFound", err)
+	}
+	if won, err := oauth.SaveOAuthTokensCAS(ctx, uuid.New(), winner, db.OAuthTokenRecord{AccessTokenCiphertext: "ghost"}); err != nil || won {
+		t.Fatalf("missing-account CAS = (%v, %v); want (false, nil)", won, err)
+	}
+
+	// The first-grant write wins against a tokenless row.
+	firstGrant := db.OAuthTokenRecord{
+		AccessTokenCiphertext:   "first-access",
+		RefreshTokenCiphertext:  "first-refresh",
+		RefreshTokenFingerprint: strings.Repeat("d", 64),
+		TokenScope:              "offline_access",
+	}
+	if won, err := oauth.SaveOAuthTokensIfUnset(ctx, tokenless.ID, firstGrant); err != nil || !won {
+		t.Fatalf("IfUnset on a tokenless row = (%v, %v); want (true, nil)", won, err)
+	}
+	if got, err := oauth.GetByProvider(ctx, "google", "", "goog-tokenless"); err != nil {
+		t.Fatalf("reload first grant: %v", err)
+	} else if got.AccessTokenCiphertext != "first-access" || got.RefreshTokenFingerprint != strings.Repeat("d", 64) {
+		t.Fatalf("first grant = %+v", got)
+	}
+
+	// A stored grant keeps its place, and a document that never carried the
+	// fingerprint field counts as tokenless.
+	if won, err := oauth.SaveOAuthTokensIfUnset(ctx, tokenless.ID, db.OAuthTokenRecord{
+		AccessTokenCiphertext: "late-access", RefreshTokenFingerprint: strings.Repeat("e", 64),
+	}); err != nil || won {
+		t.Fatalf("IfUnset over a stored grant = (%v, %v); want (false, nil)", won, err)
+	}
+	legacyID := uuid.New()
+	if _, err := links.InsertOne(ctx, bson.M{
+		"_id": legacyID.String(), "user_id": uuid.New().String(), "provider_id": "google",
+		"provider_tenant_id": "", "provider_user_id": "goog-legacy-unset", "email": "legacy@example.com",
+	}); err != nil {
+		t.Fatalf("insert legacy link: %v", err)
+	}
+	if won, err := oauth.SaveOAuthTokensIfUnset(ctx, legacyID, firstGrant); err != nil || !won {
+		t.Fatalf("IfUnset on a columnless row = (%v, %v); want (true, nil)", won, err)
+	}
+
+	// The access-only write leaves the refresh columns exactly as stored.
+	accessExpiry := time.Now().UTC().Add(time.Hour).Truncate(time.Millisecond)
+	if err := oauth.SaveOAuthAccess(ctx, tokenless.ID, db.OAuthTokenRecord{
+		AccessTokenCiphertext: "access-only",
+		TokenScope:            "read:user",
+		TokenExpiresAt:        &accessExpiry,
+	}); err != nil {
+		t.Fatalf("SaveOAuthAccess failed: %v", err)
+	}
+	accessOnly, err := oauth.GetByProvider(ctx, "google", "", "goog-tokenless")
+	if err != nil {
+		t.Fatalf("reload access-only row: %v", err)
+	}
+	if accessOnly.AccessTokenCiphertext != "access-only" || accessOnly.TokenScope != "read:user" ||
+		accessOnly.RefreshTokenCiphertext != "first-refresh" || accessOnly.RefreshTokenFingerprint != strings.Repeat("d", 64) {
+		t.Fatalf("access-only tokens = %+v", accessOnly)
+	}
+	if accessOnly.TokenExpiresAt == nil || !accessOnly.TokenExpiresAt.Equal(accessExpiry) {
+		t.Fatalf("access-only expiry = %v; want %v", accessOnly.TokenExpiresAt, accessExpiry)
+	}
+	if err := oauth.SaveOAuthAccess(ctx, uuid.New(), db.OAuthTokenRecord{AccessTokenCiphertext: "ghost"}); !stderrors.Is(err, gorm.ErrRecordNotFound) {
+		t.Fatalf("missing-account SaveOAuthAccess = %v; want ErrRecordNotFound", err)
+	}
+	if won, err := oauth.SaveOAuthTokensIfUnset(ctx, uuid.New(), db.OAuthTokenRecord{AccessTokenCiphertext: "ghost"}); err != nil || won {
+		t.Fatalf("missing-account IfUnset = (%v, %v); want (false, nil)", won, err)
+	}
+}

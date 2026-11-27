@@ -60,6 +60,11 @@ const (
 	CodeOAuthIDTokenInvalid       Code = "OAUTH_ID_TOKEN_INVALID"
 	CodeOAuthTenantInvalid        Code = "OAUTH_TENANT_INVALID"
 
+	// OAuth token refresh error codes
+	CodeOAuthTokenDecryptionFailed Code = "OAUTH_TOKEN_DECRYPTION_FAILED"
+	CodeOAuthReauthRequired        Code = "OAUTH_REAUTH_REQUIRED"
+	CodeOAuthRefreshUnsupported    Code = "OAUTH_REFRESH_UNSUPPORTED"
+
 	// Phase 4 Session errors
 	CodeSessionNotFound Code = "SESSION_NOT_FOUND" // 401
 	CodeSessionExpired  Code = "SESSION_EXPIRED"   // 401
@@ -142,15 +147,15 @@ func (c Code) HTTPStatus() int {
 		CodeTOTPNotEnrolled, CodeTOTPCodeInvalid, CodeTOTPCodeReplayed, CodeTOTPBackupCodeInvalid,
 		CodeDatabaseUnsupported:
 		return http.StatusBadRequest
-	case CodeTransactionUnsupported:
+	case CodeTransactionUnsupported, CodeOAuthRefreshUnsupported:
 		return http.StatusNotImplemented
-	case CodeDatabaseAdapterFailed:
+	case CodeDatabaseAdapterFailed, CodeOAuthTokenDecryptionFailed:
 		return http.StatusInternalServerError
 	case CodeInvalidCredentials, CodeUnauthenticated,
 		CodeSessionNotFound, CodeSessionExpired, CodeSessionInvalid,
 		CodeMFARequired, CodeMFAInvalidCode,
 		CodeTwoFactorTokenInvalid, CodeTwoFactorTokenExpired,
-		CodeOAuthIDTokenInvalid:
+		CodeOAuthIDTokenInvalid, CodeOAuthReauthRequired:
 		return http.StatusUnauthorized
 	case CodeEmailNotVerified, CodeCSRFTokenMissing, CodeCSRFTokenInvalid, CodeOAuthStateInvalid:
 		return http.StatusForbidden
@@ -366,6 +371,8 @@ var (
 	ErrOAuthStateCookiePathInvalid     = New(CodeInvalidConfig, "oauth state cookie path is invalid", nil)
 	ErrOAuthStateSecretTooShort        = New(CodeInvalidConfig, "oauth state secret length too short", nil)
 	ErrOAuthStateSecretRequired        = New(CodeInvalidConfig, "oauth state secret is required when providers are configured", nil)
+	ErrOAuthTokenKEKMissing            = New(CodeInvalidConfig, "oauth token encryption key is required when providers are configured", nil)
+	ErrOAuthTokenKEKInvalid            = New(CodeInvalidConfig, "oauth token encryption key must be comma-separated kid:base64 entries with 32-byte keys", nil)
 	ErrOAuthStateCookieNameCollision   = New(CodeInvalidConfig, "oauth state cookie name must not match session or CSRF cookie name", nil)
 	ErrOAuthGraphVersionInvalid        = New(CodeInvalidConfig, "facebook graph version must be <major>.<minor> with an optional v prefix, no leading zeros, and at least 19.0", nil)
 	ErrTOTPEncryptionKeyInvalid        = New(CodeInvalidConfig, "totp encryption key must be 64 hex chars (32 bytes)", nil)
@@ -412,6 +419,14 @@ var (
 	ErrOAuthTokenExchangeFailed  = New(CodeOAuthTokenExchangeFailed, "oauth token exchange failed", nil)
 	ErrOAuthIDTokenInvalid       = New(CodeOAuthIDTokenInvalid, "oauth id token verification failed", nil)
 	ErrOAuthTenantInvalid        = New(CodeOAuthTenantInvalid, "oauth tenant is invalid or untrusted", nil)
+	ErrOAuthTokenKeyNotFound     = New(CodeOAuthTokenDecryptionFailed, "oauth token encryption key not found", nil)
+	ErrOAuthTokenCorrupt         = New(CodeOAuthTokenDecryptionFailed, "oauth token failed authentication", nil)
+	ErrOAuthReauthRequired       = New(CodeOAuthReauthRequired, "oauth grant is no longer usable; re-authentication required", nil)
+	ErrOAuthRefreshUnsupported   = New(CodeOAuthRefreshUnsupported, "oauth provider does not support token refresh", nil)
+	// ErrOAuthGrantRejected is the adapter-level classification of the
+	// provider's own rejection; it shares the re-auth wire code but never
+	// substitutes for a generic refresh failure.
+	ErrOAuthGrantRejected = New(CodeOAuthReauthRequired, "oauth provider rejected the grant", nil)
 
 	// Predefined sentinel errors for Phase 4 Session, CSRF, and Rate Limiting.
 	ErrSessionNotFound   = New(CodeSessionNotFound, "Session is invalid or has expired", nil)

@@ -57,8 +57,8 @@ func TestMySQLDefaultMigrationsEmbedded(t *testing.T) {
 		current = next
 	}
 
-	if count != 11 {
-		t.Fatalf("expected 11 mysql migration versions, found %d", count)
+	if count != 12 {
+		t.Fatalf("expected 12 mysql migration versions, found %d", count)
 	}
 }
 
@@ -589,5 +589,57 @@ func TestMySQLMigration000011_TenantQualifiesIdentityKey(t *testing.T) {
 	}
 	if !strings.Contains(string(downData), "DROP COLUMN provider_tenant_id") {
 		t.Fatal("mysql migration 11 down must drop the tenant column it added")
+	}
+}
+
+// TestMySQLMigration000012_AddsOAuthAccountTokens mirrors the postgres pin: five
+// token columns, NOT NULL without a non-empty default, nullable expiry, and a
+// down migration that drops exactly those five.
+func TestMySQLMigration000012_AddsOAuthAccountTokens(t *testing.T) {
+	data, err := defaultMigrationsFS.ReadFile("migrations/mysql/000012_add_oauth_account_tokens.up.sql")
+	if err != nil {
+		t.Fatalf("failed to read mysql migration 12 up: %v", err)
+	}
+	content := string(data)
+
+	columns := []struct{ name, definition string }{
+		{"access_token_ciphertext", "TEXT NOT NULL"},
+		{"refresh_token_ciphertext", "TEXT NOT NULL"},
+		{"refresh_token_fingerprint", "VARCHAR(64) NOT NULL DEFAULT ''"},
+		{"token_expires_at", "DATETIME(6) NULL"},
+		{"token_scope", "TEXT NOT NULL"},
+	}
+
+	lastIdx := -1
+	for _, column := range columns {
+		statement := "ADD COLUMN " + column.name + " " + column.definition + ";"
+		idx := strings.Index(content, statement)
+		if idx == -1 {
+			t.Fatalf("mysql migration 12 up must contain %q", statement)
+		}
+		if idx < lastIdx {
+			t.Errorf("mysql migration 12 up adds %s out of model order", column.name)
+		}
+		lastIdx = idx
+		if strings.Contains(statement, "DEFAULT") && !strings.Contains(statement, "DEFAULT ''") {
+			t.Errorf("mysql migration 12 up must not give %s a non-empty default: %q", column.name, statement)
+		}
+	}
+
+	downData, err := defaultMigrationsFS.ReadFile("migrations/mysql/000012_add_oauth_account_tokens.down.sql")
+	if err != nil {
+		t.Fatalf("failed to read mysql migration 12 down: %v", err)
+	}
+	down := string(downData)
+	if drops := strings.Count(down, "DROP COLUMN "); drops != len(columns) {
+		t.Fatalf("mysql migration 12 down must drop exactly %d columns, got %d: %q", len(columns), drops, down)
+	}
+	for _, column := range columns {
+		if !strings.Contains(down, "DROP COLUMN "+column.name+";") {
+			t.Errorf("mysql migration 12 down must drop %s", column.name)
+		}
+	}
+	if strings.Contains(strings.ToUpper(down), "DROP TABLE") {
+		t.Error("mysql migration 12 down must drop only the token columns, never the links table")
 	}
 }

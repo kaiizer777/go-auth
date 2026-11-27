@@ -15,6 +15,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -469,7 +470,15 @@ type XIdP struct {
 	Username     string
 	Avatar       string
 
-	codes *authorizeCodes
+	// RefreshCalls counts every refresh_token grant that reached the token
+	// endpoint, accepted or replayed.
+	RefreshCalls atomic.Int64
+
+	mu           sync.Mutex
+	access       string
+	accessIssued int
+	refreshToken string
+	codes        *authorizeCodes
 }
 
 // NewXIdP starts an X-shaped IdP.
@@ -482,6 +491,7 @@ func NewXIdP(redirectURI ...string) *XIdP {
 		UserID:       "x-idp-user-1",
 		Username:     "x_idp_user",
 		Avatar:       "https://pbs.twimg.com/idp_normal.jpg",
+		refreshToken: "x-idp-refresh-token",
 		codes:        newAuthorizeCodes(),
 	}
 	idp.codes.registerClient(
@@ -502,7 +512,24 @@ func NewXIdP(redirectURI ...string) *XIdP {
 // Close shuts the IdP down.
 func (i *XIdP) Close() { i.Server.Close() }
 
-func (i *XIdP) accessToken() string { return "x-idp-access-token" }
+// accessToken returns the one token /2/users/me currently accepts.
+func (i *XIdP) accessToken() string {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	return i.access
+}
+
+// mintAccessToken issues a distinct access token per grant and retires the
+// previous one, so a stale token is rejected by me() the way a real provider
+// rejects it. A constant token would let a refresh that re-persisted the old
+// value pass unnoticed.
+func (i *XIdP) mintAccessToken() string {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	i.accessIssued++
+	i.access = fmt.Sprintf("x-idp-access-token-%d", i.accessIssued)
+	return i.access
+}
 
 func (i *XIdP) token(w http.ResponseWriter, r *http.Request) {
 	if err := r.ParseForm(); err != nil {
@@ -517,25 +544,70 @@ func (i *XIdP) token(w http.ResponseWriter, r *http.Request) {
 		writeOAuthError(w, "invalid_client")
 		return
 	}
-	if r.PostForm.Get("grant_type") != "authorization_code" {
+	switch r.PostForm.Get("grant_type") {
+	case "authorization_code":
+		i.exchangeCode(w, r)
+	case "refresh_token":
+		i.refreshGrant(w, r)
+	default:
 		writeOAuthError(w, "invalid_grant")
-		return
 	}
+}
+
+// exchangeCode issues the code's token pair. A refresh token is issued only for
+// a granted offline.access scope, the way X withholds it for online-only access.
+func (i *XIdP) exchangeCode(w http.ResponseWriter, r *http.Request) {
 	ac, ok := i.codes.complete(r.PostForm)
 	if !ok {
 		writeOAuthError(w, "invalid_grant")
 		return
 	}
-	writeJSON(w, grantedScope(map[string]any{
+	payload := map[string]any{
+		"token_type":   "bearer",
+		"access_token": i.mintAccessToken(),
+		"expires_in":   7200,
+	}
+	if scopeGranted(ac.scope, "offline.access") {
+		i.mu.Lock()
+		payload["refresh_token"] = i.refreshToken
+		i.mu.Unlock()
+	}
+	writeJSON(w, grantedScope(payload, ac))
+}
+
+// refreshGrant redeems the current refresh token and rotates it. Replaying any
+// other value is invalid_grant, matching X's single-use rotation.
+func (i *XIdP) refreshGrant(w http.ResponseWriter, r *http.Request) {
+	i.RefreshCalls.Add(1)
+
+	presented := r.PostForm.Get("refresh_token")
+	i.mu.Lock()
+	if presented == "" || presented != i.refreshToken {
+		i.mu.Unlock()
+		writeOAuthError(w, "invalid_grant")
+		return
+	}
+	rotated := fmt.Sprintf("x-idp-refresh-token-%d", i.RefreshCalls.Load())
+	i.refreshToken = rotated
+	i.mu.Unlock()
+
+	writeJSON(w, map[string]any{
 		"token_type":    "bearer",
-		"access_token":  i.accessToken(),
+		"access_token":  i.mintAccessToken(),
 		"expires_in":    7200,
-		"refresh_token": "x-idp-refresh-token",
-	}, ac))
+		"refresh_token": rotated,
+	})
 }
 
 func (i *XIdP) me(w http.ResponseWriter, r *http.Request) {
-	if bearerToken(r) != i.accessToken() {
+	token := bearerToken(r)
+	// Before the first grant accessToken() is "", so an equality check alone
+	// would authenticate a request that presents no bearer at all.
+	if token == "" {
+		writeOAuthErrorStatus(w, "invalid_token", http.StatusUnauthorized)
+		return
+	}
+	if token != i.accessToken() {
 		writeOAuthError(w, "invalid_token")
 		return
 	}
@@ -720,6 +792,12 @@ func grantedScope(payload map[string]any, ac authorizeCode) map[string]any {
 	return payload
 }
 
+// scopeGranted reports whether scope carries want as a whole element, so
+// "xoffline.access" and "offline.access.read" do not match "offline.access".
+func scopeGranted(scope, want string) bool {
+	return slices.Contains(strings.Fields(scope), want)
+}
+
 func freshCode() (string, error) {
 	raw := make([]byte, 16)
 	if _, err := rand.Read(raw); err != nil {
@@ -734,8 +812,12 @@ func writeJSON(w http.ResponseWriter, v any) {
 }
 
 func writeOAuthError(w http.ResponseWriter, code string) {
+	writeOAuthErrorStatus(w, code, http.StatusBadRequest)
+}
+
+func writeOAuthErrorStatus(w http.ResponseWriter, code string, status int) {
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusBadRequest)
+	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(map[string]string{"error": code})
 }
 

@@ -61,6 +61,7 @@ func oauthTestConfig() config.Config {
 	cfg := testConfig()
 	cfg.SessionCookieSecure = false
 	cfg.OAuth.StateSecret = "test-state-secret-at-least-32-bytes!"
+	cfg.OAuth.TokenKEK = "test-kid:AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
 	return cfg
 }
 
@@ -75,6 +76,11 @@ func oauthTestEnv(t *testing.T, info *oauth.UserInfo, opts ...Option) (*gorm.DB,
 		provider_user_id VARCHAR(255) NOT NULL,
 		email VARCHAR(255) NOT NULL,
 		verified INTEGER NOT NULL DEFAULT 0,
+		access_token_ciphertext TEXT NOT NULL DEFAULT '',
+		refresh_token_ciphertext TEXT NOT NULL DEFAULT '',
+		refresh_token_fingerprint CHAR(64) NOT NULL DEFAULT '',
+		token_expires_at DATETIME,
+		token_scope TEXT NOT NULL DEFAULT '',
 		created_at DATETIME,
 		updated_at DATETIME
 	)`).Error; err != nil {
@@ -776,6 +782,10 @@ func (s *stubCallbackOAuthService) HandleCallback(ctx context.Context, w http.Re
 		return s.callbackFn(ctx, w, r, providerID, code, state, sessType)
 	}
 	return nil, "", "", nil
+}
+
+func (s *stubCallbackOAuthService) LinkedAccountToken(context.Context, uuid.UUID, string) (*oauth.OAuthToken, error) {
+	return nil, nil
 }
 
 func TestOAuthRateLimited(t *testing.T) {

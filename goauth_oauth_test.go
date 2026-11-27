@@ -14,6 +14,8 @@ import (
 	"github.com/kaiizer777/go-auth/oauth"
 )
 
+const testTokenKEK = "test-kid:AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
+
 func providerQuery(t *testing.T, p oauth.Provider) (url.Values, string) {
 	t.Helper()
 	u, err := url.Parse(p.AuthURL("state", "challenge"))
@@ -31,6 +33,7 @@ func validatedOAuthConfig(t *testing.T, mutate func(*config.Config)) config.Conf
 	cfg.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
 	cfg.BaseURL = "https://auth.example.com"
 	cfg.OAuth.StateSecret = "test-state-secret-at-least-32-bytes!"
+	cfg.OAuth.TokenKEK = testTokenKEK
 	mutate(&cfg)
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("Validate = %v", err)
@@ -258,6 +261,7 @@ func TestNewOAuthProviders_TenantPrecedence(t *testing.T) {
 			"BaseURL": "https://auth.example.com",
 			"OAuth": {
 				"StateSecret": "test-state-secret-at-least-32-bytes!",
+				"TokenKEK": "test-kid:AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
 				"Providers": {
 					"microsoft": {
 						"ClientID": "map-id",
@@ -374,6 +378,7 @@ func TestNewWithDB_RegistersTypedOAuthProviders(t *testing.T) {
 	cfg.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
 	cfg.BaseURL = "https://auth.example.com"
 	cfg.OAuth.StateSecret = "test-state-secret-at-least-32-bytes!"
+	cfg.OAuth.TokenKEK = testTokenKEK
 	cfg.OAuth.Microsoft = &config.MicrosoftConfig{
 		ClientID:       "ms-id",
 		ClientSecret:   "ms-secret",

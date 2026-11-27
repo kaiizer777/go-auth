@@ -145,16 +145,27 @@ func (p PasswordResetToken) LogValue() slog.Value {
 // unverified link may only sign in the account it was created on, and only
 // while that account still holds no proven credential; it can never merge,
 // recover, or resolve by email. Legacy rows decode as false (fail-closed).
+//
+// The token columns hold opaque AES-256-GCM envelopes, never plaintext: this
+// package is plaintext-blind and does no crypto. AccessTokenCiphertext and
+// RefreshTokenCiphertext are the sealed envelopes, RefreshTokenFingerprint is
+// the hex SHA-256 fingerprint of the stored refresh token, and TokenExpiresAt is
+// nil while no token is stored.
 type OAuthAccount struct {
-	ID               uuid.UUID `gorm:"primaryKey;type:varchar(36)"`
-	UserID           uuid.UUID `gorm:"type:varchar(36);not null;index"`
-	ProviderID       string    `gorm:"type:varchar(32);not null"`
-	ProviderTenantID string    `gorm:"type:varchar(64);not null"`
-	ProviderUserID   string    `gorm:"type:varchar(255);not null"`
-	Email            string    `gorm:"type:varchar(255);not null;index"`
-	Verified         bool      `gorm:"not null;default:false"`
-	CreatedAt        time.Time
-	UpdatedAt        time.Time
+	ID                      uuid.UUID `gorm:"primaryKey;type:varchar(36)"`
+	UserID                  uuid.UUID `gorm:"type:varchar(36);not null;index"`
+	ProviderID              string    `gorm:"type:varchar(32);not null"`
+	ProviderTenantID        string    `gorm:"type:varchar(64);not null"`
+	ProviderUserID          string    `gorm:"type:varchar(255);not null"`
+	Email                   string    `gorm:"type:varchar(255);not null;index"`
+	Verified                bool      `gorm:"not null;default:false"`
+	AccessTokenCiphertext   string    `gorm:"type:text;not null;default:''" json:"-"`
+	RefreshTokenCiphertext  string    `gorm:"type:text;not null;default:''" json:"-"`
+	RefreshTokenFingerprint string    `gorm:"type:varchar(64);not null;default:''" json:"-"`
+	TokenExpiresAt          *time.Time
+	TokenScope              string `gorm:"type:text;not null;default:''"`
+	CreatedAt               time.Time
+	UpdatedAt               time.Time
 }
 
 // BeforeCreate hook generates a new UUID if none is set.
@@ -168,8 +179,15 @@ func (o *OAuthAccount) BeforeCreate(tx *gorm.DB) error {
 // TableName returns the table name for OAuthAccount.
 func (OAuthAccount) TableName() string { return "oauth_accounts" }
 
-// LogValue implements slog.LogValuer to prevent federated identifier leakage in logs.
+// LogValue implements slog.LogValuer to prevent federated identifier and token
+// leakage in logs.
 func (o OAuthAccount) LogValue() slog.Value {
+	// A nil expiry is the honest "no token stored" state; a zero time.Time
+	// would render as year 1 and read like a real expiry.
+	expiresAt := slog.Any("token_expires_at", nil)
+	if o.TokenExpiresAt != nil {
+		expiresAt = slog.Time("token_expires_at", o.TokenExpiresAt.UTC())
+	}
 	return slog.GroupValue(
 		slog.String("id", o.ID.String()),
 		slog.String("user_id", o.UserID.String()),
@@ -178,6 +196,11 @@ func (o OAuthAccount) LogValue() slog.Value {
 		slog.String("provider_user_id", "[REDACTED]"),
 		slog.String("email", o.Email),
 		slog.Bool("verified", o.Verified),
+		slog.String("access_token_ciphertext", "[REDACTED]"),
+		slog.String("refresh_token_ciphertext", "[REDACTED]"),
+		slog.String("refresh_token_fingerprint", "[REDACTED]"),
+		expiresAt,
+		slog.String("token_scope", o.TokenScope),
 		slog.Time("created_at", o.CreatedAt),
 		slog.Time("updated_at", o.UpdatedAt),
 	)

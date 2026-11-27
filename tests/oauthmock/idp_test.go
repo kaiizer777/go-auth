@@ -243,9 +243,146 @@ func TestXIdPRequiresBasicAuthAndNoBodyClientID(t *testing.T) {
 		t.Fatalf("client_id in body status = %d; want 400", got)
 	}
 
+	wrongSecret := map[string]string{"Authorization": "Basic " + base64.StdEncoding.EncodeToString(
+		[]byte(url.QueryEscape(idp.ClientID)+":"+url.QueryEscape("wrong-client-secret")))}
+	if got := idpPostForm(t, tokenURL, form(idpAuthorizeScope(t, idp.Server.URL+"/i/oauth2/authorize", idp.ClientID, "users.read")), wrongSecret); got != http.StatusBadRequest {
+		t.Fatalf("wrong client secret status = %d; want 400", got)
+	}
+
 	noBasic := form(idpAuthorizeScope(t, idp.Server.URL+"/i/oauth2/authorize", idp.ClientID, "users.read"))
 	if got := idpPostForm(t, tokenURL, noBasic, nil); got != http.StatusBadRequest {
 		t.Fatalf("missing basic auth status = %d; want 400", got)
+	}
+}
+
+// xBasicAuth is the RFC 6749 §2.3.1 credential pair the X token endpoint wants.
+func xBasicAuth(idp *XIdP) map[string]string {
+	return map[string]string{"Authorization": "Basic " + base64.StdEncoding.EncodeToString(
+		[]byte(url.QueryEscape(idp.ClientID)+":"+url.QueryEscape(idp.ClientSecret)))}
+}
+
+// xExchangeCode redeems one authorize code for the requested scope.
+func xExchangeCode(t *testing.T, idp *XIdP, scope string) (int, map[string]any) {
+	t.Helper()
+	code := idpAuthorizeScope(t, idp.Server.URL+"/i/oauth2/authorize", idp.ClientID, scope)
+	return idpPostFormJSON(t, idp.Server.URL+"/2/oauth2/token", url.Values{
+		"grant_type":    {"authorization_code"},
+		"code":          {code},
+		"redirect_uri":  {idpTestRedirect},
+		"code_verifier": {idpTestVerifier},
+	}, xBasicAuth(idp))
+}
+
+func TestXIdPRefreshTokenRequiresOfflineAccess(t *testing.T) {
+	t.Parallel()
+	idp := NewXIdP()
+	t.Cleanup(idp.Close)
+
+	if status, body := xExchangeCode(t, idp, "users.read"); status != http.StatusOK || body["refresh_token"] != nil {
+		t.Fatalf("users.read exchange = %d %v; want 200 without refresh_token", status, body)
+	}
+	if status, body := xExchangeCode(t, idp, "users.read offline.access"); status != http.StatusOK || body["refresh_token"] != "x-idp-refresh-token" {
+		t.Fatalf("offline.access exchange = %d %v; want 200 with the X fixture refresh token", status, body)
+	}
+}
+
+func TestXIdPRefreshGrantRotatesAndRejectsReplay(t *testing.T) {
+	t.Parallel()
+	idp := NewXIdP()
+	t.Cleanup(idp.Close)
+
+	_, pair := xExchangeCode(t, idp, "users.read offline.access")
+	refreshForm := func(token string) url.Values {
+		return url.Values{"grant_type": {"refresh_token"}, "refresh_token": {token}}
+	}
+
+	status, rotated := idpPostFormJSON(t, idp.Server.URL+"/2/oauth2/token", refreshForm("x-idp-refresh-token"), xBasicAuth(idp))
+	if status != http.StatusOK {
+		t.Fatalf("refresh status = %d; want 200", status)
+	}
+	next, _ := rotated["refresh_token"].(string)
+	if next == "" || next == pair["refresh_token"] {
+		t.Fatalf("refresh_token = %v; want a rotated value", rotated["refresh_token"])
+	}
+	if rotated["access_token"] == pair["access_token"] {
+		t.Fatal("refresh issued the exchange's access token; want a distinguishable one")
+	}
+
+	status, replayed := idpPostFormJSON(t, idp.Server.URL+"/2/oauth2/token", refreshForm("x-idp-refresh-token"), xBasicAuth(idp))
+	if status != http.StatusBadRequest || replayed["error"] != "invalid_grant" {
+		t.Fatalf("replay = %d %v; want 400 invalid_grant", status, replayed)
+	}
+
+	if got := idp.RefreshCalls.Load(); got != 2 {
+		t.Fatalf("refresh calls = %d; want 2", got)
+	}
+
+	// me() accepts only the newest access token, which is what makes a refresh
+	// that kept the stale one fail end to end.
+	oldAccess, _ := pair["access_token"].(string)
+	newAccess, _ := rotated["access_token"].(string)
+	if status := xMeStatus(t, idp, oldAccess); status != http.StatusBadRequest {
+		t.Fatalf("me with the exchanged access token = %d; want 400 after rotation", status)
+	}
+	if status := xMeStatus(t, idp, newAccess); status != http.StatusOK {
+		t.Fatalf("me with the refreshed access token = %d; want 200", status)
+	}
+
+	status, body := idpPostFormJSON(t, idp.Server.URL+"/2/oauth2/token", refreshForm(next), nil)
+	if status != http.StatusBadRequest || body["error"] != "invalid_client" {
+		t.Fatalf("refresh without basic auth = %d %v; want 400 invalid_client", status, body)
+	}
+	if got := idp.RefreshCalls.Load(); got != 2 {
+		t.Fatalf("refresh calls after unauthenticated attempt = %d; want 2", got)
+	}
+}
+
+// TestXIdPMeRequiresBearer pins the pre-grant failure mode: me() compares the
+// presented bearer against its own empty access token, so without this guard an
+// unauthenticated request matched.
+func TestXIdPMeRequiresBearer(t *testing.T) {
+	t.Parallel()
+	idp := NewXIdP()
+	t.Cleanup(idp.Close)
+
+	if status := xMeStatus(t, idp, ""); status != http.StatusUnauthorized {
+		t.Fatalf("me without a bearer = %d; want 401", status)
+	}
+	if status := xMeStatus(t, idp, "x-idp-access-token-0"); status != http.StatusBadRequest {
+		t.Fatalf("me with an unissued bearer = %d; want 400", status)
+	}
+}
+
+// xMeStatus calls the X IdP profile endpoint with one bearer token.
+func xMeStatus(t *testing.T, idp *XIdP, accessToken string) int {
+	t.Helper()
+
+	req, err := http.NewRequest(http.MethodGet, idp.Server.URL+"/2/users/me", nil)
+	if err != nil {
+		t.Fatalf("build me request: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("me: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	return resp.StatusCode
+}
+
+func TestScopeGrantedMatchesWholeElements(t *testing.T) {
+	t.Parallel()
+	for scope, want := range map[string]bool{
+		"users.read offline.access":      true,
+		"offline.access":                 true,
+		"users.read xoffline.access":     false,
+		"users.read offline.access.read": false,
+		"users.readoffline.access":       false,
+		"":                               false,
+	} {
+		if got := scopeGranted(scope, "offline.access"); got != want {
+			t.Fatalf("scopeGranted(%q) = %v; want %v", scope, got, want)
+		}
 	}
 }
 
@@ -272,11 +409,22 @@ func TestDiscordIdPRejectsWrongBearer(t *testing.T) {
 // idpPostJSON posts a form and decodes the JSON body.
 func idpPostJSON(t *testing.T, endpoint string, form url.Values) map[string]any {
 	t.Helper()
+	_, body := idpPostFormJSON(t, endpoint, form, nil)
+	return body
+}
+
+// idpPostFormJSON posts a form with optional headers, returning the status and
+// the decoded JSON body so callers can assert an error response.
+func idpPostFormJSON(t *testing.T, endpoint string, form url.Values, header map[string]string) (int, map[string]any) {
+	t.Helper()
 	req, err := http.NewRequest(http.MethodPost, endpoint, strings.NewReader(form.Encode()))
 	if err != nil {
 		t.Fatalf("build request: %v", err)
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	for k, v := range header {
+		req.Header.Set(k, v)
+	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("post %s: %v", endpoint, err)
@@ -286,7 +434,7 @@ func idpPostJSON(t *testing.T, endpoint string, form url.Values) map[string]any 
 	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
 		t.Fatalf("decode %s response: %v", endpoint, err)
 	}
-	return body
+	return resp.StatusCode, body
 }
 
 func TestMicrosoftIdPTokenLegBindsRedirectAndScope(t *testing.T) {

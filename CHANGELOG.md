@@ -33,6 +33,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   no migration runner.
 - Facebook `assert_email_verified` (default `false`) declares that a non-empty
   Graph email is trustworthy. Without it the address is stored as unverified.
+- Provider access and refresh tokens are persisted encrypted on every link path.
+  Each value is sealed with AES-256-GCM under a keyring key identified by its
+  `kid`, and the envelope binds the provider, the account row, and the token
+  field as additional authenticated data, so a ciphertext cannot be replayed onto
+  another row or field. `oauth_accounts` stores no plaintext token.
+- `LinkedAccountToken` returns a linked account's access token and renews an
+  expired one on demand. The refresh token never leaves the library; the rotated
+  pair is written back with a compare-and-swap on the stored refresh-token
+  fingerprint, and concurrent renewals of one account within a process collapse
+  into a single provider request.
+- X renews a stored grant through `POST /2/oauth2/token` with
+  `grant_type=refresh_token` and treats `invalid_grant` as a dead grant. Other
+  provider errors keep the stored grant. Providers without refresh support
+  report `OAUTH_REFRESH_UNSUPPORTED`.
 
 ### Changed
 
@@ -85,6 +99,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   an empty token (#78).
 
 ### Upgrade notes
+
+- `GOAUTH_TOKEN_KEK` (or `OAuth.TokenKEK`) is required whenever a provider is
+  configured. Startup fails with an invalid-configuration error when the keyring
+  is missing or malformed; there is no plaintext mode and no generated fallback.
+- `GOAUTH_TOKEN_KEK` takes comma-separated `kid:base64key` entries, for example
+  `k1:<base64 of 32 bytes>,k0:<base64 of 32 bytes>`. A kid is 1-32 characters of
+  `[A-Za-z0-9._-]`; each key must decode from strict padded standard base64 to
+  exactly 32 bytes. The first entry encrypts new values and every entry can
+  decrypt.
+- Key rotation: prepend the new entry and keep the old one until every affected
+  row has been rewritten by a login or a refresh, then remove the old entry.
+  There is no `kid` column, so after removing a key the only signal that a row
+  still references it is the decryption error logged the first time that row is
+  used.
+- A provider that rejects a stored grant clears it and reports
+  `OAUTH_REAUTH_REQUIRED`; the user must go through the provider again. The
+  application session stays valid: a dead provider grant does not sign the user
+  out.
 
 - Migration 000011 adds `oauth_accounts.provider_tenant_id` as `NOT NULL`
   without a default and rolls the unique key over to

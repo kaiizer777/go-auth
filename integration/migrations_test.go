@@ -5,7 +5,9 @@ package integration
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -245,8 +247,8 @@ func TestMigrations_DownRefusedOnSeededDB(t *testing.T) {
 	if _, err := sqlDB2.Exec(`DELETE FROM users WHERE email = 'down-rollback@example.com'`); err != nil {
 		t.Fatalf("failed to remove seed row: %v", err)
 	}
-	if verr, ddirty, verr2 := m2.Version(); verr2 != nil || verr != 11 || ddirty {
-		t.Fatalf("expected version 11 clean after re-up, got version=%d dirty=%v err=%v", verr, ddirty, verr2)
+	if verr, ddirty, verr2 := m2.Version(); verr2 != nil || verr != 12 || ddirty {
+		t.Fatalf("expected version 12 clean after re-up, got version=%d dirty=%v err=%v", verr, ddirty, verr2)
 	}
 }
 
@@ -735,6 +737,171 @@ func TestMigration000011_TenantQualifiesIdentityKey(t *testing.T) {
 	_, _ = sqlDB.Exec(`DELETE FROM users WHERE id = $1`, userID)
 	if err := m.Up(); err != nil && err != migrate.ErrNoChange {
 		t.Fatalf("restoring head failed: %v", err)
+	}
+}
+
+// TestMigration000012_UpAndDown runs the token-envelope migration against a
+// live database: the up adds the five columns, a populated grant round-trips,
+// the down drops only the columns, and re-applying the up restores them empty.
+func TestMigration000012_UpAndDown(t *testing.T) {
+	dbURL := resolveDatabaseURL()
+	testDB, err := sql.Open("pgx", dbURL)
+	if err != nil {
+		if os.Getenv("CI") != "" {
+			t.Fatalf("CI: failed to open postgres connection: %v", err)
+		}
+		t.Skipf("Postgres not available, skipping: %v", err)
+	}
+	pingCtx, pingCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer pingCancel()
+	if err := testDB.PingContext(pingCtx); err != nil {
+		_ = testDB.Close()
+		if os.Getenv("CI") != "" {
+			t.Fatalf("CI: PostgreSQL connection failed: %v", err)
+		}
+		t.Skipf("Postgres not available, skipping: %v", err)
+	}
+	_ = testDB.Close()
+
+	m, sqlDB := newMigrator(t, dbURL)
+	t.Cleanup(func() {
+		_, _ = m.Close()
+		_ = sqlDB.Close()
+	})
+
+	if err := m.Migrate(11); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("m.Migrate(11) failed: %v", err)
+	}
+	requireNoOAuthTokenColumns(t, sqlDB)
+
+	if err := m.Steps(1); err != nil {
+		t.Fatalf("000012 up migration failed: %v", err)
+	}
+	requireOAuthTokenColumns(t, sqlDB)
+
+	var userID string
+	if err := sqlDB.QueryRow(`INSERT INTO users (email, password_hash, credential_version, email_verified) VALUES
+		('tokens-migration@example.com', 'hash', 1, true) RETURNING id`).Scan(&userID); err != nil {
+		t.Fatalf("failed to seed user: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = sqlDB.Exec(`DELETE FROM oauth_accounts WHERE user_id = $1`, userID)
+		_, _ = sqlDB.Exec(`DELETE FROM users WHERE id = $1`, userID)
+	})
+
+	fingerprint := strings.Repeat("a", 64)
+	expiresAt := time.Now().UTC().Add(2 * time.Hour).Truncate(time.Microsecond)
+	if _, err := sqlDB.Exec(`INSERT INTO oauth_accounts
+		(user_id, provider_id, provider_tenant_id, provider_user_id, email,
+		 access_token_ciphertext, refresh_token_ciphertext, refresh_token_fingerprint, token_expires_at, token_scope)
+		VALUES ($1, 'x', '', 'token-sub', 'tokens-migration@example.com', '{"v":1}', '{"v":1}', $2, $3, 'users.read offline.access')`,
+		userID, fingerprint, expiresAt); err != nil {
+		t.Fatalf("failed to seed token link: %v", err)
+	}
+
+	var (
+		access, refresh, storedFingerprint, scope string
+		storedExpiry                              time.Time
+	)
+	if err := sqlDB.QueryRow(`SELECT access_token_ciphertext, refresh_token_ciphertext,
+		refresh_token_fingerprint, token_expires_at, token_scope
+		FROM oauth_accounts WHERE user_id = $1`, userID).
+		Scan(&access, &refresh, &storedFingerprint, &storedExpiry, &scope); err != nil {
+		t.Fatalf("failed to read the seeded grant: %v", err)
+	}
+	if access != `{"v":1}` || refresh != `{"v":1}` || storedFingerprint != fingerprint || scope != "users.read offline.access" {
+		t.Fatalf("stored grant = (%q, %q, %q, %q); want the seeded values", access, refresh, storedFingerprint, scope)
+	}
+	if !storedExpiry.Equal(expiresAt) {
+		t.Fatalf("stored expiry = %v; want %v", storedExpiry, expiresAt)
+	}
+
+	if err := m.Steps(-1); err != nil {
+		t.Fatalf("000012 down migration failed: %v", err)
+	}
+	requireNoOAuthTokenColumns(t, sqlDB)
+	var surviving int
+	if err := sqlDB.QueryRow(`SELECT COUNT(*) FROM oauth_accounts WHERE user_id = $1`, userID).Scan(&surviving); err != nil {
+		t.Fatalf("failed to count surviving links: %v", err)
+	}
+	if surviving != 1 {
+		t.Fatalf("links after the 000012 down = %d; want the populated row to survive", surviving)
+	}
+
+	if err := m.Steps(1); err != nil {
+		t.Fatalf("000012 re-up migration failed: %v", err)
+	}
+	requireOAuthTokenColumns(t, sqlDB)
+	// Scan each re-added column on its own: concatenating in SQL would cast a
+	// CHAR column through text(bpchar), which trims the padding and hides the
+	// very thing this asserts: that an empty fingerprint reads back as "".
+	var reUpAccess, reUpFingerprint, reUpScope string
+	if err := sqlDB.QueryRow(`SELECT access_token_ciphertext, refresh_token_fingerprint, token_scope
+		FROM oauth_accounts WHERE user_id = $1`, userID).
+		Scan(&reUpAccess, &reUpFingerprint, &reUpScope); err != nil {
+		t.Fatalf("failed to read the re-added columns: %v", err)
+	}
+	if reUpAccess != "" || reUpFingerprint != "" || reUpScope != "" {
+		t.Fatalf("re-added columns = (%q, %q, %q); want the empty backfill", reUpAccess, reUpFingerprint, reUpScope)
+	}
+
+	if err := m.Up(); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("restoring head failed: %v", err)
+	}
+}
+
+// requireOAuthTokenColumns asserts the five columns 000012 adds, with their
+// types and nullability: the fingerprint is a VARCHAR(64) and only the expiry
+// may be NULL.
+func requireOAuthTokenColumns(t *testing.T, sqlDB *sql.DB) {
+	t.Helper()
+
+	want := map[string]string{
+		"access_token_ciphertext":   "text/NO/0",
+		"refresh_token_ciphertext":  "text/NO/0",
+		"refresh_token_fingerprint": "character varying/NO/64",
+		"token_expires_at":          "timestamp with time zone/YES/0",
+		"token_scope":               "text/NO/0",
+	}
+	got := map[string]string{}
+	rows, err := sqlDB.Query(`SELECT column_name, data_type, is_nullable, COALESCE(character_maximum_length, 0)
+		FROM information_schema.columns
+		WHERE table_schema = 'public' AND table_name = 'oauth_accounts'
+		  AND column_name IN ('access_token_ciphertext', 'refresh_token_ciphertext',
+			'refresh_token_fingerprint', 'token_expires_at', 'token_scope')`)
+	if err != nil {
+		t.Fatalf("query oauth_accounts columns: %v", err)
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var name, dataType, nullable string
+		var maxLength int
+		if err := rows.Scan(&name, &dataType, &nullable, &maxLength); err != nil {
+			t.Fatalf("scan oauth_accounts column: %v", err)
+		}
+		got[name] = fmt.Sprintf("%s/%s/%d", dataType, nullable, maxLength)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate oauth_accounts columns: %v", err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("oauth token columns = %v; want %v", got, want)
+	}
+}
+
+// requireNoOAuthTokenColumns asserts none of 000012's columns exist.
+func requireNoOAuthTokenColumns(t *testing.T, sqlDB *sql.DB) {
+	t.Helper()
+
+	var count int
+	if err := sqlDB.QueryRow(`SELECT COUNT(*) FROM information_schema.columns
+		WHERE table_schema = 'public' AND table_name = 'oauth_accounts'
+		  AND column_name IN ('access_token_ciphertext', 'refresh_token_ciphertext',
+			'refresh_token_fingerprint', 'token_expires_at', 'token_scope')`).Scan(&count); err != nil {
+		t.Fatalf("count oauth token columns: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("oauth token columns present = %d; want none", count)
 	}
 }
 

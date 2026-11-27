@@ -172,16 +172,22 @@ func TestDocumentSerialization_RoundTrip(t *testing.T) {
 	t.Run("OAuthAccountDoc", func(t *testing.T) {
 		id := uuid.New()
 		userID := uuid.New()
+		tokenExpiresAt := now.Add(time.Hour)
 		acc := &db.OAuthAccount{
-			ID:               id,
-			UserID:           userID,
-			ProviderID:       "google",
-			ProviderTenantID: "tenant-a",
-			ProviderUserID:   "google-uid-123",
-			Email:            "user@example.com",
-			Verified:         true,
-			CreatedAt:        now,
-			UpdatedAt:        now,
+			ID:                      id,
+			UserID:                  userID,
+			ProviderID:              "google",
+			ProviderTenantID:        "tenant-a",
+			ProviderUserID:          "google-uid-123",
+			Email:                   "user@example.com",
+			Verified:                true,
+			AccessTokenCiphertext:   `{"v":1,"alg":"A256GCM","ct":"access"}`,
+			RefreshTokenCiphertext:  `{"v":1,"alg":"A256GCM","ct":"refresh"}`,
+			RefreshTokenFingerprint: strings.Repeat("a", 64),
+			TokenExpiresAt:          &tokenExpiresAt,
+			TokenScope:              "users.read offline.access",
+			CreatedAt:               now,
+			UpdatedAt:               now,
 		}
 
 		doc := oauthAccountDocFromDomain(acc)
@@ -201,8 +207,46 @@ func TestDocumentSerialization_RoundTrip(t *testing.T) {
 			roundTripped.ProviderTenantID != acc.ProviderTenantID ||
 			roundTripped.ProviderUserID != acc.ProviderUserID ||
 			roundTripped.Email != acc.Email ||
-			!roundTripped.Verified {
+			!roundTripped.Verified ||
+			roundTripped.AccessTokenCiphertext != acc.AccessTokenCiphertext ||
+			roundTripped.RefreshTokenCiphertext != acc.RefreshTokenCiphertext ||
+			roundTripped.RefreshTokenFingerprint != acc.RefreshTokenFingerprint ||
+			roundTripped.TokenScope != acc.TokenScope {
 			t.Fatalf("roundtrip mismatch: got %+v, want %+v", roundTripped, acc)
+		}
+		if roundTripped.TokenExpiresAt == nil || !roundTripped.TokenExpiresAt.Equal(tokenExpiresAt) {
+			t.Fatalf("token_expires_at roundtrip = %v; want %v", roundTripped.TokenExpiresAt, tokenExpiresAt)
+		}
+	})
+
+	t.Run("OAuthAccountDoc without tokens keeps nil expiry", func(t *testing.T) {
+		acc := &db.OAuthAccount{
+			ID:               uuid.New(),
+			UserID:           uuid.New(),
+			ProviderID:       "google",
+			ProviderTenantID: "tenant-a",
+			ProviderUserID:   "tokenless-uid",
+			Email:            "tokenless@example.com",
+			CreatedAt:        now,
+			UpdatedAt:        now,
+		}
+
+		data, err := bson.Marshal(oauthAccountDocFromDomain(acc))
+		if err != nil {
+			t.Fatalf("bson.Marshal failed: %v", err)
+		}
+		var unmarshaled OAuthAccountDoc
+		if err := bson.Unmarshal(data, &unmarshaled); err != nil {
+			t.Fatalf("bson.Unmarshal failed: %v", err)
+		}
+
+		got := unmarshaled.toDomain()
+		if got.TokenExpiresAt != nil {
+			t.Fatalf("nil token_expires_at decoded as %v; want nil", got.TokenExpiresAt)
+		}
+		if got.AccessTokenCiphertext != "" || got.RefreshTokenCiphertext != "" ||
+			got.RefreshTokenFingerprint != "" || got.TokenScope != "" {
+			t.Fatalf("empty token fields decoded as %+v", got)
 		}
 	})
 
@@ -230,8 +274,15 @@ func TestDocumentSerialization_RoundTrip(t *testing.T) {
 		if unmarshaled.Verified {
 			t.Fatal("missing verified field must decode false")
 		}
+		if unmarshaled.TokenExpiresAt != nil {
+			t.Fatalf("missing token_expires_at must decode nil, got %v", unmarshaled.TokenExpiresAt)
+		}
 		if got := unmarshaled.toDomain(); got.Verified {
 			t.Fatalf("legacy document decoded Verified=%v; want false", got.Verified)
+		} else if got.TokenExpiresAt != nil || got.TokenScope != "" ||
+			got.AccessTokenCiphertext != "" || got.RefreshTokenCiphertext != "" ||
+			got.RefreshTokenFingerprint != "" {
+			t.Fatalf("legacy document decoded token fields: %+v", got)
 		}
 	})
 
@@ -897,4 +948,119 @@ func TestMongoStore_CanceledContext_AllMethods(t *testing.T) {
 		return nil
 	}))
 	_ = store.Close()
+}
+
+// TestOAuthTokenSetDoc pins the write payload both token paths share: every
+// token column is overwritten, and a nil expiry is written as null so it decodes
+// back to a nil pointer instead of a year-1 time.
+func TestOAuthTokenSetDoc(t *testing.T) {
+	expiresAt := time.Now().UTC().Truncate(time.Millisecond)
+	doc := oauthTokenSetDoc(db.OAuthTokenRecord{
+		AccessTokenCiphertext:   "sealed-access",
+		RefreshTokenCiphertext:  "sealed-refresh",
+		RefreshTokenFingerprint: strings.Repeat("a", 64),
+		TokenScope:              "offline_access",
+		TokenExpiresAt:          &expiresAt,
+	})
+	want := []string{
+		"access_token_ciphertext", "refresh_token_ciphertext", "refresh_token_fingerprint",
+		"token_scope", "token_expires_at", "updated_at",
+	}
+	if len(doc) != len(want) {
+		t.Fatalf("payload has %d keys; want %d: %v", len(doc), len(want), doc)
+	}
+	for _, key := range want {
+		if _, ok := doc[key]; !ok {
+			t.Fatalf("payload is missing %q: %v", key, doc)
+		}
+	}
+	if got, ok := doc["token_expires_at"].(time.Time); !ok || !got.Equal(expiresAt) {
+		t.Fatalf("token_expires_at = %v; want %v", doc["token_expires_at"], expiresAt)
+	}
+
+	// An all-empty record clears the columns and leaves the expiry unset.
+	cleared := oauthTokenSetDoc(db.OAuthTokenRecord{})
+	for _, key := range want[:4] {
+		if cleared[key] != "" {
+			t.Fatalf("cleared %q = %v; want empty string", key, cleared[key])
+		}
+	}
+	if cleared["token_expires_at"] != nil {
+		t.Fatalf("cleared token_expires_at = %v; want nil", cleared["token_expires_at"])
+	}
+
+	// The null must survive a BSON round trip as a nil pointer, not a zero time.
+	data, err := bson.Marshal(bson.M{
+		"_id": uuid.New().String(), "token_expires_at": cleared["token_expires_at"],
+	})
+	if err != nil {
+		t.Fatalf("bson.Marshal failed: %v", err)
+	}
+	var roundTripped OAuthAccountDoc
+	if err := bson.Unmarshal(data, &roundTripped); err != nil {
+		t.Fatalf("bson.Unmarshal failed: %v", err)
+	}
+	if roundTripped.TokenExpiresAt != nil {
+		t.Fatalf("null token_expires_at decoded as %v; want nil", roundTripped.TokenExpiresAt)
+	}
+}
+
+// TestOAuthPartialTokenWrites pins the payloads of the writes that own a single
+// column group: a refresh-only clear cannot blank the access columns, a rotated
+// pair leaves them to their own writer, and the absent-value filter also matches
+// documents written before the token columns existed.
+func TestOAuthPartialTokenWrites(t *testing.T) {
+	refreshColumns := []string{"refresh_token_ciphertext", "refresh_token_fingerprint", "updated_at"}
+
+	cleared := oauthRefreshClearSet()
+	if len(cleared) != len(refreshColumns) {
+		t.Fatalf("clear payload has %d keys; want %d: %v", len(cleared), len(refreshColumns), cleared)
+	}
+	for _, key := range refreshColumns[:2] {
+		if cleared[key] != "" {
+			t.Fatalf("cleared %q = %v; want empty", key, cleared[key])
+		}
+	}
+	if _, ok := cleared["updated_at"].(time.Time); !ok {
+		t.Fatalf("clear payload updated_at = %T; want time.Time", cleared["updated_at"])
+	}
+	for _, key := range []string{"access_token_ciphertext", "token_scope", "token_expires_at"} {
+		if _, ok := cleared[key]; ok {
+			t.Fatalf("refresh clear writes %q: %v", key, cleared)
+		}
+	}
+
+	rotated := oauthRefreshPairSet(db.OAuthTokenRecord{
+		AccessTokenCiphertext:   "rotated-access",
+		RefreshTokenCiphertext:  "rotated-refresh",
+		RefreshTokenFingerprint: strings.Repeat("a", 64),
+		TokenScope:              "offline_access",
+	})
+	if len(rotated) != len(refreshColumns) {
+		t.Fatalf("rotated payload has %d keys; want %d: %v", len(rotated), len(refreshColumns), rotated)
+	}
+	if rotated["refresh_token_ciphertext"] != "rotated-refresh" ||
+		rotated["refresh_token_fingerprint"] != strings.Repeat("a", 64) {
+		t.Fatalf("rotated payload = %v; want the refresh pair", rotated)
+	}
+	for _, key := range []string{"access_token_ciphertext", "token_scope", "token_expires_at"} {
+		if _, ok := rotated[key]; ok {
+			t.Fatalf("rotated payload writes %q: %v", key, rotated)
+		}
+	}
+
+	for _, field := range []string{"refresh_token_fingerprint", "access_token_ciphertext"} {
+		filter := bson.M{"_id": "id", "$or": oauthAbsentOr(field)}
+		or, ok := filter["$or"].([]bson.M)
+		if !ok || len(or) != 2 {
+			t.Fatalf("%s absent filter = %v; want two alternatives", field, filter["$or"])
+		}
+		if or[0][field] != "" {
+			t.Fatalf("%s absent filter does not match the empty column: %v", field, or[0])
+		}
+		exists, ok := or[1][field].(bson.M)
+		if !ok || exists["$exists"] != false {
+			t.Fatalf("%s absent filter does not match a missing column: %v", field, or[1])
+		}
+	}
 }

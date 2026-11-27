@@ -55,16 +55,73 @@ type PasswordResetTokenStore interface {
 	ConsumeToken(ctx context.Context, tokenHash []byte, now time.Time) (bool, error)
 }
 
+// OAuthTokenRecord is the opaque token payload written by OAuthAccountStore.
+// It carries sealed envelopes and the rotation fingerprint only: this package
+// holds no plaintext token and performs no crypto, so a credential cannot be
+// stored through this type. A nil TokenExpiresAt means "no expiry stored" and
+// an all-empty record clears the tokens.
+type OAuthTokenRecord struct {
+	AccessTokenCiphertext   string
+	RefreshTokenCiphertext  string
+	RefreshTokenFingerprint string
+	TokenScope              string
+	TokenExpiresAt          *time.Time
+}
+
 // OAuthAccountStore defines storage operations for external identity provider links.
 // Identities are keyed by (provider, tenant, provider user id): a pairwise
 // subject is only unique within the tenant that issued it.
 type OAuthAccountStore interface {
 	Create(ctx context.Context, account *OAuthAccount) error
 	GetByProvider(ctx context.Context, providerID, providerTenantID, providerUserID string) (*OAuthAccount, error)
+	// GetByUserID returns every link the user holds, most recently updated
+	// first. A user may hold more than one link for one provider, so callers
+	// that resolve a single row take the first match for that provider.
 	GetByUserID(ctx context.Context, userID uuid.UUID) ([]*OAuthAccount, error)
 	UpdateProviderUserID(ctx context.Context, id uuid.UUID, providerUserID string) error
 	Delete(ctx context.Context, id uuid.UUID) error
 	DeleteByUserID(ctx context.Context, userID uuid.UUID) error
+
+	// SaveOAuthTokens overwrites every token field on the account. It reports
+	// the backend not-found error when no account holds id.
+	SaveOAuthTokens(ctx context.Context, id uuid.UUID, rec OAuthTokenRecord) error
+	// SaveOAuthTokensCAS writes the record only when the stored refresh-token
+	// fingerprint equals expectedFingerprint, reporting whether it won. A miss
+	// is (false, nil): another writer rotated first and the caller re-reads. An
+	// empty expectation never matches, so a tokenless account cannot be
+	// overwritten by a refresh that has no stored fingerprint to prove.
+	SaveOAuthTokensCAS(ctx context.Context, id uuid.UUID, expectedFingerprint string, rec OAuthTokenRecord) (bool, error)
+	// SaveOAuthTokensIfUnset writes the record only while the account holds no
+	// refresh token, reporting whether it won. It is the guarded write for a
+	// first grant: a row that already stored one is never overwritten.
+	SaveOAuthTokensIfUnset(ctx context.Context, id uuid.UUID, rec OAuthTokenRecord) (bool, error)
+	// SaveOAuthAccess writes only the access fields (ciphertext, expiry, scope)
+	// and leaves the refresh columns untouched, so a grant that carries no
+	// refresh token cannot erase one another writer stored. It reports the
+	// backend not-found error when no account holds id.
+	SaveOAuthAccess(ctx context.Context, id uuid.UUID, rec OAuthTokenRecord) error
+	// ClearOAuthRefresh empties only the refresh columns (ciphertext,
+	// fingerprint) when the stored fingerprint equals expectedFingerprint, and
+	// never writes the access, scope, or expiry columns, so a discard cannot
+	// restore an envelope another writer already replaced. A miss is
+	// (false, nil): another writer owns the grant. An empty expectation never
+	// matches.
+	ClearOAuthRefresh(ctx context.Context, id uuid.UUID, expectedFingerprint string) (bool, error)
+	// SaveOAuthRefreshIfUnset writes the record's refresh columns only while the
+	// account holds no refresh token, and its access columns only while the
+	// account holds no access token, so a concurrent access-only winner keeps
+	// its envelope. A miss is (false, nil): a refresh grant is already stored.
+	// An empty rec fingerprint never matches the guard and is never written. A
+	// backend that cannot apply both groups in one statement reports an error
+	// after the refresh pair landed as (true, error): the pair stands, and the
+	// caller retries or serves the stored grant.
+	SaveOAuthRefreshIfUnset(ctx context.Context, id uuid.UUID, rec OAuthTokenRecord) (bool, error)
+	// SaveOAuthAccessCAS writes only the access fields when the stored access
+	// ciphertext equals expectedCiphertext, so an older grant cannot replace a
+	// newer access envelope. An empty expectation asserts only that the access
+	// column is still empty, which is a value it can prove. A miss is
+	// (false, nil).
+	SaveOAuthAccessCAS(ctx context.Context, id uuid.UUID, expectedCiphertext string, rec OAuthTokenRecord) (bool, error)
 }
 
 // TotpStore defines storage operations for RFC 6238 TOTP two-factor authentication.

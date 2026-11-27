@@ -310,7 +310,7 @@ func TestUnverifiedLinkTakeoverDefense(t *testing.T) {
 			wg.Add(1)
 			go func(i int) {
 				defer wg.Done()
-				u, _, _, err := inner.linkOrCreate(context.Background(), "google", unverified(), "")
+				u, _, _, err := inner.linkOrCreate(context.Background(), "google", unverified(), "", nil)
 				outs[i] = outcome{user: u, err: err}
 			}(i)
 		}

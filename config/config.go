@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/kaiizer777/go-auth/crypto"
 	"github.com/kaiizer777/go-auth/email"
 	"github.com/kaiizer777/go-auth/errors"
 )
@@ -100,6 +101,9 @@ func (p ProviderConfig) String() string {
 	return fmt.Sprintf("ProviderConfig{ClientID: %s, ClientSecret: %s, RedirectURL: %s}", p.ClientID, secret, p.RedirectURL)
 }
 
+// GoString implements fmt.GoStringer so %#v masks ClientSecret and PrivateKey.
+func (p ProviderConfig) GoString() string { return "config." + p.String() }
+
 // OAuthConfig groups configurations for all external identity providers.
 type OAuthConfig struct {
 	// Providers maps provider ID ("google", "github", "apple", "microsoft") to provider configuration.
@@ -114,7 +118,12 @@ type OAuthConfig struct {
 	StateCookiePath string           // Default: "/" (ensures cookies are sent on /auth/oauth/* and /api/auth/oauth/*)
 	StateTTL        time.Duration    // Default: 10 * time.Minute
 	StateSecret     string           // Required when any OAuth provider is enabled; empty fails closed at startup. Min 32 bytes.
-	CallbackBaseURL string           // e.g. "https://api.example.com"
+	// TokenKEK is the comma-separated `kid:base64key` keyring that encrypts
+	// stored OAuth tokens. The first entry encrypts, every entry decrypts, each
+	// key must decode to 32 bytes. Required when any provider is enabled; empty
+	// fails closed at startup. Never logged.
+	TokenKEK        string
+	CallbackBaseURL string // e.g. "https://api.example.com"
 	// StateCookieSameSite is the base SameSite policy for the OAuth state
 	// cookie on GET-redirect flows. Default: Lax. form_post providers (Apple)
 	// always escalate to None+Secure regardless, since browsers withhold Lax
@@ -122,11 +131,15 @@ type OAuthConfig struct {
 	StateCookieSameSite http.SameSite
 }
 
-// LogValue implements slog.LogValuer to ensure StateSecret and nested provider secrets are redacted.
+// LogValue implements slog.LogValuer to ensure StateSecret, TokenKEK and nested provider secrets are redacted.
 func (o OAuthConfig) LogValue() slog.Value {
 	secretMasked := "[REDACTED]"
 	if o.StateSecret == "" {
 		secretMasked = ""
+	}
+	kekMasked := "[REDACTED]"
+	if o.TokenKEK == "" {
+		kekMasked = ""
 	}
 	providerAttrs := make([]slog.Attr, 0, len(o.Providers))
 	for name, provider := range o.Providers {
@@ -134,6 +147,7 @@ func (o OAuthConfig) LogValue() slog.Value {
 	}
 	attrs := []slog.Attr{
 		slog.String("state_secret", secretMasked),
+		slog.String("token_kek", kekMasked),
 		slog.String("state_cookie_name", o.StateCookieName),
 		slog.String("state_cookie_path", o.StateCookiePath),
 		slog.Duration("state_ttl", o.StateTTL),
@@ -157,15 +171,23 @@ func (o OAuthConfig) LogValue() slog.Value {
 	return slog.GroupValue(attrs...)
 }
 
-// String implements fmt.Stringer to ensure StateSecret is masked when printed.
+// String implements fmt.Stringer to ensure StateSecret and TokenKEK are masked when printed.
 func (o OAuthConfig) String() string {
 	secret := "[REDACTED]"
 	if o.StateSecret == "" {
 		secret = ""
 	}
-	return fmt.Sprintf("OAuthConfig{Providers: %v, Microsoft: %v, Facebook: %v, Discord: %v, X: %v, StateSecret: %s, CallbackBaseURL: %s}",
-		o.Providers, o.Microsoft, o.Facebook, o.Discord, o.X, secret, o.CallbackBaseURL)
+	kek := "[REDACTED]"
+	if o.TokenKEK == "" {
+		kek = ""
+	}
+	return fmt.Sprintf("OAuthConfig{Providers: %v, Microsoft: %v, Facebook: %v, Discord: %v, X: %v, StateSecret: %s, TokenKEK: %s, CallbackBaseURL: %s}",
+		o.Providers, o.Microsoft, o.Facebook, o.Discord, o.X, secret, kek, o.CallbackBaseURL)
 }
+
+// GoString implements fmt.GoStringer so %#v masks StateSecret, TokenKEK and the
+// nested provider credentials.
+func (o OAuthConfig) GoString() string { return "config." + o.String() }
 
 // SecurityHeadersConfig groups HTTP security header policies.
 // Struct fields are ordered largest-to-smallest to eliminate memory alignment padding.
@@ -212,6 +234,9 @@ func (t TOTPConfig) String() string {
 	return fmt.Sprintf("TOTPConfig{EncryptionKey: %s, Issuer: %s, ChallengeTokenTTL: %v, AttemptWindow: %v, MaxAttemptsPerWindow: %d}",
 		keyMasked, t.Issuer, t.ChallengeTokenTTL, t.AttemptWindow, t.MaxAttemptsPerWindow)
 }
+
+// GoString implements fmt.GoStringer so %#v masks EncryptionKey.
+func (t TOTPConfig) GoString() string { return "config." + t.String() }
 
 // DefaultTOTPConfig returns safe production defaults for TOTP configuration.
 func DefaultTOTPConfig() TOTPConfig {
@@ -801,6 +826,15 @@ func (c *Config) validate() error {
 	} else if len(c.OAuth.StateSecret) < 32 {
 		return errors.ErrOAuthStateSecretTooShort
 	}
+	// A non-empty keyring must parse here so a typo fails at startup rather than
+	// on the first token write. Empty stays valid: this function performs no
+	// environment reads, and the constructors enforce the provider-enabled
+	// requirement after resolving GOAUTH_TOKEN_KEK.
+	if c.OAuth.TokenKEK != "" {
+		if _, err := crypto.ParseKeyring(c.OAuth.TokenKEK); err != nil {
+			return errors.ErrOAuthTokenKEKInvalid
+		}
+	}
 	if !isToken(c.OAuth.StateCookieName) {
 		return errors.ErrOAuthStateCookieNameInvalid
 	}
@@ -865,10 +899,11 @@ func (c *Config) validate() error {
 
 	if c.OAuth.X != nil {
 		// Same merge rule as Microsoft above: no pre-merge default when a map
-		// entry carries explicit scopes.
+		// entry carries explicit scopes. X scopes the profile endpoint with both
+		// users.read and tweet.read, so the default requests both.
 		_, xMapEntry := c.OAuth.Providers["x"]
 		if len(c.OAuth.X.Scopes) == 0 && !xMapEntry {
-			c.OAuth.X.Scopes = []string{"users.read"}
+			c.OAuth.X.Scopes = []string{"tweet.read", "users.read", "offline.access"}
 		}
 	}
 
@@ -1176,3 +1211,7 @@ func (c Config) String() string {
 	return fmt.Sprintf("Config{DatabaseURL: %s, BaseURL: %s, MigrationsPath: %s, MaxOpenConns: %d, MaxIdleConns: %d}",
 		RedactURL(c.DatabaseURL), c.BaseURL, c.MigrationsPath, c.MaxOpenConns, c.MaxIdleConns)
 }
+
+// GoString implements fmt.GoStringer so %#v masks DatabaseURL and every nested
+// secret-bearing section.
+func (c Config) GoString() string { return "config." + c.String() }

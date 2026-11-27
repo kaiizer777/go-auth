@@ -3,6 +3,7 @@ package config
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -12,12 +13,32 @@ import (
 	"github.com/kaiizer777/go-auth/errors"
 )
 
+// testTokenKEK is a fixed valid keyring: kid "test-kid" plus the 32 bytes 0x00-0x1f.
+const testTokenKEK = "test-kid:AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
+
 func validOAuthBase() Config {
 	cfg := DefaultConfig()
 	cfg.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
 	cfg.BaseURL = "https://example.com"
 	cfg.OAuth.StateSecret = "test-state-secret-at-least-32-bytes!"
 	return cfg
+}
+
+// assertXDefaultScopes pins the X default on both default surfaces: GET
+// /2/users/me is scoped with users.read and tweet.read, plus offline.access for
+// the refresh token.
+func assertXDefaultScopes(t *testing.T, got []string) {
+	t.Helper()
+
+	want := []string{"tweet.read", "users.read", "offline.access"}
+	if len(got) != len(want) {
+		t.Fatalf("Scopes = %v; want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("Scopes = %v; want %v", got, want)
+		}
+	}
 }
 
 func TestOAuthDefaults(t *testing.T) {
@@ -250,6 +271,34 @@ func TestConfigValidate_OAuth(t *testing.T) {
 			mutate: func(c *Config) {
 				c.OAuth.StateSecret = ""
 				c.OAuth.Providers = map[string]ProviderConfig{"google": {}}
+			},
+			wantErr: nil,
+		},
+		{
+			name: "malformed token keyring rejected",
+			mutate: func(c *Config) {
+				c.OAuth.TokenKEK = "not-a-keyring"
+			},
+			wantErr: errors.ErrOAuthTokenKEKInvalid,
+		},
+		{
+			name: "token keyring with non-base64 key rejected",
+			mutate: func(c *Config) {
+				c.OAuth.TokenKEK = "kid:not-base64!"
+			},
+			wantErr: errors.ErrOAuthTokenKEKInvalid,
+		},
+		{
+			name: "token keyring with short key rejected",
+			mutate: func(c *Config) {
+				c.OAuth.TokenKEK = "kid:AAECAwQFBgcICQoLDA0ODw=="
+			},
+			wantErr: errors.ErrOAuthTokenKEKInvalid,
+		},
+		{
+			name: "valid token keyring passes with no providers",
+			mutate: func(c *Config) {
+				c.OAuth.TokenKEK = testTokenKEK
 			},
 			wantErr: nil,
 		},
@@ -1396,16 +1445,27 @@ func TestProviderConfigLogValue(t *testing.T) {
 		if err := cfg.Validate(); err != nil {
 			t.Fatalf("Validate = %v", err)
 		}
-		if len(cfg.OAuth.X.Scopes) != 1 || cfg.OAuth.X.Scopes[0] != "users.read" {
-			t.Fatalf("Scopes = %v; want [users.read]", cfg.OAuth.X.Scopes)
+		assertXDefaultScopes(t, cfg.OAuth.X.Scopes)
+		// Merge premise (oauth sync): the typed X default wins the
+		// resolveProviders merge, so the merged map entry carries it rather than
+		// the map-surface default.
+		assertXDefaultScopes(t, cfg.OAuth.Providers["x"].Scopes)
+	})
+
+	t.Run("X map-only provider defaults scopes", func(t *testing.T) {
+		cfg := validOAuthBase()
+		cfg.OAuth.Providers = map[string]ProviderConfig{
+			"x": {
+				ClientID:     "x-id",
+				ClientSecret: "x-secret",
+				RedirectURL:  "https://example.com/callback",
+				Enabled:      true,
+			},
 		}
-		// Merge premise (oauth sync): the typed X default is least-privilege
-		// [users.read] and wins the resolveProviders merge, so the merged map
-		// entry carries it rather than the broader remote default.
-		scopes := cfg.OAuth.Providers["x"].Scopes
-		if len(scopes) != 1 || scopes[0] != "users.read" {
-			t.Fatalf("Scopes = %v; want [users.read]", scopes)
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("Validate = %v", err)
 		}
+		assertXDefaultScopes(t, cfg.OAuth.Providers["x"].Scopes)
 	})
 
 	t.Run("XConfig masks client secret in LogValue and String", func(t *testing.T) {
@@ -1541,6 +1601,51 @@ func TestOAuthConfigLogValueEmptyProviders(t *testing.T) {
 		if _, isObject := raw.(map[string]any); !isObject {
 			t.Fatalf("providers = %v; want a group object", raw)
 		}
+	}
+}
+
+func TestOAuthConfigTokenKEKRedaction(t *testing.T) {
+	o := OAuthConfig{
+		StateSecret: "state-secret-super-confidential",
+		TokenKEK:    testTokenKEK,
+	}
+	encodedKey := "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
+
+	attrs := make(map[string]string)
+	for _, attr := range o.LogValue().Group() {
+		attrs[attr.Key] = attr.Value.String()
+	}
+	if attrs["token_kek"] != "[REDACTED]" {
+		t.Errorf("token_kek = %q; want [REDACTED]", attrs["token_kek"])
+	}
+
+	rendered := map[string]string{
+		"String()": o.String(),
+		"fmt %+v":  fmt.Sprintf("%+v", o),
+	}
+	for name, out := range rendered {
+		if strings.Contains(out, encodedKey) || strings.Contains(out, "test-kid") {
+			t.Fatalf("%s leaked token keyring: %q", name, out)
+		}
+		if !strings.Contains(out, "[REDACTED]") {
+			t.Fatalf("%s expected [REDACTED], got: %q", name, out)
+		}
+	}
+
+	var buf bytes.Buffer
+	slog.New(slog.NewJSONHandler(&buf, nil)).Info("oauth config", "oauth", o)
+	if line := buf.String(); strings.Contains(line, encodedKey) {
+		t.Fatalf("JSON log leaked token keyring: %s", line)
+	}
+
+	empty := OAuthConfig{}
+	for _, attr := range empty.LogValue().Group() {
+		if attr.Key == "token_kek" && attr.Value.String() != "" {
+			t.Fatalf("empty token_kek = %q; want empty", attr.Value.String())
+		}
+	}
+	if strings.Contains(empty.String(), "[REDACTED]") {
+		t.Fatalf("empty TokenKEK rendered [REDACTED]: %q", empty.String())
 	}
 }
 

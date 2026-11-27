@@ -8,6 +8,8 @@ import (
 	"context"
 	"log/slog"
 	"net/http"
+	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -72,10 +74,42 @@ var (
 	}
 )
 
+// tokenKEKEnvVar is the only place the token keyring environment variable is read.
+const tokenKEKEnvVar = "GOAUTH_TOKEN_KEK"
+
+// resolveTokenKEK applies the environment keyring when the config leaves it
+// unset; an explicit config value always wins. Config.Validate stays free of
+// environment reads on purpose.
+func resolveTokenKEK(cfg *config.Config) {
+	if cfg.OAuth.TokenKEK != "" {
+		return
+	}
+	cfg.OAuth.TokenKEK = strings.TrimSpace(os.Getenv(tokenKEKEnvVar))
+}
+
+// requireProviderTokenKEK fails closed when a provider is configured without a
+// keyring. cfg must have passed Validate so Providers carries the resolved
+// enable flags; there is no default, generated, or plaintext fallback.
+func requireProviderTokenKEK(cfg *config.Config) error {
+	if cfg.OAuth.TokenKEK != "" {
+		return nil
+	}
+	for _, provider := range cfg.OAuth.Providers {
+		if provider.Enabled {
+			return errors.Wrap(errors.ErrOAuthTokenKEKMissing, errors.CodeInvalidConfig, "goauth: invalid configuration")
+		}
+	}
+	return nil
+}
+
 // NewWithStore initializes Auth using an existing db.Store.
 func NewWithStore(store db.Store, cfg config.Config) (*Auth, error) {
+	resolveTokenKEK(&cfg)
 	if err := cfg.Validate(); err != nil {
 		return nil, errors.Wrap(err, errors.CodeInvalidConfig, "goauth: invalid configuration")
+	}
+	if err := requireProviderTokenKEK(&cfg); err != nil {
+		return nil, err
 	}
 
 	emailHooks := cfg.EmailHooks
@@ -242,8 +276,12 @@ func NewWithDB(database *gorm.DB, cfg config.Config) (*Auth, error) {
 // New validates runtime configuration, establishes database connectivity,
 // runs pending migrations, and initializes the HTTP handler chain.
 func New(cfg config.Config) (*Auth, error) {
+	resolveTokenKEK(&cfg)
 	if err := cfg.Validate(); err != nil {
 		return nil, errors.Wrap(err, errors.CodeInvalidConfig, "goauth: invalid configuration")
+	}
+	if err := requireProviderTokenKEK(&cfg); err != nil {
+		return nil, err
 	}
 
 	switch cfg.DatabaseType {

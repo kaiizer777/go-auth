@@ -55,6 +55,9 @@ func (m MicrosoftConfig) String() string {
 		m.ClientID, secret, m.Tenant, m.RedirectURI, m.Scopes, m.JWKSCacheTTL)
 }
 
+// GoString implements fmt.GoStringer so %#v masks ClientSecret.
+func (m MicrosoftConfig) GoString() string { return "config." + m.String() }
+
 // DiscordConfig defines configuration for Discord OAuth.
 type DiscordConfig struct {
 	ClientID     string   `json:"client_id"`
@@ -88,6 +91,9 @@ func (d DiscordConfig) String() string {
 	return fmt.Sprintf("DiscordConfig{ClientID: %s, ClientSecret: %s, RedirectURI: %s, Scopes: %v}",
 		d.ClientID, secret, d.RedirectURI, d.Scopes)
 }
+
+// GoString implements fmt.GoStringer so %#v masks ClientSecret.
+func (d DiscordConfig) GoString() string { return "config." + d.String() }
 
 // FacebookConfig defines configuration for Facebook Graph API.
 type FacebookConfig struct {
@@ -132,6 +138,9 @@ func (f FacebookConfig) String() string {
 		f.AppID, secret, f.RedirectURI, f.Scopes, f.GraphVersion)
 }
 
+// GoString implements fmt.GoStringer so %#v masks AppSecret.
+func (f FacebookConfig) GoString() string { return "config." + f.String() }
+
 // XConfig defines configuration for X (formerly Twitter) OAuth 2.0.
 type XConfig struct {
 	ClientID     string   `json:"client_id"`
@@ -165,6 +174,9 @@ func (x XConfig) String() string {
 	return fmt.Sprintf("XConfig{ClientID: %s, ClientSecret: %s, RedirectURI: %s, Scopes: %v}",
 		x.ClientID, secret, x.RedirectURI, x.Scopes)
 }
+
+// GoString implements fmt.GoStringer so %#v masks ClientSecret.
+func (x XConfig) GoString() string { return "config." + x.String() }
 
 // resolveProviders folds the typed per-provider sections into Providers, then
 // defaults the merged entries. Running on raw inputs keeps "unset" and
@@ -348,6 +360,8 @@ func applyProviderDefaults(id string, p *ProviderConfig) {
 		}
 	case "x":
 		if len(p.Scopes) == 0 {
+			// GET /2/users/me requires both users.read and tweet.read; without
+			// tweet.read the default login fails at the profile call.
 			p.Scopes = []string{"tweet.read", "users.read", "offline.access"}
 		}
 	}
