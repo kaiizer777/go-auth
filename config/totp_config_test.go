@@ -253,13 +253,18 @@ func TestTOTPConfig_KeyringRedaction(t *testing.T) {
 	keyring := testTOTPKeyring("k2")
 	cfg := TOTPConfig{EncryptionKey: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", Keyring: keyring, Issuer: "test-app"}
 
+	var foundKeyring bool
 	for _, attr := range cfg.LogValue().Group() {
 		if attr.Key != "keyring" {
 			continue
 		}
+		foundKeyring = true
 		if got := attr.Value.String(); got != "[REDACTED]" {
 			t.Fatalf("LogValue keyring = %q, want [REDACTED]", got)
 		}
+	}
+	if !foundKeyring {
+		t.Fatal("LogValue carries no keyring attribute")
 	}
 
 	if strings.Contains(cfg.String(), keyring) {

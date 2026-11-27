@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"reflect"
@@ -16,6 +17,7 @@ import (
 	"github.com/golang-migrate/migrate/v4"
 	pgmigrate "github.com/golang-migrate/migrate/v4/database/postgres"
 	"github.com/golang-migrate/migrate/v4/source/iofs"
+	"github.com/jackc/pgx/v5/pgconn"
 	_ "github.com/jackc/pgx/v5/stdlib"
 
 	"github.com/kaiizer777/go-auth/db"
@@ -1027,14 +1029,15 @@ func TestMigration000013_UpAndDown(t *testing.T) {
 	if err := m.Steps(-1); err != nil {
 		t.Fatalf("000013 down migration failed: %v", err)
 	}
-	var hasColumn bool
-	if err := sqlDB.QueryRow(`
-		SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'totp_secrets' AND column_name = 'secret_kid')
-	`).Scan(&hasColumn); err != nil {
-		t.Fatalf("failed to inspect dropped column: %v", err)
-	}
-	if hasColumn {
-		t.Fatal("000013 down must drop secret_kid")
+	// Probing the column directly is the property under test: an information_schema
+	// lookup can pass on a schema mismatch, a read of a dropped column cannot.
+	var (
+		probeHint string
+		pgErr     *pgconn.PgError
+	)
+	err = sqlDB.QueryRow(`SELECT secret_kid FROM totp_secrets LIMIT 0`).Scan(&probeHint)
+	if !errors.As(err, &pgErr) || pgErr.Code != "42703" {
+		t.Fatalf("reading secret_kid after down = %v; want undefined_column (42703)", err)
 	}
 	var storedAfterDown []byte
 	if err := sqlDB.QueryRow(`SELECT encrypted_secret FROM totp_secrets WHERE user_id = $1`, userID).Scan(&storedAfterDown); err != nil {
