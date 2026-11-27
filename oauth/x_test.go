@@ -73,8 +73,8 @@ func TestXProvider_AuthCodeURL(t *testing.T) {
 		RedirectURI:  "https://myapp.com/cb",
 	})
 	u2, _ := url.Parse(emptyScopeProvider.AuthURL("st", "ch"))
-	if u2.Query().Get("scope") != "users.read offline.access" {
-		t.Errorf("default scope = %q; want 'users.read offline.access'", u2.Query().Get("scope"))
+	if u2.Query().Get("scope") != "tweet.read users.read offline.access" {
+		t.Errorf("default scope = %q; want 'tweet.read users.read offline.access'", u2.Query().Get("scope"))
 	}
 }
 
@@ -1077,7 +1077,7 @@ func TestXProvider_RefreshToken(t *testing.T) {
 		wantRateLimit bool
 	}{
 		{"invalid_grant rejects the grant", "revoked-refresh-token", true, false},
-		{"invalid_request rejects the grant", "invalid-request-refresh-token", true, false},
+		{"invalid_request stays a provider error", "invalid-request-refresh-token", false, false},
 		{"invalid_client stays a provider error", "bad-client-refresh-token", false, false},
 		{"401 problem body stays a provider error", "problem-refresh-token", false, false},
 		{"429 maps to the rate limit error", "rate-limited-refresh-token", false, true},

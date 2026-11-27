@@ -119,7 +119,7 @@ func TestAdapterAuthURLByteStable(t *testing.T) {
 		},
 		{
 			id:      "x",
-			wantURL: "https://twitter.com/i/oauth2/authorize?client_id=test-client&code_challenge=ch&code_challenge_method=S256&redirect_uri=https%3A%2F%2Fapp.example.com%2Fcb&response_type=code&scope=users.read+offline.access&state=st",
+			wantURL: "https://twitter.com/i/oauth2/authorize?client_id=test-client&code_challenge=ch&code_challenge_method=S256&redirect_uri=https%3A%2F%2Fapp.example.com%2Fcb&response_type=code&scope=tweet.read+users.read+offline.access&state=st",
 		},
 	}
 	for _, tt := range tests {

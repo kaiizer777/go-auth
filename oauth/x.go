@@ -32,10 +32,10 @@ var _ TokenRefresher = (*XProvider)(nil)
 
 // NewXProvider constructs a new X (Twitter) OAuth 2.0 provider adapter.
 func NewXProvider(cfg config.XConfig, opts ...EndpointOption) *XProvider {
-	// Login baseline: users.read for /2/users/me and offline.access so the
-	// code exchange can issue a refresh token.
+	// Login baseline: /2/users/me is scoped with both users.read and tweet.read,
+	// plus offline.access so the code exchange can issue a refresh token.
 	if len(cfg.Scopes) == 0 {
-		cfg.Scopes = []string{"users.read", "offline.access"}
+		cfg.Scopes = []string{"tweet.read", "users.read", "offline.access"}
 	}
 	ep := resolveEndpoints(EndpointOverride{
 		AuthorizeURL: "https://twitter.com/i/oauth2/authorize",
@@ -67,7 +67,7 @@ func (p *XProvider) AuthCodeURL(state, codeChallenge string, opts ...AuthCodeOpt
 	q.Set("response_type", "code")
 	q.Set("client_id", p.cfg.ClientID)
 	q.Set("redirect_uri", p.cfg.RedirectURI)
-	q.Set("scope", scopesOrDefault(p.cfg.Scopes, "users.read", "offline.access"))
+	q.Set("scope", scopesOrDefault(p.cfg.Scopes, "tweet.read", "users.read", "offline.access"))
 	q.Set("state", state)
 	q.Set("code_challenge", codeChallenge)
 	q.Set("code_challenge_method", "S256")
@@ -374,14 +374,13 @@ func (p *XProvider) ExchangeCode(ctx context.Context, code, codeVerifier string)
 	return p.postTokenRequest(ctx, form, tokenErrorPolicy{failureMsg: "oauth token exchange failed"})
 }
 
-// refreshGrantError classifies X's `error` value for a refresh request.
-// invalid_grant and invalid_request mean the presented token is dead: the service
-// must clear it and send the user back through login. Anything else — notably
-// invalid_client, which means the deployment's credentials are wrong — stays a
-// provider error: clearing tokens would log every user out over an operator mistake.
+// refreshGrantError classifies X's `error` value for a refresh request. Only
+// invalid_grant means the presented token is dead, and only that code lets the
+// service clear a stored grant (RFC 6749 §5.2). invalid_request describes the
+// request — our parameters or an upstream contract change — and invalid_client a
+// deployment credential, so neither may destroy every user's stored token.
 func refreshGrantError(errorValue string) error {
-	switch errorValue {
-	case "invalid_grant", "invalid_request":
+	if errorValue == "invalid_grant" {
 		return errors.ErrOAuthGrantRejected
 	}
 	return nil
