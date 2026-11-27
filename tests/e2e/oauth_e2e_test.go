@@ -438,6 +438,114 @@ func TestE2E_FullBrowserOAuthJourneys(t *testing.T) {
 		if gotKeys["discord"] != "discord-snowflake-888" {
 			t.Fatalf("discord link provider_user_id = %q; want %q", gotKeys["discord"], "discord-snowflake-888")
 		}
+
+		// The active session decides the link owner even when the provider
+		// presents an address another local account already owns.
+		t.Run("discord link wins over the provider address owner", func(t *testing.T) {
+			h, dbConn, pReg, cfg := setupOAuthE2EStack(t)
+
+			msIdP, err := oauthmock.NewMicrosoftIdP(cfg.BaseURL + "/auth/oauth/microsoft/callback")
+			if err != nil {
+				t.Fatalf("NewMicrosoftIdP: %v", err)
+			}
+			defer msIdP.Close()
+			msIdP.TenantID = oauth.MicrosoftConsumerTenantGUID
+			msIdP.OID = "ms-user-oid-2b"
+			msIdP.Subject = "ms-user-sub-2b"
+			msIdP.Email = "session-linker@example.com"
+
+			msProvider := oauth.NewMicrosoftProvider(config.MicrosoftConfig{
+				ClientID:       msIdP.ClientID,
+				ClientSecret:   msIdP.ClientSecret,
+				RedirectURI:    cfg.BaseURL + "/auth/oauth/microsoft/callback",
+				TrustedTenants: []string{msIdP.TenantID},
+			}, oauth.WithEndpoints(microsoftEndpoints(msIdP)))
+
+			discordIdP := oauthmock.NewDiscordIdP(cfg.BaseURL + "/auth/oauth/discord/callback")
+			defer discordIdP.Close()
+			discordIdP.UserID = "discord-snowflake-999"
+			discordIdP.Email = "address-owner@example.com"
+
+			discordProvider := oauth.NewDiscordProvider(config.DiscordConfig{
+				ClientID:     discordIdP.ClientID,
+				ClientSecret: discordIdP.ClientSecret,
+				RedirectURI:  cfg.BaseURL + "/auth/oauth/discord/callback",
+			}, oauth.WithEndpoints(oauth.EndpointOverride{
+				AuthorizeURL: discordIdP.Server.URL + "/oauth2/authorize",
+				TokenURL:     discordIdP.Server.URL + "/api/v10/oauth2/token",
+				UserInfoURL:  discordIdP.Server.URL + "/api/v10/users/@me",
+			}))
+
+			for _, p := range []oauth.Provider{msProvider, discordProvider} {
+				if err := (*pReg).Register(p); err != nil {
+					t.Fatalf("register %s adapter: %v", p.ID(), err)
+				}
+			}
+
+			authorizeURL, cookies := initiateOAuth(t, h, "microsoft", "")
+			cbRec := callbackOAuth(t, h, authorizeAtIdP(t, authorizeURL), cookies...)
+			sessionCookie := responseCookie(t, cbRec, cfg.SessionCookieName)
+			if sessionCookie == nil {
+				t.Fatalf("microsoft login failed, no session cookie: %d (%s)", cbRec.Code, cbRec.Body.String())
+			}
+
+			var sessionUser db.User
+			if err := dbConn.Where("email = ?", msIdP.Email).First(&sessionUser).Error; err != nil {
+				t.Fatalf("microsoft-created user not found: %v", err)
+			}
+
+			// The claimed address already belongs to a verified account with a
+			// password; the link must not move the identity onto that account.
+			owner := db.User{
+				ID:            uuid.New(),
+				Email:         discordIdP.Email,
+				PasswordHash:  "address-owner-password-hash",
+				EmailVerified: true,
+			}
+			if err := dbConn.Create(&owner).Error; err != nil {
+				t.Fatalf("seed address owner: %v", err)
+			}
+
+			linkAuthorizeURL, linkCookies := initiateOAuth(t, h, "discord", "?link=true&redirect_url=/settings/links", sessionCookie)
+			linkCallback := authorizeAtIdP(t, linkAuthorizeURL)
+			linkRec := callbackOAuth(t, h, linkCallback, append(linkCookies, sessionCookie)...)
+			if linkRec.Code != http.StatusFound {
+				t.Fatalf("discord link callback = %d (%s); want 302", linkRec.Code, linkRec.Body.String())
+			}
+			if got, want := linkRec.Header().Get("Location"), "/settings/links"; got != want {
+				t.Fatalf("discord link redirect = %q; want %q", got, want)
+			}
+
+			var discordLinks []db.OAuthAccount
+			if err := dbConn.Where("provider_id = ?", "discord").Find(&discordLinks).Error; err != nil {
+				t.Fatalf("query discord links: %v", err)
+			}
+			if len(discordLinks) != 1 {
+				t.Fatalf("expected 1 discord link after the collision, got %d", len(discordLinks))
+			}
+			if discordLinks[0].UserID != sessionUser.ID {
+				t.Fatalf("discord link user_id = %s; want the session user %s", discordLinks[0].UserID, sessionUser.ID)
+			}
+
+			var ownerLinkCount int64
+			if err := dbConn.Model(&db.OAuthAccount{}).Where("user_id = ?", owner.ID).Count(&ownerLinkCount).Error; err != nil || ownerLinkCount != 0 {
+				t.Fatalf("expected no link for the address owner, got count=%d err=%v", ownerLinkCount, err)
+			}
+			var gotOwner db.User
+			if err := dbConn.Where("id = ?", owner.ID).First(&gotOwner).Error; err != nil {
+				t.Fatalf("address owner disappeared: %v", err)
+			}
+			if !gotOwner.EmailVerified {
+				t.Fatal("address owner email_verified was cleared")
+			}
+			if gotOwner.PasswordHash != "address-owner-password-hash" {
+				t.Fatalf("address owner password hash changed to %q", gotOwner.PasswordHash)
+			}
+			var userCount int64
+			if err := dbConn.Model(&db.User{}).Count(&userCount).Error; err != nil || userCount != 2 {
+				t.Fatalf("expected 2 users (session user and address owner), got count=%d err=%v", userCount, err)
+			}
+		})
 	})
 
 	// 3. Journey 3: X (Twitter) missing email fail closed + returning user login
