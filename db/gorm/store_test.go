@@ -1814,11 +1814,15 @@ func TestTotpStore_RewrapPair(t *testing.T) {
 	}
 
 	var ciphertext []byte
-	if err := database.Raw("SELECT encrypted_secret FROM totp_secrets WHERE id = ?", target.String()).Row().Scan(&ciphertext); err != nil {
-		t.Fatalf("read ciphertext: %v", err)
+	var hintAfterStale string
+	if err := database.Raw("SELECT encrypted_secret, secret_kid FROM totp_secrets WHERE id = ?", target.String()).Row().Scan(&ciphertext, &hintAfterStale); err != nil {
+		t.Fatalf("read row after stale CAS: %v", err)
 	}
 	if !equalsBytes(ciphertext, []byte("new-blob")) {
 		t.Fatalf("ciphertext = %q, want new-blob", ciphertext)
+	}
+	if hintAfterStale != "k2" {
+		t.Fatalf("hint after a missed CAS = %q, want k2", hintAfterStale)
 	}
 }
 
