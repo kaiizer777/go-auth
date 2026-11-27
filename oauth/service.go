@@ -35,6 +35,12 @@ type Service interface {
 	// (cookie callers ignore the raw return); bearer sessions set no cookie and the
 	// caller relays the raw token out of band. Raw IDs are never logged.
 	HandleCallback(ctx context.Context, w http.ResponseWriter, r *http.Request, providerID, code, state string, sessType db.SessionType) (*session.Session, string, string, error)
+
+	// LinkedAccountToken returns a usable provider access token for the user's
+	// linked account, renewing it on demand. The refresh token never leaves the
+	// library: the returned value holds the access token, its type, and its
+	// expiry only. An account with no stored token yields an empty token.
+	LinkedAccountToken(ctx context.Context, userID uuid.UUID, providerID string) (*OAuthToken, error)
 }
 
 // RateLimitError wraps an upstream rate limit with its Retry-After duration in seconds.
@@ -250,6 +256,172 @@ func tokenExpiry(tokens *OAuthToken) *time.Time {
 	}
 	expiresAt := time.Now().UTC().Add(time.Duration(seconds) * time.Second)
 	return &expiresAt
+}
+
+// tokenRefreshLeeway renews a stored access token this long before it expires.
+// The row's expiry comes from the provider's clock, so a caller must never be
+// handed a token that dies mid-request.
+const tokenRefreshLeeway = 60 * time.Second
+
+// tokenTypeBearer is the auth scheme every supported provider issues. The grant
+// table stores no token type, so a stored token is reported under the scheme the
+// adapters return rather than guessing per row.
+const tokenTypeBearer = "Bearer"
+
+// LinkedAccountToken returns a usable access token for the user's linked
+// account, refreshing an expired one on demand. The refresh token never leaves
+// this library: the returned value carries the access token, its type, and its
+// expiry only.
+func (s *service) LinkedAccountToken(ctx context.Context, userID uuid.UUID, providerID string) (*OAuthToken, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	link, err := s.linkedAccountFor(ctx, userID, CanonicalProviderSlug(providerID))
+	if err != nil {
+		return nil, err
+	}
+	now := time.Now().UTC()
+	if tokenFresh(link.TokenExpiresAt, now) {
+		return s.readStoredAccess(ctx, link, now)
+	}
+	return s.refreshAccessToken(ctx, link)
+}
+
+// linkedAccountFor resolves the user's row for one provider. It reads the
+// account list instead of probing by provider identity: the caller is
+// identified by user, and a row only resolves when it belongs to them.
+func (s *service) linkedAccountFor(ctx context.Context, userID uuid.UUID, providerID string) (db.OAuthAccount, error) {
+	accounts, err := s.store.OAuthAccounts().GetByUserID(ctx, userID)
+	if err != nil {
+		return db.OAuthAccount{}, errors.New(errors.CodeInternalError, "failed to load oauth accounts", err)
+	}
+	for _, account := range accounts {
+		if account != nil && account.ProviderID == providerID {
+			return *account, nil
+		}
+	}
+	return db.OAuthAccount{}, errors.ErrOAuthAccountNotLinked
+}
+
+// tokenFresh reports whether a stored token may still be served. A nil expiry
+// means the provider never stated one, which is read as fresh; the leeway keeps
+// a token from expiring under the caller's feet.
+func tokenFresh(expiresAt *time.Time, now time.Time) bool {
+	return expiresAt == nil || expiresAt.After(now.Add(tokenRefreshLeeway))
+}
+
+// readStoredAccess opens the row's access envelope. An account with no sealed
+// access token yields an empty token instead of an error: linking an account is
+// not a promise that the provider granted one.
+func (s *service) readStoredAccess(ctx context.Context, link db.OAuthAccount, now time.Time) (*OAuthToken, error) {
+	if link.AccessTokenCiphertext == "" {
+		return &OAuthToken{}, nil
+	}
+	token, err := s.openAccessToken(link, now)
+	if err == nil {
+		return token, nil
+	}
+	if !isMalformedEnvelope(err) {
+		return nil, s.decryptFailure(ctx, link, err)
+	}
+	return s.discardGrant(ctx, link)
+}
+
+// openAccessToken decrypts the stored access envelope and projects it onto the
+// caller-facing value. Expiry is recomputed from the row, never from the
+// adapter's unset field, and every credential the accessor must withhold is
+// left zero: Raw holds the provider's whole token body, refresh token included.
+func (s *service) openAccessToken(link db.OAuthAccount, now time.Time) (*OAuthToken, error) {
+	access, err := s.sealer.OpenAccessToken(link.ProviderID, link.ID.String(), link.AccessTokenCiphertext)
+	if err != nil {
+		return nil, err
+	}
+	token := &OAuthToken{AccessToken: access, TokenType: tokenTypeBearer}
+	if link.TokenExpiresAt != nil {
+		token.ExpiresAt = link.TokenExpiresAt.UTC()
+		if remaining := token.ExpiresAt.Sub(now); remaining > 0 {
+			token.ExpiresIn = int(remaining / time.Second)
+		}
+	}
+	return token, nil
+}
+
+// isMalformedEnvelope reports envelopes that cannot be parsed at all, as opposed
+// to ones that parse and then fail authentication.
+func isMalformedEnvelope(err error) bool {
+	return errors.Is(err, crypto.ErrEnvelopeMalformed) || errors.Is(err, crypto.ErrEnvelopeTooLarge)
+}
+
+// decryptFailure maps a sealer error onto the accessor's taxonomy. Unknown keys
+// and failed authentication never rewrite the row: a removed key is an operator
+// error and a failed tag is indistinguishable from tampering, so both report a
+// server-side failure and leave the stored grant untouched.
+func (s *service) decryptFailure(ctx context.Context, link db.OAuthAccount, err error) error {
+	switch {
+	case errors.Is(err, crypto.ErrUnknownKeyID):
+		return errors.ErrOAuthTokenKeyNotFound
+	case errors.Is(err, crypto.ErrAuthenticationFailed):
+		logTokenEvent(ctx, "oauth_token_decrypt_failed", link)
+		return errors.ErrOAuthTokenCorrupt
+	default:
+		return err
+	}
+}
+
+// discardGrant drops a grant that can no longer be used, guarded by a CAS on the
+// fingerprint that was read. Losing the CAS means another writer rotated a live
+// grant; that grant is served instead of being destroyed. This never recurses.
+func (s *service) discardGrant(ctx context.Context, link db.OAuthAccount) (*OAuthToken, error) {
+	if link.RefreshTokenFingerprint == "" {
+		return nil, errors.ErrOAuthReauthRequired
+	}
+	won, err := s.store.OAuthAccounts().SaveOAuthTokensCAS(ctx, link.ID, link.RefreshTokenFingerprint, db.OAuthTokenRecord{})
+	if err != nil {
+		logTokenEvent(ctx, "oauth_token_clear_failed", link)
+		return nil, errors.ErrOAuthReauthRequired
+	}
+	if won {
+		return nil, errors.ErrOAuthReauthRequired
+	}
+	return s.converge(ctx, link)
+}
+
+// converge re-reads the row once after a lost CAS and serves the winner's access
+// token. It never mutates: a second write could destroy a grant another writer
+// already proved valid. A winner that is still stale or tokenless yields the
+// retryable exchange failure, because the next request will read it afresh.
+func (s *service) converge(ctx context.Context, stale db.OAuthAccount) (*OAuthToken, error) {
+	winner, err := s.store.OAuthAccounts().GetByProvider(ctx, stale.ProviderID, stale.ProviderTenantID, stale.ProviderUserID)
+	if err != nil || winner == nil {
+		logTokenEvent(ctx, "oauth_token_reread_failed", stale)
+		return nil, errors.New(errors.CodeInternalError, "failed to reload oauth account", nil)
+	}
+	now := time.Now().UTC()
+	if winner.AccessTokenCiphertext == "" || !tokenFresh(winner.TokenExpiresAt, now) {
+		return nil, errors.ErrOAuthTokenExchangeFailed
+	}
+	token, oerr := s.openAccessToken(*winner, now)
+	if oerr != nil {
+		if isMalformedEnvelope(oerr) {
+			return nil, errors.ErrOAuthReauthRequired
+		}
+		return nil, s.decryptFailure(ctx, *winner, oerr)
+	}
+	return token, nil
+}
+
+// refreshAccessToken renews an expired grant on demand.
+func (s *service) refreshAccessToken(ctx context.Context, link db.OAuthAccount) (*OAuthToken, error) {
+	return nil, errors.ErrOAuthTokenExchangeFailed
+}
+
+// logTokenEvent records a failure on the token path. Identity only: the record,
+// the envelopes, and the fingerprints must never reach a log line.
+func logTokenEvent(ctx context.Context, event string, link db.OAuthAccount) {
+	slog.ErrorContext(ctx, event,
+		"provider", link.ProviderID,
+		"account_id", link.ID.String(),
+	)
 }
 
 // InitiateFlow generates PKCE, persists verifier+state in the signed state

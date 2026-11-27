@@ -784,6 +784,10 @@ func (s *stubCallbackOAuthService) HandleCallback(ctx context.Context, w http.Re
 	return nil, "", "", nil
 }
 
+func (s *stubCallbackOAuthService) LinkedAccountToken(context.Context, uuid.UUID, string) (*oauth.OAuthToken, error) {
+	return nil, nil
+}
+
 func TestOAuthRateLimited(t *testing.T) {
 	rlInfo := &oauth.UserInfo{ProviderID: "google", ProviderUserID: "sub-rl", Email: "rl@example.com", EmailVerified: true}
 
