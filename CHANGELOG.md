@@ -16,6 +16,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `(provider_id, provider_tenant_id, provider_user_id)`; the old
   `(provider_id, provider_user_id)` constraint and its Mongo index are removed.
 - `OAuthAccountStore.UpdateProviderUserID(ctx context.Context, id uuid.UUID, providerUserID string) error` was added to the `OAuthAccountStore` interface. External or custom implementations of `OAuthAccountStore` must implement this method to support provider user ID updates (such as migrating legacy Microsoft OIDs to pairwise subjects).
+- Facebook `graph_version` must be a `v`-prefixed `<major>.<minor>` with no
+  leading zeros and a major of at least 19. `19.0`, `v19`, non-numeric forms
+  such as `v0x13`, and leading-zero forms such as `v019.0` are rejected during
+  config validation and at provider construction: `NewFacebookProviderChecked`
+  returns the error, `NewProvider` propagates it, and `NewFacebookProvider`
+  panics on an invalid version.
 
 ### Added
 
@@ -84,12 +90,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tenant-qualified key can be formed. Such sign-ins fail before the userinfo
   request. A pinned tenant (GUID or domain) and the `consumers` authority still
   accept this path, keying the identity on the configured tenant.
-- Facebook `graph_version` must be a `v`-prefixed `<major>.<minor>` with no
-  leading zeros and a major of at least 19. `19.0`, `v19`, non-numeric forms
-  such as `v0x13`, and leading-zero forms such as `v019.0` are rejected during
-  config validation and at provider construction: `NewFacebookProviderChecked`
-  returns the error, `NewProvider` propagates it, and `NewFacebookProvider`
-  panics on an invalid version.
 
 ### Fixed
 
