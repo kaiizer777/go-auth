@@ -572,10 +572,9 @@ func (s *service) exchangeRefreshToken(ctx context.Context, link db.OAuthAccount
 // persistPastClear stores a pair the provider just issued when the persist CAS
 // lost because a concurrent clear emptied the row. The provider already spent
 // the presented token, so the pair in hand is the only grant left; dropping it
-// would force a re-login for a rotation that succeeded. The unconditional write
-// is safe against the clear that just landed (it CASed on the old fingerprint,
-// which no longer matches) and against another clear that follows; a row holding
-// any other grant is served instead of overwritten.
+// would force a re-login for a rotation that succeeded. The write is guarded
+// like any other first grant: a row that was filled after the reread holds the
+// newer grant and is served instead of being overwritten.
 func (s *service) persistPastClear(ctx context.Context, link db.OAuthAccount, rec db.OAuthTokenRecord, refreshed *OAuthToken) (*OAuthToken, error) {
 	current, err := s.rereadOwned(ctx, link)
 	if err != nil {
@@ -584,9 +583,13 @@ func (s *service) persistPastClear(ctx context.Context, link db.OAuthAccount, re
 	if current.AccessTokenCiphertext != "" || current.RefreshTokenFingerprint != "" {
 		return s.serveGrant(ctx, *current)
 	}
-	if werr := s.store.OAuthAccounts().SaveOAuthTokens(ctx, link.ID, rec); werr != nil {
+	won, werr := s.store.OAuthAccounts().SaveOAuthTokensIfUnset(ctx, link.ID, rec)
+	if werr != nil {
 		logTokenEvent(ctx, "oauth_token_refresh_persist_failed", link)
 		return nil, errors.ErrOAuthTokenExchangeFailed
+	}
+	if !won {
+		return s.converge(ctx, link)
 	}
 	return refreshedAccess(refreshed), nil
 }

@@ -469,6 +469,21 @@ func (s *readCountingOAuthStore) GetByUserID(ctx context.Context, userID uuid.UU
 	return s.OAuthAccountStore.GetByUserID(ctx, userID)
 }
 
+// interceptReadOAuthStore runs onRead after a successful identity lookup, so a
+// test can land a competing write between a caller's reread and its write.
+type interceptReadOAuthStore struct {
+	db.OAuthAccountStore
+	onRead func(ctx context.Context, row db.OAuthAccount)
+}
+
+func (s *interceptReadOAuthStore) GetByProvider(ctx context.Context, providerID, providerTenantID, providerUserID string) (*db.OAuthAccount, error) {
+	row, err := s.OAuthAccountStore.GetByProvider(ctx, providerID, providerTenantID, providerUserID)
+	if err == nil && row != nil && s.onRead != nil {
+		s.onRead(ctx, *row)
+	}
+	return row, err
+}
+
 func TestLinkedAccountToken_Refresh(t *testing.T) {
 	ctx := context.Background()
 
@@ -711,6 +726,51 @@ func TestLinkedAccountToken_Refresh(t *testing.T) {
 		if stored.RefreshTokenFingerprint != want {
 			t.Fatalf("fingerprint = %q; want the rotated %q", stored.RefreshTokenFingerprint, want)
 		}
+	})
+
+	// The clear that emptied the row does not reserve it: a callback can fill it
+	// between the reread and the write. That grant is the newer one, so the
+	// rotated pair must not replace it.
+	t.Run("a grant stored after the reread is served instead of overwritten", func(t *testing.T) {
+		provider := &stubRefreshProvider{stubProvider: &stubProvider{id: "google"}}
+		database, svc, link, owner := tokenAccessEnv(t, provider, tokenTestGrant(), staleExpiry())
+		var landed sync.Once
+		base := svc.store
+		svc.store = &wrappedTxStore{Store: base, oauth: &interceptReadOAuthStore{
+			OAuthAccountStore: base.OAuthAccounts(),
+			onRead: func(readCtx context.Context, row db.OAuthAccount) {
+				if row.AccessTokenCiphertext != "" || row.RefreshTokenFingerprint != "" {
+					return
+				}
+				landed.Do(func() {
+					competitor, serr := svc.sealedTokens(link.ProviderID, link.ID.String(),
+						&OAuthToken{AccessToken: "callback-access", RefreshToken: "callback-refresh", ExpiresIn: 3600})
+					if serr != nil {
+						t.Errorf("seal callback grant: %v", serr)
+						return
+					}
+					if werr := base.OAuthAccounts().SaveOAuthTokens(readCtx, link.ID, competitor); werr != nil {
+						t.Errorf("store callback grant: %v", werr)
+					}
+				})
+			},
+		}}
+		provider.refreshFn = func(context.Context, string) (*OAuthToken, error) {
+			if err := clearGrant(svc, link); err != nil {
+				return nil, err
+			}
+			return &OAuthToken{AccessToken: "rotated-access", RefreshToken: "rotated-refresh", ExpiresIn: 3600}, nil
+		}
+
+		token, err := svc.LinkedAccountToken(ctx, owner.ID, "google")
+		if err != nil {
+			t.Fatalf("LinkedAccountToken = %v; want the callback grant", err)
+		}
+		if token.AccessToken != "callback-access" {
+			t.Fatalf("AccessToken = %q; want callback-access", token.AccessToken)
+		}
+		requireSanitized(t, token)
+		requireStoredGrant(t, reloadTokenLink(t, database, link.ID), "callback-access", "callback-refresh")
 	})
 
 	t.Run("transport failure keeps the grant and reports exchange failed", func(t *testing.T) {
