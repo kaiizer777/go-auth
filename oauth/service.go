@@ -435,19 +435,15 @@ func (s *service) discardGrant(ctx context.Context, link db.OAuthAccount) (*OAut
 }
 
 // discardRefresh drops a refresh grant that can no longer be used while leaving
-// the access grant in place: only the field that failed is treated as unusable,
-// so a readable access envelope is not lost with it. The write is guarded by the
-// fingerprint that was read; a lost CAS serves the winner.
+// the access grant in place: the write owns only the refresh columns, so an
+// access envelope another writer stored after this row was read is never
+// restored or blanked. The clear is guarded by the fingerprint that was read; a
+// lost guard serves the winner.
 func (s *service) discardRefresh(ctx context.Context, link db.OAuthAccount) (*OAuthToken, error) {
 	if link.RefreshTokenFingerprint == "" {
 		return nil, errors.ErrOAuthReauthRequired
 	}
-	rec := db.OAuthTokenRecord{
-		AccessTokenCiphertext: link.AccessTokenCiphertext,
-		TokenScope:            link.TokenScope,
-		TokenExpiresAt:        link.TokenExpiresAt,
-	}
-	won, err := s.store.OAuthAccounts().SaveOAuthTokensCAS(ctx, link.ID, link.RefreshTokenFingerprint, rec)
+	won, err := s.store.OAuthAccounts().ClearOAuthRefresh(ctx, link.ID, link.RefreshTokenFingerprint)
 	if err != nil {
 		logTokenEvent(ctx, "oauth_token_clear_failed", link)
 		return nil, errors.ErrOAuthReauthRequired

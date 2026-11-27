@@ -538,6 +538,33 @@ func (s *failingWriteOAuthStore) fail(armed *int) bool {
 	return true
 }
 
+// interleavingOAuthStore runs before the next refresh clear or token CAS: the
+// ordering a concurrent writer produces between a caller's pre-read and its
+// write, which the single-connection test store cannot produce on its own.
+type interleavingOAuthStore struct {
+	db.OAuthAccountStore
+	once   sync.Once
+	before func(ctx context.Context)
+}
+
+func (s *interleavingOAuthStore) run(ctx context.Context) {
+	s.once.Do(func() {
+		if s.before != nil {
+			s.before(ctx)
+		}
+	})
+}
+
+func (s *interleavingOAuthStore) ClearOAuthRefresh(ctx context.Context, id uuid.UUID, expectedFingerprint string) (bool, error) {
+	s.run(ctx)
+	return s.OAuthAccountStore.ClearOAuthRefresh(ctx, id, expectedFingerprint)
+}
+
+func (s *interleavingOAuthStore) SaveOAuthTokensCAS(ctx context.Context, id uuid.UUID, expectedFingerprint string, rec db.OAuthTokenRecord) (bool, error) {
+	s.run(ctx)
+	return s.OAuthAccountStore.SaveOAuthTokensCAS(ctx, id, expectedFingerprint, rec)
+}
+
 func TestLinkedAccountToken_Refresh(t *testing.T) {
 	ctx := context.Background()
 
@@ -1035,6 +1062,48 @@ func TestLinkedAccountToken_Refresh(t *testing.T) {
 			stored.TokenScope != before.TokenScope ||
 			!sameExpiry(stored.TokenExpiresAt, before.TokenExpiresAt) {
 			t.Fatal("malformed refresh envelope destroyed the access envelope")
+		}
+		if stored.RefreshTokenCiphertext != "" || stored.RefreshTokenFingerprint != "" {
+			t.Fatalf("refresh columns = (%q, %q); want cleared", stored.RefreshTokenCiphertext, stored.RefreshTokenFingerprint)
+		}
+		if provider.calls() != 0 {
+			t.Fatalf("refresh calls = %d; want 0", provider.calls())
+		}
+	})
+
+	// The access column has its own writers, so discarding the refresh grant
+	// must not carry the caller's access snapshot over a newer envelope.
+	t.Run("discarding a refresh grant keeps a concurrent access-only write", func(t *testing.T) {
+		provider := &stubRefreshProvider{stubProvider: &stubProvider{id: "google"}}
+		database, svc, link, owner := tokenAccessEnv(t, provider, tokenTestGrant(), staleExpiry())
+		setTokenColumn(t, database, link.ID, "refresh_token_ciphertext", "{not-json")
+		liveExpiry := time.Now().UTC().Add(2 * time.Hour)
+		liveAccess := sealWith(t, testTokenKEK, func(sealer *crypto.TokenSealer) (string, error) {
+			return sealer.SealAccessToken(link.ProviderID, link.ID.String(), "live-access")
+		})
+		base := svc.store
+		svc.store = &wrappedTxStore{Store: base, oauth: &interleavingOAuthStore{
+			OAuthAccountStore: base.OAuthAccounts(),
+			before: func(writeCtx context.Context) {
+				if werr := base.OAuthAccounts().SaveOAuthAccess(writeCtx, link.ID, db.OAuthTokenRecord{
+					AccessTokenCiphertext: liveAccess,
+					TokenScope:            "read:user",
+					TokenExpiresAt:        &liveExpiry,
+				}); werr != nil {
+					t.Errorf("store concurrent access token: %v", werr)
+				}
+			},
+		}}
+
+		_, err := svc.LinkedAccountToken(ctx, owner.ID, "google")
+		requireCode(t, err, errors.CodeOAuthReauthRequired, http.StatusUnauthorized)
+
+		stored := reloadTokenLink(t, database, link.ID)
+		if stored.AccessTokenCiphertext != liveAccess {
+			t.Fatal("the discard restored the access envelope its caller read")
+		}
+		if stored.TokenScope != "read:user" || stored.TokenExpiresAt == nil || !stored.TokenExpiresAt.Equal(liveExpiry) {
+			t.Fatalf("access metadata = (%q, %v); want the concurrent writer's", stored.TokenScope, stored.TokenExpiresAt)
 		}
 		if stored.RefreshTokenCiphertext != "" || stored.RefreshTokenFingerprint != "" {
 			t.Fatalf("refresh columns = (%q, %q); want cleared", stored.RefreshTokenCiphertext, stored.RefreshTokenFingerprint)
