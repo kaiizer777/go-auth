@@ -353,6 +353,13 @@ func (s *service) readStoredAccess(ctx context.Context, link db.OAuthAccount, no
 	if !isMalformedEnvelope(err) {
 		return nil, s.decryptFailure(ctx, link, err)
 	}
+	// A malformed access envelope condemns the access fields only: the stored
+	// refresh grant may still be live, and the refresh CAS rewrites the access
+	// envelope. Renew instead of destroying a grant only a new login could
+	// replace.
+	if link.RefreshTokenCiphertext != "" && link.RefreshTokenFingerprint != "" {
+		return s.refreshAccessToken(ctx, link)
+	}
 	return s.discardGrant(ctx, link)
 }
 
@@ -407,6 +414,30 @@ func (s *service) discardGrant(ctx context.Context, link db.OAuthAccount) (*OAut
 		return nil, errors.ErrOAuthReauthRequired
 	}
 	won, err := s.store.OAuthAccounts().SaveOAuthTokensCAS(ctx, link.ID, link.RefreshTokenFingerprint, db.OAuthTokenRecord{})
+	if err != nil {
+		logTokenEvent(ctx, "oauth_token_clear_failed", link)
+		return nil, errors.ErrOAuthReauthRequired
+	}
+	if won {
+		return nil, errors.ErrOAuthReauthRequired
+	}
+	return s.converge(ctx, link)
+}
+
+// discardRefresh drops a refresh grant that can no longer be used while leaving
+// the access grant in place: only the field that failed is treated as unusable,
+// so a readable access envelope is not lost with it. The write is guarded by the
+// fingerprint that was read; a lost CAS serves the winner.
+func (s *service) discardRefresh(ctx context.Context, link db.OAuthAccount) (*OAuthToken, error) {
+	if link.RefreshTokenFingerprint == "" {
+		return nil, errors.ErrOAuthReauthRequired
+	}
+	rec := db.OAuthTokenRecord{
+		AccessTokenCiphertext: link.AccessTokenCiphertext,
+		TokenScope:            link.TokenScope,
+		TokenExpiresAt:        link.TokenExpiresAt,
+	}
+	won, err := s.store.OAuthAccounts().SaveOAuthTokensCAS(ctx, link.ID, link.RefreshTokenFingerprint, rec)
 	if err != nil {
 		logTokenEvent(ctx, "oauth_token_clear_failed", link)
 		return nil, errors.ErrOAuthReauthRequired
@@ -517,8 +548,14 @@ func (s *service) exchangeRefreshToken(ctx context.Context, link db.OAuthAccount
 		return s.serveGrant(ctx, *current)
 	}
 	if current.AccessTokenCiphertext != "" && tokenFresh(current.TokenExpiresAt, time.Now().UTC()) {
-		// The same grant was rewritten with a usable access token in the window.
-		return s.serveGrant(ctx, *current)
+		// The same grant was rewritten with an access token in the window: serve
+		// it without spending the refresh token. An envelope the sealer cannot
+		// open is not usable, and the exchange below replaces every token column.
+		if token, oerr := s.openAccessToken(*current, time.Now().UTC()); oerr == nil {
+			return token, nil
+		} else if !isMalformedEnvelope(oerr) {
+			return nil, s.decryptFailure(ctx, *current, oerr)
+		}
 	}
 	provider, err := s.providerFor(link.ProviderID)
 	if err != nil {
@@ -532,7 +569,7 @@ func (s *service) exchangeRefreshToken(ctx context.Context, link db.OAuthAccount
 	refreshToken, err := s.sealer.OpenRefreshToken(link.ProviderID, link.ID.String(), link.RefreshTokenCiphertext)
 	if err != nil {
 		if isMalformedEnvelope(err) {
-			return s.discardGrant(ctx, link)
+			return s.discardRefresh(ctx, link)
 		}
 		return nil, s.decryptFailure(ctx, link, err)
 	}

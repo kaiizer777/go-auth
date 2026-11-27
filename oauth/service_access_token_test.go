@@ -367,20 +367,39 @@ func TestLinkedAccountToken_ReadPath(t *testing.T) {
 		requireSameGrant(t, before, reloadTokenLink(t, database, link.ID))
 	})
 
-	t.Run("malformed envelope clears the grant", func(t *testing.T) {
+	t.Run("malformed access envelope renews from the stored refresh grant", func(t *testing.T) {
 		provider := &stubRefreshProvider{stubProvider: &stubProvider{id: "google"}}
 		expiresAt := time.Now().UTC().Add(time.Hour)
 		database, svc, link, owner := tokenAccessEnv(t, provider, tokenTestGrant(), &expiresAt)
 		setTokenColumn(t, database, link.ID, "access_token_ciphertext", "{not-json")
+		provider.refreshFn = func(context.Context, string) (*OAuthToken, error) {
+			return &OAuthToken{AccessToken: "recovered-access", RefreshToken: "recovered-refresh", ExpiresIn: 3600}, nil
+		}
+
+		token, err := svc.LinkedAccountToken(ctx, owner.ID, "google")
+		if err != nil {
+			t.Fatalf("LinkedAccountToken = %v; want a renewed token", err)
+		}
+		if token.AccessToken != "recovered-access" {
+			t.Fatalf("AccessToken = %q; want recovered-access", token.AccessToken)
+		}
+		requireSanitized(t, token)
+		requireStoredGrant(t, reloadTokenLink(t, database, link.ID), "recovered-access", "recovered-refresh")
+	})
+
+	t.Run("malformed access envelope survives a failed renewal", func(t *testing.T) {
+		provider := &stubRefreshProvider{stubProvider: &stubProvider{id: "google"}}
+		expiresAt := time.Now().UTC().Add(time.Hour)
+		database, svc, link, owner := tokenAccessEnv(t, provider, tokenTestGrant(), &expiresAt)
+		setTokenColumn(t, database, link.ID, "access_token_ciphertext", "{not-json")
+		before := reloadTokenLink(t, database, link.ID)
+		provider.refreshFn = func(context.Context, string) (*OAuthToken, error) {
+			return nil, errors.New(errors.CodeOAuthProviderError, "oauth token request failed", stderrors.New("dial tcp: i/o timeout"))
+		}
 
 		_, err := svc.LinkedAccountToken(ctx, owner.ID, "google")
-		requireCode(t, err, errors.CodeOAuthReauthRequired, http.StatusUnauthorized)
-
-		cleared := reloadTokenLink(t, database, link.ID)
-		if cleared.AccessTokenCiphertext != "" || cleared.RefreshTokenCiphertext != "" ||
-			cleared.RefreshTokenFingerprint != "" || cleared.TokenScope != "" || cleared.TokenExpiresAt != nil {
-			t.Fatalf("grant = %+v; want cleared", cleared)
-		}
+		requireCode(t, err, errors.CodeOAuthTokenExchangeFailed, http.StatusBadGateway)
+		requireSameGrant(t, before, reloadTokenLink(t, database, link.ID))
 	})
 
 	t.Run("malformed envelope without a fingerprint is not cleared", func(t *testing.T) {
@@ -821,14 +840,26 @@ func TestLinkedAccountToken_Refresh(t *testing.T) {
 		}
 	})
 
-	t.Run("malformed refresh envelope clears the grant", func(t *testing.T) {
+	t.Run("malformed refresh envelope keeps the access envelope", func(t *testing.T) {
 		provider := &stubRefreshProvider{stubProvider: &stubProvider{id: "google"}}
 		database, svc, link, owner := tokenAccessEnv(t, provider, tokenTestGrant(), staleExpiry())
 		setTokenColumn(t, database, link.ID, "refresh_token_ciphertext", "{not-json")
+		before := reloadTokenLink(t, database, link.ID)
 
 		_, err := svc.LinkedAccountToken(ctx, owner.ID, "google")
 		requireCode(t, err, errors.CodeOAuthReauthRequired, http.StatusUnauthorized)
-		requireClearedGrant(t, reloadTokenLink(t, database, link.ID))
+		stored := reloadTokenLink(t, database, link.ID)
+		if stored.AccessTokenCiphertext != before.AccessTokenCiphertext ||
+			stored.TokenScope != before.TokenScope ||
+			!sameExpiry(stored.TokenExpiresAt, before.TokenExpiresAt) {
+			t.Fatal("malformed refresh envelope destroyed the access envelope")
+		}
+		if stored.RefreshTokenCiphertext != "" || stored.RefreshTokenFingerprint != "" {
+			t.Fatalf("refresh columns = (%q, %q); want cleared", stored.RefreshTokenCiphertext, stored.RefreshTokenFingerprint)
+		}
+		if provider.calls() != 0 {
+			t.Fatalf("refresh calls = %d; want 0", provider.calls())
+		}
 	})
 
 	t.Run("oversize refreshed access token persists nothing", func(t *testing.T) {
