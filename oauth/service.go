@@ -1567,17 +1567,20 @@ func (s *service) keepFirstGrant(ctx context.Context, link db.OAuthAccount, toke
 // the new grant did not replace: providers that issue a refresh token on first
 // consent only would otherwise lose the credential a re-login never re-issues.
 // A grant that carries no refresh token never touches the refresh columns, so it
-// cannot erase one another callback stored after this one read the row. When the
-// row it read already holds a refresh envelope, that write is a CAS on the
-// stored fingerprint, so a concurrent rotation wins instead of being overwritten
-// by the older grant. A refresh-bearing grant for a row that held none is
-// written under the same guard: a first grant that landed after the read is
-// never replaced by an older exchange.
+// cannot erase one another callback stored after this one read the row; its
+// access write is a CAS on the access ciphertext this callback read, so a login
+// that minted a newer access token in between is not replaced. When the row it
+// read already holds a refresh envelope, that write is a CAS on the stored
+// fingerprint, so a concurrent rotation wins instead of being overwritten by
+// the older grant. A refresh-bearing grant for a row that held none is written
+// under the same guard: a first grant that landed after the read is never
+// replaced by an older exchange.
 func (s *service) writeGrant(ctx context.Context, link db.OAuthAccount, rec db.OAuthTokenRecord, tokens *OAuthToken) error {
 	carriesRefresh := tokens != nil && tokens.RefreshToken != ""
 	if link.RefreshTokenCiphertext == "" || link.RefreshTokenFingerprint == "" {
 		if !carriesRefresh {
-			return s.store.OAuthAccounts().SaveOAuthAccess(ctx, link.ID, rec)
+			_, err := s.store.OAuthAccounts().SaveOAuthAccessCAS(ctx, link.ID, link.AccessTokenCiphertext, rec)
+			return err
 		}
 		_, err := s.store.OAuthAccounts().SaveOAuthTokensIfUnset(ctx, link.ID, rec)
 		return err

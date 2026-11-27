@@ -340,8 +340,9 @@ func TestTokenPersistence(t *testing.T) {
 
 	// The row this callback read had no refresh token, so there is no fingerprint
 	// to CAS on. A concurrent login may still add the credential the provider
-	// issues only once; the access-only write must leave it in place.
-	t.Run("refresh-less login keeps a refresh token added after its read", func(t *testing.T) {
+	// issues only once; the access-only write must leave it in place, and its
+	// own access envelope must survive a grant that landed after this read.
+	t.Run("refresh-less login keeps a grant stored after its read", func(t *testing.T) {
 		provider := &stubRefreshProvider{stubProvider: &stubProvider{id: "google"}}
 		database, svc, link, _ := tokenAccessEnv(t, provider, &OAuthToken{AccessToken: tokenTestAccess}, nil)
 		rec, err := svc.sealedTokens(link.ProviderID, link.ID.String(), tokenTestGrant())
@@ -356,10 +357,61 @@ func TestTokenPersistence(t *testing.T) {
 		svc.persistTokens(context.Background(), link, &OAuthToken{AccessToken: "relogin-access", ExpiresIn: 600})
 
 		stored := reloadTokenLink(t, database, link.ID)
-		requireStoredGrant(t, stored, "relogin-access", tokenTestRefresh)
+		requireStoredGrant(t, stored, tokenTestAccess, tokenTestRefresh)
 		if stored.RefreshTokenCiphertext != storedGrant.RefreshTokenCiphertext ||
 			stored.RefreshTokenFingerprint != storedGrant.RefreshTokenFingerprint {
 			t.Fatal("login zeroed the refresh token a concurrent writer stored")
+		}
+		if stored.AccessTokenCiphertext != storedGrant.AccessTokenCiphertext {
+			t.Fatal("login replaced the access envelope a concurrent writer stored")
+		}
+	})
+
+	// The access-only login writes under a CAS on the envelope it read, so a
+	// login that minted a newer access token in between keeps it.
+	t.Run("older access-only login keeps a newer access token", func(t *testing.T) {
+		provider := &stubRefreshProvider{stubProvider: &stubProvider{id: "google"}}
+		database, svc, link, _ := tokenAccessEnv(t, provider, &OAuthToken{AccessToken: tokenTestAccess}, nil)
+		newer := sealWith(t, testTokenKEK, func(sealer *crypto.TokenSealer) (string, error) {
+			return sealer.SealAccessToken(link.ProviderID, link.ID.String(), "newer-access")
+		})
+		newerExpiry := time.Now().UTC().Add(time.Hour)
+		if err := svc.store.OAuthAccounts().SaveOAuthAccess(context.Background(), link.ID, db.OAuthTokenRecord{
+			AccessTokenCiphertext: newer,
+			TokenScope:            "read:user",
+			TokenExpiresAt:        &newerExpiry,
+		}); err != nil {
+			t.Fatalf("store newer access token: %v", err)
+		}
+
+		// The login read the row before that write; its CAS must lose.
+		svc.persistTokens(context.Background(), link, &OAuthToken{AccessToken: "older-access", ExpiresIn: 600})
+
+		stored := reloadTokenLink(t, database, link.ID)
+		if stored.AccessTokenCiphertext != newer {
+			t.Fatal("the older login replaced the newer access token")
+		}
+		if stored.TokenScope != "read:user" || stored.TokenExpiresAt == nil || !stored.TokenExpiresAt.Equal(newerExpiry) {
+			t.Fatalf("access metadata = (%q, %v); want the newer writer's", stored.TokenScope, stored.TokenExpiresAt)
+		}
+	})
+
+	// Nothing changed between the read and the write: the access-only login is
+	// still the writer that stores the grant.
+	t.Run("refresh-less login stores the access token when nothing changed", func(t *testing.T) {
+		provider := &stubRefreshProvider{stubProvider: &stubProvider{id: "google"}}
+		database, svc, link, _ := tokenAccessEnv(t, provider, &OAuthToken{AccessToken: tokenTestAccess}, nil)
+
+		svc.persistTokens(context.Background(), link, &OAuthToken{AccessToken: "relogin-access", ExpiresIn: 600})
+
+		stored := reloadTokenLink(t, database, link.ID)
+		access, err := tokenTestSealer(t).OpenAccessToken(stored.ProviderID, stored.ID.String(), stored.AccessTokenCiphertext)
+		if err != nil || access != "relogin-access" {
+			t.Fatalf("stored access = (%q, %v); want relogin-access", access, err)
+		}
+		if stored.RefreshTokenCiphertext != "" || stored.RefreshTokenFingerprint != "" {
+			t.Fatalf("refresh columns = (%q, %q); want them untouched",
+				stored.RefreshTokenCiphertext, stored.RefreshTokenFingerprint)
 		}
 	})
 
