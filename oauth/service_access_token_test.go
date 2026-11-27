@@ -904,6 +904,80 @@ func TestRefreshFlightCallerDeadline(t *testing.T) {
 	}
 }
 
+// TestRefreshFlightOutlivesLeaderCancellation pins the flight's detachment from
+// the caller that started it: the shared exchange runs under
+// context.WithoutCancel, so a leader that abandons its wait cannot cancel the
+// rotation its joiners are waiting on.
+func TestRefreshFlightOutlivesLeaderCancellation(t *testing.T) {
+	provider := &stubRefreshProvider{stubProvider: &stubProvider{id: "google"}}
+	_, svc, link, _ := tokenAccessEnv(t, provider, tokenTestGrant(), staleExpiry())
+
+	entries := make(chan struct{}, 2)
+	release := make(chan struct{})
+	provider.refreshFn = func(ctx context.Context, _ string) (*OAuthToken, error) {
+		entries <- struct{}{}
+		<-release
+		// A provider call that outlives its caller must still run on a live
+		// context; a real HTTP exchange would abort here.
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		return &OAuthToken{AccessToken: "shared-access", RefreshToken: "shared-refresh", ExpiresIn: 3600}, nil
+	}
+
+	leaderCtx, cancelLeader := context.WithCancel(context.Background())
+	leader := make(chan error, 1)
+	go func() {
+		_, err := svc.refreshAccessToken(leaderCtx, link)
+		leader <- err
+	}()
+	<-entries
+
+	type outcome struct {
+		token *OAuthToken
+		err   error
+	}
+	joined := make(chan outcome, 1)
+	go func() {
+		token, err := svc.refreshAccessToken(context.Background(), link)
+		joined <- outcome{token: token, err: err}
+	}()
+	// singleflight exposes no join signal, so a caller that failed to join is
+	// observed as the second provider entry its own exchange would produce.
+	select {
+	case <-entries:
+		close(release)
+		t.Fatal("joiner started its own exchange instead of joining the flight")
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	cancelLeader()
+	select {
+	case err := <-leader:
+		if !stderrors.Is(err, context.Canceled) {
+			t.Fatalf("leader err = %v; want context.Canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("leader outlived its own cancelled context")
+	}
+
+	close(release)
+	select {
+	case got := <-joined:
+		if got.err != nil {
+			t.Fatalf("joiner = %v; want the shared token", got.err)
+		}
+		if got.token == nil || got.token.AccessToken != "shared-access" {
+			t.Fatalf("joiner token = %+v; want the shared exchange result", got.token)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("joiner never received the shared result")
+	}
+	if provider.calls() != 1 {
+		t.Fatalf("refresh calls = %d; want one shared exchange", provider.calls())
+	}
+}
+
 // TestConvergeRejectsForeignGrant pins the owner check on convergence: a lost
 // CAS must never serve a row that is not the caller's own link, because a delete
 // plus relink can move the provider identity to another row or another user.
