@@ -47,6 +47,52 @@ func TestConfigValidate_FailingValidationLeavesConfigUntouched(t *testing.T) {
 	}
 }
 
+// TestValidateGraphVersion_ParityWithConfigValidate pins that Config.Validate
+// applies the same grammar the exported validator exposes. The empty version is
+// covered separately: applyProviderDefaults rewrites it to v19.0 before the
+// validation loop, so it is not a grammar disagreement.
+func TestValidateGraphVersion_ParityWithConfigValidate(t *testing.T) {
+	versions := []string{
+		"v19.0", "v22.0", "v100.10", "19.0", "v0x13", "v19.0 beta", "../x",
+		"v18.9", "v19", "v19.0.1", " v19.0", "v19.0 ", "V19.0", "v019.0",
+	}
+	for _, version := range versions {
+		t.Run(version, func(t *testing.T) {
+			cfg := validOAuthBase()
+			cfg.OAuth.Facebook = &FacebookConfig{
+				AppID:        "fb-app-id",
+				AppSecret:    "fb-app-secret",
+				RedirectURI:  "https://example.com/callback",
+				GraphVersion: version,
+			}
+
+			validateErr := ValidateGraphVersion(version)
+			configErr := cfg.Validate()
+			got := errors.Is(configErr, errors.ErrOAuthGraphVersionInvalid)
+			want := errors.Is(validateErr, errors.ErrOAuthGraphVersionInvalid)
+			if got != want {
+				t.Fatalf("Config.Validate error = %v; ValidateGraphVersion error = %v", configErr, validateErr)
+			}
+			if validateErr == nil && configErr != nil {
+				t.Fatalf("Config.Validate = %v; want nil", configErr)
+			}
+		})
+	}
+
+	cfg := validOAuthBase()
+	cfg.OAuth.Facebook = &FacebookConfig{
+		AppID:       "fb-app-id",
+		AppSecret:   "fb-app-secret",
+		RedirectURI: "https://example.com/callback",
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Config.Validate with an empty graph version = %v; want nil", err)
+	}
+	if got := cfg.OAuth.Providers["facebook"].GraphVersion; got != "v19.0" {
+		t.Fatalf("resolved graph version = %q; want v19.0", got)
+	}
+}
+
 func TestDefaultConfig(t *testing.T) {
 	cfg := DefaultConfig()
 
