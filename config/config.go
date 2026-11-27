@@ -1039,9 +1039,10 @@ func isToken(s string) bool {
 
 // ValidateGraphVersion reports whether version is an acceptable Facebook Graph
 // API version: a lowercase "v" prefix followed by "<major>.<minor>", no leading
-// zeros, and a major of at least 19. It is the single grammar shared by
-// Config.Validate and the oauth Facebook adapter, so the two cannot drift; do not
-// reimplement it. Callers that accept an unset version must default it first.
+// zeros, and a major of at least 19. The empty string is rejected; callers that
+// accept an unset version must default it to "v19.0" before validating. It is
+// the single grammar shared by Config.Validate and the oauth Facebook adapter,
+// so the two cannot drift; do not reimplement it.
 func ValidateGraphVersion(version string) error {
 	if !graphVersionRegex.MatchString(version) {
 		return errors.ErrOAuthGraphVersionInvalid
