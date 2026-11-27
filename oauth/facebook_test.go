@@ -3,6 +3,7 @@ package oauth
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -214,7 +215,7 @@ func TestNewFacebookProvider_GraphVersion(t *testing.T) {
 		}
 	}
 
-	for _, version := range []string{"19.0", "../x", "v19.0 beta"} {
+	for _, version := range []string{"19.0", "../x", "v19.0 beta", "v18.9"} {
 		t.Run("panics on "+version, func(t *testing.T) {
 			t.Parallel()
 
@@ -224,8 +225,9 @@ func TestNewFacebookProvider_GraphVersion(t *testing.T) {
 				if !ok {
 					t.Fatalf("panic = %v; want a string", recovered)
 				}
-				if !strings.Contains(msg, version) || !strings.Contains(msg, "NewFacebookProviderChecked") {
-					t.Fatalf("panic = %q; want it to name %q and NewFacebookProviderChecked", msg, version)
+				want := fmt.Sprintf(`oauth: invalid Facebook graph version %q: expected "v<major>.<minor>" with a major of at least 19 (for example "v19.0"); use NewFacebookProviderChecked to receive this as an error`, version)
+				if msg != want {
+					t.Fatalf("panic = %q; want %q", msg, want)
 				}
 			}()
 
