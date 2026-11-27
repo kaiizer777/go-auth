@@ -780,4 +780,65 @@ func TestOAuthAccountStore_SaveOAuthTokens(t *testing.T) {
 	if won, err := oauth.SaveOAuthTokensCAS(ctx, uuid.New(), winner, db.OAuthTokenRecord{AccessTokenCiphertext: "ghost"}); err != nil || won {
 		t.Fatalf("missing-account CAS = (%v, %v); want (false, nil)", won, err)
 	}
+
+	// The first-grant write wins against a tokenless row.
+	firstGrant := db.OAuthTokenRecord{
+		AccessTokenCiphertext:   "first-access",
+		RefreshTokenCiphertext:  "first-refresh",
+		RefreshTokenFingerprint: strings.Repeat("d", 64),
+		TokenScope:              "offline_access",
+	}
+	if won, err := oauth.SaveOAuthTokensIfUnset(ctx, tokenless.ID, firstGrant); err != nil || !won {
+		t.Fatalf("IfUnset on a tokenless row = (%v, %v); want (true, nil)", won, err)
+	}
+	if got, err := oauth.GetByProvider(ctx, "google", "", "goog-tokenless"); err != nil {
+		t.Fatalf("reload first grant: %v", err)
+	} else if got.AccessTokenCiphertext != "first-access" || got.RefreshTokenFingerprint != strings.Repeat("d", 64) {
+		t.Fatalf("first grant = %+v", got)
+	}
+
+	// A stored grant keeps its place, and a document that never carried the
+	// fingerprint field counts as tokenless.
+	if won, err := oauth.SaveOAuthTokensIfUnset(ctx, tokenless.ID, db.OAuthTokenRecord{
+		AccessTokenCiphertext: "late-access", RefreshTokenFingerprint: strings.Repeat("e", 64),
+	}); err != nil || won {
+		t.Fatalf("IfUnset over a stored grant = (%v, %v); want (false, nil)", won, err)
+	}
+	legacyID := uuid.New()
+	if _, err := links.InsertOne(ctx, bson.M{
+		"_id": legacyID.String(), "user_id": uuid.New().String(), "provider_id": "google",
+		"provider_tenant_id": "", "provider_user_id": "goog-legacy-unset", "email": "legacy@example.com",
+	}); err != nil {
+		t.Fatalf("insert legacy link: %v", err)
+	}
+	if won, err := oauth.SaveOAuthTokensIfUnset(ctx, legacyID, firstGrant); err != nil || !won {
+		t.Fatalf("IfUnset on a columnless row = (%v, %v); want (true, nil)", won, err)
+	}
+
+	// The access-only write leaves the refresh columns exactly as stored.
+	accessExpiry := time.Now().UTC().Add(time.Hour).Truncate(time.Millisecond)
+	if err := oauth.SaveOAuthAccess(ctx, tokenless.ID, db.OAuthTokenRecord{
+		AccessTokenCiphertext: "access-only",
+		TokenScope:            "read:user",
+		TokenExpiresAt:        &accessExpiry,
+	}); err != nil {
+		t.Fatalf("SaveOAuthAccess failed: %v", err)
+	}
+	accessOnly, err := oauth.GetByProvider(ctx, "google", "", "goog-tokenless")
+	if err != nil {
+		t.Fatalf("reload access-only row: %v", err)
+	}
+	if accessOnly.AccessTokenCiphertext != "access-only" || accessOnly.TokenScope != "read:user" ||
+		accessOnly.RefreshTokenCiphertext != "first-refresh" || accessOnly.RefreshTokenFingerprint != strings.Repeat("d", 64) {
+		t.Fatalf("access-only tokens = %+v", accessOnly)
+	}
+	if accessOnly.TokenExpiresAt == nil || !accessOnly.TokenExpiresAt.Equal(accessExpiry) {
+		t.Fatalf("access-only expiry = %v; want %v", accessOnly.TokenExpiresAt, accessExpiry)
+	}
+	if err := oauth.SaveOAuthAccess(ctx, uuid.New(), db.OAuthTokenRecord{AccessTokenCiphertext: "ghost"}); !stderrors.Is(err, gorm.ErrRecordNotFound) {
+		t.Fatalf("missing-account SaveOAuthAccess = %v; want ErrRecordNotFound", err)
+	}
+	if won, err := oauth.SaveOAuthTokensIfUnset(ctx, uuid.New(), db.OAuthTokenRecord{AccessTokenCiphertext: "ghost"}); err != nil || won {
+		t.Fatalf("missing-account IfUnset = (%v, %v); want (false, nil)", won, err)
+	}
 }

@@ -745,21 +745,29 @@ func (s *oauthAccountStore) DeleteByUserID(ctx context.Context, userID uuid.UUID
 	return err
 }
 
-// oauthTokenSetDoc is the $set payload both write paths share. A nil expiry is
-// written as null so the field decodes back to a nil pointer, never a year-1 time.
-func oauthTokenSetDoc(rec db.OAuthTokenRecord) bson.M {
+// oauthAccessSetDoc is the $set payload for an access-only write: the refresh
+// fields are absent so a tokenless grant cannot erase them. A nil expiry is
+// written as null so the field decodes back to a nil pointer, never a year-1
+// time.
+func oauthAccessSetDoc(rec db.OAuthTokenRecord) bson.M {
 	set := bson.M{
-		"access_token_ciphertext":   rec.AccessTokenCiphertext,
-		"refresh_token_ciphertext":  rec.RefreshTokenCiphertext,
-		"refresh_token_fingerprint": rec.RefreshTokenFingerprint,
-		"token_scope":               rec.TokenScope,
-		"updated_at":                time.Now().UTC(),
+		"access_token_ciphertext": rec.AccessTokenCiphertext,
+		"token_scope":             rec.TokenScope,
+		"updated_at":              time.Now().UTC(),
 	}
 	if rec.TokenExpiresAt != nil {
 		set["token_expires_at"] = rec.TokenExpiresAt.UTC()
 	} else {
 		set["token_expires_at"] = nil
 	}
+	return set
+}
+
+// oauthTokenSetDoc is the $set payload both all-column write paths share.
+func oauthTokenSetDoc(rec db.OAuthTokenRecord) bson.M {
+	set := oauthAccessSetDoc(rec)
+	set["refresh_token_ciphertext"] = rec.RefreshTokenCiphertext
+	set["refresh_token_fingerprint"] = rec.RefreshTokenFingerprint
 	return set
 }
 
@@ -792,6 +800,36 @@ func (s *oauthAccountStore) SaveOAuthTokensCAS(ctx context.Context, id uuid.UUID
 		return false, NormalizeMongoError(err)
 	}
 	return res.MatchedCount > 0, nil
+}
+
+func (s *oauthAccountStore) SaveOAuthTokensIfUnset(ctx context.Context, id uuid.UUID, rec db.OAuthTokenRecord) (bool, error) {
+	// A document written before the token columns existed has no fingerprint
+	// field at all, so an equality on "" alone would never match it.
+	res, err := s.collection().UpdateOne(s.store.resolveCtx(ctx),
+		bson.M{"_id": id.String(), "$or": []bson.M{
+			{"refresh_token_fingerprint": ""},
+			{"refresh_token_fingerprint": bson.M{"$exists": false}},
+		}},
+		bson.M{"$set": oauthTokenSetDoc(rec)},
+	)
+	if err != nil {
+		return false, NormalizeMongoError(err)
+	}
+	return res.MatchedCount > 0, nil
+}
+
+func (s *oauthAccountStore) SaveOAuthAccess(ctx context.Context, id uuid.UUID, rec db.OAuthTokenRecord) error {
+	res, err := s.collection().UpdateOne(s.store.resolveCtx(ctx),
+		bson.M{"_id": id.String()},
+		bson.M{"$set": oauthAccessSetDoc(rec)},
+	)
+	if err != nil {
+		return NormalizeMongoError(err)
+	}
+	if res.MatchedCount == 0 {
+		return gorm.ErrRecordNotFound
+	}
+	return nil
 }
 
 // ==========================================

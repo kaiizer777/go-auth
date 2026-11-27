@@ -321,6 +321,47 @@ func (s *oauthAccountStore) SaveOAuthTokensCAS(ctx context.Context, id uuid.UUID
 	return res.RowsAffected > 0, nil
 }
 
+func (s *oauthAccountStore) SaveOAuthTokensIfUnset(ctx context.Context, id uuid.UUID, rec db.OAuthTokenRecord) (bool, error) {
+	res := s.db.WithContext(ctx).Model(&db.OAuthAccount{}).
+		Where("id = ? AND refresh_token_fingerprint = ?", id, "").
+		Updates(oauthTokenUpdates(rec))
+	if err := res.Error; err != nil {
+		return false, db.NormalizeMySQLError(err)
+	}
+	return res.RowsAffected > 0, nil
+}
+
+// oauthAccessUpdates is the column payload for an access-only write: the refresh
+// columns are deliberately absent so a tokenless grant cannot erase them.
+func oauthAccessUpdates(rec db.OAuthTokenRecord) map[string]any {
+	return map[string]any{
+		"access_token_ciphertext": rec.AccessTokenCiphertext,
+		"token_scope":             rec.TokenScope,
+		"token_expires_at":        rec.TokenExpiresAt,
+		"updated_at":              time.Now().UTC(),
+	}
+}
+
+func (s *oauthAccountStore) SaveOAuthAccess(ctx context.Context, id uuid.UUID, rec db.OAuthTokenRecord) error {
+	res := s.db.WithContext(ctx).Model(&db.OAuthAccount{}).Where("id = ?", id).Updates(oauthAccessUpdates(rec))
+	if err := res.Error; err != nil {
+		return db.NormalizeMySQLError(err)
+	}
+	if res.RowsAffected > 0 {
+		return nil
+	}
+	// Same MySQL no-op caveat as SaveOAuthTokens: zero affected rows alone does
+	// not prove the account is missing.
+	var exists int64
+	if err := s.db.WithContext(ctx).Model(&db.OAuthAccount{}).Where("id = ?", id).Count(&exists).Error; err != nil {
+		return db.NormalizeMySQLError(err)
+	}
+	if exists == 0 {
+		return gorm.ErrRecordNotFound
+	}
+	return nil
+}
+
 type totpStore struct {
 	db *gorm.DB
 }

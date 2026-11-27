@@ -889,6 +889,66 @@ func TestOAuthAccountStore_AllMethods(t *testing.T) {
 		t.Fatalf("missing-account CAS = (%v, %v); want (false, nil)", won, err)
 	}
 
+	// The first-grant write wins only while no refresh token is stored.
+	if err := oauth.SaveOAuthTokens(ctx, acc3.ID, db.OAuthTokenRecord{}); err != nil {
+		t.Fatalf("clear before IfUnset failed: %v", err)
+	}
+	if won, err := oauth.SaveOAuthTokensIfUnset(ctx, acc3.ID, db.OAuthTokenRecord{
+		AccessTokenCiphertext:   "first-access",
+		RefreshTokenCiphertext:  "first-refresh",
+		RefreshTokenFingerprint: strings.Repeat("d", 64),
+		TokenScope:              "offline_access",
+		TokenExpiresAt:          &newExpiry,
+	}); err != nil || !won {
+		t.Fatalf("IfUnset on a tokenless row = (%v, %v); want (true, nil)", won, err)
+	}
+	assertTokens(reload(), "first-access", "first-refresh", strings.Repeat("d", 64), "offline_access")
+
+	// A stored grant keeps its place: the guarded write loses and mutates nothing.
+	if won, err := oauth.SaveOAuthTokensIfUnset(ctx, acc3.ID, db.OAuthTokenRecord{
+		AccessTokenCiphertext:   "late-access",
+		RefreshTokenCiphertext:  "late-refresh",
+		RefreshTokenFingerprint: strings.Repeat("e", 64),
+	}); err != nil || won {
+		t.Fatalf("IfUnset over a stored grant = (%v, %v); want (false, nil)", won, err)
+	}
+	assertTokens(reload(), "first-access", "first-refresh", strings.Repeat("d", 64), "offline_access")
+
+	// IfUnset against a missing account is a miss, not an error.
+	if won, err := oauth.SaveOAuthTokensIfUnset(ctx, uuid.New(), db.OAuthTokenRecord{
+		AccessTokenCiphertext: "ghost",
+	}); err != nil || won {
+		t.Fatalf("missing-account IfUnset = (%v, %v); want (false, nil)", won, err)
+	}
+
+	// The access-only write leaves the refresh columns exactly as stored.
+	accessExpiry := newExpiry.Add(time.Hour)
+	if err := oauth.SaveOAuthAccess(ctx, acc3.ID, db.OAuthTokenRecord{
+		AccessTokenCiphertext: "access-only",
+		TokenScope:            "read:user",
+		TokenExpiresAt:        &accessExpiry,
+	}); err != nil {
+		t.Fatalf("SaveOAuthAccess failed: %v", err)
+	}
+	accessOnly := reload()
+	assertTokens(accessOnly, "access-only", "first-refresh", strings.Repeat("d", 64), "read:user")
+	if accessOnly.TokenExpiresAt == nil || !accessOnly.TokenExpiresAt.Equal(accessExpiry) {
+		t.Fatalf("access-only expiry = %v; want %v", accessOnly.TokenExpiresAt, accessExpiry)
+	}
+	// A nil expiry on the access-only path clears the expiry, not the refresh.
+	if err := oauth.SaveOAuthAccess(ctx, acc3.ID, db.OAuthTokenRecord{AccessTokenCiphertext: "access-only"}); err != nil {
+		t.Fatalf("SaveOAuthAccess without expiry failed: %v", err)
+	}
+	accessOnly = reload()
+	assertTokens(accessOnly, "access-only", "first-refresh", strings.Repeat("d", 64), "")
+	if accessOnly.TokenExpiresAt != nil {
+		t.Fatalf("access-only nil expiry stored as %v; want nil", accessOnly.TokenExpiresAt)
+	}
+	// The access-only path reports the backend not-found error.
+	if err := oauth.SaveOAuthAccess(ctx, uuid.New(), db.OAuthTokenRecord{AccessTokenCiphertext: "ghost"}); !errors.Is(err, gormdriver.ErrRecordNotFound) {
+		t.Fatalf("missing-account SaveOAuthAccess = %v; want ErrRecordNotFound", err)
+	}
+
 	// The unconditional path reports the backend not-found error.
 	if err := oauth.SaveOAuthTokens(ctx, uuid.New(), db.OAuthTokenRecord{AccessTokenCiphertext: "ghost"}); !errors.Is(err, gormdriver.ErrRecordNotFound) {
 		t.Fatalf("missing-account SaveOAuthTokens = %v; want ErrRecordNotFound", err)

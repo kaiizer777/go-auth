@@ -91,6 +91,15 @@ type OAuthAccountStore interface {
 	// empty expectation never matches, so a tokenless account cannot be
 	// overwritten by a refresh that has no stored fingerprint to prove.
 	SaveOAuthTokensCAS(ctx context.Context, id uuid.UUID, expectedFingerprint string, rec OAuthTokenRecord) (bool, error)
+	// SaveOAuthTokensIfUnset writes the record only while the account holds no
+	// refresh token, reporting whether it won. It is the guarded write for a
+	// first grant: a row that already stored one is never overwritten.
+	SaveOAuthTokensIfUnset(ctx context.Context, id uuid.UUID, rec OAuthTokenRecord) (bool, error)
+	// SaveOAuthAccess writes only the access fields (ciphertext, expiry, scope)
+	// and leaves the refresh columns untouched, so a grant that carries no
+	// refresh token cannot erase one another writer stored. It reports the
+	// backend not-found error when no account holds id.
+	SaveOAuthAccess(ctx context.Context, id uuid.UUID, rec OAuthTokenRecord) error
 }
 
 // TotpStore defines storage operations for RFC 6238 TOTP two-factor authentication.
