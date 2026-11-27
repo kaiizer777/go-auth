@@ -210,6 +210,20 @@ func setupE2EServerWithConfig(t *testing.T, mutate func(*config.Config)) (*httpt
 	return server, client, capture, sqlDB
 }
 
+// newCookieJarClient returns an independent cookie-jar client, so a second
+// device can hold its own session without sharing the harness client's jar.
+func newCookieJarClient(t *testing.T) *http.Client {
+	t.Helper()
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		t.Fatalf("failed to initialize cookiejar: %v", err)
+	}
+	return &http.Client{
+		Jar:     jar,
+		Timeout: 30 * time.Second,
+	}
+}
+
 func postJSON(t *testing.T, client *http.Client, targetURL string, payload any) (*http.Response, map[string]any) {
 	t.Helper()
 	csrfToken := fetchCSRFToken(t, client, targetURL)
