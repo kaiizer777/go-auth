@@ -628,6 +628,31 @@ func TestTokenErrorsDoNotLeakEnvelopeContent(t *testing.T) {
 	}
 }
 
+// TestTokenSentinelMessages pins the exported error text: the secret envelope
+// refactor reuses these sentinels, and rewording them would silently change the
+// observable behaviour of unchanged token code.
+func TestTokenSentinelMessages(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		err  error
+		want string
+	}{
+		{ErrSealerUnconfigured, "token sealer is not configured"},
+		{ErrPlaintextTooLarge, "token plaintext exceeds size limit"},
+		{ErrEnvelopeTooLarge, "token envelope exceeds size limit"},
+		{ErrEnvelopeMalformed, "token envelope is malformed"},
+		{ErrUnknownKeyID, "token envelope references an unknown key id"},
+		{ErrAuthenticationFailed, "token envelope authentication failed"},
+		{ErrSealFailed, "token seal failed"},
+	}
+	for _, tt := range tests {
+		if got := tt.err.Error(); got != tt.want {
+			t.Errorf("error text = %q, want %q", got, tt.want)
+		}
+	}
+}
+
 func TestRefreshTokenFingerprint(t *testing.T) {
 	t.Parallel()
 

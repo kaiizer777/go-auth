@@ -27,15 +27,17 @@ const (
 	maxTokenEnvelope        = 8192
 )
 
-// Predefined sentinel errors for envelope operations.
+// Predefined sentinel errors for envelope operations. The texts are the
+// observable surface of a public API, so they keep their original wording;
+// callers branch on the sentinel, never on the message.
 var (
-	ErrSealerUnconfigured   = errors.New(errors.CodeInternalError, "sealer is not configured", nil)
-	ErrPlaintextTooLarge    = errors.New(errors.CodeValidationError, "plaintext exceeds size limit", nil)
-	ErrEnvelopeTooLarge     = errors.New(errors.CodeValidationError, "envelope exceeds size limit", nil)
-	ErrEnvelopeMalformed    = errors.New(errors.CodeInternalError, "envelope is malformed", nil)
-	ErrUnknownKeyID         = errors.New(errors.CodeInternalError, "envelope references an unknown key id", nil)
-	ErrAuthenticationFailed = errors.New(errors.CodeInternalError, "envelope authentication failed", nil)
-	ErrSealFailed           = errors.New(errors.CodeInternalError, "envelope seal failed", nil)
+	ErrSealerUnconfigured   = errors.New(errors.CodeInternalError, "token sealer is not configured", nil)
+	ErrPlaintextTooLarge    = errors.New(errors.CodeValidationError, "token plaintext exceeds size limit", nil)
+	ErrEnvelopeTooLarge     = errors.New(errors.CodeValidationError, "token envelope exceeds size limit", nil)
+	ErrEnvelopeMalformed    = errors.New(errors.CodeInternalError, "token envelope is malformed", nil)
+	ErrUnknownKeyID         = errors.New(errors.CodeInternalError, "token envelope references an unknown key id", nil)
+	ErrAuthenticationFailed = errors.New(errors.CodeInternalError, "token envelope authentication failed", nil)
+	ErrSealFailed           = errors.New(errors.CodeInternalError, "token seal failed", nil)
 	ErrEmptyRefreshToken    = errors.New(errors.CodeValidationError, "refresh token is empty", nil)
 )
 
