@@ -395,33 +395,45 @@ func (s *oauthAccountStore) ClearOAuthRefresh(ctx context.Context, id uuid.UUID,
 	return res.RowsAffected > 0, nil
 }
 
-// SaveOAuthRefreshIfUnset stores a rotated refresh pair over a row holding none.
-// The access columns are written in the same statement but only while the row
-// still holds no access envelope, so a concurrent access-only winner keeps it;
-// the CASE keeps that condition in the guarded write instead of a second
-// statement that could land between another writer's commit.
+// SaveOAuthRefreshIfUnset stores a rotated refresh pair over a row holding none,
+// then fills the access columns only while the row still holds no access
+// envelope, so a concurrent access-only winner keeps its own. Each guard lives
+// in its own WHERE clause, which every backend evaluates against the original
+// row: no assignment may read a column the same statement writes, because MySQL
+// applies single-table SET assignments left to right against already-updated
+// values.
+//
+// The two statements run sequentially, so the access write is skipped when the
+// refresh guard misses — a stored refresh grant owns the row and the caller lost
+// — and a failed access write reports (true, error): the refresh pair landed and
+// the row keeps a usable grant.
 func (s *oauthAccountStore) SaveOAuthRefreshIfUnset(ctx context.Context, id uuid.UUID, rec db.OAuthTokenRecord) (bool, error) {
 	if rec.RefreshTokenFingerprint == "" {
 		return false, nil
 	}
-	updates := map[string]any{
-		"refresh_token_ciphertext":  rec.RefreshTokenCiphertext,
-		"refresh_token_fingerprint": rec.RefreshTokenFingerprint,
-		"updated_at":                time.Now().UTC(),
-	}
-	if rec.AccessTokenCiphertext != "" {
-		const noAccess = "access_token_ciphertext = ''"
-		updates["access_token_ciphertext"] = gorm.Expr("CASE WHEN "+noAccess+" THEN ? ELSE access_token_ciphertext END", rec.AccessTokenCiphertext)
-		updates["token_scope"] = gorm.Expr("CASE WHEN "+noAccess+" THEN ? ELSE token_scope END", rec.TokenScope)
-		updates["token_expires_at"] = gorm.Expr("CASE WHEN "+noAccess+" THEN ? ELSE token_expires_at END", rec.TokenExpiresAt)
-	}
 	res := s.db.WithContext(ctx).Model(&db.OAuthAccount{}).
 		Where("id = ? AND refresh_token_fingerprint = ?", id, "").
-		Updates(updates)
+		Updates(map[string]any{
+			"refresh_token_ciphertext":  rec.RefreshTokenCiphertext,
+			"refresh_token_fingerprint": rec.RefreshTokenFingerprint,
+			"updated_at":                time.Now().UTC(),
+		})
 	if err := res.Error; err != nil {
 		return false, db.NormalizeMySQLError(err)
 	}
-	return res.RowsAffected > 0, nil
+	if res.RowsAffected == 0 {
+		return false, nil
+	}
+	if rec.AccessTokenCiphertext == "" {
+		return true, nil
+	}
+	access := s.db.WithContext(ctx).Model(&db.OAuthAccount{}).
+		Where("id = ? AND access_token_ciphertext = ?", id, "").
+		Updates(oauthAccessUpdates(rec))
+	if err := access.Error; err != nil {
+		return true, db.NormalizeMySQLError(err)
+	}
+	return true, nil
 }
 
 type totpStore struct {

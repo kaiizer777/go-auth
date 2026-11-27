@@ -1170,6 +1170,189 @@ func TestOAuthAccountStore_PartialColumnWrites(t *testing.T) {
 	})
 }
 
+// sqlRecorder captures every statement gorm runs so a test can assert its shape.
+type sqlRecorder struct {
+	mu    sync.Mutex
+	stmts []string
+}
+
+func (r *sqlRecorder) LogMode(logger.LogLevel) logger.Interface { return r }
+func (r *sqlRecorder) Info(context.Context, string, ...any)     {}
+func (r *sqlRecorder) Warn(context.Context, string, ...any)     {}
+func (r *sqlRecorder) Error(context.Context, string, ...any)    {}
+
+func (r *sqlRecorder) Trace(_ context.Context, _ time.Time, fc func() (string, int64), _ error) {
+	sql, _ := fc()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.stmts = append(r.stmts, sql)
+}
+
+// reset drops the statements recorded so far.
+func (r *sqlRecorder) reset() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.stmts = nil
+}
+
+// updates returns the UPDATE statements recorded so far.
+func (r *sqlRecorder) updates() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var out []string
+	for _, stmt := range r.stmts {
+		if strings.HasPrefix(strings.ToUpper(strings.TrimSpace(stmt)), "UPDATE") {
+			out = append(out, stmt)
+		}
+	}
+	return out
+}
+
+// splitUpdate returns the SET assignment list and the WHERE clause of an UPDATE.
+func splitUpdate(t *testing.T, stmt string) (set, where string) {
+	t.Helper()
+	upper := strings.ToUpper(stmt)
+	i := strings.Index(upper, " SET ")
+	j := strings.Index(upper, " WHERE ")
+	if i < 0 || j < i {
+		t.Fatalf("unexpected UPDATE shape: %s", stmt)
+	}
+	return stmt[i+len(" SET ") : j], stmt[j+len(" WHERE "):]
+}
+
+// TestOAuthAccountStore_RefreshIfUnsetGuardsInWhere pins the guard placement:
+// MySQL applies single-table SET assignments left to right against the row it is
+// updating, so an assignment that reads a column the same statement writes takes
+// the already-updated value. A CASE map over access_token_ciphertext therefore
+// leaves token_scope and token_expires_at stale or NULL, and tokenFresh treats a
+// nil expiry as fresh. The guards must stay in their own WHERE clauses.
+func TestOAuthAccountStore_RefreshIfUnsetGuardsInWhere(t *testing.T) {
+	ctx := context.Background()
+	database, _ := setupTestDB(t)
+	recorder := &sqlRecorder{}
+	oauth := &oauthAccountStore{db: database.Session(&gormdriver.Session{Logger: recorder})}
+	userID := uuid.New()
+	expiresAt := time.Now().UTC().Truncate(time.Millisecond)
+
+	newLink := func(t *testing.T, sub string, rec db.OAuthTokenRecord) *db.OAuthAccount {
+		t.Helper()
+		acc := &db.OAuthAccount{
+			UserID:         userID,
+			ProviderID:     "github",
+			ProviderUserID: sub,
+			Email:          sub + "@example.com",
+		}
+		if err := oauth.Create(ctx, acc); err != nil {
+			t.Fatalf("create link %s: %v", sub, err)
+		}
+		if rec != (db.OAuthTokenRecord{}) {
+			if err := oauth.SaveOAuthTokens(ctx, acc.ID, rec); err != nil {
+				t.Fatalf("seed tokens for %s: %v", sub, err)
+			}
+		}
+		return acc
+	}
+	reload := func(t *testing.T, sub string) *db.OAuthAccount {
+		t.Helper()
+		got, err := oauth.GetByProvider(ctx, "github", "", sub)
+		if err != nil {
+			t.Fatalf("reload link %s: %v", sub, err)
+		}
+		return got
+	}
+
+	rotated := db.OAuthTokenRecord{
+		AccessTokenCiphertext:   "rotated-access",
+		RefreshTokenCiphertext:  "rotated-refresh",
+		RefreshTokenFingerprint: strings.Repeat("9", 64),
+		TokenScope:              "offline_access",
+		TokenExpiresAt:          &expiresAt,
+	}
+
+	t.Run("assignments never read a column the statement writes", func(t *testing.T) {
+		acc := newLink(t, "guard-where", db.OAuthTokenRecord{})
+		recorder.reset()
+
+		if won, err := oauth.SaveOAuthRefreshIfUnset(ctx, acc.ID, rotated); err != nil || !won {
+			t.Fatalf("refresh-if-unset over a tokenless row = (%v, %v); want (true, nil)", won, err)
+		}
+
+		stmts := recorder.updates()
+		if len(stmts) != 2 {
+			t.Fatalf("UPDATE statements = %d (%v); want 2: the refresh pair, then the access fill", len(stmts), stmts)
+		}
+		refreshSet, refreshWhere := splitUpdate(t, stmts[0])
+		accessSet, accessWhere := splitUpdate(t, stmts[1])
+		if !strings.Contains(refreshSet, "refresh_token_fingerprint") ||
+			!strings.Contains(refreshWhere, "refresh_token_fingerprint") {
+			t.Fatalf("first statement = %s; want the refresh pair guarded on its fingerprint in WHERE", stmts[0])
+		}
+		if !strings.Contains(accessSet, "access_token_ciphertext") ||
+			!strings.Contains(accessWhere, "access_token_ciphertext") {
+			t.Fatalf("second statement = %s; want the access fill guarded on access_token_ciphertext in WHERE", stmts[1])
+		}
+		for _, stmt := range stmts {
+			set, _ := splitUpdate(t, stmt)
+			if strings.Contains(strings.ToUpper(set), "CASE") {
+				t.Fatalf("assignment = %s; want no cross-referencing CASE", stmt)
+			}
+			assigned := make([]string, 0, 4)
+			for _, assignment := range strings.Split(set, ",") {
+				col, _, ok := strings.Cut(assignment, "=")
+				if !ok {
+					t.Fatalf("unparsable assignment %q in %s", assignment, stmt)
+				}
+				assigned = append(assigned, strings.Trim(strings.TrimSpace(col), "`\""))
+			}
+			for _, assignment := range strings.Split(set, ",") {
+				col, expr, _ := strings.Cut(assignment, "=")
+				col = strings.Trim(strings.TrimSpace(col), "`\"")
+				lowerExpr := strings.ToLower(expr)
+				for _, other := range assigned {
+					if other == col {
+						continue
+					}
+					if strings.Contains(lowerExpr, other) {
+						t.Fatalf("assignment %q reads %q, which the same statement writes: %s", col, other, stmt)
+					}
+				}
+			}
+		}
+
+		stored := reload(t, "guard-where")
+		if stored.AccessTokenCiphertext != "rotated-access" || stored.TokenScope != "offline_access" {
+			t.Fatalf("access columns = %+v; want the record's", stored)
+		}
+		if stored.TokenExpiresAt == nil || !stored.TokenExpiresAt.Equal(expiresAt) {
+			t.Fatalf("expiry = %v; want the record's non-nil expiry", stored.TokenExpiresAt)
+		}
+	})
+
+	t.Run("an access-filled row keeps a non-nil expiry", func(t *testing.T) {
+		winnerExpiry := expiresAt.Add(-time.Minute)
+		acc := newLink(t, "guard-winner", db.OAuthTokenRecord{
+			AccessTokenCiphertext: "winner-access",
+			TokenScope:            "read:user",
+			TokenExpiresAt:        &winnerExpiry,
+		})
+
+		if won, err := oauth.SaveOAuthRefreshIfUnset(ctx, acc.ID, rotated); err != nil || !won {
+			t.Fatalf("refresh-if-unset over an access-only row = (%v, %v); want (true, nil)", won, err)
+		}
+		stored := reload(t, "guard-winner")
+		if stored.AccessTokenCiphertext != "winner-access" || stored.TokenScope != "read:user" {
+			t.Fatalf("access columns = %+v; want the winner's untouched", stored)
+		}
+		if stored.TokenExpiresAt == nil || !stored.TokenExpiresAt.Equal(winnerExpiry) {
+			t.Fatalf("expiry = %v; want the winner's non-nil expiry", stored.TokenExpiresAt)
+		}
+		if stored.RefreshTokenCiphertext != "rotated-refresh" || stored.RefreshTokenFingerprint != strings.Repeat("9", 64) {
+			t.Fatalf("refresh columns = (%q, %q); want the rotated pair",
+				stored.RefreshTokenCiphertext, stored.RefreshTokenFingerprint)
+		}
+	})
+}
+
 func TestOAuthAccountStore_TenantScopedKey(t *testing.T) {
 	_, store := setupTestDB(t)
 	ctx := context.Background()
