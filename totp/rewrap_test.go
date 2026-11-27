@@ -299,9 +299,12 @@ func corruptSealedCiphertext(t *testing.T, envelope []byte) []byte {
 	if err := json.Unmarshal(envelope, &doc); err != nil {
 		t.Fatalf("decode envelope: %v", err)
 	}
-	ct, _ := doc["ct"].(string)
+	ct, ok := doc["ct"].(string)
+	if !ok {
+		t.Fatalf("envelope has no ct field: %s", envelope)
+	}
 	raw, err := base64.RawURLEncoding.Strict().DecodeString(ct)
-	if err != nil {
+	if err != nil || len(raw) == 0 {
 		t.Fatalf("decode ct: %v", err)
 	}
 	raw[0] ^= 0xff
