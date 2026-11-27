@@ -63,6 +63,9 @@ func NewFacebookProvider(cfg config.FacebookConfig, opts ...FacebookOption) *Fac
 	version := cfg.GraphVersion
 	if version == "" {
 		version = "v19.0"
+	} else if !strings.HasPrefix(version, "v") {
+		// Graph paths require the "v" prefix; validation accepts it as optional.
+		version = "v" + version
 	}
 	if len(cfg.Scopes) == 0 {
 		cfg.Scopes = []string{"email", "public_profile"}
