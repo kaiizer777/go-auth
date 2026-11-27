@@ -2,7 +2,10 @@ package crypto
 
 import (
 	"bytes"
+	"crypto/aes"
+	"crypto/cipher"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"io"
 	"strings"
@@ -662,5 +665,56 @@ func TestRefreshTokenFingerprint(t *testing.T) {
 
 	if _, err := first.RefreshTokenFingerprint(""); !errors.Is(err, ErrEmptyRefreshToken) {
 		t.Fatalf("empty token error = %v, want ErrEmptyRefreshToken", err)
+	}
+}
+
+// TestTokenAADBytesPinned pins the exact additional data a stored OAuth token is
+// authenticated with. Reordering or reformatting the components would silently
+// make every token written before the change unreadable, so this test builds the
+// bytes by hand and GCM-opens a real envelope with them.
+func TestTokenAADBytesPinned(t *testing.T) {
+	t.Parallel()
+
+	const kid, providerID, accountID, field = "k1", "github", "acct-1", "access_token"
+
+	sealer := newTestSealer(t, keyringSpec(kid, 0x11))
+	envelope, err := sealer.SealAccessToken(providerID, accountID, "token")
+	if err != nil {
+		t.Fatalf("SealAccessToken() error = %v", err)
+	}
+
+	doc := decodeTokenEnvelope(t, envelope)
+	nonce, err := base64.RawURLEncoding.DecodeString(doc["n"].(string))
+	if err != nil {
+		t.Fatalf("decode nonce: %v", err)
+	}
+	ciphertext, err := base64.RawURLEncoding.DecodeString(doc["ct"].(string))
+	if err != nil {
+		t.Fatalf("decode ct: %v", err)
+	}
+
+	// label | u32be len | component, for kid, provider, account, field.
+	aad := []byte("goauth.oauth.token/v1")
+	for _, component := range []string{kid, providerID, accountID, field} {
+		var length [4]byte
+		binary.BigEndian.PutUint32(length[:], uint32(len(component)))
+		aad = append(aad, length[:]...)
+		aad = append(aad, component...)
+	}
+
+	block, err := aes.NewCipher(testKeyBytes(t, 0x11))
+	if err != nil {
+		t.Fatalf("aes.NewCipher: %v", err)
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		t.Fatalf("cipher.NewGCM: %v", err)
+	}
+	plaintext, err := gcm.Open(nil, nonce, ciphertext, aad)
+	if err != nil {
+		t.Fatalf("hand-written token AAD does not authenticate the envelope: %v", err)
+	}
+	if string(plaintext) != "token" {
+		t.Fatalf("hand-written token AAD opened %q", plaintext)
 	}
 }
