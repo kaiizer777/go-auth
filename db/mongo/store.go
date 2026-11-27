@@ -742,6 +742,55 @@ func (s *oauthAccountStore) DeleteByUserID(ctx context.Context, userID uuid.UUID
 	return err
 }
 
+// oauthTokenSetDoc is the $set payload both write paths share. A nil expiry is
+// written as null so the field decodes back to a nil pointer, never a year-1 time.
+func oauthTokenSetDoc(rec db.OAuthTokenRecord) bson.M {
+	set := bson.M{
+		"access_token_ciphertext":   rec.AccessTokenCiphertext,
+		"refresh_token_ciphertext":  rec.RefreshTokenCiphertext,
+		"refresh_token_fingerprint": rec.RefreshTokenFingerprint,
+		"token_scope":               rec.TokenScope,
+		"updated_at":                time.Now().UTC(),
+	}
+	if rec.TokenExpiresAt != nil {
+		set["token_expires_at"] = rec.TokenExpiresAt.UTC()
+	} else {
+		set["token_expires_at"] = nil
+	}
+	return set
+}
+
+func (s *oauthAccountStore) SaveOAuthTokens(ctx context.Context, id uuid.UUID, rec db.OAuthTokenRecord) error {
+	res, err := s.collection().UpdateOne(s.store.resolveCtx(ctx),
+		bson.M{"_id": id.String()},
+		bson.M{"$set": oauthTokenSetDoc(rec)},
+	)
+	if err != nil {
+		return NormalizeMongoError(err)
+	}
+	if res.MatchedCount == 0 {
+		return gorm.ErrRecordNotFound
+	}
+	return nil
+}
+
+func (s *oauthAccountStore) SaveOAuthTokensCAS(ctx context.Context, id uuid.UUID, expectedFingerprint string, rec db.OAuthTokenRecord) (bool, error) {
+	// An empty expectation is never proof of the stored token: a link that
+	// carries no fingerprint must not be overwritten by a refresh that has
+	// nothing to match. Checked before the filter is built.
+	if expectedFingerprint == "" {
+		return false, nil
+	}
+	res, err := s.collection().UpdateOne(s.store.resolveCtx(ctx),
+		bson.M{"_id": id.String(), "refresh_token_fingerprint": expectedFingerprint},
+		bson.M{"$set": oauthTokenSetDoc(rec)},
+	)
+	if err != nil {
+		return false, NormalizeMongoError(err)
+	}
+	return res.MatchedCount > 0, nil
+}
+
 // ==========================================
 // TotpStore implementation
 // ==========================================

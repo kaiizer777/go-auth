@@ -270,6 +270,55 @@ func (s *oauthAccountStore) DeleteByUserID(ctx context.Context, userID uuid.UUID
 	return s.db.WithContext(ctx).Where("user_id = ?", userID).Delete(&db.OAuthAccount{}).Error
 }
 
+// oauthTokenUpdates builds the column payload both write paths share. updated_at
+// is always restamped, so the row changes unless a retry lands inside the same
+// timestamp precision with an identical record.
+func oauthTokenUpdates(rec db.OAuthTokenRecord) map[string]any {
+	return map[string]any{
+		"access_token_ciphertext":   rec.AccessTokenCiphertext,
+		"refresh_token_ciphertext":  rec.RefreshTokenCiphertext,
+		"refresh_token_fingerprint": rec.RefreshTokenFingerprint,
+		"token_scope":               rec.TokenScope,
+		"token_expires_at":          rec.TokenExpiresAt,
+		"updated_at":                time.Now().UTC(),
+	}
+}
+
+func (s *oauthAccountStore) SaveOAuthTokens(ctx context.Context, id uuid.UUID, rec db.OAuthTokenRecord) error {
+	res := s.db.WithContext(ctx).Model(&db.OAuthAccount{}).Where("id = ?", id).Updates(oauthTokenUpdates(rec))
+	if err := res.Error; err != nil {
+		return db.NormalizeMySQLError(err)
+	}
+	if res.RowsAffected > 0 {
+		return nil
+	}
+	// MySQL reports 0 affected rows for an UPDATE that changes nothing (identical
+	// tokens saved inside the same microsecond), so zero rows alone cannot prove
+	// the account is missing. CAS needs no equivalent: there a no-op reports a
+	// miss and the caller re-reads the winner's token, which is the same outcome.
+	var exists int64
+	if err := s.db.WithContext(ctx).Model(&db.OAuthAccount{}).Where("id = ?", id).Count(&exists).Error; err != nil {
+		return db.NormalizeMySQLError(err)
+	}
+	if exists == 0 {
+		return gorm.ErrRecordNotFound
+	}
+	return nil
+}
+
+func (s *oauthAccountStore) SaveOAuthTokensCAS(ctx context.Context, id uuid.UUID, expectedFingerprint string, rec db.OAuthTokenRecord) (bool, error) {
+	if expectedFingerprint == "" {
+		return false, nil
+	}
+	res := s.db.WithContext(ctx).Model(&db.OAuthAccount{}).
+		Where("id = ? AND refresh_token_fingerprint = ?", id, expectedFingerprint).
+		Updates(oauthTokenUpdates(rec))
+	if err := res.Error; err != nil {
+		return false, db.NormalizeMySQLError(err)
+	}
+	return res.RowsAffected > 0, nil
+}
+
 type totpStore struct {
 	db *gorm.DB
 }

@@ -55,6 +55,19 @@ type PasswordResetTokenStore interface {
 	ConsumeToken(ctx context.Context, tokenHash []byte, now time.Time) (bool, error)
 }
 
+// OAuthTokenRecord is the opaque token payload written by OAuthAccountStore.
+// It carries sealed envelopes and the rotation fingerprint only: this package
+// holds no plaintext token and performs no crypto, so a credential cannot be
+// stored through this type. A nil TokenExpiresAt means "no expiry stored" and
+// an all-empty record clears the tokens.
+type OAuthTokenRecord struct {
+	AccessTokenCiphertext   string
+	RefreshTokenCiphertext  string
+	RefreshTokenFingerprint string
+	TokenScope              string
+	TokenExpiresAt          *time.Time
+}
+
 // OAuthAccountStore defines storage operations for external identity provider links.
 // Identities are keyed by (provider, tenant, provider user id): a pairwise
 // subject is only unique within the tenant that issued it.
@@ -65,6 +78,16 @@ type OAuthAccountStore interface {
 	UpdateProviderUserID(ctx context.Context, id uuid.UUID, providerUserID string) error
 	Delete(ctx context.Context, id uuid.UUID) error
 	DeleteByUserID(ctx context.Context, userID uuid.UUID) error
+
+	// SaveOAuthTokens overwrites every token field on the account. It reports
+	// the backend not-found error when no account holds id.
+	SaveOAuthTokens(ctx context.Context, id uuid.UUID, rec OAuthTokenRecord) error
+	// SaveOAuthTokensCAS writes the record only when the stored refresh-token
+	// fingerprint equals expectedFingerprint, reporting whether it won. A miss
+	// is (false, nil): another writer rotated first and the caller re-reads. An
+	// empty expectation never matches, so a tokenless account cannot be
+	// overwritten by a refresh that has no stored fingerprint to prove.
+	SaveOAuthTokensCAS(ctx context.Context, id uuid.UUID, expectedFingerprint string, rec OAuthTokenRecord) (bool, error)
 }
 
 // TotpStore defines storage operations for RFC 6238 TOTP two-factor authentication.

@@ -949,3 +949,58 @@ func TestMongoStore_CanceledContext_AllMethods(t *testing.T) {
 	}))
 	_ = store.Close()
 }
+
+// TestOAuthTokenSetDoc pins the write payload both token paths share: every
+// token column is overwritten, and a nil expiry is written as null so it decodes
+// back to a nil pointer instead of a year-1 time.
+func TestOAuthTokenSetDoc(t *testing.T) {
+	expiresAt := time.Now().UTC().Truncate(time.Millisecond)
+	doc := oauthTokenSetDoc(db.OAuthTokenRecord{
+		AccessTokenCiphertext:   "sealed-access",
+		RefreshTokenCiphertext:  "sealed-refresh",
+		RefreshTokenFingerprint: strings.Repeat("a", 64),
+		TokenScope:              "offline_access",
+		TokenExpiresAt:          &expiresAt,
+	})
+	want := []string{
+		"access_token_ciphertext", "refresh_token_ciphertext", "refresh_token_fingerprint",
+		"token_scope", "token_expires_at", "updated_at",
+	}
+	if len(doc) != len(want) {
+		t.Fatalf("payload has %d keys; want %d: %v", len(doc), len(want), doc)
+	}
+	for _, key := range want {
+		if _, ok := doc[key]; !ok {
+			t.Fatalf("payload is missing %q: %v", key, doc)
+		}
+	}
+	if got, ok := doc["token_expires_at"].(time.Time); !ok || !got.Equal(expiresAt) {
+		t.Fatalf("token_expires_at = %v; want %v", doc["token_expires_at"], expiresAt)
+	}
+
+	// An all-empty record clears the columns and leaves the expiry unset.
+	cleared := oauthTokenSetDoc(db.OAuthTokenRecord{})
+	for _, key := range want[:4] {
+		if cleared[key] != "" {
+			t.Fatalf("cleared %q = %v; want empty string", key, cleared[key])
+		}
+	}
+	if cleared["token_expires_at"] != nil {
+		t.Fatalf("cleared token_expires_at = %v; want nil", cleared["token_expires_at"])
+	}
+
+	// The null must survive a BSON round trip as a nil pointer, not a zero time.
+	data, err := bson.Marshal(bson.M{
+		"_id": uuid.New().String(), "token_expires_at": cleared["token_expires_at"],
+	})
+	if err != nil {
+		t.Fatalf("bson.Marshal failed: %v", err)
+	}
+	var roundTripped OAuthAccountDoc
+	if err := bson.Unmarshal(data, &roundTripped); err != nil {
+		t.Fatalf("bson.Unmarshal failed: %v", err)
+	}
+	if roundTripped.TokenExpiresAt != nil {
+		t.Fatalf("null token_expires_at decoded as %v; want nil", roundTripped.TokenExpiresAt)
+	}
+}

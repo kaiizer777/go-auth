@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -734,11 +735,187 @@ func TestOAuthAccountStore_AllMethods(t *testing.T) {
 	if len(listAfter) != 0 {
 		t.Fatalf("expected 0 accounts after DeleteByUserID, got %d", len(listAfter))
 	}
+
+	// 7. SaveOAuthTokens / SaveOAuthTokensCAS
+	acc3 := &db.OAuthAccount{
+		UserID:         userID,
+		ProviderID:     "gitlab",
+		ProviderUserID: "gl_7",
+		Email:          "gl@example.com",
+	}
+	if err := oauth.Create(ctx, acc3); err != nil {
+		t.Fatalf("Create oauth account for token writes failed: %v", err)
+	}
+	reload := func() *db.OAuthAccount {
+		t.Helper()
+		got, err := oauth.GetByProvider(ctx, "gitlab", "", "gl_7")
+		if err != nil {
+			t.Fatalf("reload oauth account failed: %v", err)
+		}
+		return got
+	}
+	assertTokens := func(acc *db.OAuthAccount, access, refresh, fingerprint, scope string) {
+		t.Helper()
+		if acc.AccessTokenCiphertext != access ||
+			acc.RefreshTokenCiphertext != refresh ||
+			acc.RefreshTokenFingerprint != fingerprint ||
+			acc.TokenScope != scope {
+			t.Fatalf("token fields = %+v; want access %q refresh %q fingerprint %q scope %q",
+				acc, access, refresh, fingerprint, scope)
+		}
+	}
+
+	// A nil expiry must stay nil, both after a write and after clearing.
+	if err := oauth.SaveOAuthTokens(ctx, acc3.ID, db.OAuthTokenRecord{
+		AccessTokenCiphertext:   "sealed-access",
+		RefreshTokenCiphertext:  "sealed-refresh",
+		RefreshTokenFingerprint: strings.Repeat("a", 64),
+		TokenScope:              "read:user offline_access",
+	}); err != nil {
+		t.Fatalf("SaveOAuthTokens without expiry failed: %v", err)
+	}
+	stored := reload()
+	assertTokens(stored, "sealed-access", "sealed-refresh", strings.Repeat("a", 64), "read:user offline_access")
+	if stored.TokenExpiresAt != nil {
+		t.Fatalf("nil expiry stored as %v; want nil", stored.TokenExpiresAt)
+	}
+
+	// An all-empty record clears every token column.
+	if err := oauth.SaveOAuthTokens(ctx, acc3.ID, db.OAuthTokenRecord{}); err != nil {
+		t.Fatalf("SaveOAuthTokens clear failed: %v", err)
+	}
+	cleared := reload()
+	assertTokens(cleared, "", "", "", "")
+	if cleared.TokenExpiresAt != nil {
+		t.Fatalf("cleared expiry = %v; want nil", cleared.TokenExpiresAt)
+	}
+
+	// An expiry round-trips, and an identical re-save stays a success.
+	expiresAt := time.Now().UTC().Truncate(time.Millisecond)
+	if err := oauth.SaveOAuthTokens(ctx, acc3.ID, db.OAuthTokenRecord{
+		AccessTokenCiphertext:   "sealed-access",
+		RefreshTokenCiphertext:  "sealed-refresh",
+		RefreshTokenFingerprint: strings.Repeat("b", 64),
+		TokenScope:              "offline_access",
+		TokenExpiresAt:          &expiresAt,
+	}); err != nil {
+		t.Fatalf("SaveOAuthTokens with expiry failed: %v", err)
+	}
+	stored = reload()
+	assertTokens(stored, "sealed-access", "sealed-refresh", strings.Repeat("b", 64), "offline_access")
+	if stored.TokenExpiresAt == nil || !stored.TokenExpiresAt.Equal(expiresAt) {
+		t.Fatalf("expiry roundtrip = %v; want %v", stored.TokenExpiresAt, expiresAt)
+	}
+	if err := oauth.SaveOAuthTokens(ctx, acc3.ID, db.OAuthTokenRecord{
+		AccessTokenCiphertext:   "sealed-access",
+		RefreshTokenCiphertext:  "sealed-refresh",
+		RefreshTokenFingerprint: strings.Repeat("b", 64),
+		TokenScope:              "offline_access",
+		TokenExpiresAt:          &expiresAt,
+	}); err != nil {
+		t.Fatalf("identical re-save failed: %v", err)
+	}
+
+	// Re-seed a fingerprint so the CAS cases have a current value to compare.
+	winner := strings.Repeat("c", 64)
+	if err := oauth.SaveOAuthTokens(ctx, acc3.ID, db.OAuthTokenRecord{
+		AccessTokenCiphertext:   "sealed-access",
+		RefreshTokenCiphertext:  "sealed-refresh",
+		RefreshTokenFingerprint: strings.Repeat("b", 64),
+		TokenScope:              "offline_access",
+		TokenExpiresAt:          &expiresAt,
+	}); err != nil {
+		t.Fatalf("re-seed tokens failed: %v", err)
+	}
+
+	// An empty expectation never matches, even though the column is non-empty.
+	if won, err := oauth.SaveOAuthTokensCAS(ctx, acc3.ID, "", db.OAuthTokenRecord{
+		RefreshTokenCiphertext:  "attacker-refresh",
+		RefreshTokenFingerprint: winner,
+	}); err != nil || won {
+		t.Fatalf("empty expectation CAS = (%v, %v); want (false, nil)", won, err)
+	}
+	assertTokens(reload(), "sealed-access", "sealed-refresh", strings.Repeat("b", 64), "offline_access")
+
+	// A stale expectation is a miss, not an error, and must not mutate the row.
+	if won, err := oauth.SaveOAuthTokensCAS(ctx, acc3.ID, strings.Repeat("a", 64), db.OAuthTokenRecord{
+		RefreshTokenCiphertext:  "stale-refresh",
+		RefreshTokenFingerprint: winner,
+	}); err != nil || won {
+		t.Fatalf("stale expectation CAS = (%v, %v); want (false, nil)", won, err)
+	}
+	assertTokens(reload(), "sealed-access", "sealed-refresh", strings.Repeat("b", 64), "offline_access")
+
+	// A matching expectation wins and overwrites all five fields.
+	newExpiry := expiresAt.Add(time.Hour)
+	if won, err := oauth.SaveOAuthTokensCAS(ctx, acc3.ID, strings.Repeat("b", 64), db.OAuthTokenRecord{
+		AccessTokenCiphertext:   "rotated-access",
+		RefreshTokenCiphertext:  "rotated-refresh",
+		RefreshTokenFingerprint: winner,
+		TokenScope:              "offline_access",
+		TokenExpiresAt:          &newExpiry,
+	}); err != nil || !won {
+		t.Fatalf("matching expectation CAS = (%v, %v); want (true, nil)", won, err)
+	}
+	rotated := reload()
+	assertTokens(rotated, "rotated-access", "rotated-refresh", winner, "offline_access")
+	if rotated.TokenExpiresAt == nil || !rotated.TokenExpiresAt.Equal(newExpiry) {
+		t.Fatalf("rotated expiry = %v; want %v", rotated.TokenExpiresAt, newExpiry)
+	}
+
+	// The losing fingerprint is now stale: replaying it must miss.
+	if won, err := oauth.SaveOAuthTokensCAS(ctx, acc3.ID, strings.Repeat("b", 64), db.OAuthTokenRecord{
+		RefreshTokenFingerprint: "loser",
+	}); err != nil || won {
+		t.Fatalf("replayed expectation CAS = (%v, %v); want (false, nil)", won, err)
+	}
+	assertTokens(reload(), "rotated-access", "rotated-refresh", winner, "offline_access")
+
+	// After a clear, an empty expectation still cannot match the empty column.
+	if err := oauth.SaveOAuthTokens(ctx, acc3.ID, db.OAuthTokenRecord{}); err != nil {
+		t.Fatalf("clear before empty-expectation CAS failed: %v", err)
+	}
+	if won, err := oauth.SaveOAuthTokensCAS(ctx, acc3.ID, "", db.OAuthTokenRecord{
+		AccessTokenCiphertext: "unproven",
+	}); err != nil || won {
+		t.Fatalf("empty expectation against empty column CAS = (%v, %v); want (false, nil)", won, err)
+	}
+	assertTokens(reload(), "", "", "", "")
+
+	// CAS against a missing account is a miss, not an error.
+	if won, err := oauth.SaveOAuthTokensCAS(ctx, uuid.New(), winner, db.OAuthTokenRecord{
+		AccessTokenCiphertext: "ghost",
+	}); err != nil || won {
+		t.Fatalf("missing-account CAS = (%v, %v); want (false, nil)", won, err)
+	}
+
+	// The unconditional path reports the backend not-found error.
+	if err := oauth.SaveOAuthTokens(ctx, uuid.New(), db.OAuthTokenRecord{AccessTokenCiphertext: "ghost"}); !errors.Is(err, gormdriver.ErrRecordNotFound) {
+		t.Fatalf("missing-account SaveOAuthTokens = %v; want ErrRecordNotFound", err)
+	}
 }
 
 // TestOAuthAccountStore_TenantScopedKey pins #72 at the storage boundary: one
 // pairwise subject in two tenants is two identities, and a lookup only resolves
 // the tenant it names.
+// TestOAuthTokenUpdates_NilExpiryVsZero pins the write payload: a nil expiry is
+// written as SQL NULL, while a supplied zero time must not be coerced to NULL.
+func TestOAuthTokenUpdates_NilExpiryVsZero(t *testing.T) {
+	updates := oauthTokenUpdates(db.OAuthTokenRecord{})
+	if got, ok := updates["token_expires_at"]; !ok || got != (*time.Time)(nil) {
+		t.Fatalf("nil expiry payload = %v (present=%v); want a nil *time.Time", got, ok)
+	}
+	if _, ok := updates["updated_at"].(time.Time); !ok {
+		t.Fatalf("updated_at payload = %T; want time.Time", updates["updated_at"])
+	}
+
+	zero := time.Time{}
+	got, ok := oauthTokenUpdates(db.OAuthTokenRecord{TokenExpiresAt: &zero})["token_expires_at"].(*time.Time)
+	if !ok || got == nil || !got.IsZero() {
+		t.Fatalf("zero expiry payload = %v; want a non-nil zero *time.Time", got)
+	}
+}
+
 func TestOAuthAccountStore_TenantScopedKey(t *testing.T) {
 	_, store := setupTestDB(t)
 	ctx := context.Background()
