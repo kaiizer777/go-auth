@@ -24,6 +24,23 @@ func validOAuthBase() Config {
 	return cfg
 }
 
+// assertXDefaultScopes pins the X default on both default surfaces: GET
+// /2/users/me is scoped with users.read and tweet.read, plus offline.access for
+// the refresh token.
+func assertXDefaultScopes(t *testing.T, got []string) {
+	t.Helper()
+
+	want := []string{"tweet.read", "users.read", "offline.access"}
+	if len(got) != len(want) {
+		t.Fatalf("Scopes = %v; want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("Scopes = %v; want %v", got, want)
+		}
+	}
+}
+
 func TestOAuthDefaults(t *testing.T) {
 	cfg := DefaultConfig()
 	if cfg.OAuth.StateCookieName != "oauth_state" {
@@ -1428,16 +1445,11 @@ func TestProviderConfigLogValue(t *testing.T) {
 		if err := cfg.Validate(); err != nil {
 			t.Fatalf("Validate = %v", err)
 		}
-		if len(cfg.OAuth.X.Scopes) != 2 || cfg.OAuth.X.Scopes[0] != "users.read" || cfg.OAuth.X.Scopes[1] != "offline.access" {
-			t.Fatalf("Scopes = %v; want [users.read offline.access]", cfg.OAuth.X.Scopes)
-		}
-		// Merge premise (oauth sync): the typed X default is
-		// [users.read offline.access] and wins the resolveProviders merge, so the
-		// merged map entry carries it rather than the map-surface default.
-		scopes := cfg.OAuth.Providers["x"].Scopes
-		if len(scopes) != 2 || scopes[0] != "users.read" || scopes[1] != "offline.access" {
-			t.Fatalf("Scopes = %v; want [users.read offline.access]", scopes)
-		}
+		assertXDefaultScopes(t, cfg.OAuth.X.Scopes)
+		// Merge premise (oauth sync): the typed X default wins the
+		// resolveProviders merge, so the merged map entry carries it rather than
+		// the map-surface default.
+		assertXDefaultScopes(t, cfg.OAuth.Providers["x"].Scopes)
 	})
 
 	t.Run("X map-only provider defaults scopes", func(t *testing.T) {
@@ -1453,10 +1465,7 @@ func TestProviderConfigLogValue(t *testing.T) {
 		if err := cfg.Validate(); err != nil {
 			t.Fatalf("Validate = %v", err)
 		}
-		scopes := cfg.OAuth.Providers["x"].Scopes
-		if len(scopes) != 2 || scopes[0] != "users.read" || scopes[1] != "offline.access" {
-			t.Fatalf("Scopes = %v; want [users.read offline.access]", scopes)
-		}
+		assertXDefaultScopes(t, cfg.OAuth.Providers["x"].Scopes)
 	})
 
 	t.Run("XConfig masks client secret in LogValue and String", func(t *testing.T) {

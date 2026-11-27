@@ -889,10 +889,11 @@ func (c *Config) validate() error {
 
 	if c.OAuth.X != nil {
 		// Same merge rule as Microsoft above: no pre-merge default when a map
-		// entry carries explicit scopes.
+		// entry carries explicit scopes. X scopes the profile endpoint with both
+		// users.read and tweet.read, so the default requests both.
 		_, xMapEntry := c.OAuth.Providers["x"]
 		if len(c.OAuth.X.Scopes) == 0 && !xMapEntry {
-			c.OAuth.X.Scopes = []string{"users.read", "offline.access"}
+			c.OAuth.X.Scopes = []string{"tweet.read", "users.read", "offline.access"}
 		}
 	}
 

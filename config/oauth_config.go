@@ -348,7 +348,9 @@ func applyProviderDefaults(id string, p *ProviderConfig) {
 		}
 	case "x":
 		if len(p.Scopes) == 0 {
-			p.Scopes = []string{"users.read", "offline.access"}
+			// GET /2/users/me requires both users.read and tweet.read; without
+			// tweet.read the default login fails at the profile call.
+			p.Scopes = []string{"tweet.read", "users.read", "offline.access"}
 		}
 	}
 }
