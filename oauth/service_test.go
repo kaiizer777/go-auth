@@ -744,7 +744,7 @@ func TestUnverifiedSignupLinkProvenance(t *testing.T) {
 			wg.Add(1)
 			go func(i int) {
 				defer wg.Done()
-				u, _, _, err := svc.linkOrCreate(context.Background(), "google", info, "")
+				u, _, _, err := svc.linkOrCreate(context.Background(), "google", info, "", nil)
 				outs[i] = outcome{user: u, err: err}
 			}(i)
 		}
@@ -783,7 +783,7 @@ func TestUnverifiedSignupLinkProvenance(t *testing.T) {
 		// Calling createUserAndLink exercises the losing create-race path:
 		// attempting to create the user fails on email uniqueness, invoking
 		// linkRacedUser and mergeOrConverge.
-		got, _, created, err := rawSvc.(*service).createUserAndLink(context.Background(), "google", unverified())
+		got, _, created, err := rawSvc.(*service).createUserAndLink(context.Background(), "google", unverified(), nil)
 		if err != nil {
 			t.Fatalf("createUserAndLink over a pending row = %v; want convergence", err)
 		}
@@ -858,7 +858,7 @@ func TestMergeGateRejectsUnstorableIdentity(t *testing.T) {
 		if err := database.Create(&existing).Error; err != nil {
 			t.Fatalf("seed user: %v", err)
 		}
-		_, _, _, err := rawSvc.(*service).linkOrCreate(context.Background(), "google", oversized("gate@example.com"), "")
+		_, _, _, err := rawSvc.(*service).linkOrCreate(context.Background(), "google", oversized("gate@example.com"), "", nil)
 		requireCode(t, err, errors.CodeOAuthProviderError, http.StatusBadGateway)
 		if n := countRows(t, database, &db.OAuthAccount{}); n != 0 {
 			t.Fatalf("oauth_accounts = %d; want 0", n)
@@ -871,7 +871,7 @@ func TestMergeGateRejectsUnstorableIdentity(t *testing.T) {
 		if err := database.Create(&winner).Error; err != nil {
 			t.Fatalf("seed winner: %v", err)
 		}
-		_, _, _, err := rawSvc.(*service).createUserAndLink(context.Background(), "google", oversized("raced-gate@example.com"))
+		_, _, _, err := rawSvc.(*service).createUserAndLink(context.Background(), "google", oversized("raced-gate@example.com"), nil)
 		requireCode(t, err, errors.CodeOAuthProviderError, http.StatusBadGateway)
 		if n := countRows(t, database, &db.OAuthAccount{}); n != 0 {
 			t.Fatalf("oauth_accounts = %d; want 0", n)
@@ -1045,7 +1045,7 @@ func TestHandleCallbackActiveSessionLinking(t *testing.T) {
 		database, _, _, rawSvc := setupServiceTest(t, nil)
 		info := &UserInfo{ProviderID: "google", ProviderUserID: "sub-bad-id",
 			Email: "provider-owner@personal.example", EmailVerified: true}
-		_, _, _, err := rawSvc.(*service).linkOrCreate(context.Background(), "google", info, "not-a-uuid")
+		_, _, _, err := rawSvc.(*service).linkOrCreate(context.Background(), "google", info, "not-a-uuid", nil)
 		requireCode(t, err, errors.CodeOAuthAccountNotLinked, http.StatusNotFound)
 		requireIdentityRows(t, database, 0, 0, 0)
 	})
@@ -1058,7 +1058,7 @@ func TestHandleCallbackActiveSessionLinking(t *testing.T) {
 			users: &failingGetByIDUserStore{UserStore: base.Users(), err: stderrors.New("dial tcp: connection refused")},
 		}
 		svc := NewServiceWithStore(broken, nil, nil, serviceTestConfig()).(*service)
-		_, _, _, err := svc.linkOrCreate(context.Background(), "google", verifiedInfo(), uuid.New().String())
+		_, _, _, err := svc.linkOrCreate(context.Background(), "google", verifiedInfo(), uuid.New().String(), nil)
 		requireCode(t, err, errors.CodeInternalError, http.StatusInternalServerError)
 	})
 
@@ -1069,7 +1069,7 @@ func TestHandleCallbackActiveSessionLinking(t *testing.T) {
 			Store: base,
 			users: nilUserStore{UserStore: base.Users()},
 		}, nil, nil, serviceTestConfig()).(*service)
-		_, _, _, err := svc.linkOrCreate(context.Background(), "google", verifiedInfo(), uuid.New().String())
+		_, _, _, err := svc.linkOrCreate(context.Background(), "google", verifiedInfo(), uuid.New().String(), nil)
 		requireCode(t, err, errors.CodeOAuthAccountNotLinked, http.StatusNotFound)
 	})
 
@@ -1626,7 +1626,7 @@ func TestLinkOrCreateConcurrent(t *testing.T) {
 			wg.Add(1)
 			go func(i int) {
 				defer wg.Done()
-				u, _, _, err := svc.linkOrCreate(context.Background(), "google", info, "")
+				u, _, _, err := svc.linkOrCreate(context.Background(), "google", info, "", nil)
 				outs[i] = outcome{u, err}
 			}(i)
 		}
@@ -1782,7 +1782,7 @@ func TestHandleCallbackAuditFlags(t *testing.T) {
 		}
 		// Enter the create step directly: the seeded link is exactly what a
 		// concurrent winner leaves behind, so the insert must lose to it.
-		user, linked, created, err := svc.(*service).createUserAndLink(context.Background(), "google", verifiedInfo())
+		user, linked, created, err := svc.(*service).createUserAndLink(context.Background(), "google", verifiedInfo(), nil)
 		if err != nil {
 			t.Fatalf("createUserAndLink = %v", err)
 		}
@@ -1827,7 +1827,7 @@ func TestService_CreateUserEmailRaceRecovery(t *testing.T) {
 			Email:          "raced@example.com",
 			EmailVerified:  true,
 		}
-		user, linked, created, err := svc.(*service).createUserAndLink(ctx, "google", info)
+		user, linked, created, err := svc.(*service).createUserAndLink(ctx, "google", info, nil)
 		if err != nil {
 			t.Fatalf("expected successful race recovery, got err: %v", err)
 		}
@@ -1870,7 +1870,7 @@ func TestService_CreateUserEmailRaceRecovery(t *testing.T) {
 			Email:          "unverified@example.com",
 			EmailVerified:  true,
 		}
-		_, _, _, err := svc.(*service).createUserAndLink(ctx, "google", info)
+		_, _, _, err := svc.(*service).createUserAndLink(ctx, "google", info, nil)
 		if !errors.Is(err, errors.ErrOAuthAccountLinkConflict) {
 			t.Fatalf("expected ErrOAuthAccountLinkConflict, got %v", err)
 		}
@@ -1895,7 +1895,7 @@ func TestService_CreateUserEmailRaceRecovery(t *testing.T) {
 			Email:          "raced-unverified@example.com",
 			EmailVerified:  false,
 		}
-		_, _, _, err := svc.(*service).createUserAndLink(ctx, "facebook", info)
+		_, _, _, err := svc.(*service).createUserAndLink(ctx, "facebook", info, nil)
 		if !errors.Is(err, errors.ErrOAuthEmailUnverified) {
 			t.Fatalf("expected ErrOAuthEmailUnverified, got %v", err)
 		}
@@ -1920,12 +1920,12 @@ func TestService_SubjectCaseSensitivity(t *testing.T) {
 		EmailVerified:  true,
 	}
 
-	u1, linked1, created1, err1 := svc.(*service).createUserAndLink(ctx, "google", upperInfo)
+	u1, linked1, created1, err1 := svc.(*service).createUserAndLink(ctx, "google", upperInfo, nil)
 	if err1 != nil || !linked1 || !created1 {
 		t.Fatalf("create upper failed: %v", err1)
 	}
 
-	u2, linked2, created2, err2 := svc.(*service).createUserAndLink(ctx, "google", lowerInfo)
+	u2, linked2, created2, err2 := svc.(*service).createUserAndLink(ctx, "google", lowerInfo, nil)
 	if err2 != nil || !linked2 || !created2 {
 		t.Fatalf("create lower failed: %v", err2)
 	}
@@ -2057,7 +2057,7 @@ func TestService_CreateUserAndLink_RetryIsolation(t *testing.T) {
 			EmailVerified:  true,
 		}
 
-		_, _, _, err := testSvc.createUserAndLink(ctx, "google", info)
+		_, _, _, err := testSvc.createUserAndLink(ctx, "google", info, nil)
 		if err == nil {
 			t.Fatal("expected error, got nil")
 		}
@@ -2123,7 +2123,7 @@ func TestService_CreateUserAndLink_RetryIsolation(t *testing.T) {
 			EmailVerified:  true,
 		}
 
-		_, _, _, err := testSvc.createUserAndLink(ctx, "google", info)
+		_, _, _, err := testSvc.createUserAndLink(ctx, "google", info, nil)
 		if err == nil {
 			t.Fatal("expected error, got nil")
 		}

@@ -436,7 +436,7 @@ func (s *service) HandleCallback(ctx context.Context, w http.ResponseWriter, r *
 		}
 	}
 
-	user, linked, created, err := s.linkOrCreate(ctx, providerID, info, activeUserID)
+	user, linked, created, err := s.linkOrCreate(ctx, providerID, info, activeUserID, tokens)
 	if err != nil {
 		// Gate sentinels map to their historical literal reasons before the
 		// code-derived fallback, which stays the producer of UPPER_SNAKE
@@ -669,10 +669,11 @@ func (s *service) findUserByEmail(ctx context.Context, email string) (db.User, e
 	return *user, nil
 }
 
-// insertLink writes the oauth_accounts row for userID. errLinkConflict means a
-// concurrent callback already claimed (providerID, tenant, providerUserID).
-// verified mirrors the callback's provider attestation and is never inferred.
-func (s *service) insertLink(ctx context.Context, accountStore db.OAuthAccountStore, userID uuid.UUID, providerID, providerTenantID, providerUserID, email string, verified bool) error {
+// insertLink writes the oauth_accounts row for userID, sealed grant included.
+// errLinkConflict means a concurrent callback already claimed (providerID,
+// tenant, providerUserID). verified mirrors the callback's provider attestation
+// and is never inferred.
+func (s *service) insertLink(ctx context.Context, accountStore db.OAuthAccountStore, userID uuid.UUID, providerID, providerTenantID, providerUserID, email string, verified bool, tokens *OAuthToken) error {
 	row := db.OAuthAccount{
 		ID:               uuid.New(),
 		UserID:           userID,
@@ -682,6 +683,14 @@ func (s *service) insertLink(ctx context.Context, accountStore db.OAuthAccountSt
 		Email:            email,
 		Verified:         verified,
 	}
+	// Sealed per invocation: Transaction may re-run its callback with a
+	// regenerated row id, and the AAD binds each envelope to the id it was
+	// written for. A record sealed above the callback would become undecryptable.
+	rec, err := s.sealedTokens(row.ProviderID, row.ID.String(), tokens)
+	if err != nil {
+		return err
+	}
+	applyTokenRecord(&row, rec)
 	if err := accountStore.Create(ctx, &row); err != nil {
 		if isUniqueViolation(err) {
 			return errLinkConflict
@@ -691,6 +700,57 @@ func (s *service) insertLink(ctx context.Context, accountStore db.OAuthAccountSt
 	return nil
 }
 
+// sealedTokens builds the sealed grant for the row identified by accountID. The
+// AAD always comes from the persisted row, never from the callback argument. A
+// grant without a refresh token stores empty values instead of reusing an older
+// one: providers rotate it away on every exchange.
+func (s *service) sealedTokens(providerID, accountID string, tokens *OAuthToken) (db.OAuthTokenRecord, error) {
+	rec := db.OAuthTokenRecord{
+		TokenExpiresAt: tokenExpiry(tokens),
+		TokenScope:     tokenScope(tokens),
+	}
+	if tokens == nil {
+		return rec, nil
+	}
+	access, err := s.sealer.SealAccessToken(providerID, accountID, tokens.AccessToken)
+	if err != nil {
+		return db.OAuthTokenRecord{}, errors.New(errors.CodeInternalError, "failed to seal oauth access token", err)
+	}
+	rec.AccessTokenCiphertext = access
+	if tokens.RefreshToken == "" {
+		return rec, nil
+	}
+	refresh, err := s.sealer.SealRefreshToken(providerID, accountID, tokens.RefreshToken)
+	if err != nil {
+		return db.OAuthTokenRecord{}, errors.New(errors.CodeInternalError, "failed to seal oauth refresh token", err)
+	}
+	fingerprint, err := s.sealer.RefreshTokenFingerprint(tokens.RefreshToken)
+	if err != nil {
+		return db.OAuthTokenRecord{}, errors.New(errors.CodeInternalError, "failed to fingerprint oauth refresh token", err)
+	}
+	rec.RefreshTokenCiphertext = refresh
+	rec.RefreshTokenFingerprint = fingerprint
+	return rec, nil
+}
+
+// tokenScope reads the granted scope the provider echoed in the token body.
+func tokenScope(tokens *OAuthToken) string {
+	if tokens == nil || tokens.Raw == nil {
+		return ""
+	}
+	scope, _ := tokens.Raw["scope"].(string)
+	return scope
+}
+
+// applyTokenRecord writes the sealed grant onto the row it was sealed for.
+func applyTokenRecord(row *db.OAuthAccount, rec db.OAuthTokenRecord) {
+	row.AccessTokenCiphertext = rec.AccessTokenCiphertext
+	row.RefreshTokenCiphertext = rec.RefreshTokenCiphertext
+	row.RefreshTokenFingerprint = rec.RefreshTokenFingerprint
+	row.TokenScope = rec.TokenScope
+	row.TokenExpiresAt = rec.TokenExpiresAt
+}
+
 // attachLink attaches the provider identity to ownerID in one transaction: the
 // owner is re-read under a row lock, the claim gate is evaluated on that locked
 // row, and the link insert commits inside the same transaction. A concurrent
@@ -698,7 +758,7 @@ func (s *service) insertLink(ctx context.Context, accountStore db.OAuthAccountSt
 // or blocks until the insert commits; it can no longer slip between a stale read
 // and the write. Losing the unique race converges on the winner's row, which
 // reports linked=false.
-func (s *service) attachLink(ctx context.Context, ownerID uuid.UUID, providerID string, info *UserInfo) (db.User, bool, error) {
+func (s *service) attachLink(ctx context.Context, ownerID uuid.UUID, providerID string, info *UserInfo, tokens *OAuthToken) (db.User, bool, error) {
 	var owner db.User
 	linked := false
 	err := s.store.Transaction(ctx, func(txStore db.Store) error {
@@ -723,7 +783,7 @@ func (s *service) attachLink(ctx context.Context, ownerID uuid.UUID, providerID 
 			// an authenticated owner carries no email and is trusted.
 			verified = true
 		}
-		if ierr := s.insertLink(ctx, txStore.OAuthAccounts(), owner.ID, providerID, info.ProviderTenantID, info.ProviderUserID, email, verified); ierr != nil {
+		if ierr := s.insertLink(ctx, txStore.OAuthAccounts(), owner.ID, providerID, info.ProviderTenantID, info.ProviderUserID, email, verified, tokens); ierr != nil {
 			return ierr
 		}
 		linked = true
@@ -821,7 +881,7 @@ func (s *service) relinkExisting(ctx context.Context, providerID, providerTenant
 // it mirrors password signup, which refuses an already-registered email instead
 // of taking it over, and no verification-mail or takeover flow exists here, so
 // the address stays blocked until the squatted row is removed out of band.
-func (s *service) linkRacedUser(ctx context.Context, providerID string, info *UserInfo) (db.User, bool, bool, error) {
+func (s *service) linkRacedUser(ctx context.Context, providerID string, info *UserInfo, tokens *OAuthToken) (db.User, bool, bool, error) {
 	existing, err := s.findUserByEmail(ctx, info.Email)
 	if err != nil {
 		if !errors.Is(err, gorm.ErrRecordNotFound) && !errors.Is(err, errors.ErrUserNotFound) {
@@ -834,7 +894,7 @@ func (s *service) linkRacedUser(ctx context.Context, providerID string, info *Us
 		}
 		return db.User{}, false, false, errors.New(errors.CodeInternalError, "failed to query user", err)
 	}
-	return s.mergeOrConverge(ctx, providerID, existing, info)
+	return s.mergeOrConverge(ctx, providerID, existing, info, tokens)
 }
 
 // mergeOrConverge decides what an address collision with a live local account
@@ -846,7 +906,7 @@ func (s *service) linkRacedUser(ctx context.Context, providerID string, info *Us
 // unclaimed account. The create-race path and the pre-existing-owner path share
 // this rule so the outcome cannot depend on which goroutine observes the winner's
 // commit first.
-func (s *service) mergeOrConverge(ctx context.Context, providerID string, existing db.User, info *UserInfo) (db.User, bool, bool, error) {
+func (s *service) mergeOrConverge(ctx context.Context, providerID string, existing db.User, info *UserInfo, tokens *OAuthToken) (db.User, bool, bool, error) {
 	if gerr := validateProviderIdentity(info, providerID); gerr != nil {
 		if errors.Is(gerr, errors.ErrOAuthEmailUnverified) && !isClaimedAccount(existing) {
 			link, found, err := s.findLink(ctx, providerID, info.ProviderTenantID, info.ProviderUserID)
@@ -891,7 +951,7 @@ func (s *service) mergeOrConverge(ctx context.Context, providerID string, existi
 	// owner with local proof of the address. The check runs on the row-locked
 	// owner inside attachLink, so a claim or revocation that lands mid-flight is
 	// observed rather than overwritten.
-	user, linked, lerr := s.attachLink(ctx, existing.ID, providerID, info)
+	user, linked, lerr := s.attachLink(ctx, existing.ID, providerID, info, tokens)
 	if lerr != nil {
 		return db.User{}, false, false, lerr
 	}
@@ -935,7 +995,7 @@ func (s *service) invalidateLink(ctx context.Context, link db.OAuthAccount) {
 // between them (verified user, no link) or a lost link race orphan the loser's
 // user. Session creation stays post-commit: cookie issuance cannot roll back.
 // Unique conflicts roll the transaction back before converging on the winner.
-func (s *service) createUserAndLink(ctx context.Context, providerID string, info *UserInfo) (db.User, bool, bool, error) {
+func (s *service) createUserAndLink(ctx context.Context, providerID string, info *UserInfo, tokens *OAuthToken) (db.User, bool, bool, error) {
 	user := db.User{
 		ID:            uuid.New(),
 		Email:         info.Email,
@@ -955,7 +1015,7 @@ func (s *service) createUserAndLink(ctx context.Context, providerID string, info
 			return err
 		}
 		op = "failed to link oauth account"
-		if err := s.insertLink(ctx, txStore.OAuthAccounts(), user.ID, providerID, info.ProviderTenantID, info.ProviderUserID, info.Email, info.EmailVerified); err != nil {
+		if err := s.insertLink(ctx, txStore.OAuthAccounts(), user.ID, providerID, info.ProviderTenantID, info.ProviderUserID, info.Email, info.EmailVerified, tokens); err != nil {
 			linkConflict = errors.Is(err, errLinkConflict)
 			return err
 		}
@@ -963,7 +1023,7 @@ func (s *service) createUserAndLink(ctx context.Context, providerID string, info
 	})
 	if txErr != nil {
 		if userConflict {
-			return s.linkRacedUser(ctx, providerID, info)
+			return s.linkRacedUser(ctx, providerID, info, tokens)
 		}
 		if linkConflict {
 			return s.relinkExisting(ctx, providerID, info.ProviderTenantID, info.ProviderUserID)
@@ -973,11 +1033,30 @@ func (s *service) createUserAndLink(ctx context.Context, providerID string, info
 	return user, info.EmailVerified, true, nil
 }
 
+// persistTokens overwrites the stored grant for an already-linked identity. A
+// failure is swallowed by design: the login's identity decision is already
+// valid, so refusing it would punish a user for a transient store fault that
+// the next callback repairs. The attributes stop at the identity — a driver
+// error may echo row values, and no envelope, fingerprint, or token is ever
+// logged.
+func (s *service) persistTokens(ctx context.Context, link db.OAuthAccount, tokens *OAuthToken) {
+	rec, err := s.sealedTokens(link.ProviderID, link.ID.String(), tokens)
+	if err == nil {
+		err = s.store.OAuthAccounts().SaveOAuthTokens(ctx, link.ID, rec)
+	}
+	if err != nil {
+		slog.ErrorContext(ctx, "oauth_token_persist_failed",
+			"provider", link.ProviderID,
+			"account_id", link.ID.String(),
+		)
+	}
+}
+
 // linkOrCreate executes the linking decision tree. Returns the user plus
 // whether an oauth_accounts row was inserted and whether the user was created.
 // Concurrent duplicate callbacks converge idempotently: a unique-constraint
 // loss re-reads the winner instead of 500ing.
-func (s *service) linkOrCreate(ctx context.Context, providerID string, info *UserInfo, activeUserID string) (db.User, bool, bool, error) {
+func (s *service) linkOrCreate(ctx context.Context, providerID string, info *UserInfo, activeUserID string, tokens *OAuthToken) (db.User, bool, bool, error) {
 	// 1. Returning user check: the provider identity resolves its owner. An
 	// unverified link signs in only the account it was created on, and only
 	// while that owner is unclaimed: once a verification or password reset
@@ -1008,6 +1087,11 @@ func (s *service) linkOrCreate(ctx context.Context, providerID string, info *Use
 			s.invalidateLink(ctx, link)
 			return db.User{}, false, false, errors.ErrOAuthEmailUnverified
 		}
+		// Unconditional: the provider rotates the refresh token on every grant,
+		// so the stored one is stale the moment this callback succeeds. The
+		// identity decision above already stands, therefore a failure here must
+		// not fail the login — the next callback repairs the row.
+		s.persistTokens(ctx, link, tokens)
 		return user, false, false, nil
 	}
 
@@ -1046,7 +1130,7 @@ func (s *service) linkOrCreate(ctx context.Context, providerID string, info *Use
 		// A password does not count as proof: a squatter can set one on an
 		// address they do not own, and the link would outlive the owner's
 		// recovery. The user must verify or reset first.
-		user, linked, lerr := s.attachLink(ctx, owner.ID, providerID, info)
+		user, linked, lerr := s.attachLink(ctx, owner.ID, providerID, info, tokens)
 		if lerr != nil {
 			return db.User{}, false, false, lerr
 		}
@@ -1071,10 +1155,10 @@ func (s *service) linkOrCreate(ctx context.Context, providerID string, info *Use
 	// to an owner, only converging on the row a concurrent unverified signup left.
 	existing, err := s.findUserByEmail(ctx, info.Email)
 	if err == nil {
-		return s.mergeOrConverge(ctx, providerID, existing, info)
+		return s.mergeOrConverge(ctx, providerID, existing, info, tokens)
 	}
 	if !errors.Is(err, gorm.ErrRecordNotFound) && !errors.Is(err, errors.ErrUserNotFound) {
 		return db.User{}, false, false, errors.New(errors.CodeInternalError, "failed to query user", err)
 	}
-	return s.createUserAndLink(ctx, providerID, info)
+	return s.createUserAndLink(ctx, providerID, info, tokens)
 }
