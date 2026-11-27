@@ -600,7 +600,14 @@ func (i *XIdP) refreshGrant(w http.ResponseWriter, r *http.Request) {
 }
 
 func (i *XIdP) me(w http.ResponseWriter, r *http.Request) {
-	if bearerToken(r) != i.accessToken() {
+	token := bearerToken(r)
+	// Before the first grant accessToken() is "", so an equality check alone
+	// would authenticate a request that presents no bearer at all.
+	if token == "" {
+		writeOAuthErrorStatus(w, "invalid_token", http.StatusUnauthorized)
+		return
+	}
+	if token != i.accessToken() {
 		writeOAuthError(w, "invalid_token")
 		return
 	}
@@ -805,8 +812,12 @@ func writeJSON(w http.ResponseWriter, v any) {
 }
 
 func writeOAuthError(w http.ResponseWriter, code string) {
+	writeOAuthErrorStatus(w, code, http.StatusBadRequest)
+}
+
+func writeOAuthErrorStatus(w http.ResponseWriter, code string, status int) {
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusBadRequest)
+	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(map[string]string{"error": code})
 }
 

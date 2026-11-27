@@ -337,6 +337,22 @@ func TestXIdPRefreshGrantRotatesAndRejectsReplay(t *testing.T) {
 	}
 }
 
+// TestXIdPMeRequiresBearer pins the pre-grant failure mode: me() compares the
+// presented bearer against its own empty access token, so without this guard an
+// unauthenticated request matched.
+func TestXIdPMeRequiresBearer(t *testing.T) {
+	t.Parallel()
+	idp := NewXIdP()
+	t.Cleanup(idp.Close)
+
+	if status := xMeStatus(t, idp, ""); status != http.StatusUnauthorized {
+		t.Fatalf("me without a bearer = %d; want 401", status)
+	}
+	if status := xMeStatus(t, idp, "x-idp-access-token-0"); status != http.StatusBadRequest {
+		t.Fatalf("me with an unissued bearer = %d; want 400", status)
+	}
+}
+
 // xMeStatus calls the X IdP profile endpoint with one bearer token.
 func xMeStatus(t *testing.T, idp *XIdP, accessToken string) int {
 	t.Helper()

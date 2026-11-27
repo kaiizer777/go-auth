@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"regexp"
 	"runtime"
 	"strings"
 	"sync"
@@ -631,12 +632,29 @@ func TestOAuthSecurity_ZeroSecretLeakInLogs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("decode test key: %v", err)
 	}
+	// Negative controls: slog escapes control bytes and base64-encodes []byte,
+	// so a raw substring search can never see either form. Both arms must find a
+	// secret that the handler really did render, or the leak assertions are dead.
+	var escapedProbe, base64Probe bytes.Buffer
+	probe := slog.New(slog.NewJSONHandler(&escapedProbe, nil))
+	probe.Info("escaped probe", "key", string(keyBytes))
+	probe = slog.New(slog.NewJSONHandler(&base64Probe, nil))
+	probe.Info("base64 probe", "key", keyBytes)
+	if !secLogLeaks(escapedProbe.String(), string(keyBytes)) {
+		t.Fatal("leak detector misses a JSON-escaped key")
+	}
+	if !secLogLeaks(base64Probe.String(), string(keyBytes)) {
+		t.Fatal("leak detector misses a base64-encoded key")
+	}
 	var stored db.OAuthAccount
 	if err := database.Where("provider_id = ?", "apple").First(&stored).Error; err != nil {
 		t.Fatalf("load linked apple account: %v", err)
 	}
 	if stored.AccessTokenCiphertext == "" || stored.RefreshTokenCiphertext == "" {
 		t.Fatal("linked account must store both sealed token columns")
+	}
+	if secLogLeaks(logs, encodedKey) {
+		t.Errorf("log leaked the token key in base64")
 	}
 	for name, secret := range map[string]string{
 		"access token":       m.AccessToken,
@@ -649,7 +667,7 @@ func TestOAuthSecurity_ZeroSecretLeakInLogs(t *testing.T) {
 		"access ciphertext":  stored.AccessTokenCiphertext,
 		"refresh ciphertext": stored.RefreshTokenCiphertext,
 	} {
-		if secret != "" && strings.Contains(logs, secret) {
+		if secret != "" && secLogLeaks(logs, secret) {
 			t.Errorf("log leaked %s", name)
 		}
 	}
@@ -675,6 +693,55 @@ func TestOAuthSecurity_ZeroSecretLeakInLogs(t *testing.T) {
 		t.Fatalf("sessions = %d, err = %v; want 1", n, err)
 	}
 }
+
+// secLogLeaks reports whether secret appears in captured slog output: verbatim,
+// inside a decoded JSON value (the handler escapes control bytes, so a raw
+// substring search cannot see them), or inside any base64 chunk the log carries.
+func secLogLeaks(logs, secret string) bool {
+	if strings.Contains(logs, secret) {
+		return true
+	}
+	for _, line := range strings.Split(logs, "\n") {
+		var record any
+		if err := json.Unmarshal([]byte(line), &record); err == nil && secJSONValueContains(record, secret) {
+			return true
+		}
+	}
+	for _, chunk := range secBase64Chunk.FindAllString(logs, -1) {
+		for _, enc := range []*base64.Encoding{base64.StdEncoding, base64.RawStdEncoding, base64.RawURLEncoding} {
+			if raw, err := enc.DecodeString(chunk); err == nil && bytes.Contains(raw, []byte(secret)) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// secJSONValueContains walks a decoded JSON value, including nested groups and
+// slices, for the secret in any string it holds.
+func secJSONValueContains(value any, secret string) bool {
+	switch v := value.(type) {
+	case string:
+		return strings.Contains(v, secret)
+	case map[string]any:
+		for key, inner := range v {
+			if strings.Contains(key, secret) || secJSONValueContains(inner, secret) {
+				return true
+			}
+		}
+	case []any:
+		for _, inner := range v {
+			if secJSONValueContains(inner, secret) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// secBase64Chunk matches the base64 runs a JSON log line can carry, including
+// the URL-safe alphabet and padding.
+var secBase64Chunk = regexp.MustCompile(`[A-Za-z0-9+/=_-]{16,}`)
 
 // secLogSink is a mutex-guarded writer so captured slog output stays race-clean.
 type secLogSink struct {
