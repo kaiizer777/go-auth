@@ -18,14 +18,9 @@ import (
 	"github.com/kaiizer777/go-auth/errors"
 )
 
-const (
-	// secretKeyField is the stable AAD field binding a sealed secret to the
-	// totp_secrets.encrypted_secret column.
-	secretKeyField = "encrypted_secret"
-	// legacyKeyID parks the 64-hex EncryptionKey in the ring as a
-	// decryption-only entry, so an unchanged deployment still opens its rows.
-	legacyKeyID = "legacy"
-)
+// secretKeyField is the stable AAD field binding a sealed secret to the
+// totp_secrets.encrypted_secret column.
+const secretKeyField = "encrypted_secret"
 
 // Crypto seals TOTP secrets through the shared crypto envelope, and provides
 // RFC 6238 TOTP generation and verification helpers.
@@ -45,19 +40,9 @@ func NewCrypto(cfg config.TOTPConfig) (*Crypto, error) {
 }
 
 func parseTOTPKeyring(cfg config.TOTPConfig) (*crypto.Keyring, error) {
-	spec := cfg.Keyring
-	if cfg.EncryptionKey != "" {
-		if len(cfg.EncryptionKey) != 64 {
-			return nil, errors.ErrTOTPEncryptionKeyInvalid
-		}
-		key, err := hex.DecodeString(cfg.EncryptionKey)
-		if err != nil || len(key) != 32 {
-			return nil, errors.ErrTOTPEncryptionKeyInvalid
-		}
-		if spec != "" {
-			spec += ","
-		}
-		spec += legacyKeyID + ":" + base64.StdEncoding.EncodeToString(key)
+	spec, err := cfg.KeyringSpec()
+	if err != nil {
+		return nil, err
 	}
 	if spec == "" {
 		return nil, errors.ErrTOTPEncryptionKeyInvalid

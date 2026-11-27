@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"log/slog"
@@ -247,6 +248,28 @@ func DefaultTOTPConfig() TOTPConfig {
 		MaxAttemptsPerWindow: 5,
 		AttemptWindow:        5 * time.Minute,
 	}
+}
+
+// legacyTOTPKeyID is the kid the hex EncryptionKey joins the TOTP ring under.
+// Stored envelopes and the secret_kid hint record it, so it is fixed.
+const legacyTOTPKeyID = "legacy"
+
+// KeyringSpec returns the exact ring spec the TOTP service builds: Keyring
+// followed by the hex EncryptionKey under kid "legacy" as a decryption-only
+// entry. An empty result means neither key surface is configured.
+func (t TOTPConfig) KeyringSpec() (string, error) {
+	if t.EncryptionKey == "" {
+		return t.Keyring, nil
+	}
+	key, err := hex.DecodeString(t.EncryptionKey)
+	if err != nil || len(key) != 32 {
+		return "", errors.ErrTOTPEncryptionKeyInvalid
+	}
+	entry := legacyTOTPKeyID + ":" + base64.StdEncoding.EncodeToString(key)
+	if t.Keyring == "" {
+		return entry, nil
+	}
+	return t.Keyring + "," + entry, nil
 }
 
 // DatabaseType specifies the supported persistence backend dialect.
@@ -962,11 +985,15 @@ func (c *Config) validate() error {
 			return errors.ErrTOTPEncryptionKeyInvalid
 		}
 	}
-	// A non-empty ring must parse here so a typo fails at startup instead of on
-	// the first enrolment. Both surfaces may be set at once: the constructor
-	// appends the hex key to the ring as a decryption-only entry.
-	if c.TOTP.Keyring != "" {
-		if _, err := crypto.ParseKeyring(c.TOTP.Keyring); err != nil {
+	// Validate the composed ring, not just the configured keyring: the service
+	// appends the hex key under kid "legacy", so a keyring already claiming that
+	// kid would pass here and then fail every TOTP operation at runtime.
+	spec, err := c.TOTP.KeyringSpec()
+	if err != nil {
+		return err
+	}
+	if spec != "" {
+		if _, err := crypto.ParseKeyring(spec); err != nil {
 			return errors.ErrTOTPKeyringInvalid
 		}
 	}

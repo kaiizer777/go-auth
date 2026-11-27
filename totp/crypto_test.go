@@ -25,6 +25,10 @@ import (
 // testdata, captured from the AES-only implementation before it was removed.
 const legacyFixtureSecret = "JBSWY3DPEHPK3PXP"
 
+// legacyKeyID is the kid the hex EncryptionKey is sealed under. Envelopes and
+// secret_kid store it, so it is a persisted value; config composes the ring.
+const legacyKeyID = "legacy"
+
 func validTestHexKey() string {
 	return "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 }

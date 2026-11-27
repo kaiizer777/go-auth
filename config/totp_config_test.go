@@ -161,6 +161,21 @@ func TestConfigValidate_TOTP(t *testing.T) {
 			},
 			wantErr: errors.ErrTOTPKeyringInvalid,
 		},
+		{
+			name: "keyring reusing the legacy kid alongside the hex key fails ErrTOTPKeyringInvalid",
+			mutate: func(c *Config) {
+				c.TOTP.Keyring = testTOTPKeyring("legacy")
+			},
+			wantErr: errors.ErrTOTPKeyringInvalid,
+		},
+		{
+			name: "keyring reusing the legacy kid without the hex key passes",
+			mutate: func(c *Config) {
+				c.TOTP.EncryptionKey = ""
+				c.TOTP.Keyring = testTOTPKeyring("legacy")
+			},
+			wantErr: nil,
+		},
 	}
 
 	for _, tt := range tests {
