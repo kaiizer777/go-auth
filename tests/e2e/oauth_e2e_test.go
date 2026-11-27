@@ -353,7 +353,7 @@ func TestE2E_FullBrowserOAuthJourneys(t *testing.T) {
 		discordIdP := oauthmock.NewDiscordIdP(cfg.BaseURL + "/auth/oauth/discord/callback")
 		defer discordIdP.Close()
 		discordIdP.UserID = "discord-snowflake-888"
-		discordIdP.Email = "existing-user@example.com"
+		discordIdP.Email = "linked-discord-user@example.com"
 
 		discordProvider := oauth.NewDiscordProvider(config.DiscordConfig{
 			ClientID:     discordIdP.ClientID,
@@ -379,6 +379,13 @@ func TestE2E_FullBrowserOAuthJourneys(t *testing.T) {
 			t.Fatalf("microsoft login failed, no session cookie: %d (%s)", cbRec.Code, cbRec.Body.String())
 		}
 
+		// The providers present different addresses, so email matching cannot
+		// produce the outcome below: only the active session can attach Discord.
+		var sessionUser db.User
+		if err := dbConn.Where("email = ?", msIdP.Email).First(&sessionUser).Error; err != nil {
+			t.Fatalf("microsoft-created user not found: %v", err)
+		}
+
 		// Explicit link intent: the state carries the signed-in user and the
 		// callback must resolve the same live session.
 		linkAuthorizeURL, linkCookies := initiateOAuth(t, h, "discord", "?link=true", sessionCookie)
@@ -390,17 +397,28 @@ func TestE2E_FullBrowserOAuthJourneys(t *testing.T) {
 		if linkRec.Code != http.StatusFound {
 			t.Fatalf("discord link callback = %d (%s); want 302", linkRec.Code, linkRec.Body.String())
 		}
+		if responseCookie(t, linkRec, cfg.SessionCookieName) == nil {
+			t.Fatal("expected session cookie set on the discord link callback")
+		}
 
-		var user db.User
-		if err := dbConn.Where("email = ?", "existing-user@example.com").First(&user).Error; err != nil {
-			t.Fatalf("user not found: %v", err)
+		var sessCount int64
+		if err := dbConn.Model(&db.Session{}).Where("user_id = ?", sessionUser.ID).Count(&sessCount).Error; err != nil || sessCount != 2 {
+			t.Fatalf("expected 2 sessions for the linked user (microsoft login and discord callback), got count=%d err=%v", sessCount, err)
+		}
+		var userCount int64
+		if err := dbConn.Model(&db.User{}).Count(&userCount).Error; err != nil || userCount != 1 {
+			t.Fatalf("expected the discord identity to attach to the existing user, got user count=%d err=%v", userCount, err)
+		}
+		var linkCount int64
+		if err := dbConn.Model(&db.OAuthAccount{}).Count(&linkCount).Error; err != nil || linkCount != 2 {
+			t.Fatalf("expected 2 linked identities, got count=%d err=%v", linkCount, err)
 		}
 		var links []db.OAuthAccount
-		if err := dbConn.Where("user_id = ?", user.ID).Find(&links).Error; err != nil {
+		if err := dbConn.Where("user_id = ?", sessionUser.ID).Find(&links).Error; err != nil {
 			t.Fatalf("query links: %v", err)
 		}
 		if len(links) != 2 {
-			t.Fatalf("expected 2 linked identities (microsoft and discord), got %d", len(links))
+			t.Fatalf("expected 2 linked identities on the session user, got %d", len(links))
 		}
 		gotKeys := map[string]string{}
 		gotTenants := map[string]string{}
