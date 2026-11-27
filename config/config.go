@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/kaiizer777/go-auth/crypto"
 	"github.com/kaiizer777/go-auth/email"
 	"github.com/kaiizer777/go-auth/errors"
 )
@@ -114,7 +115,12 @@ type OAuthConfig struct {
 	StateCookiePath string           // Default: "/" (ensures cookies are sent on /auth/oauth/* and /api/auth/oauth/*)
 	StateTTL        time.Duration    // Default: 10 * time.Minute
 	StateSecret     string           // Required when any OAuth provider is enabled; empty fails closed at startup. Min 32 bytes.
-	CallbackBaseURL string           // e.g. "https://api.example.com"
+	// TokenKEK is the comma-separated `kid:base64key` keyring that encrypts
+	// stored OAuth tokens. The first entry encrypts, every entry decrypts, each
+	// key must decode to 32 bytes. Required when any provider is enabled; empty
+	// fails closed at startup. Never logged.
+	TokenKEK        string
+	CallbackBaseURL string // e.g. "https://api.example.com"
 	// StateCookieSameSite is the base SameSite policy for the OAuth state
 	// cookie on GET-redirect flows. Default: Lax. form_post providers (Apple)
 	// always escalate to None+Secure regardless, since browsers withhold Lax
@@ -122,11 +128,15 @@ type OAuthConfig struct {
 	StateCookieSameSite http.SameSite
 }
 
-// LogValue implements slog.LogValuer to ensure StateSecret and nested provider secrets are redacted.
+// LogValue implements slog.LogValuer to ensure StateSecret, TokenKEK and nested provider secrets are redacted.
 func (o OAuthConfig) LogValue() slog.Value {
 	secretMasked := "[REDACTED]"
 	if o.StateSecret == "" {
 		secretMasked = ""
+	}
+	kekMasked := "[REDACTED]"
+	if o.TokenKEK == "" {
+		kekMasked = ""
 	}
 	providerAttrs := make([]slog.Attr, 0, len(o.Providers))
 	for name, provider := range o.Providers {
@@ -134,6 +144,7 @@ func (o OAuthConfig) LogValue() slog.Value {
 	}
 	attrs := []slog.Attr{
 		slog.String("state_secret", secretMasked),
+		slog.String("token_kek", kekMasked),
 		slog.String("state_cookie_name", o.StateCookieName),
 		slog.String("state_cookie_path", o.StateCookiePath),
 		slog.Duration("state_ttl", o.StateTTL),
@@ -157,14 +168,18 @@ func (o OAuthConfig) LogValue() slog.Value {
 	return slog.GroupValue(attrs...)
 }
 
-// String implements fmt.Stringer to ensure StateSecret is masked when printed.
+// String implements fmt.Stringer to ensure StateSecret and TokenKEK are masked when printed.
 func (o OAuthConfig) String() string {
 	secret := "[REDACTED]"
 	if o.StateSecret == "" {
 		secret = ""
 	}
-	return fmt.Sprintf("OAuthConfig{Providers: %v, Microsoft: %v, Facebook: %v, Discord: %v, X: %v, StateSecret: %s, CallbackBaseURL: %s}",
-		o.Providers, o.Microsoft, o.Facebook, o.Discord, o.X, secret, o.CallbackBaseURL)
+	kek := "[REDACTED]"
+	if o.TokenKEK == "" {
+		kek = ""
+	}
+	return fmt.Sprintf("OAuthConfig{Providers: %v, Microsoft: %v, Facebook: %v, Discord: %v, X: %v, StateSecret: %s, TokenKEK: %s, CallbackBaseURL: %s}",
+		o.Providers, o.Microsoft, o.Facebook, o.Discord, o.X, secret, kek, o.CallbackBaseURL)
 }
 
 // SecurityHeadersConfig groups HTTP security header policies.
@@ -800,6 +815,15 @@ func (c *Config) validate() error {
 		}
 	} else if len(c.OAuth.StateSecret) < 32 {
 		return errors.ErrOAuthStateSecretTooShort
+	}
+	// A non-empty keyring must parse here so a typo fails at startup rather than
+	// on the first token write. Empty stays valid: this function performs no
+	// environment reads, and the constructors enforce the provider-enabled
+	// requirement after resolving GOAUTH_TOKEN_KEK.
+	if c.OAuth.TokenKEK != "" {
+		if _, err := crypto.ParseKeyring(c.OAuth.TokenKEK); err != nil {
+			return errors.ErrOAuthTokenKEKInvalid
+		}
 	}
 	if !isToken(c.OAuth.StateCookieName) {
 		return errors.ErrOAuthStateCookieNameInvalid

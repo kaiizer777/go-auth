@@ -489,6 +489,7 @@ func TestNew_OAuthRegistryWiring(t *testing.T) {
 	cfg.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
 	cfg.BaseURL = "https://auth.example.com"
 	cfg.OAuth.StateSecret = "test-state-secret-at-least-32-bytes!"
+	cfg.OAuth.TokenKEK = testTokenKEK
 	cfg.OAuth.Providers = map[string]config.ProviderConfig{
 		"microsoft": {
 			ClientID:     "ms-client-id",
@@ -526,6 +527,95 @@ func TestNew_OAuthRegistryWiring(t *testing.T) {
 	if _, err := a.OAuthService().InitiateFlow(rec, req, "slack"); err == nil {
 		t.Error("InitiateFlow(slack) expected error, got nil")
 	}
+}
+
+func oauthProviderConfig() config.Config {
+	cfg := config.DefaultConfig()
+	cfg.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+	cfg.BaseURL = "https://auth.example.com"
+	cfg.OAuth.StateSecret = "test-state-secret-at-least-32-bytes!"
+	cfg.OAuth.Providers = map[string]config.ProviderConfig{
+		"google": {
+			ClientID:     "gid",
+			ClientSecret: "gsecret",
+			RedirectURL:  "https://auth.example.com/auth/oauth/google/callback",
+			Enabled:      true,
+		},
+	}
+	return cfg
+}
+
+func TestNew_RequiresTokenKEK(t *testing.T) {
+	t.Run("New and NewWithStore fail alike when keyring is absent", func(t *testing.T) {
+		t.Setenv(tokenKEKEnvVar, "")
+		_, newErr := New(oauthProviderConfig())
+		_, storeErr := NewWithStore(nil, oauthProviderConfig())
+		if !stderrors.Is(newErr, errors.ErrOAuthTokenKEKMissing) {
+			t.Fatalf("New err = %v; want ErrOAuthTokenKEKMissing", newErr)
+		}
+		if !stderrors.Is(storeErr, errors.ErrOAuthTokenKEKMissing) {
+			t.Fatalf("NewWithStore err = %v; want ErrOAuthTokenKEKMissing", storeErr)
+		}
+		if newErr.Error() != storeErr.Error() {
+			t.Errorf("New err = %q; NewWithStore err = %q", newErr, storeErr)
+		}
+		var appErr *errors.Error
+		if !errors.As(newErr, &appErr) || appErr.Code() != errors.CodeInvalidConfig {
+			t.Errorf("err = %v; want a CodeInvalidConfig error", newErr)
+		}
+	})
+
+	t.Run("whitespace environment keyring counts as absent", func(t *testing.T) {
+		t.Setenv(tokenKEKEnvVar, "   ")
+		_, err := NewWithStore(nil, oauthProviderConfig())
+		if !stderrors.Is(err, errors.ErrOAuthTokenKEKMissing) {
+			t.Fatalf("err = %v; want ErrOAuthTokenKEKMissing", err)
+		}
+	})
+
+	t.Run("malformed explicit keyring is rejected", func(t *testing.T) {
+		t.Setenv(tokenKEKEnvVar, "")
+		cfg := oauthProviderConfig()
+		cfg.OAuth.TokenKEK = "typo-not-a-keyring"
+		_, err := NewWithStore(nil, cfg)
+		if !stderrors.Is(err, errors.ErrOAuthTokenKEKInvalid) {
+			t.Fatalf("err = %v; want ErrOAuthTokenKEKInvalid", err)
+		}
+		if strings.Contains(err.Error(), "typo-not-a-keyring") {
+			t.Fatalf("err leaked keyring spec: %v", err)
+		}
+	})
+
+	t.Run("environment keyring satisfies the gate", func(t *testing.T) {
+		t.Setenv(tokenKEKEnvVar, testTokenKEK)
+		a, err := NewWithStore(gormstore.New(openTestSQLite(t)), oauthProviderConfig())
+		if err != nil {
+			t.Fatalf("NewWithStore = %v", err)
+		}
+		t.Cleanup(func() { _ = a.Close() })
+	})
+
+	t.Run("explicit keyring wins over environment", func(t *testing.T) {
+		t.Setenv(tokenKEKEnvVar, "not-a-keyring")
+		cfg := oauthProviderConfig()
+		cfg.OAuth.TokenKEK = testTokenKEK
+		a, err := NewWithStore(gormstore.New(openTestSQLite(t)), cfg)
+		if err != nil {
+			t.Fatalf("NewWithStore = %v", err)
+		}
+		t.Cleanup(func() { _ = a.Close() })
+	})
+
+	t.Run("no providers leaves the keyring optional", func(t *testing.T) {
+		t.Setenv(tokenKEKEnvVar, "")
+		cfg := oauthProviderConfig()
+		cfg.OAuth.Providers = nil
+		a, err := NewWithStore(gormstore.New(openTestSQLite(t)), cfg)
+		if err != nil {
+			t.Fatalf("NewWithStore = %v", err)
+		}
+		t.Cleanup(func() { _ = a.Close() })
+	})
 }
 
 func TestNewWithDB_ZeroCleanupTick(t *testing.T) {

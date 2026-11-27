@@ -366,6 +366,8 @@ var (
 	ErrOAuthStateCookiePathInvalid     = New(CodeInvalidConfig, "oauth state cookie path is invalid", nil)
 	ErrOAuthStateSecretTooShort        = New(CodeInvalidConfig, "oauth state secret length too short", nil)
 	ErrOAuthStateSecretRequired        = New(CodeInvalidConfig, "oauth state secret is required when providers are configured", nil)
+	ErrOAuthTokenKEKMissing            = New(CodeInvalidConfig, "oauth token encryption key is required when providers are configured", nil)
+	ErrOAuthTokenKEKInvalid            = New(CodeInvalidConfig, "oauth token encryption key must be comma-separated kid:base64 entries with 32-byte keys", nil)
 	ErrOAuthStateCookieNameCollision   = New(CodeInvalidConfig, "oauth state cookie name must not match session or CSRF cookie name", nil)
 	ErrOAuthGraphVersionInvalid        = New(CodeInvalidConfig, "facebook graph version must be <major>.<minor> with an optional v prefix, no leading zeros, and at least 19.0", nil)
 	ErrTOTPEncryptionKeyInvalid        = New(CodeInvalidConfig, "totp encryption key must be 64 hex chars (32 bytes)", nil)
