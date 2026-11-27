@@ -140,6 +140,289 @@ func TestPasswordSquatCannotAttachLink(t *testing.T) {
 	}
 }
 
+// signIn mints a cookie session for the account owning addr, standing in for
+// the login that precedes an explicit link.
+func signIn(t *testing.T, database *gorm.DB, cfg *config.Config, addr string) (db.User, string) {
+	t.Helper()
+	var user db.User
+	if err := database.Where("email = ?", addr).First(&user).Error; err != nil {
+		t.Fatalf("load %s: %v", addr, err)
+	}
+	_, raw, err := session.NewService(database, cfg).
+		CreateSession(context.Background(), user.ID, user.CredentialVersion, db.SessionTypeCookie, "127.0.0.1", "ua")
+	if err != nil {
+		t.Fatalf("create session for %s: %v", addr, err)
+	}
+	return user, raw
+}
+
+// linkIdentity completes one explicit ?link=true callback for the signed-in owner.
+func linkIdentity(t *testing.T, svc Service, cfg *config.Config, providerID, rawSession string) (*session.Session, error) {
+	t.Helper()
+	state, cookie := initiateLinked(t, svc, cfg, providerID, rawSession)
+	rec, req := callbackRequestWithSession(state, cookie, cfg, rawSession)
+	sess, _, _, err := svc.HandleCallback(req.Context(), rec, req, providerID, "code-1", state, db.SessionTypeCookie)
+	return sess, err
+}
+
+// TestLinkEmailOwnershipRejectsForeignAddress is the #89 scenario: a provider
+// account reporting an address another local account already owns must not be
+// linkable, and the address's owner must keep the identity available.
+func TestLinkEmailOwnershipRejectsForeignAddress(t *testing.T) {
+	const (
+		victimAddr   = "address-owner@example.test"
+		attackerAddr = "attacker@example.test"
+		sub          = "sub-squatted-identity"
+	)
+	for _, tc := range []struct{ name, providerEmail string }{
+		{name: "exact address", providerEmail: victimAddr},
+		{name: "case variant address", providerEmail: "ADDRESS-OWNER@example.test"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			database, cfg, _, svc := setupServiceTest(t, &UserInfo{
+				ProviderID: "google", ProviderUserID: sub,
+				Email: tc.providerEmail, EmailVerified: true,
+			})
+			signupPasswordVerified(t, database, cfg, victimAddr, "AddressOwner#2026!")
+			signupPasswordVerified(t, database, cfg, attackerAddr, "Attacker#2026!")
+			_, attackerSession := signIn(t, database, cfg, attackerAddr)
+
+			sess, err := linkIdentity(t, svc, cfg, "google", attackerSession)
+			if sess != nil {
+				t.Fatalf("session minted for %v; the rejection must not authorize the link", sess.UserID)
+			}
+			requireCode(t, err, errors.CodeOAuthAccountLinkConflict, http.StatusConflict)
+			requireIdentityRows(t, database, 2, 0, 1)
+
+			owner, ownerSession := signIn(t, database, cfg, victimAddr)
+			sess, err = linkIdentity(t, svc, cfg, "google", ownerSession)
+			if err != nil {
+				t.Fatalf("owner link = %v; want the rejected identity to stay available", err)
+			}
+			if sess.UserID != owner.ID {
+				t.Fatalf("session user = %v; want %v", sess.UserID, owner.ID)
+			}
+			requireIdentityRows(t, database, 2, 1, 3)
+			var links []db.OAuthAccount
+			if err := database.Where("provider_id = ? AND provider_user_id = ?", "google", sub).Find(&links).Error; err != nil {
+				t.Fatalf("load links: %v", err)
+			}
+			if len(links) != 1 {
+				t.Fatalf("links for the provider identity = %d; want 1", len(links))
+			}
+			if links[0].UserID != owner.ID {
+				t.Fatalf("link owner = %v; want %v", links[0].UserID, owner.ID)
+			}
+		})
+	}
+}
+
+// TestLinkEmailOwnershipAllowsOwnAddress pins the accept side: the owner's own
+// address links, and the same address may be linked again through a second
+// provider because oauth_accounts.email carries no unique constraint.
+func TestLinkEmailOwnershipAllowsOwnAddress(t *testing.T) {
+	const addr = "self-owned@example.test"
+	database := serviceTestDB(t)
+	cfg := serviceTestConfig()
+	svc := NewService(database, session.NewService(database, cfg), map[string]Provider{
+		"google": &stubProvider{id: "google", info: &UserInfo{
+			ProviderID: "google", ProviderUserID: "sub-self-google", Email: addr, EmailVerified: true}},
+		"facebook": &stubProvider{id: "facebook", info: &UserInfo{
+			ProviderID: "facebook", ProviderUserID: "sub-self-facebook", Email: addr, EmailVerified: true}},
+	}, cfg)
+
+	signupPasswordVerified(t, database, cfg, addr, "SelfOwned#2026!")
+	owner, rawSession := signIn(t, database, cfg, addr)
+	for _, providerID := range []string{"google", "facebook"} {
+		sess, err := linkIdentity(t, svc, cfg, providerID, rawSession)
+		if err != nil {
+			t.Fatalf("%s link = %v; want the owner's own address accepted", providerID, err)
+		}
+		if sess.UserID != owner.ID {
+			t.Fatalf("%s session user = %v; want %v", providerID, sess.UserID, owner.ID)
+		}
+	}
+	var links []db.OAuthAccount
+	if err := database.Order("provider_id").Find(&links).Error; err != nil {
+		t.Fatalf("load links: %v", err)
+	}
+	if len(links) != 2 {
+		t.Fatalf("links = %d; want one per provider", len(links))
+	}
+	for _, link := range links {
+		if link.UserID != owner.ID {
+			t.Fatalf("%s link owner = %v; want %v", link.ProviderID, link.UserID, owner.ID)
+		}
+		if link.Email != addr {
+			t.Fatalf("%s link email = %q; want %q", link.ProviderID, link.Email, addr)
+		}
+	}
+}
+
+// TestLinkEmailOwnershipAllowsSubjectOnlyIdentity pins that an identity with no
+// address gains no ownership query and keeps the trusted empty-address link.
+func TestLinkEmailOwnershipAllowsSubjectOnlyIdentity(t *testing.T) {
+	const addr = "subject-only-owner@example.test"
+	database := serviceTestDB(t)
+	cfg := serviceTestConfig()
+	svc := NewService(database, session.NewService(database, cfg), map[string]Provider{
+		"apple": &stubProvider{id: "apple", info: &UserInfo{
+			ProviderID: "apple", ProviderUserID: "sub-subject-apple"}},
+		"x": &stubProvider{id: "x", info: &UserInfo{
+			ProviderID: "x", ProviderUserID: "sub-subject-x"}},
+	}, cfg)
+
+	signupPasswordVerified(t, database, cfg, addr, "SubjectOnly#2026!")
+	owner, rawSession := signIn(t, database, cfg, addr)
+	for _, providerID := range []string{"apple", "x"} {
+		sess, err := linkIdentity(t, svc, cfg, providerID, rawSession)
+		if err != nil {
+			t.Fatalf("%s link = %v; want a subject-only identity accepted", providerID, err)
+		}
+		if sess.UserID != owner.ID {
+			t.Fatalf("%s session user = %v; want %v", providerID, sess.UserID, owner.ID)
+		}
+	}
+	var links []db.OAuthAccount
+	if err := database.Find(&links).Error; err != nil {
+		t.Fatalf("load links: %v", err)
+	}
+	if len(links) != 2 {
+		t.Fatalf("links = %d; want one per provider", len(links))
+	}
+	for _, link := range links {
+		if link.Email != "" {
+			t.Fatalf("%s link email = %q; want empty", link.ProviderID, link.Email)
+		}
+		if !link.Verified {
+			t.Fatalf("%s link verified = false; want the explicit attach to stay trusted", link.ProviderID)
+		}
+	}
+}
+
+// TestLinkEmailOwnershipRelinkIsIdempotent pins the returning-user step: the
+// same provider identity attached to the same owner again inserts nothing.
+func TestLinkEmailOwnershipRelinkIsIdempotent(t *testing.T) {
+	const addr = "relinked@example.test"
+	database, cfg, stub, rawSvc := setupServiceTest(t, &UserInfo{
+		ProviderID: "google", ProviderUserID: "sub-relink",
+		Email: addr, EmailVerified: true,
+	})
+	signupPasswordVerified(t, database, cfg, addr, "Relinked#2026!")
+	owner, rawSession := signIn(t, database, cfg, addr)
+	if _, err := linkIdentity(t, rawSvc, cfg, "google", rawSession); err != nil {
+		t.Fatalf("first link = %v", err)
+	}
+
+	user, linked, created, err := rawSvc.(*service).linkOrCreate(
+		context.Background(), "google", stub.info, owner.ID.String(), nil)
+	if err != nil {
+		t.Fatalf("relink = %v", err)
+	}
+	if linked || created {
+		t.Fatalf("relink linked=%v created=%v; want both false", linked, created)
+	}
+	if user.ID != owner.ID {
+		t.Fatalf("relink user = %v; want %v", user.ID, owner.ID)
+	}
+	if n := countRows(t, database, &db.OAuthAccount{}); n != 1 {
+		t.Fatalf("oauth_accounts = %d; want 1", n)
+	}
+}
+
+// TestLinkEmailOwnershipNewUserCallback pins the unclaimed-address first
+// login: an unauthenticated callback creates the account and its link.
+func TestLinkEmailOwnershipNewUserCallback(t *testing.T) {
+	const addr = "fresh-user@example.test"
+	database, cfg, _, svc := setupServiceTest(t, &UserInfo{
+		ProviderID: "google", ProviderUserID: "sub-fresh",
+		Email: addr, EmailVerified: true,
+	})
+	runCallback(t, svc, cfg)
+	requireIdentityRows(t, database, 1, 1, 1)
+
+	var link db.OAuthAccount
+	if err := database.First(&link).Error; err != nil {
+		t.Fatalf("load link: %v", err)
+	}
+	if link.Email != addr || !link.Verified {
+		t.Fatalf("link email=%q verified=%v; want %q and true", link.Email, link.Verified, addr)
+	}
+}
+
+// storeEmailFault injects a GetByEmail failure into both store views: the
+// service reads the address through the transaction it opens, so the tx view
+// must observe the same fault as the root view.
+type storeEmailFault struct {
+	db.Store
+	err error
+}
+
+func (s *storeEmailFault) Users() db.UserStore {
+	return &faultEmailUserStore{UserStore: s.Store.Users(), err: s.err}
+}
+
+func (s *storeEmailFault) Transaction(ctx context.Context, fn func(db.Store) error) error {
+	return s.Store.Transaction(ctx, func(tx db.Store) error {
+		return fn(&wrappedTxStore{Store: tx, users: &faultEmailUserStore{UserStore: tx.Users(), err: s.err}})
+	})
+}
+
+type faultEmailUserStore struct {
+	db.UserStore
+	err error
+}
+
+func (u *faultEmailUserStore) GetByEmail(context.Context, string) (*db.User, error) {
+	return nil, u.err
+}
+
+// TestLinkEmailOwnershipStoreFaults pins the miss/failure contract of the
+// ownership probe. An email collision can never raise a unique violation:
+// oauth_accounts has no unique index on email, so this rejection is enforced in
+// the service alone. The identity-column 23505 keeps converging on the winning
+// row through relinkExisting.
+func TestLinkEmailOwnershipStoreFaults(t *testing.T) {
+	const addr = "store-fault@example.test"
+	for _, tc := range []struct {
+		name      string
+		storeErr  error
+		wantCode  errors.Code
+		wantLinks int
+	}{
+		{name: "store failure is internal", storeErr: gorm.ErrInvalidDB, wantCode: errors.CodeInternalError},
+		{name: "record not found is a miss", storeErr: gorm.ErrRecordNotFound, wantLinks: 1},
+		{name: "user not found is a miss", storeErr: errors.ErrUserNotFound, wantLinks: 1},
+		{name: "nil owner without error is a miss", wantLinks: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			database, cfg, stub, rawSvc := setupServiceTest(t, &UserInfo{
+				ProviderID: "google", ProviderUserID: "sub-store-fault",
+				Email: addr, EmailVerified: true,
+			})
+			signupPasswordVerified(t, database, cfg, addr, "StoreFault#2026!")
+			_, rawSession := signIn(t, database, cfg, addr)
+			base := rawSvc.(*service).store
+			svc := NewServiceWithStore(
+				&storeEmailFault{Store: base, err: tc.storeErr},
+				session.NewService(database, cfg), map[string]Provider{"google": stub}, cfg)
+
+			sess, err := linkIdentity(t, svc, cfg, "google", rawSession)
+			if tc.wantCode != "" {
+				if sess != nil {
+					t.Fatalf("session minted for %v on a store failure", sess.UserID)
+				}
+				requireCode(t, err, tc.wantCode, http.StatusInternalServerError)
+			} else if err != nil {
+				t.Fatalf("link = %v; want the probe treated as a miss", err)
+			}
+			if n := countRows(t, database, &db.OAuthAccount{}); n != int64(tc.wantLinks) {
+				t.Fatalf("oauth_accounts = %d; want %d", n, tc.wantLinks)
+			}
+		})
+	}
+}
+
 func TestUnverifiedLinkAuthenticatesItsOwner(t *testing.T) {
 	const addr = "unverified-owner@example.test"
 	unverified := func(sub string) *UserInfo {
