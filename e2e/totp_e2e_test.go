@@ -16,6 +16,7 @@ import (
 	ptotp "github.com/pquerna/otp/totp"
 
 	"github.com/kaiizer777/go-auth/config"
+	"github.com/kaiizer777/go-auth/crypto"
 )
 
 const e2eTOTPEncryptionKey = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
@@ -447,7 +448,7 @@ var e2eTOTPKeyring = func() string {
 // silent 2FA bypass: the server enables TOTP, enrollment writes an envelope, and
 // a live code confirms it.
 func TestE2E_TOTPJourney_KeyringOnly(t *testing.T) {
-	server, client, capture, _ := setupE2EServerWithConfig(t, func(cfg *config.Config) {
+	server, client, capture, sqlDB := setupE2EServerWithConfig(t, func(cfg *config.Config) {
 		cfg.RequireEmailVerification = true
 		cfg.TOTP.EncryptionKey = ""
 		cfg.TOTP.Keyring = e2eTOTPKeyring
@@ -490,5 +491,35 @@ func TestE2E_TOTPJourney_KeyringOnly(t *testing.T) {
 	resp, body = getJSON(t, client, server.URL+"/auth/totp/status")
 	if resp.StatusCode != http.StatusOK || body["enabled"] != true {
 		t.Fatalf("expected enabled=true after confirm, got %d: %v", resp.StatusCode, body)
+	}
+
+	// A row that stayed legacy would still confirm and verify, so the stored
+	// bytes have to prove the envelope: it must parse with the configured kid
+	// and open under the owner binding to the secret the server handed out.
+	var (
+		userID string
+		stored []byte
+	)
+	if err := sqlDB.QueryRow("SELECT id FROM users WHERE email = $1", email).Scan(&userID); err != nil {
+		t.Fatalf("read enrolled user: %v", err)
+	}
+	if err := sqlDB.QueryRow("SELECT encrypted_secret FROM totp_secrets WHERE user_id = $1", userID).Scan(&stored); err != nil {
+		t.Fatalf("read stored secret: %v", err)
+	}
+
+	ring, err := crypto.ParseKeyring(e2eTOTPKeyring)
+	if err != nil {
+		t.Fatalf("parse e2e keyring: %v", err)
+	}
+	sealer := crypto.NewSecretSealer(ring)
+	if kid, ok := sealer.EnvelopeKeyID(stored); !ok || kid != "primary" {
+		t.Fatalf("stored secret = %q; want an envelope under kid primary", stored)
+	}
+	plaintext, err := sealer.Open(userID, "encrypted_secret", stored)
+	if err != nil {
+		t.Fatalf("open stored envelope: %v", err)
+	}
+	if string(plaintext) != secret {
+		t.Fatalf("stored envelope holds %q, want the enrolled secret", plaintext)
 	}
 }
