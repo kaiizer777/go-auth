@@ -109,7 +109,7 @@ func TestFacebookProvider_AuthCodeURL(t *testing.T) {
 	}
 }
 
-func TestFacebookProvider_AuthCodeURL_GraphVersionPrefix(t *testing.T) {
+func TestFacebookProvider_AuthCodeURL_GraphVersion(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
