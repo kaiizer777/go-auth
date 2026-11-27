@@ -452,6 +452,10 @@ func TestLinkedAccountToken_Refresh(t *testing.T) {
 
 		stored := reloadTokenLink(t, database, link.ID)
 		requireStoredGrant(t, stored, "rotated-access", "rotated-refresh")
+		// The refresh grant carries no scope: RFC 6749 §6 keeps the stored one.
+		if stored.TokenScope != tokenTestScope {
+			t.Fatalf("token scope = %q; want the unchanged grant scope %q", stored.TokenScope, tokenTestScope)
+		}
 		want, ferr := tokenTestSealer(t).RefreshTokenFingerprint("rotated-refresh")
 		if ferr != nil {
 			t.Fatalf("fingerprint: %v", ferr)

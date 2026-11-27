@@ -482,6 +482,11 @@ func (s *service) exchangeRefreshToken(ctx context.Context, link db.OAuthAccount
 	if err != nil {
 		return nil, err
 	}
+	// RFC 6749 §6: a refresh response that omits scope leaves the grant
+	// unchanged, and the CAS rewrites every token column.
+	if rec.TokenScope == "" {
+		rec.TokenScope = link.TokenScope
+	}
 	won, err := s.store.OAuthAccounts().SaveOAuthTokensCAS(ctx, link.ID, link.RefreshTokenFingerprint, rec)
 	if err != nil {
 		logTokenEvent(ctx, "oauth_token_refresh_persist_failed", link)
@@ -986,8 +991,8 @@ func (s *service) insertLink(ctx context.Context, accountStore db.OAuthAccountSt
 
 // sealedTokens builds the sealed grant for the row identified by accountID. The
 // AAD always comes from the persisted row, never from the callback argument. A
-// grant without a refresh token stores empty values instead of reusing an older
-// one: providers rotate it away on every exchange.
+// grant without a refresh token yields an empty refresh envelope: readers that
+// must keep a stored one preserve it themselves (see writeGrant).
 func (s *service) sealedTokens(providerID, accountID string, tokens *OAuthToken) (db.OAuthTokenRecord, error) {
 	rec := db.OAuthTokenRecord{
 		TokenExpiresAt: tokenExpiry(tokens),
@@ -1326,7 +1331,12 @@ func (s *service) createUserAndLink(ctx context.Context, providerID string, info
 func (s *service) persistTokens(ctx context.Context, link db.OAuthAccount, tokens *OAuthToken) {
 	rec, err := s.sealedTokens(link.ProviderID, link.ID.String(), tokens)
 	if err == nil {
-		err = s.store.OAuthAccounts().SaveOAuthTokens(ctx, link.ID, rec)
+		// RFC 6749 §4.1.4 makes the code exchange's scope optional; an omitted
+		// value must not blank a granted scope the row still describes.
+		if rec.TokenScope == "" {
+			rec.TokenScope = link.TokenScope
+		}
+		err = s.writeGrant(ctx, link, rec, tokens)
 	}
 	if err != nil {
 		slog.ErrorContext(ctx, "oauth_token_persist_failed",
@@ -1334,6 +1344,23 @@ func (s *service) persistTokens(ctx context.Context, link db.OAuthAccount, token
 			"account_id", link.ID.String(),
 		)
 	}
+}
+
+// writeGrant stores rec for an existing row, keeping a stored refresh envelope
+// the new grant did not replace: providers that issue a refresh token on first
+// consent only would otherwise lose the credential a re-login never re-issues.
+// The preserving write is a CAS on the stored fingerprint, so a concurrent
+// rotation wins instead of being overwritten by the older grant.
+func (s *service) writeGrant(ctx context.Context, link db.OAuthAccount, rec db.OAuthTokenRecord, tokens *OAuthToken) error {
+	keepStoredRefresh := tokens != nil && tokens.RefreshToken == "" &&
+		link.RefreshTokenCiphertext != "" && link.RefreshTokenFingerprint != ""
+	if !keepStoredRefresh {
+		return s.store.OAuthAccounts().SaveOAuthTokens(ctx, link.ID, rec)
+	}
+	rec.RefreshTokenCiphertext = link.RefreshTokenCiphertext
+	rec.RefreshTokenFingerprint = link.RefreshTokenFingerprint
+	_, err := s.store.OAuthAccounts().SaveOAuthTokensCAS(ctx, link.ID, link.RefreshTokenFingerprint, rec)
+	return err
 }
 
 // linkOrCreate executes the linking decision tree. Returns the user plus
@@ -1371,10 +1398,11 @@ func (s *service) linkOrCreate(ctx context.Context, providerID string, info *Use
 			s.invalidateLink(ctx, link)
 			return db.User{}, false, false, errors.ErrOAuthEmailUnverified
 		}
-		// Unconditional: the provider rotates the refresh token on every grant,
-		// so the stored one is stale the moment this callback succeeds. The
-		// identity decision above already stands, therefore a failure here must
-		// not fail the login — the next callback repairs the row.
+		// Unconditional attempt: the provider may rotate the refresh token on
+		// this grant. The identity decision above already stands, so a store
+		// failure must not fail the login — the next callback repairs the row.
+		// A grant that omits the refresh token keeps the stored one (see
+		// persistTokens).
 		s.persistTokens(ctx, link, tokens)
 		return user, false, false, nil
 	}

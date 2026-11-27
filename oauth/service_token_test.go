@@ -236,6 +236,50 @@ func TestTokenPersistence(t *testing.T) {
 		}
 	})
 
+	t.Run("returning login without a refresh token keeps the stored one", func(t *testing.T) {
+		database, cfg, stub, svc := setupServiceTest(t, verifiedInfo())
+		stub.token = tokenTestGrant()
+		runCallback(t, svc, cfg)
+		first := loadTokenLink(t, database, "sub-123")
+
+		// Providers that issue a refresh token on first consent only answer a
+		// later login without one; the stored grant must survive that login.
+		stub.token = &OAuthToken{AccessToken: "relogin-access", ExpiresIn: 600}
+		runCallback(t, svc, cfg)
+
+		second := loadTokenLink(t, database, "sub-123")
+		requireStoredGrant(t, second, "relogin-access", tokenTestRefresh)
+		if second.RefreshTokenCiphertext != first.RefreshTokenCiphertext {
+			t.Fatal("refresh envelope rewritten by a grant that carried no refresh token")
+		}
+		if second.RefreshTokenFingerprint != first.RefreshTokenFingerprint {
+			t.Fatalf("fingerprint = %q; want the stored %q", second.RefreshTokenFingerprint, first.RefreshTokenFingerprint)
+		}
+		if second.AccessTokenCiphertext == first.AccessTokenCiphertext {
+			t.Fatal("access token ciphertext unchanged; the login grant was not stored")
+		}
+		// The scope-less grant must not blank the granted scope either.
+		if second.TokenScope != tokenTestScope {
+			t.Fatalf("token scope = %q; want the unchanged %q", second.TokenScope, tokenTestScope)
+		}
+	})
+
+	t.Run("refresh-less login does not overwrite a concurrent rotation", func(t *testing.T) {
+		provider := &stubRefreshProvider{stubProvider: &stubProvider{id: "google"}}
+		database, svc, link, _ := tokenAccessEnv(t, provider, tokenTestGrant(), nil)
+		rotateGrant(t, svc, link, &OAuthToken{AccessToken: "winner-access", RefreshToken: "winner-refresh", ExpiresIn: 3600})
+		won := reloadTokenLink(t, database, link.ID)
+
+		// The login read the row before the rotation; its CAS must lose.
+		svc.persistTokens(context.Background(), link, &OAuthToken{AccessToken: "relogin-access", ExpiresIn: 600})
+
+		stored := reloadTokenLink(t, database, link.ID)
+		requireStoredGrant(t, stored, "winner-access", "winner-refresh")
+		if stored.AccessTokenCiphertext != won.AccessTokenCiphertext {
+			t.Fatal("login overwrote the winner's grant")
+		}
+	})
+
 	t.Run("merge path stores the sealed grant", func(t *testing.T) {
 		database, cfg, stub, svc := setupServiceTest(t, &UserInfo{
 			ProviderID: "google", ProviderUserID: "sub-merge",
