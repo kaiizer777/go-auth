@@ -23,13 +23,14 @@ const rewrapBatchSize = 200
 // partial sweep locks out the users it already migrated. That risk is why the
 // sweep is an explicit call and never a startup hook.
 //
-// The sweep is idempotent and resumable. Rows already on the active kid are
-// skipped without a write, each row commits on its own, and a row's ciphertext
-// and key-id hint are written by a single CAS-guarded statement, so an
-// interruption leaves every row either fully migrated or untouched. Infrastructure
-// failures return an error; a row that no ring key can open aborts the run
-// because that row is a future lockout, and the count of rows already rewritten
-// travels with the error.
+// The sweep is idempotent and resumable. Every candidate row is opened; one that
+// already carries the active kid is skipped without a write, so a corrupt row is
+// surfaced as an abort rather than counted as migrated. Each row commits on its
+// own, and a row's ciphertext and key-id hint are written by a single CAS-guarded
+// statement, so an interruption leaves every row either fully migrated or
+// untouched. Infrastructure failures return an error; a row that no ring key can
+// open aborts the run because that row is a future lockout, and the count of rows
+// already rewritten travels with the error.
 func RewrapSecrets(ctx context.Context, store db.Store, cfg config.TOTPConfig, logger *slog.Logger) (int, error) {
 	if store == nil {
 		panic("totp: nil db.Store")
@@ -99,17 +100,22 @@ type secretSweeper struct {
 }
 
 // rewrap moves one row onto the active key. A row already sealed under the
-// active kid is skipped; a CAS miss means a concurrent writer (an enrolment
-// recreating the pending row) owns it now, so it is skipped rather than retried.
+// active kid is opened to prove it is readable and then skipped; a CAS miss
+// means a concurrent writer (an enrolment recreating the pending row) owns it
+// now, so it is skipped rather than retried.
 func (s *secretSweeper) rewrap(ctx context.Context, row db.TotpSecretRewrap) (bool, error) {
-	if kid, ok := s.crypt.EnvelopeKeyID(row.EncryptedSecret); ok && kid == s.activeKid {
-		return false, nil
-	}
-
+	// Open before consulting the kid: the kid is an unauthenticated claim, so a
+	// corrupt blob that merely names the active kid must abort as unopenable
+	// instead of being skipped as already migrated.
 	plaintext, err := s.crypt.Decrypt(row.UserID, row.EncryptedSecret)
 	if err != nil {
 		return false, fmt.Errorf("secret %s (user %s) cannot be opened by any ring key: %w", row.ID, row.UserID, err)
 	}
+	if kid, ok := s.crypt.EnvelopeKeyID(row.EncryptedSecret); ok && kid == s.activeKid {
+		clear(plaintext)
+		return false, nil
+	}
+
 	sealed, sealErr := s.crypt.Encrypt(row.UserID, plaintext)
 	clear(plaintext)
 	if sealErr != nil {

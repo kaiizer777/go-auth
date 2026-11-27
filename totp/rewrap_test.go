@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"strings"
 	"sync/atomic"
@@ -233,7 +234,7 @@ func TestRewrapSecrets_SkipsRowsAlreadyOnActiveKid(t *testing.T) {
 	if err != nil {
 		t.Fatalf("seal: %v", err)
 	}
-	row := seedSecret(t, database, store, "rewrap-skip-2@example.com", sealed, true)
+	row := seedSecretFor(t, store, user.ID, sealed, true)
 
 	rewritten, err := RewrapSecrets(context.Background(), store, cfg, nil)
 	if err != nil {
@@ -245,6 +246,72 @@ func TestRewrapSecrets_SkipsRowsAlreadyOnActiveKid(t *testing.T) {
 	if !bytes.Equal(storedBlob(t, store, row.UserID), sealed) {
 		t.Fatal("row on the active kid was rewritten")
 	}
+}
+
+func TestRewrapSecrets_CorruptRowClaimingActiveKidAborts(t *testing.T) {
+	t.Parallel()
+
+	database := setupTestDB(t)
+	store := gormstoreOf(t, database)
+
+	cfg := config.TOTPConfig{EncryptionKey: validTestHexKey()}
+	crypt, err := NewCrypto(cfg)
+	if err != nil {
+		t.Fatalf("NewCrypto: %v", err)
+	}
+	user := createTestUser(t, database, "rewrap-corrupt-kid@example.com", true)
+	sealed, err := crypt.Encrypt(user.ID, []byte(legacyFixtureSecret))
+	if err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+	corrupt := corruptSealedCiphertext(t, sealed)
+	row := seedSecretFor(t, store, user.ID, corrupt, true)
+
+	// The claim names the active kid, yet the blob no longer authenticates.
+	if kid, ok := crypt.EnvelopeKeyID(corrupt); !ok || kid != crypt.ActiveKeyID() {
+		t.Fatalf("corrupt row kid = (%q, %v), want the active kid", kid, ok)
+	}
+	if _, err := crypt.Decrypt(user.ID, corrupt); err == nil {
+		t.Fatal("corrupt row still opens")
+	}
+
+	rewritten, err := RewrapSecrets(context.Background(), store, cfg, nil)
+	if err == nil {
+		t.Fatal("RewrapSecrets skipped a corrupt row claiming the active kid")
+	}
+	if rewritten != 0 {
+		t.Fatalf("rewritten = %d, want 0", rewritten)
+	}
+	if !strings.Contains(err.Error(), row.UserID.String()) {
+		t.Errorf("error does not name the failing owner: %v", err)
+	}
+	if !bytes.Equal(storedBlob(t, store, row.UserID), corrupt) {
+		t.Fatal("corrupt row was modified")
+	}
+}
+
+// corruptSealedCiphertext keeps the envelope structurally valid and its kid
+// claim intact, but flips a ciphertext bit so it can no longer be opened.
+func corruptSealedCiphertext(t *testing.T, envelope []byte) []byte {
+	t.Helper()
+
+	var doc map[string]any
+	if err := json.Unmarshal(envelope, &doc); err != nil {
+		t.Fatalf("decode envelope: %v", err)
+	}
+	ct, _ := doc["ct"].(string)
+	raw, err := base64.RawURLEncoding.Strict().DecodeString(ct)
+	if err != nil {
+		t.Fatalf("decode ct: %v", err)
+	}
+	raw[0] ^= 0xff
+	doc["ct"] = base64.RawURLEncoding.EncodeToString(raw)
+
+	out, err := json.Marshal(doc)
+	if err != nil {
+		t.Fatalf("encode envelope: %v", err)
+	}
+	return out
 }
 
 func TestRewrapSecrets_UnopenableRowAbortsAndPreservesBytes(t *testing.T) {
