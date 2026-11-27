@@ -439,9 +439,10 @@ func TestE2E_FullBrowserOAuthJourneys(t *testing.T) {
 			t.Fatalf("discord link provider_user_id = %q; want %q", gotKeys["discord"], "discord-snowflake-888")
 		}
 
-		// The active session decides the link owner even when the provider
-		// presents an address another local account already owns.
-		t.Run("discord link wins over the provider address owner", func(t *testing.T) {
+		// The provider address belongs to another verified local account, so the
+		// explicit link is refused: persisting it would squat that account's
+		// address and permanently claim the provider identity it reported.
+		t.Run("discord link is refused when the address is owned elsewhere", func(t *testing.T) {
 			h, dbConn, pReg, cfg := setupOAuthE2EStack(t)
 
 			msIdP, err := oauthmock.NewMicrosoftIdP(cfg.BaseURL + "/auth/oauth/microsoft/callback")
@@ -495,7 +496,7 @@ func TestE2E_FullBrowserOAuthJourneys(t *testing.T) {
 			}
 
 			// The claimed address already belongs to a verified account with a
-			// password; the link must not move the identity onto that account.
+			// password; the link must not claim it on the session user's behalf.
 			owner := db.User{
 				ID:            uuid.New(),
 				Email:         discordIdP.Email,
@@ -509,22 +510,30 @@ func TestE2E_FullBrowserOAuthJourneys(t *testing.T) {
 			linkAuthorizeURL, linkCookies := initiateOAuth(t, h, "discord", "?link=true&redirect_url=/settings/links", sessionCookie)
 			linkCallback := authorizeAtIdP(t, linkAuthorizeURL)
 			linkRec := callbackOAuth(t, h, linkCallback, append(linkCookies, sessionCookie)...)
-			if linkRec.Code != http.StatusFound {
-				t.Fatalf("discord link callback = %d (%s); want 302", linkRec.Code, linkRec.Body.String())
+			if linkRec.Code != http.StatusConflict {
+				t.Fatalf("discord link callback = %d (%s); want 409", linkRec.Code, linkRec.Body.String())
 			}
-			if got, want := linkRec.Header().Get("Location"), "/settings/links"; got != want {
-				t.Fatalf("discord link redirect = %q; want %q", got, want)
-			}
+			assertErrorCode(t, linkRec, "OAUTH_ACCOUNT_LINK_CONFLICT")
 
 			var discordLinks []db.OAuthAccount
 			if err := dbConn.Where("provider_id = ?", "discord").Find(&discordLinks).Error; err != nil {
 				t.Fatalf("query discord links: %v", err)
 			}
-			if len(discordLinks) != 1 {
-				t.Fatalf("expected 1 discord link after the collision, got %d", len(discordLinks))
+			if len(discordLinks) != 0 {
+				t.Fatalf("expected no discord link after the refusal, got %d", len(discordLinks))
 			}
-			if discordLinks[0].UserID != sessionUser.ID {
-				t.Fatalf("discord link user_id = %s; want the session user %s", discordLinks[0].UserID, sessionUser.ID)
+
+			var sessionLinks []db.OAuthAccount
+			if err := dbConn.Where("user_id = ?", sessionUser.ID).Find(&sessionLinks).Error; err != nil {
+				t.Fatalf("query session user links: %v", err)
+			}
+			if len(sessionLinks) != 1 || sessionLinks[0].ProviderID != "microsoft" {
+				t.Fatalf("session user links = %+v; want only the microsoft identity", sessionLinks)
+			}
+
+			var sessCount int64
+			if err := dbConn.Model(&db.Session{}).Where("user_id = ?", sessionUser.ID).Count(&sessCount).Error; err != nil || sessCount != 1 {
+				t.Fatalf("expected the refused link to mint no session, got count=%d err=%v", sessCount, err)
 			}
 
 			var ownerLinkCount int64
