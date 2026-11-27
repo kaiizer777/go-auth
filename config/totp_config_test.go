@@ -2,6 +2,8 @@ package config
 
 import (
 	"bytes"
+	"encoding/base64"
+	"fmt"
 	"log/slog"
 	"strings"
 	"testing"
@@ -16,6 +18,12 @@ func validTOTPBase() Config {
 	cfg.BaseURL = "https://example.com"
 	cfg.TOTP.EncryptionKey = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 	return cfg
+}
+
+// testTOTPKeyring renders a single-entry kid:base64 keyring that parses.
+func testTOTPKeyring(kid string) string {
+	key := bytes.Repeat([]byte{0x2a}, 32)
+	return kid + ":" + base64.StdEncoding.EncodeToString(key)
 }
 
 func TestTOTPDefaults(t *testing.T) {
@@ -105,6 +113,54 @@ func TestConfigValidate_TOTP(t *testing.T) {
 			},
 			wantErr: errors.ErrTOTPAttemptWindowInvalid,
 		},
+		{
+			name: "keyring alongside the hex key passes",
+			mutate: func(c *Config) {
+				c.TOTP.Keyring = testTOTPKeyring("k2")
+			},
+			wantErr: nil,
+		},
+		{
+			name: "keyring only passes",
+			mutate: func(c *Config) {
+				c.TOTP.EncryptionKey = ""
+				c.TOTP.Keyring = testTOTPKeyring("k2")
+			},
+			wantErr: nil,
+		},
+		{
+			name:    "neither key surface still passes",
+			mutate:  func(c *Config) { c.TOTP.EncryptionKey = "" },
+			wantErr: nil,
+		},
+		{
+			name: "malformed keyring fails ErrTOTPKeyringInvalid",
+			mutate: func(c *Config) {
+				c.TOTP.Keyring = "k2:not-base64"
+			},
+			wantErr: errors.ErrTOTPKeyringInvalid,
+		},
+		{
+			name: "keyring with a short key fails ErrTOTPKeyringInvalid",
+			mutate: func(c *Config) {
+				c.TOTP.Keyring = "k2:" + base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0x2a}, 16))
+			},
+			wantErr: errors.ErrTOTPKeyringInvalid,
+		},
+		{
+			name: "whitespace-only keyring fails ErrTOTPKeyringInvalid",
+			mutate: func(c *Config) {
+				c.TOTP.Keyring = "   "
+			},
+			wantErr: errors.ErrTOTPKeyringInvalid,
+		},
+		{
+			name: "duplicate kid in the keyring fails ErrTOTPKeyringInvalid",
+			mutate: func(c *Config) {
+				c.TOTP.Keyring = testTOTPKeyring("k2") + "," + testTOTPKeyring("k2")
+			},
+			wantErr: errors.ErrTOTPKeyringInvalid,
+		},
 	}
 
 	for _, tt := range tests {
@@ -173,5 +229,43 @@ func TestTOTPConfig_LogValueRedaction(t *testing.T) {
 	}
 	if !strings.Contains(output, "[REDACTED]") {
 		t.Errorf("expected [REDACTED] in log output: %s", output)
+	}
+}
+
+func TestTOTPConfig_KeyringRedaction(t *testing.T) {
+	t.Parallel()
+
+	keyring := testTOTPKeyring("k2")
+	cfg := TOTPConfig{EncryptionKey: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", Keyring: keyring, Issuer: "test-app"}
+
+	for _, attr := range cfg.LogValue().Group() {
+		if attr.Key != "keyring" {
+			continue
+		}
+		if got := attr.Value.String(); got != "[REDACTED]" {
+			t.Fatalf("LogValue keyring = %q, want [REDACTED]", got)
+		}
+	}
+
+	if strings.Contains(cfg.String(), keyring) {
+		t.Fatalf("String() leaked the keyring: %q", cfg.String())
+	}
+	if !strings.Contains(cfg.String(), "Keyring: [REDACTED]") {
+		t.Fatalf("String() did not mask the keyring: %q", cfg.String())
+	}
+	for _, verb := range []string{"%v", "%+v", "%#v", "%s"} {
+		if out := fmt.Sprintf(verb, cfg); strings.Contains(out, keyring) || strings.Contains(out, keyring[:16]) {
+			t.Fatalf("%s leaked the keyring: %s", verb, out)
+		}
+	}
+
+	unset := TOTPConfig{Issuer: "test-app"}
+	if strings.Contains(unset.String(), "[REDACTED]") {
+		t.Fatalf("unset keyring should not be redacted: %q", unset.String())
+	}
+	for _, attr := range unset.LogValue().Group() {
+		if attr.Key == "keyring" && attr.Value.String() != "" {
+			t.Fatalf("unset keyring LogValue = %q, want empty", attr.Value.String())
+		}
 	}
 }

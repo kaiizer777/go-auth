@@ -204,6 +204,7 @@ type SecurityHeadersConfig struct {
 // TOTPConfig groups configuration settings for RFC 6238 TOTP two-factor authentication.
 type TOTPConfig struct {
 	EncryptionKey        string        // 64-hex AES-256 key (32 bytes)
+	Keyring              string        // Optional `kid:base64key[,…]` ring; the hex key joins it under kid "legacy"
 	Issuer               string        // App name / issuer for OTP URI; default "go-auth"
 	ChallengeTokenTTL    time.Duration // Default: 10m; valid range: 1m–30m
 	AttemptWindow        time.Duration // Default: 5m; min: 1m
@@ -212,12 +213,9 @@ type TOTPConfig struct {
 
 // LogValue implements slog.LogValuer to prevent secret encryption key leakage in logs.
 func (t TOTPConfig) LogValue() slog.Value {
-	keyMasked := "[REDACTED]"
-	if t.EncryptionKey == "" {
-		keyMasked = ""
-	}
 	return slog.GroupValue(
-		slog.String("encryption_key", keyMasked),
+		slog.String("encryption_key", maskSecret(t.EncryptionKey)),
+		slog.String("keyring", maskSecret(t.Keyring)),
 		slog.String("issuer", t.Issuer),
 		slog.Duration("challenge_token_ttl", t.ChallengeTokenTTL),
 		slog.Duration("attempt_window", t.AttemptWindow),
@@ -227,16 +225,19 @@ func (t TOTPConfig) LogValue() slog.Value {
 
 // String implements fmt.Stringer to ensure EncryptionKey is masked when formatted.
 func (t TOTPConfig) String() string {
-	keyMasked := "[REDACTED]"
-	if t.EncryptionKey == "" {
-		keyMasked = ""
-	}
-	return fmt.Sprintf("TOTPConfig{EncryptionKey: %s, Issuer: %s, ChallengeTokenTTL: %v, AttemptWindow: %v, MaxAttemptsPerWindow: %d}",
-		keyMasked, t.Issuer, t.ChallengeTokenTTL, t.AttemptWindow, t.MaxAttemptsPerWindow)
+	return fmt.Sprintf("TOTPConfig{EncryptionKey: %s, Keyring: %s, Issuer: %s, ChallengeTokenTTL: %v, AttemptWindow: %v, MaxAttemptsPerWindow: %d}",
+		maskSecret(t.EncryptionKey), maskSecret(t.Keyring), t.Issuer, t.ChallengeTokenTTL, t.AttemptWindow, t.MaxAttemptsPerWindow)
 }
 
 // GoString implements fmt.GoStringer so %#v masks EncryptionKey.
 func (t TOTPConfig) GoString() string { return "config." + t.String() }
+
+func maskSecret(value string) string {
+	if value == "" {
+		return ""
+	}
+	return "[REDACTED]"
+}
 
 // DefaultTOTPConfig returns safe production defaults for TOTP configuration.
 func DefaultTOTPConfig() TOTPConfig {
@@ -959,6 +960,14 @@ func (c *Config) validate() error {
 		}
 		if _, err := hex.DecodeString(c.TOTP.EncryptionKey); err != nil {
 			return errors.ErrTOTPEncryptionKeyInvalid
+		}
+	}
+	// A non-empty ring must parse here so a typo fails at startup instead of on
+	// the first enrolment. Both surfaces may be set at once: the constructor
+	// appends the hex key to the ring as a decryption-only entry.
+	if c.TOTP.Keyring != "" {
+		if _, err := crypto.ParseKeyring(c.TOTP.Keyring); err != nil {
+			return errors.ErrTOTPKeyringInvalid
 		}
 	}
 
