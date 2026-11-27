@@ -705,6 +705,17 @@ func TestMigration000013_AddsTotpSecretKid(t *testing.T) {
 	if !strings.Contains(mysqlDown, "ALTER TABLE totp_secrets DROP COLUMN secret_kid;") {
 		t.Fatalf("mysql migration 13 down must drop secret_kid: %q", mysqlDown)
 	}
+	// golang-migrate stamps the down target, not the version it is leaving, so a
+	// failed down is recovered by forcing 12 - never by re-running the ALTER.
+	if !strings.Contains(mysqlDown, "down target, 12, as dirty") {
+		t.Errorf("mysql migration 13 down must name the dirty down target: %q", mysqlDown)
+	}
+	if !strings.Contains(mysqlDown, "migrate force 12") {
+		t.Errorf("mysql migration 13 down must recover with `migrate force 12`: %q", mysqlDown)
+	}
+	if strings.Contains(mysqlDown, "force 13") {
+		t.Errorf("mysql migration 13 down must not force the up version: %q", mysqlDown)
+	}
 
 	for name, content := range map[string]string{
 		"postgres up":   postgresUp,
