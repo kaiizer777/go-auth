@@ -16,10 +16,12 @@ Both fields live under `TOTP` and either one enables two-factor authentication:
 | `Keyring` | `kid:base64key[,kid:base64key…]`, the same grammar as `OAuth.TokenKEK`. The first entry encrypts, every entry decrypts. |
 
 They combine into a single ring at construction: the configured keyring first,
-then the hex key appended as a decryption-only entry under the fixed kid
-`legacy`. Consequences:
+then the hex key under the fixed kid `legacy`. That entry is decryption-only when
+a `Keyring` precedes it; with no `Keyring`, it is the ring head and encrypts as
+well. Consequences:
 
-- `EncryptionKey` only — unchanged deployments start and read every existing row.
+- `EncryptionKey` only — the hex key is the ring head, so it encrypts new rows
+  and still reads every existing one.
 - `Keyring` + `EncryptionKey` — new writes use the ring head, the old key still
   opens every legacy row and every row sealed under `legacy`. This is the
   rotation path.

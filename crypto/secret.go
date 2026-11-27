@@ -55,6 +55,11 @@ func (s *SecretSealer) Seal(subject, field string, plaintext []byte) ([]byte, er
 // length or first byte: a legacy nonce is random, so roughly 1 in 256 legacy
 // rows begins with '{'. They are opened under every ring entry, because the
 // operator may have parked the old key under any kid.
+//
+// The legacy attempt needs the blob to fit the parsing budget (maxSecretBlob,
+// well above any row this library wrote). A larger blob is refused with
+// ErrEnvelopeTooLarge before it is parsed, so it is never opened as an envelope
+// and never reaches the legacy path either.
 func (s *SecretSealer) Open(subject, field string, blob []byte) ([]byte, error) {
 	if s == nil || s.sealer == nil {
 		return nil, ErrSealerUnconfigured

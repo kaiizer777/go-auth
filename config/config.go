@@ -255,8 +255,9 @@ func DefaultTOTPConfig() TOTPConfig {
 const legacyTOTPKeyID = "legacy"
 
 // KeyringSpec returns the exact ring spec the TOTP service builds: Keyring
-// followed by the hex EncryptionKey under kid "legacy" as a decryption-only
-// entry. An empty result means neither key surface is configured.
+// followed by the hex EncryptionKey under kid "legacy". That entry only decrypts
+// when a Keyring precedes it; with an empty Keyring it is the ring head and
+// encrypts. An empty result means neither key surface is configured.
 func (t TOTPConfig) KeyringSpec() (string, error) {
 	if t.EncryptionKey == "" {
 		return t.Keyring, nil
