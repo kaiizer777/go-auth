@@ -511,6 +511,10 @@ func TestMigrations_NoExplicitTransactionWrappers(t *testing.T) {
 		"migrations/000010_resolve_microsoft_oid_links.down.sql",
 		"migrations/000011_add_oauth_account_tenant.up.sql",
 		"migrations/000011_add_oauth_account_tenant.down.sql",
+		"migrations/000012_add_oauth_account_tokens.up.sql",
+		"migrations/000012_add_oauth_account_tokens.down.sql",
+		"migrations/mysql/000012_add_oauth_account_tokens.up.sql",
+		"migrations/mysql/000012_add_oauth_account_tokens.down.sql",
 	}
 
 	for _, file := range files {
@@ -612,6 +616,59 @@ func TestMigration000011_TenantQualifiesIdentityKey(t *testing.T) {
 	}
 	if !strings.Contains(string(downData), "DROP COLUMN IF EXISTS provider_tenant_id") {
 		t.Fatal("migration 11 down must drop the tenant column it added")
+	}
+}
+
+// TestMigration000012_AddsOAuthAccountTokens pins the token schema for #54: the
+// four non-expiry columns are NOT NULL with an empty-string default so a legacy
+// row reads as "no token stored", the expiry stays nullable, and the down
+// migration drops exactly the columns the up added.
+func TestMigration000012_AddsOAuthAccountTokens(t *testing.T) {
+	data, err := defaultMigrationsFS.ReadFile("migrations/000012_add_oauth_account_tokens.up.sql")
+	if err != nil {
+		t.Fatalf("failed to read migration 12 up: %v", err)
+	}
+	content := string(data)
+
+	columns := []struct{ name, definition string }{
+		{"access_token_ciphertext", "TEXT NOT NULL DEFAULT ''"},
+		{"refresh_token_ciphertext", "TEXT NOT NULL DEFAULT ''"},
+		{"refresh_token_fingerprint", "CHAR(64) NOT NULL DEFAULT ''"},
+		{"token_expires_at", "TIMESTAMPTZ"},
+		{"token_scope", "TEXT NOT NULL DEFAULT ''"},
+	}
+
+	lastIdx := -1
+	for _, column := range columns {
+		statement := "ADD COLUMN IF NOT EXISTS " + column.name + " " + column.definition
+		idx := strings.Index(content, statement)
+		if idx == -1 {
+			t.Fatalf("migration 12 up must contain %q", statement)
+		}
+		if idx < lastIdx {
+			t.Errorf("migration 12 up adds %s out of model order", column.name)
+		}
+		lastIdx = idx
+		if stmt := upToSemicolon(content[idx:]); strings.Contains(stmt, "DEFAULT") && !strings.Contains(stmt, "DEFAULT ''") {
+			t.Errorf("migration 12 up must not give %s a non-empty default: %q", column.name, stmt)
+		}
+	}
+
+	downData, err := defaultMigrationsFS.ReadFile("migrations/000012_add_oauth_account_tokens.down.sql")
+	if err != nil {
+		t.Fatalf("failed to read migration 12 down: %v", err)
+	}
+	down := string(downData)
+	if drops := strings.Count(down, "DROP COLUMN IF EXISTS"); drops != len(columns) {
+		t.Fatalf("migration 12 down must drop exactly %d columns, got %d: %q", len(columns), drops, down)
+	}
+	for _, column := range columns {
+		if !strings.Contains(down, "DROP COLUMN IF EXISTS "+column.name+";") {
+			t.Errorf("migration 12 down must drop %s", column.name)
+		}
+	}
+	if strings.Contains(down, "DROP TABLE") {
+		t.Error("migration 12 down must drop only the token columns, never the links table")
 	}
 }
 

@@ -172,16 +172,22 @@ func TestDocumentSerialization_RoundTrip(t *testing.T) {
 	t.Run("OAuthAccountDoc", func(t *testing.T) {
 		id := uuid.New()
 		userID := uuid.New()
+		tokenExpiresAt := now.Add(time.Hour)
 		acc := &db.OAuthAccount{
-			ID:               id,
-			UserID:           userID,
-			ProviderID:       "google",
-			ProviderTenantID: "tenant-a",
-			ProviderUserID:   "google-uid-123",
-			Email:            "user@example.com",
-			Verified:         true,
-			CreatedAt:        now,
-			UpdatedAt:        now,
+			ID:                      id,
+			UserID:                  userID,
+			ProviderID:              "google",
+			ProviderTenantID:        "tenant-a",
+			ProviderUserID:          "google-uid-123",
+			Email:                   "user@example.com",
+			Verified:                true,
+			AccessTokenCiphertext:   `{"v":1,"alg":"A256GCM","ct":"access"}`,
+			RefreshTokenCiphertext:  `{"v":1,"alg":"A256GCM","ct":"refresh"}`,
+			RefreshTokenFingerprint: strings.Repeat("a", 64),
+			TokenExpiresAt:          &tokenExpiresAt,
+			TokenScope:              "users.read offline.access",
+			CreatedAt:               now,
+			UpdatedAt:               now,
 		}
 
 		doc := oauthAccountDocFromDomain(acc)
@@ -201,8 +207,46 @@ func TestDocumentSerialization_RoundTrip(t *testing.T) {
 			roundTripped.ProviderTenantID != acc.ProviderTenantID ||
 			roundTripped.ProviderUserID != acc.ProviderUserID ||
 			roundTripped.Email != acc.Email ||
-			!roundTripped.Verified {
+			!roundTripped.Verified ||
+			roundTripped.AccessTokenCiphertext != acc.AccessTokenCiphertext ||
+			roundTripped.RefreshTokenCiphertext != acc.RefreshTokenCiphertext ||
+			roundTripped.RefreshTokenFingerprint != acc.RefreshTokenFingerprint ||
+			roundTripped.TokenScope != acc.TokenScope {
 			t.Fatalf("roundtrip mismatch: got %+v, want %+v", roundTripped, acc)
+		}
+		if roundTripped.TokenExpiresAt == nil || !roundTripped.TokenExpiresAt.Equal(tokenExpiresAt) {
+			t.Fatalf("token_expires_at roundtrip = %v; want %v", roundTripped.TokenExpiresAt, tokenExpiresAt)
+		}
+	})
+
+	t.Run("OAuthAccountDoc without tokens keeps nil expiry", func(t *testing.T) {
+		acc := &db.OAuthAccount{
+			ID:               uuid.New(),
+			UserID:           uuid.New(),
+			ProviderID:       "google",
+			ProviderTenantID: "tenant-a",
+			ProviderUserID:   "tokenless-uid",
+			Email:            "tokenless@example.com",
+			CreatedAt:        now,
+			UpdatedAt:        now,
+		}
+
+		data, err := bson.Marshal(oauthAccountDocFromDomain(acc))
+		if err != nil {
+			t.Fatalf("bson.Marshal failed: %v", err)
+		}
+		var unmarshaled OAuthAccountDoc
+		if err := bson.Unmarshal(data, &unmarshaled); err != nil {
+			t.Fatalf("bson.Unmarshal failed: %v", err)
+		}
+
+		got := unmarshaled.toDomain()
+		if got.TokenExpiresAt != nil {
+			t.Fatalf("nil token_expires_at decoded as %v; want nil", got.TokenExpiresAt)
+		}
+		if got.AccessTokenCiphertext != "" || got.RefreshTokenCiphertext != "" ||
+			got.RefreshTokenFingerprint != "" || got.TokenScope != "" {
+			t.Fatalf("empty token fields decoded as %+v", got)
 		}
 	})
 
@@ -230,8 +274,15 @@ func TestDocumentSerialization_RoundTrip(t *testing.T) {
 		if unmarshaled.Verified {
 			t.Fatal("missing verified field must decode false")
 		}
+		if unmarshaled.TokenExpiresAt != nil {
+			t.Fatalf("missing token_expires_at must decode nil, got %v", unmarshaled.TokenExpiresAt)
+		}
 		if got := unmarshaled.toDomain(); got.Verified {
 			t.Fatalf("legacy document decoded Verified=%v; want false", got.Verified)
+		} else if got.TokenExpiresAt != nil || got.TokenScope != "" ||
+			got.AccessTokenCiphertext != "" || got.RefreshTokenCiphertext != "" ||
+			got.RefreshTokenFingerprint != "" {
+			t.Fatalf("legacy document decoded token fields: %+v", got)
 		}
 	})
 

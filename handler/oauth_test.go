@@ -75,6 +75,11 @@ func oauthTestEnv(t *testing.T, info *oauth.UserInfo, opts ...Option) (*gorm.DB,
 		provider_user_id VARCHAR(255) NOT NULL,
 		email VARCHAR(255) NOT NULL,
 		verified INTEGER NOT NULL DEFAULT 0,
+		access_token_ciphertext TEXT NOT NULL DEFAULT '',
+		refresh_token_ciphertext TEXT NOT NULL DEFAULT '',
+		refresh_token_fingerprint CHAR(64) NOT NULL DEFAULT '',
+		token_expires_at DATETIME,
+		token_scope TEXT NOT NULL DEFAULT '',
 		created_at DATETIME,
 		updated_at DATETIME
 	)`).Error; err != nil {

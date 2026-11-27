@@ -44,6 +44,11 @@ func setupOAuthFlow(t *testing.T, mocks map[string]*oauthmock.Mock, modifyCfg ..
 		provider_tenant_id VARCHAR(64) NOT NULL,
 		provider_user_id VARCHAR(255) NOT NULL, email VARCHAR(255) NOT NULL,
 		verified INTEGER NOT NULL DEFAULT 0,
+		access_token_ciphertext TEXT NOT NULL DEFAULT '',
+		refresh_token_ciphertext TEXT NOT NULL DEFAULT '',
+		refresh_token_fingerprint CHAR(64) NOT NULL DEFAULT '',
+		token_expires_at DATETIME,
+		token_scope TEXT NOT NULL DEFAULT '',
 		created_at DATETIME, updated_at DATETIME,
 		CONSTRAINT uq_oauth_accounts_provider_tenant_uid UNIQUE (provider_id, provider_tenant_id, provider_user_id),
 		FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
