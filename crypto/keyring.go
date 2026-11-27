@@ -3,6 +3,7 @@ package crypto
 import (
 	"encoding/base64"
 	"fmt"
+	"io"
 	"strings"
 
 	"github.com/kaiizer777/go-auth/errors"
@@ -12,6 +13,7 @@ const (
 	keyIDMaxLength = 32
 	keyBytes       = 32
 	keyringTrimSet = " \t\r\n"
+	redactedMarker = "[redacted]"
 )
 
 // Predefined sentinel errors for token keyring operations.
@@ -23,8 +25,13 @@ var (
 // keyMaterial holds raw AES-256 key bytes; no formatter renders them.
 type keyMaterial [keyBytes]byte
 
-func (keyMaterial) String() string   { return "[redacted]" }
-func (keyMaterial) GoString() string { return "crypto.keyMaterial{[redacted]}" }
+func (keyMaterial) String() string   { return redactedMarker }
+func (keyMaterial) GoString() string { return "crypto.keyMaterial{" + redactedMarker + "}" }
+
+// Format overrides every verb. String and GoString only cover the verbs fmt
+// routes through a Stringer; the numeric verbs (%d, %b, %o, ...) skip them and
+// print the array elements one by one.
+func (keyMaterial) Format(f fmt.State, _ rune) { _, _ = io.WriteString(f, redactedMarker) }
 
 type keyringEntry struct {
 	kid string
@@ -42,8 +49,12 @@ type Keyring struct {
 // the exported value would get the unexported entries field rendered by fmt,
 // which prints key bytes in decimal because fmt cannot call methods through an
 // unexported field.
-func (Keyring) String() string   { return "[redacted]" }
-func (Keyring) GoString() string { return "crypto.Keyring{[redacted]}" }
+func (Keyring) String() string   { return redactedMarker }
+func (Keyring) GoString() string { return "crypto.Keyring{" + redactedMarker + "}" }
+
+// Format is what actually holds: fmt consults a Formatter for every verb, so
+// %d and friends cannot fall through to printValue and print the key bytes.
+func (Keyring) Format(f fmt.State, _ rune) { _, _ = io.WriteString(f, redactedMarker) }
 
 // ParseKeyring validates a `kid:base64key[,kid:base64key...]` specification.
 // Empty input yields ErrKeyringMissing; any grammar violation yields an error

@@ -3,7 +3,6 @@ package crypto
 import (
 	"bytes"
 	"encoding/base64"
-	"encoding/hex"
 	"fmt"
 	"strings"
 	"sync"
@@ -178,9 +177,19 @@ func TestParseKeyringErrorsDoNotLeakKeyMaterial(t *testing.T) {
 	}
 }
 
+// nestedKeyring proves fmt's recursion into struct fields and slices keeps
+// hitting the redactors at depth, not only for the top-level operand.
+type nestedKeyring struct {
+	Ring    Keyring
+	RingPtr *Keyring
+	Key     keyMaterial
+	Keys    []keyMaterial
+}
+
 // TestKeyringFormattingRedactsKeys pins the redaction marker as the only thing
-// any formatter receives: fmt renders a [32]byte as decimal, so grepping for
-// the base64 key text would pass even with String/GoString deleted.
+// any formatter receives: fmt renders a [32]byte as decimal, and the numeric
+// verbs skip String/GoString entirely, so grepping for the base64 key text
+// would pass even with the redactors deleted.
 func TestKeyringFormattingRedactsKeys(t *testing.T) {
 	t.Parallel()
 
@@ -197,11 +206,18 @@ func TestKeyringFormattingRedactsKeys(t *testing.T) {
 	}
 	keyDecimal := fmt.Sprint(keyBytesDecimal)
 	// Targets are the values reachable from outside this package plus the key
-	// material itself. fmt cannot call methods through an unexported field, so
-	// the entries slice and a single entry cannot be asserted; Keyring carries
-	// its own redacting formatters for exactly that reason.
-	targets := []any{ring, *ring, ring.entries[0].key, &ring.entries[0].key}
-	for _, verb := range []string{"%v", "%+v", "%#v", "%s"} {
+	// material itself, by value and by pointer, and nested one level down. fmt
+	// cannot call methods through an unexported field, so the entries slice and
+	// a single entry cannot be asserted; Keyring carries its own redacting
+	// formatters for exactly that reason.
+	targets := []any{
+		ring,
+		*ring,
+		ring.entries[0].key,
+		&ring.entries[0].key,
+		nestedKeyring{Ring: *ring, RingPtr: ring, Key: ring.entries[0].key, Keys: []keyMaterial{ring.entries[0].key}},
+	}
+	for _, verb := range []string{"%v", "%+v", "%#v", "%s", "%q", "%d", "%b", "%o", "%x", "%X", "%f", "%e", "%g"} {
 		for _, target := range targets {
 			out := fmt.Sprintf(verb, target)
 			if !strings.Contains(out, marker) {
@@ -211,12 +227,6 @@ func TestKeyringFormattingRedactsKeys(t *testing.T) {
 				t.Fatalf("format %q of %T leaks the key bytes: %s", verb, target, out)
 			}
 		}
-	}
-
-	// %x hex-encodes a Stringer's text rather than the struct's bytes, so the
-	// key is still absent from the output.
-	if out := fmt.Sprintf("%x", ring.entries[0].key); out != hex.EncodeToString([]byte(marker)) {
-		t.Fatalf("format %%x of keyMaterial = %q; want the hex of %q", out, marker)
 	}
 }
 
