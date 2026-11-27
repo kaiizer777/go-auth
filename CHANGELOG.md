@@ -67,7 +67,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   another user's row or another column. `TOTP.Keyring` adds an optional
   `kid:base64key[,…]` ring; `TOTP.EncryptionKey` is appended to it as a
   decryption-only `legacy` entry, so an unchanged deployment keeps reading its
-  rows and rotation only needs a new ring head. Either surface enables TOTP.
+  rows and rotation only needs a new ring head. Either surface enables TOTP. The
+  `legacy` kid is reserved: a keyring that already defines it is rejected by
+  configuration validation at startup instead of failing every TOTP operation.
 - `totp.RewrapSecrets` rewrites stored secrets onto the active key: keyset-batched,
   idempotent, resumable, one CAS-guarded `UPDATE` per row that writes ciphertext
   and the new `totp_secrets.secret_kid` hint together. It is an explicit call,

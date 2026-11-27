@@ -23,13 +23,20 @@ then the hex key appended as a decryption-only entry under the fixed kid
 - `Keyring` + `EncryptionKey` — new writes use the ring head, the old key still
   opens every legacy row and every row sealed under `legacy`. This is the
   rotation path.
-- `Keyring` only — the ring head encrypts. Legacy rows open only if the old key
+- `Keyring` only - the ring head encrypts. Legacy rows open only if the old key
   is included in the ring; the sweep below aborts loudly on a row it cannot
   open instead of leaving it behind.
 
+`legacy` is a reserved kid. A `Keyring` that already defines it, combined with a
+non-empty `EncryptionKey`, fails configuration validation
+(`ErrTOTPKeyringInvalid`) at startup instead of passing and leaving every TOTP
+operation unusable. Give the pre-existing key a different kid and list it in
+`Keyring` instead.
+
 A configured-but-unusable key surface is never a silent "2FA off": the service
 is wired, startup logs `totp_crypto_config_invalid`, and every TOTP operation
-fails closed.
+fails closed. A keyring that does not parse, or that collides with `legacy`, is
+rejected by configuration validation before the service starts.
 
 ## Stored format and the legacy read path
 
@@ -52,9 +59,11 @@ explicit call — there is no startup hook and no config flag.
   that can read envelopes. A rewrapped row is unreadable to an older binary, so
   rolling back after a partial sweep locks out the users it already migrated.
   Deploy the whole fleet first, then rewrap.
-- Resumable and idempotent: rows already on the active kid are skipped, each row
-  commits on its own, and a re-run re-opens and skips migrated rows. There is no
-  checkpoint table; the data is the progress.
+- Resumable and idempotent: every row is opened, a readable row already on the
+  active kid is skipped without a write, each row commits on its own, and a
+  re-run re-opens and skips migrated rows. There is no checkpoint table; the
+  data is the progress. Opening before skipping is what keeps a corrupt blob
+  that merely claims the active kid from being counted as migrated.
 - Per-row compare-and-swap: the ciphertext and the `secret_kid` hint are written
   by one `UPDATE … WHERE id = ? AND encrypted_secret = ?`. A concurrent
   enrolment that replaces the row makes the swap miss, and the sweep skips that
