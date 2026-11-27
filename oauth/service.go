@@ -638,23 +638,26 @@ func (s *service) persistRefreshed(ctx context.Context, link db.OAuthAccount, re
 
 // persistPastClear stores a pair the provider just issued when the persist CAS
 // lost because a concurrent clear emptied the row. The provider already spent
-// the presented token, so the pair in hand is the only grant left; dropping it
-// would force a re-login for a rotation that succeeded. The write is guarded
-// like any other first grant: a row that was filled after the reread holds the
-// newer grant and is served instead of being overwritten. Only this store write
-// is retried; the exchange has already happened and is never repeated.
+// the presented token, so the pair in hand is the only refresh grant left;
+// dropping it would force a re-login for a rotation that succeeded. An
+// access-only winner is not a completed grant: its access envelope is newer and
+// is kept, while the rotated refresh pair is still stored under it. Only this
+// store write is retried; the exchange has already happened and is never
+// repeated.
 func (s *service) persistPastClear(ctx context.Context, link db.OAuthAccount, rec db.OAuthTokenRecord, refreshed *OAuthToken) (*OAuthToken, error) {
 	current, err := s.rereadOwned(ctx, link)
 	if err != nil {
 		return nil, err
 	}
-	if current.AccessTokenCiphertext != "" || current.RefreshTokenFingerprint != "" {
+	if current.RefreshTokenFingerprint != "" {
+		// The winner holds a refresh credential of its own. It is the live grant,
+		// and the rotated pair in hand has already lost its race.
 		return s.serveGrant(ctx, *current)
 	}
 	var won bool
 	var werr error
 	for attempt := 0; attempt < persistAttempts; attempt++ {
-		won, werr = s.store.OAuthAccounts().SaveOAuthTokensIfUnset(ctx, link.ID, rec)
+		won, werr = s.store.OAuthAccounts().SaveOAuthRefreshIfUnset(ctx, link.ID, rec)
 		if werr == nil {
 			break
 		}

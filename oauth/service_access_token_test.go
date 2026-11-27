@@ -450,7 +450,13 @@ func rotateGrantFromCallback(svc *service, link db.OAuthAccount, grant *OAuthTok
 
 // clearGrant wipes the stored grant the way a concurrent invalid_grant does.
 func clearGrant(svc *service, link db.OAuthAccount) error {
-	won, err := svc.store.OAuthAccounts().SaveOAuthTokensCAS(context.Background(), link.ID, link.RefreshTokenFingerprint, db.OAuthTokenRecord{})
+	return clearStoredGrant(svc.store.OAuthAccounts(), link)
+}
+
+// clearStoredGrant clears through a specific store, so a test can wipe the row
+// behind an instrumented wrapper's back.
+func clearStoredGrant(store db.OAuthAccountStore, link db.OAuthAccount) error {
+	won, err := store.SaveOAuthTokensCAS(context.Background(), link.ID, link.RefreshTokenFingerprint, db.OAuthTokenRecord{})
 	if err != nil {
 		return err
 	}
@@ -524,6 +530,13 @@ func (s *failingWriteOAuthStore) SaveOAuthTokensIfUnset(ctx context.Context, id 
 		return false, stderrors.New("simulated write failure")
 	}
 	return s.OAuthAccountStore.SaveOAuthTokensIfUnset(ctx, id, rec)
+}
+
+func (s *failingWriteOAuthStore) SaveOAuthRefreshIfUnset(ctx context.Context, id uuid.UUID, rec db.OAuthTokenRecord) (bool, error) {
+	if s.fail(&s.ifUnsetFailures) {
+		return false, stderrors.New("simulated write failure")
+	}
+	return s.OAuthAccountStore.SaveOAuthRefreshIfUnset(ctx, id, rec)
 }
 
 // fail consumes one armed fault. Callers hold no lock: the mutex guards both the
@@ -920,6 +933,63 @@ func TestLinkedAccountToken_Refresh(t *testing.T) {
 		}
 		requireSanitized(t, token)
 		requireStoredGrant(t, reloadTokenLink(t, database, link.ID), "callback-access", "callback-refresh")
+	})
+
+	// An access-only winner filled the row the clear emptied, but the provider has
+	// already spent the presented refresh token: the rotated pair is the only
+	// refresh grant left and must land under the winner's access envelope.
+	t.Run("an access-only winner still stores the rotated refresh pair", func(t *testing.T) {
+		provider := &stubRefreshProvider{stubProvider: &stubProvider{id: "google"}}
+		database, svc, link, owner := tokenAccessEnv(t, provider, tokenTestGrant(), staleExpiry())
+		liveExpiry := time.Now().UTC().Add(time.Hour)
+		liveAccess := sealWith(t, testTokenKEK, func(sealer *crypto.TokenSealer) (string, error) {
+			return sealer.SealAccessToken(link.ProviderID, link.ID.String(), "callback-access")
+		})
+		var landed sync.Once
+		base := svc.store
+		svc.store = &wrappedTxStore{Store: base, oauth: &interleavingOAuthStore{
+			OAuthAccountStore: base.OAuthAccounts(),
+			before: func(writeCtx context.Context) {
+				landed.Do(func() {
+					if werr := base.OAuthAccounts().SaveOAuthAccess(writeCtx, link.ID, db.OAuthTokenRecord{
+						AccessTokenCiphertext: liveAccess,
+						TokenScope:            "read:user",
+						TokenExpiresAt:        &liveExpiry,
+					}); werr != nil {
+						t.Errorf("store concurrent access token: %v", werr)
+					}
+				})
+			},
+		}}
+		provider.refreshFn = func(context.Context, string) (*OAuthToken, error) {
+			// Clear behind the wrapper: only the persist CAS is interleaved.
+			if cerr := clearStoredGrant(base.OAuthAccounts(), link); cerr != nil {
+				return nil, cerr
+			}
+			return &OAuthToken{AccessToken: "rotated-access", RefreshToken: "rotated-refresh", ExpiresIn: 3600}, nil
+		}
+
+		token, err := svc.LinkedAccountToken(ctx, owner.ID, "google")
+		if err != nil {
+			t.Fatalf("LinkedAccountToken = %v; want the rotated pair stored under the winner", err)
+		}
+		if token.AccessToken != "rotated-access" {
+			t.Fatalf("AccessToken = %q; want the exchange's rotated-access", token.AccessToken)
+		}
+		requireSanitized(t, token)
+
+		stored := reloadTokenLink(t, database, link.ID)
+		requireStoredGrant(t, stored, "callback-access", "rotated-refresh")
+		if stored.AccessTokenCiphertext != liveAccess {
+			t.Fatal("the rotated access replaced the winner's envelope")
+		}
+		want, ferr := tokenTestSealer(t).RefreshTokenFingerprint("rotated-refresh")
+		if ferr != nil {
+			t.Fatalf("fingerprint: %v", ferr)
+		}
+		if stored.RefreshTokenFingerprint != want {
+			t.Fatalf("fingerprint = %q; want the rotated %q", stored.RefreshTokenFingerprint, want)
+		}
 	})
 
 	// The provider has already spent the presented refresh token when the write
