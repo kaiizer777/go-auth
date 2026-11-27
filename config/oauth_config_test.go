@@ -539,9 +539,9 @@ func TestConfigValidate_OAuth(t *testing.T) {
 			wantErr: errors.ErrOAuthRedirectURLRequired,
 		},
 		{
-			name:    "facebook graph version without v prefix allowed",
+			name:    "facebook graph version without v prefix rejected",
 			mutate:  facebookVersion("19.0"),
-			wantErr: nil,
+			wantErr: errors.ErrOAuthGraphVersionInvalid,
 		},
 		{
 			name: "facebook invalid graph version below 19 rejected",
@@ -580,7 +580,7 @@ func TestConfigValidate_OAuth(t *testing.T) {
 			wantErr: errors.ErrOAuthGraphVersionInvalid,
 		},
 		{
-			name: "facebook map graph version without v prefix allowed",
+			name: "facebook map graph version without v prefix rejected",
 			mutate: func(c *Config) {
 				c.OAuth.Providers = enabled("facebook", ProviderConfig{
 					ClientID:     "fb-app-id",
@@ -589,7 +589,7 @@ func TestConfigValidate_OAuth(t *testing.T) {
 					GraphVersion: "19.0",
 				})
 			},
-			wantErr: nil,
+			wantErr: errors.ErrOAuthGraphVersionInvalid,
 		},
 		{
 			name:    "facebook graph version NaN rejected",
@@ -870,19 +870,24 @@ func TestValidateGraphVersion(t *testing.T) {
 		wantErr bool
 	}{
 		{name: "canonical", version: "v19.0"},
-		{name: "no prefix", version: "19.0"},
+		{name: "no prefix", version: "19.0", wantErr: true},
 		{name: "two digit minor", version: "v19.10"},
 		{name: "three digit major", version: "v100.1"},
-		{name: "empty", version: ""},
+		{name: "latest major", version: "v22.0"},
+		{name: "two digit minor above floor", version: "v100.10"},
+		{name: "empty", version: "", wantErr: true},
 		{name: "long fractional minor above floor", version: "v19.9999999999999999"},
 		{name: "long minor above floor", version: "v19." + strings.Repeat("9", 30)},
 		{name: "below floor", version: "v18.0", wantErr: true},
 		{name: "below floor no prefix", version: "18.0", wantErr: true},
+		{name: "path traversal", version: "../x", wantErr: true},
+		{name: "embedded space", version: "v19.0 beta", wantErr: true},
+		{name: "malformed hex", version: "v0x13", wantErr: true},
+		{name: "extra segment", version: "v19.0.1", wantErr: true},
 		{name: "long fractional minor below floor", version: "v18.9999999999999999", wantErr: true},
 		{name: "four digit minor below floor", version: "v18.9999", wantErr: true},
 		{name: "missing minor", version: "v19", wantErr: true},
 		{name: "missing minor no prefix", version: "19", wantErr: true},
-		{name: "extra segment", version: "v19.0.1", wantErr: true},
 		{name: "NaN", version: "vNaN", wantErr: true},
 		{name: "lowercase NaN", version: "vnan", wantErr: true},
 		{name: "Inf", version: "vInf", wantErr: true},
@@ -914,12 +919,12 @@ func TestValidateGraphVersion(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := validateGraphVersion(tt.version)
+			err := ValidateGraphVersion(tt.version)
 			if gotErr := err != nil; gotErr != tt.wantErr {
-				t.Fatalf("validateGraphVersion(%q) error = %v; wantErr %v", tt.version, err, tt.wantErr)
+				t.Fatalf("ValidateGraphVersion(%q) error = %v; wantErr %v", tt.version, err, tt.wantErr)
 			}
 			if tt.wantErr && !errors.Is(err, errors.ErrOAuthGraphVersionInvalid) {
-				t.Fatalf("validateGraphVersion(%q) error = %v; want ErrOAuthGraphVersionInvalid", tt.version, err)
+				t.Fatalf("ValidateGraphVersion(%q) error = %v; want ErrOAuthGraphVersionInvalid", tt.version, err)
 			}
 		})
 	}

@@ -58,15 +58,32 @@ func FacebookEndpoints(o EndpointOverride) FacebookOption {
 	return func(opts *facebookOptions) { applyEndpoints(&opts.endpoints, o) }
 }
 
-// NewFacebookProvider constructs a new Facebook Graph API provider adapter.
+// NewFacebookProvider constructs a new Facebook Graph API provider adapter,
+// defaulting an empty GraphVersion to "v19.0".
+//
+// It panics when cfg.GraphVersion is invalid. Use NewFacebookProviderChecked to
+// receive the same failure as an error instead.
 func NewFacebookProvider(cfg config.FacebookConfig, opts ...FacebookOption) *FacebookProvider {
-	version := cfg.GraphVersion
-	if version == "" {
-		version = "v19.0"
-	} else if !strings.HasPrefix(version, "v") {
-		// Graph paths require the "v" prefix; validation accepts it as optional.
-		version = "v" + version
+	p, err := NewFacebookProviderChecked(cfg, opts...)
+	if err != nil {
+		panic(fmt.Sprintf("oauth: invalid Facebook graph version %q: expected \"v<major>.<minor>\" with a major of at least 19 (for example \"v19.0\"); use NewFacebookProviderChecked to receive this as an error", cfg.GraphVersion))
 	}
+	return p
+}
+
+// NewFacebookProviderChecked constructs a new Facebook Graph API provider adapter,
+// defaulting an empty GraphVersion to "v19.0".
+//
+// An invalid version yields a nil provider and an error wrapping
+// errors.ErrOAuthGraphVersionInvalid that names the rejected value.
+func NewFacebookProviderChecked(cfg config.FacebookConfig, opts ...FacebookOption) (*FacebookProvider, error) {
+	if cfg.GraphVersion == "" {
+		cfg.GraphVersion = "v19.0"
+	}
+	if err := config.ValidateGraphVersion(cfg.GraphVersion); err != nil {
+		return nil, fmt.Errorf("oauth: invalid Facebook graph version %q: %w", cfg.GraphVersion, err)
+	}
+	version := cfg.GraphVersion
 	if len(cfg.Scopes) == 0 {
 		cfg.Scopes = []string{"email", "public_profile"}
 	}
@@ -91,7 +108,7 @@ func NewFacebookProvider(cfg config.FacebookConfig, opts ...FacebookOption) *Fac
 		userInfoURL:          fo.endpoints.UserInfoURL,
 		debugURL:             fo.endpoints.DebugURL,
 		assertsVerifiedEmail: assertsVerifiedEmail,
-	}
+	}, nil
 }
 
 // ID returns the canonical provider slug.
