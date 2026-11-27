@@ -546,6 +546,103 @@ func TestE2E_FullBrowserOAuthJourneys(t *testing.T) {
 				t.Fatalf("expected 2 users (session user and address owner), got count=%d err=%v", userCount, err)
 			}
 		})
+
+		// An identity bound to another account never re-binds on the session's
+		// behalf, and the refusal writes nothing.
+		t.Run("discord identity linked elsewhere is refused", func(t *testing.T) {
+			h, dbConn, pReg, cfg := setupOAuthE2EStack(t)
+
+			msIdP, err := oauthmock.NewMicrosoftIdP(cfg.BaseURL + "/auth/oauth/microsoft/callback")
+			if err != nil {
+				t.Fatalf("NewMicrosoftIdP: %v", err)
+			}
+			defer msIdP.Close()
+			msIdP.TenantID = oauth.MicrosoftConsumerTenantGUID
+			msIdP.OID = "ms-user-oid-2c"
+			msIdP.Subject = "ms-user-sub-2c"
+			msIdP.Email = "session-linker-refused@example.com"
+
+			msProvider := oauth.NewMicrosoftProvider(config.MicrosoftConfig{
+				ClientID:       msIdP.ClientID,
+				ClientSecret:   msIdP.ClientSecret,
+				RedirectURI:    cfg.BaseURL + "/auth/oauth/microsoft/callback",
+				TrustedTenants: []string{msIdP.TenantID},
+			}, oauth.WithEndpoints(microsoftEndpoints(msIdP)))
+
+			discordIdP := oauthmock.NewDiscordIdP(cfg.BaseURL + "/auth/oauth/discord/callback")
+			defer discordIdP.Close()
+			discordIdP.UserID = "discord-snowflake-777"
+			discordIdP.Email = "already-linked@example.com"
+
+			discordProvider := oauth.NewDiscordProvider(config.DiscordConfig{
+				ClientID:     discordIdP.ClientID,
+				ClientSecret: discordIdP.ClientSecret,
+				RedirectURI:  cfg.BaseURL + "/auth/oauth/discord/callback",
+			}, oauth.WithEndpoints(oauth.EndpointOverride{
+				AuthorizeURL: discordIdP.Server.URL + "/oauth2/authorize",
+				TokenURL:     discordIdP.Server.URL + "/api/v10/oauth2/token",
+				UserInfoURL:  discordIdP.Server.URL + "/api/v10/users/@me",
+			}))
+
+			for _, p := range []oauth.Provider{msProvider, discordProvider} {
+				if err := (*pReg).Register(p); err != nil {
+					t.Fatalf("register %s adapter: %v", p.ID(), err)
+				}
+			}
+
+			authorizeURL, cookies := initiateOAuth(t, h, "microsoft", "")
+			cbRec := callbackOAuth(t, h, authorizeAtIdP(t, authorizeURL), cookies...)
+			sessionCookie := responseCookie(t, cbRec, cfg.SessionCookieName)
+			if sessionCookie == nil {
+				t.Fatalf("microsoft login failed, no session cookie: %d (%s)", cbRec.Code, cbRec.Body.String())
+			}
+
+			var sessionUser db.User
+			if err := dbConn.Where("email = ?", msIdP.Email).First(&sessionUser).Error; err != nil {
+				t.Fatalf("microsoft-created user not found: %v", err)
+			}
+
+			owner := db.User{
+				ID:            uuid.New(),
+				Email:         "discord-owner@example.com",
+				PasswordHash:  "discord-owner-password-hash",
+				EmailVerified: true,
+			}
+			if err := dbConn.Create(&owner).Error; err != nil {
+				t.Fatalf("seed identity owner: %v", err)
+			}
+			if err := dbConn.Create(&db.OAuthAccount{
+				ID:             uuid.New(),
+				UserID:         owner.ID,
+				ProviderID:     "discord",
+				ProviderUserID: discordIdP.UserID,
+				Email:          "discord-owner@example.com",
+				Verified:       true,
+			}).Error; err != nil {
+				t.Fatalf("seed discord identity: %v", err)
+			}
+
+			linkAuthorizeURL, linkCookies := initiateOAuth(t, h, "discord", "?link=true", sessionCookie)
+			linkCallback := authorizeAtIdP(t, linkAuthorizeURL)
+			linkRec := callbackOAuth(t, h, linkCallback, append(linkCookies, sessionCookie)...)
+			if linkRec.Code != http.StatusConflict {
+				t.Fatalf("discord link callback = %d (%s); want 409", linkRec.Code, linkRec.Body.String())
+			}
+			assertErrorCode(t, linkRec, "OAUTH_ACCOUNT_ALREADY_LINKED")
+
+			var ownerLinkCount int64
+			if err := dbConn.Model(&db.OAuthAccount{}).Where("user_id = ?", owner.ID).Count(&ownerLinkCount).Error; err != nil || ownerLinkCount != 1 {
+				t.Fatalf("expected the identity owner to keep 1 link, got count=%d err=%v", ownerLinkCount, err)
+			}
+			var sessionDiscordLinks int64
+			if err := dbConn.Model(&db.OAuthAccount{}).Where("user_id = ? AND provider_id = ?", sessionUser.ID, "discord").Count(&sessionDiscordLinks).Error; err != nil || sessionDiscordLinks != 0 {
+				t.Fatalf("expected no discord link for the session user, got count=%d err=%v", sessionDiscordLinks, err)
+			}
+			var sessCount int64
+			if err := dbConn.Model(&db.Session{}).Where("user_id = ?", sessionUser.ID).Count(&sessCount).Error; err != nil || sessCount != 1 {
+				t.Fatalf("expected the refused link to mint no session, got count=%d err=%v", sessCount, err)
+			}
+		})
 	})
 
 	// 3. Journey 3: X (Twitter) missing email fail closed + returning user login
