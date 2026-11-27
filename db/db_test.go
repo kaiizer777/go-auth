@@ -705,6 +705,14 @@ func TestMigration000013_AddsTotpSecretKid(t *testing.T) {
 	if !strings.Contains(mysqlDown, "ALTER TABLE totp_secrets DROP COLUMN secret_kid;") {
 		t.Fatalf("mysql migration 13 down must drop secret_kid: %q", mysqlDown)
 	}
+	// "exactly one column dropped" is only true while the down file holds exactly
+	// one ALTER TABLE; an extra statement could drop something else and still pass
+	// the per-column checks above.
+	for name, down := range map[string]string{"postgres": postgresDown, "mysql": mysqlDown} {
+		if statements := strings.Count(down, "ALTER TABLE "); statements != 1 {
+			t.Errorf("%s migration 13 down must contain one ALTER TABLE, got %d: %q", name, statements, down)
+		}
+	}
 	// golang-migrate stamps the down target, not the version it is leaving, so a
 	// failed down is recovered by forcing 12 - never by re-running the ALTER.
 	if !strings.Contains(mysqlDown, "down target, 12, as dirty") {
