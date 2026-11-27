@@ -1433,12 +1433,12 @@ func (s *service) grantForRow(link db.OAuthAccount, tokens *OAuthToken) (db.OAut
 	return rec, nil
 }
 
-// persistTokens overwrites the stored grant for an already-linked identity. A
-// failure is swallowed by design: the login's identity decision is already
-// valid, so refusing it would punish a user for a transient store fault that
-// the next callback repairs. The attributes stop at the identity — a driver
-// error may echo row values, and no envelope, fingerprint, or token is ever
-// logged.
+// persistTokens stores the grant for an already-linked identity under the guard
+// writeGrant applies. A failure is swallowed by design: the login's identity
+// decision is already valid, so refusing it would punish a user for a transient
+// store fault that the next callback repairs. The attributes stop at the
+// identity — a driver error may echo row values, and no envelope, fingerprint,
+// or token is ever logged.
 func (s *service) persistTokens(ctx context.Context, link db.OAuthAccount, tokens *OAuthToken) {
 	rec, err := s.grantForRow(link, tokens)
 	if err == nil {
@@ -1476,16 +1476,22 @@ func (s *service) keepFirstGrant(ctx context.Context, link db.OAuthAccount, toke
 // cannot erase one another callback stored after this one read the row. When the
 // row it read already holds a refresh envelope, that write is a CAS on the
 // stored fingerprint, so a concurrent rotation wins instead of being overwritten
-// by the older grant.
+// by the older grant. A refresh-bearing grant for a row that held none is
+// written under the same guard: a first grant that landed after the read is
+// never replaced by an older exchange.
 func (s *service) writeGrant(ctx context.Context, link db.OAuthAccount, rec db.OAuthTokenRecord, tokens *OAuthToken) error {
-	if tokens != nil && tokens.RefreshToken != "" {
-		return s.store.OAuthAccounts().SaveOAuthTokens(ctx, link.ID, rec)
-	}
+	carriesRefresh := tokens != nil && tokens.RefreshToken != ""
 	if link.RefreshTokenCiphertext == "" || link.RefreshTokenFingerprint == "" {
-		return s.store.OAuthAccounts().SaveOAuthAccess(ctx, link.ID, rec)
+		if !carriesRefresh {
+			return s.store.OAuthAccounts().SaveOAuthAccess(ctx, link.ID, rec)
+		}
+		_, err := s.store.OAuthAccounts().SaveOAuthTokensIfUnset(ctx, link.ID, rec)
+		return err
 	}
-	rec.RefreshTokenCiphertext = link.RefreshTokenCiphertext
-	rec.RefreshTokenFingerprint = link.RefreshTokenFingerprint
+	if !carriesRefresh {
+		rec.RefreshTokenCiphertext = link.RefreshTokenCiphertext
+		rec.RefreshTokenFingerprint = link.RefreshTokenFingerprint
+	}
 	_, err := s.store.OAuthAccounts().SaveOAuthTokensCAS(ctx, link.ID, link.RefreshTokenFingerprint, rec)
 	return err
 }

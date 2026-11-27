@@ -280,6 +280,64 @@ func TestTokenPersistence(t *testing.T) {
 		}
 	})
 
+	// The returning login carries a refresh token, but its read only proves the
+	// grant is unchanged while the stored fingerprint still matches: a rotation
+	// that landed in between is the live credential and must win.
+	t.Run("refresh-bearing login does not overwrite a concurrent rotation", func(t *testing.T) {
+		provider := &stubRefreshProvider{stubProvider: &stubProvider{id: "google"}}
+		database, svc, link, _ := tokenAccessEnv(t, provider, tokenTestGrant(), nil)
+		rotateGrant(t, svc, link, &OAuthToken{AccessToken: "winner-access", RefreshToken: "winner-refresh", ExpiresIn: 3600})
+		won := reloadTokenLink(t, database, link.ID)
+
+		// The login read the row before the rotation; its own refresh token is
+		// not proof that the stored one is stale.
+		svc.persistTokens(context.Background(), link, &OAuthToken{AccessToken: "relogin-access", RefreshToken: "relogin-refresh", ExpiresIn: 600})
+
+		stored := reloadTokenLink(t, database, link.ID)
+		requireStoredGrant(t, stored, "winner-access", "winner-refresh")
+		if stored.AccessTokenCiphertext != won.AccessTokenCiphertext ||
+			stored.RefreshTokenCiphertext != won.RefreshTokenCiphertext {
+			t.Fatal("login overwrote the winner's grant")
+		}
+	})
+
+	t.Run("refresh-bearing login stores the grant when nothing rotated", func(t *testing.T) {
+		provider := &stubRefreshProvider{stubProvider: &stubProvider{id: "google"}}
+		database, svc, link, _ := tokenAccessEnv(t, provider, tokenTestGrant(), nil)
+
+		svc.persistTokens(context.Background(), link, &OAuthToken{AccessToken: "relogin-access", RefreshToken: "relogin-refresh", ExpiresIn: 600})
+
+		requireStoredGrant(t, reloadTokenLink(t, database, link.ID), "relogin-access", "relogin-refresh")
+	})
+
+	t.Run("refresh-bearing login fills a tokenless row", func(t *testing.T) {
+		provider := &stubRefreshProvider{stubProvider: &stubProvider{id: "google"}}
+		database, svc, link, _ := tokenAccessEnv(t, provider, &OAuthToken{AccessToken: tokenTestAccess}, nil)
+
+		svc.persistTokens(context.Background(), link, &OAuthToken{AccessToken: "relogin-access", RefreshToken: "relogin-refresh", ExpiresIn: 600})
+
+		requireStoredGrant(t, reloadTokenLink(t, database, link.ID), "relogin-access", "relogin-refresh")
+	})
+
+	// The login read a row holding no refresh envelope, so it has no fingerprint
+	// to CAS on; the once-only credential a concurrent callback stored in the
+	// meantime must not be replaced by the older exchange.
+	t.Run("refresh-bearing login keeps a first grant stored after its read", func(t *testing.T) {
+		provider := &stubRefreshProvider{stubProvider: &stubProvider{id: "google"}}
+		database, svc, link, _ := tokenAccessEnv(t, provider, &OAuthToken{AccessToken: tokenTestAccess}, nil)
+		rec, err := svc.sealedTokens(link.ProviderID, link.ID.String(), tokenTestGrant())
+		if err != nil {
+			t.Fatalf("seal concurrent grant: %v", err)
+		}
+		if err := svc.store.OAuthAccounts().SaveOAuthTokens(context.Background(), link.ID, rec); err != nil {
+			t.Fatalf("store concurrent grant: %v", err)
+		}
+
+		svc.persistTokens(context.Background(), link, &OAuthToken{AccessToken: "relogin-access", RefreshToken: "relogin-refresh", ExpiresIn: 600})
+
+		requireStoredGrant(t, reloadTokenLink(t, database, link.ID), tokenTestAccess, tokenTestRefresh)
+	})
+
 	// The row this callback read had no refresh token, so there is no fingerprint
 	// to CAS on. A concurrent login may still add the credential the provider
 	// issues only once; the access-only write must leave it in place.
