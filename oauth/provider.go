@@ -130,6 +130,18 @@ type OIDCProvider interface {
 	VerifyIDToken(ctx context.Context, rawIDToken, nonce string) (*IDTokenClaims, error)
 }
 
+// TokenRefresher is the optional capability for providers that renew an access
+// token from a refresh token. Keeping it out of Provider preserves source
+// compatibility for implementers written against the original contract; callers
+// type-assert and report "provider does not support refresh" when it is absent.
+// ExpiresAt is left unset: absolute expiry is the caller's clock policy.
+type TokenRefresher interface {
+	// RefreshToken exchanges a refresh token for a new token pair. Providers that
+	// rotate refresh tokens return the new one; the presented token is returned
+	// only when the response omits a replacement.
+	RefreshToken(ctx context.Context, refreshToken string) (*OAuthToken, error)
+}
+
 // IDTokenClaims defines the standard OpenID Connect claims extracted from an ID Token.
 type IDTokenClaims struct {
 	Issuer            string   `json:"iss"`

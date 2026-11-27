@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -894,6 +895,228 @@ func TestXProvider_ExchangeCode(t *testing.T) {
 			t.Fatalf("expected CodeOAuthProviderError, got %v", err)
 		}
 	})
+}
+
+// TestXProvider_RefreshToken pins the refresh wire contract against a loopback
+// server: the generic oauthmock provider does not implement TokenRefresher, so
+// refresh can only be exercised through XProvider.
+func TestXProvider_RefreshToken(t *testing.T) {
+	t.Parallel()
+
+	const (
+		clientID     = "client:id@test"
+		clientSecret = "secret:key#123"
+	)
+
+	var mu sync.Mutex
+	var gotForm url.Values
+	var gotAuth, gotContentType string
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if err := r.ParseForm(); err != nil {
+			http.Error(w, "invalid form", http.StatusBadRequest)
+			return
+		}
+		mu.Lock()
+		gotForm = r.Form
+		gotAuth = r.Header.Get("Authorization")
+		gotContentType = r.Header.Get("Content-Type")
+		mu.Unlock()
+
+		// INVARIANT: client_id MUST NOT be in the body (RFC 6749 §2.3.1); X
+		// rejects a body that carries it alongside Basic auth.
+		if r.Form.Has("client_id") || r.Form.Has("client_secret") {
+			http.Error(w, "client credentials forbidden in body", http.StatusBadRequest)
+			return
+		}
+
+		writeJSON := func(status int, body any) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(status)
+			_ = json.NewEncoder(w).Encode(body)
+		}
+
+		switch r.FormValue("refresh_token") {
+		case "unrotated-refresh-token":
+			writeJSON(http.StatusOK, map[string]any{
+				"token_type":   "bearer",
+				"access_token": "unrotated-access-token",
+			})
+		case "revoked-refresh-token":
+			writeJSON(http.StatusBadRequest, map[string]any{
+				"error":             "invalid_grant",
+				"error_description": "revoked upstream detail",
+			})
+		case "invalid-request-refresh-token":
+			writeJSON(http.StatusBadRequest, map[string]any{"error": "invalid_request"})
+		case "bad-client-refresh-token":
+			writeJSON(http.StatusUnauthorized, map[string]any{"error": "invalid_client"})
+		case "problem-refresh-token":
+			w.Header().Set("Content-Type", "application/problem+json")
+			w.WriteHeader(http.StatusUnauthorized)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"type":   "https://api.twitter.com/2/problems/unauthorized",
+				"title":  "Unauthorized",
+				"detail": "problem upstream detail",
+			})
+		case "rate-limited-refresh-token":
+			w.Header().Set("Retry-After", "30")
+			writeJSON(http.StatusTooManyRequests, map[string]any{"status": 429, "title": "Too Many Requests"})
+		case "problem-200-refresh-token":
+			w.Header().Set("Content-Type", "application/problem+json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"type":   "https://api.twitter.com/2/problems/invalid-request",
+				"detail": "problem upstream detail",
+			})
+		case "no-access-token-refresh-token":
+			writeJSON(http.StatusOK, map[string]any{"token_type": "bearer", "expires_in": 7200})
+		case "bad-json-refresh-token":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte("{invalid-json"))
+		case "error-field-refresh-token":
+			writeJSON(http.StatusOK, map[string]any{"error": "server_error"})
+		case "oversized-refresh-token":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"access_token":"` + strings.Repeat("a", oauthBodyLimit) + `"}`))
+		default:
+			writeJSON(http.StatusOK, map[string]any{
+				"token_type":    "bearer",
+				"expires_in":    7200,
+				"access_token":  "rotated-access-token",
+				"refresh_token": "rotated-refresh-token",
+			})
+		}
+	}))
+	t.Cleanup(ts.Close)
+
+	p := NewXProvider(config.XConfig{
+		ClientID:     clientID,
+		ClientSecret: clientSecret,
+		RedirectURI:  "https://myapp.com/callback",
+	})
+	p.tokenURL = ts.URL
+
+	t.Run("sends the refresh grant and returns the rotated pair", func(t *testing.T) {
+		tok, err := p.RefreshToken(context.Background(), "presented-refresh-token")
+		if err != nil {
+			t.Fatalf("unexpected RefreshToken error: %v", err)
+		}
+		if tok.AccessToken != "rotated-access-token" {
+			t.Errorf("AccessToken = %q; want rotated-access-token", tok.AccessToken)
+		}
+		if tok.RefreshToken != "rotated-refresh-token" {
+			t.Errorf("RefreshToken = %q; want the rotated token from the response", tok.RefreshToken)
+		}
+		if tok.ExpiresIn != 7200 {
+			t.Errorf("ExpiresIn = %d; want 7200", tok.ExpiresIn)
+		}
+		if !tok.ExpiresAt.IsZero() {
+			t.Errorf("ExpiresAt = %v; want zero, the adapter has no clock policy", tok.ExpiresAt)
+		}
+
+		mu.Lock()
+		form, auth, contentType := gotForm, gotAuth, gotContentType
+		mu.Unlock()
+
+		if len(form) != 2 {
+			t.Errorf("form keys = %v; want exactly grant_type and refresh_token", form)
+		}
+		if got := form.Get("grant_type"); got != "refresh_token" {
+			t.Errorf("grant_type = %q; want refresh_token", got)
+		}
+		if got := form.Get("refresh_token"); got != "presented-refresh-token" {
+			t.Errorf("refresh_token = %q; want the presented token", got)
+		}
+		for _, key := range []string{"client_id", "client_secret", "code", "code_verifier", "redirect_uri"} {
+			if form.Has(key) {
+				t.Errorf("body carries %q: %v", key, form)
+			}
+		}
+		wantAuth := "Basic " + base64.StdEncoding.EncodeToString([]byte(url.QueryEscape(clientID)+":"+url.QueryEscape(clientSecret)))
+		if auth != wantAuth {
+			t.Errorf("Authorization = %q; want %q", auth, wantAuth)
+		}
+		if !strings.Contains(contentType, "application/x-www-form-urlencoded") {
+			t.Errorf("Content-Type = %q; want form encoded", contentType)
+		}
+	})
+
+	t.Run("response without a refresh token keeps the presented one", func(t *testing.T) {
+		tok, err := p.RefreshToken(context.Background(), "unrotated-refresh-token")
+		if err != nil {
+			t.Fatalf("unexpected RefreshToken error: %v", err)
+		}
+		if tok.RefreshToken != "unrotated-refresh-token" {
+			t.Errorf("RefreshToken = %q; want the presented token", tok.RefreshToken)
+		}
+		if tok.ExpiresIn != 0 {
+			t.Errorf("ExpiresIn = %d; want 0 when the response omits it", tok.ExpiresIn)
+		}
+	})
+
+	t.Run("grant rejection leaks neither the token nor upstream text", func(t *testing.T) {
+		_, err := p.RefreshToken(context.Background(), "revoked-refresh-token")
+		if !errors.Is(err, errors.ErrOAuthGrantRejected) {
+			t.Fatalf("error = %v; want ErrOAuthGrantRejected", err)
+		}
+		for _, leak := range []string{"revoked-refresh-token", "revoked upstream detail"} {
+			if strings.Contains(err.Error(), leak) {
+				t.Errorf("error %v leaks %q", err, leak)
+			}
+		}
+	})
+
+	for _, tc := range []struct {
+		name          string
+		token         string
+		wantGrant     bool
+		wantRateLimit bool
+	}{
+		{"invalid_grant rejects the grant", "revoked-refresh-token", true, false},
+		{"invalid_request rejects the grant", "invalid-request-refresh-token", true, false},
+		{"invalid_client stays a provider error", "bad-client-refresh-token", false, false},
+		{"401 problem body stays a provider error", "problem-refresh-token", false, false},
+		{"429 maps to the rate limit error", "rate-limited-refresh-token", false, true},
+		{"2xx problem document stays a provider error", "problem-200-refresh-token", false, false},
+		{"200 without an access token errors", "no-access-token-refresh-token", false, false},
+		{"malformed json errors", "bad-json-refresh-token", false, false},
+		{"200 error field stays a provider error", "error-field-refresh-token", false, false},
+		{"body beyond the limit errors", "oversized-refresh-token", false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tok, err := p.RefreshToken(context.Background(), tc.token)
+			if err == nil {
+				t.Fatalf("expected error, got token %+v", tok)
+			}
+			if tok != nil {
+				t.Fatalf("expected nil token on failure, got %+v", tok)
+			}
+			if tc.wantGrant {
+				if !errors.Is(err, errors.ErrOAuthGrantRejected) {
+					t.Fatalf("error = %v; want ErrOAuthGrantRejected", err)
+				}
+				return
+			}
+			if errors.Is(err, errors.ErrOAuthGrantRejected) {
+				t.Fatalf("error = %v; must not be a grant rejection", err)
+			}
+			if tc.wantRateLimit {
+				if !errors.Is(err, errors.ErrOAuthRateLimitExceeded) {
+					t.Fatalf("error = %v; want ErrOAuthRateLimitExceeded", err)
+				}
+				retryAfter, ok := RetryAfterFromError(err)
+				if !ok || retryAfter != 30 {
+					t.Fatalf("RetryAfter = %d, ok = %v; want 30, true", retryAfter, ok)
+				}
+				return
+			}
+			_ = xProviderError(t, err)
+		})
+	}
 }
 
 func TestXProvider_FetchUserInfo(t *testing.T) {
