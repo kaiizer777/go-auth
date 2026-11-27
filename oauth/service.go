@@ -300,18 +300,36 @@ func (s *service) LinkedAccountToken(ctx context.Context, userID uuid.UUID, prov
 
 // linkedAccountFor resolves the user's row for one provider. It reads the
 // account list instead of probing by provider identity: the caller is
-// identified by user, and a row only resolves when it belongs to them.
+// identified by user, and a row only resolves when it belongs to them. A user
+// may hold more than one link for a provider, so the most recently updated one
+// is served; the id breaks ties so the answer never depends on store order.
 func (s *service) linkedAccountFor(ctx context.Context, userID uuid.UUID, providerID string) (db.OAuthAccount, error) {
 	accounts, err := s.store.OAuthAccounts().GetByUserID(ctx, userID)
 	if err != nil {
 		return db.OAuthAccount{}, errors.New(errors.CodeInternalError, "failed to load oauth accounts", err)
 	}
+	var newest *db.OAuthAccount
 	for _, account := range accounts {
-		if account != nil && account.ProviderID == providerID {
-			return *account, nil
+		if account == nil || account.ProviderID != providerID {
+			continue
+		}
+		if newest == nil || newerLink(account, newest) {
+			newest = account
 		}
 	}
-	return db.OAuthAccount{}, errors.ErrOAuthAccountNotLinked
+	if newest == nil {
+		return db.OAuthAccount{}, errors.ErrOAuthAccountNotLinked
+	}
+	return *newest, nil
+}
+
+// newerLink reports whether candidate is the row a provider lookup prefers: the
+// most recently updated link, with the id deciding an exact tie.
+func newerLink(candidate, current *db.OAuthAccount) bool {
+	if !candidate.UpdatedAt.Equal(current.UpdatedAt) {
+		return candidate.UpdatedAt.After(current.UpdatedAt)
+	}
+	return candidate.ID.String() < current.ID.String()
 }
 
 // tokenFresh reports whether a stored token may still be served. A nil expiry

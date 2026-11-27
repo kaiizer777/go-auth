@@ -236,6 +236,39 @@ func TestLinkedAccountToken_ReadPath(t *testing.T) {
 		}
 	})
 
+	t.Run("most recently updated link wins", func(t *testing.T) {
+		provider := &stubRefreshProvider{stubProvider: &stubProvider{id: "google"}}
+		expiresAt := time.Now().UTC().Add(time.Hour)
+		database, svc, older, owner := tokenAccessEnv(t, provider,
+			&OAuthToken{AccessToken: "older-access", RefreshToken: "older-refresh", ExpiresIn: 3600}, &expiresAt)
+		older = reloadTokenLink(t, database, older.ID)
+
+		// Written second, so an unordered read (insertion order) would serve the
+		// older grant first.
+		newer := older
+		newer.ID = uuid.New()
+		newer.ProviderUserID = "sub-token-newer"
+		rec, err := svc.sealedTokens(newer.ProviderID, newer.ID.String(),
+			&OAuthToken{AccessToken: "newer-access", RefreshToken: "newer-refresh", ExpiresIn: 3600})
+		if err != nil {
+			t.Fatalf("seal newer grant: %v", err)
+		}
+		rec.TokenExpiresAt = &expiresAt
+		applyTokenRecord(&newer, rec)
+		newer.UpdatedAt = older.UpdatedAt.Add(time.Hour)
+		if err := database.Create(&newer).Error; err != nil {
+			t.Fatalf("seed newer link: %v", err)
+		}
+
+		token, err := svc.LinkedAccountToken(ctx, owner.ID, "google")
+		if err != nil {
+			t.Fatalf("LinkedAccountToken = %v", err)
+		}
+		if token.AccessToken != "newer-access" {
+			t.Fatalf("AccessToken = %q; want the most recently updated link's", token.AccessToken)
+		}
+	})
+
 	t.Run("unlinked provider is not linked", func(t *testing.T) {
 		provider := &stubRefreshProvider{stubProvider: &stubProvider{id: "google"}}
 		_, svc, _, owner := tokenAccessEnv(t, provider, tokenTestGrant(), nil)

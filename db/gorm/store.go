@@ -245,7 +245,9 @@ func (s *oauthAccountStore) GetByProvider(ctx context.Context, providerID, provi
 
 func (s *oauthAccountStore) GetByUserID(ctx context.Context, userID uuid.UUID) ([]*db.OAuthAccount, error) {
 	var accounts []*db.OAuthAccount
-	if err := s.db.WithContext(ctx).Where("user_id = ?", userID).Find(&accounts).Error; err != nil {
+	// Most recently updated first: a user can hold two links for one provider
+	// and the newest is the one a single-row lookup must resolve.
+	if err := s.db.WithContext(ctx).Where("user_id = ?", userID).Order("updated_at DESC").Find(&accounts).Error; err != nil {
 		return nil, err
 	}
 	return accounts, nil

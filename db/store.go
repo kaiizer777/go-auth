@@ -74,6 +74,9 @@ type OAuthTokenRecord struct {
 type OAuthAccountStore interface {
 	Create(ctx context.Context, account *OAuthAccount) error
 	GetByProvider(ctx context.Context, providerID, providerTenantID, providerUserID string) (*OAuthAccount, error)
+	// GetByUserID returns every link the user holds, most recently updated
+	// first. A user may hold more than one link for one provider, so callers
+	// that resolve a single row take the first match for that provider.
 	GetByUserID(ctx context.Context, userID uuid.UUID) ([]*OAuthAccount, error)
 	UpdateProviderUserID(ctx context.Context, id uuid.UUID, providerUserID string) error
 	Delete(ctx context.Context, id uuid.UUID) error

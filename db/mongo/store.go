@@ -701,7 +701,10 @@ func (s *oauthAccountStore) GetByProvider(ctx context.Context, providerID, provi
 }
 
 func (s *oauthAccountStore) GetByUserID(ctx context.Context, userID uuid.UUID) ([]*db.OAuthAccount, error) {
-	cursor, err := s.collection().Find(s.store.resolveCtx(ctx), bson.M{"user_id": userID.String()})
+	// Most recently updated first: a user can hold two links for one provider
+	// and the newest is the one a single-row lookup must resolve.
+	opts := options.Find().SetSort(bson.D{{Key: "updated_at", Value: -1}})
+	cursor, err := s.collection().Find(s.store.resolveCtx(ctx), bson.M{"user_id": userID.String()}, opts)
 	if err != nil {
 		return []*db.OAuthAccount{}, err
 	}
