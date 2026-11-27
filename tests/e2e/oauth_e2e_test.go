@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 
@@ -18,6 +19,7 @@ import (
 
 	"github.com/kaiizer777/go-auth/auth"
 	"github.com/kaiizer777/go-auth/config"
+	"github.com/kaiizer777/go-auth/crypto"
 	"github.com/kaiizer777/go-auth/db"
 	gormstore "github.com/kaiizer777/go-auth/db/gorm"
 	"github.com/kaiizer777/go-auth/handler"
@@ -175,6 +177,20 @@ func probeIdentity(t *testing.T, p oauth.Provider) *oauth.UserInfo {
 		t.Fatalf("%s FetchUserInfo: %v", p.ID(), err)
 	}
 	return info
+}
+
+// envelopeField decodes one string field from a sealed token envelope.
+func envelopeField(t *testing.T, raw, field string) string {
+	t.Helper()
+	var doc map[string]any
+	if err := json.Unmarshal([]byte(raw), &doc); err != nil {
+		t.Fatalf("decode token envelope: %v", err)
+	}
+	value, _ := doc[field].(string)
+	if value == "" {
+		t.Fatalf("token envelope missing %q", field)
+	}
+	return value
 }
 
 func assertErrorCode(t *testing.T, rec *httptest.ResponseRecorder, want string) {
@@ -479,6 +495,72 @@ func TestE2E_FullBrowserOAuthJourneys(t *testing.T) {
 		}
 		if responseCookie(t, retRec, cfg.SessionCookieName) == nil {
 			t.Fatal("expected session cookie for returning user")
+		}
+
+		// The login stores sealed envelopes, not provider plaintext, and the
+		// access envelope names the keyring's active key.
+		var link db.OAuthAccount
+		if err := dbConn.Where("provider_id = ? AND user_id = ?", "x", seededUser.ID).First(&link).Error; err != nil {
+			t.Fatalf("load x link: %v", err)
+		}
+		if link.AccessTokenCiphertext == "" || link.RefreshTokenCiphertext == "" {
+			t.Fatal("returning login must store sealed access and refresh envelopes")
+		}
+		if strings.Contains(link.AccessTokenCiphertext, "x-idp-access-token") ||
+			strings.Contains(link.RefreshTokenCiphertext, "x-idp-refresh-token") {
+			t.Fatal("oauth_accounts columns must not hold provider plaintext tokens")
+		}
+		ring, err := crypto.ParseKeyring(cfg.OAuth.TokenKEK)
+		if err != nil {
+			t.Fatalf("ParseKeyring: %v", err)
+		}
+		if got, want := envelopeField(t, link.AccessTokenCiphertext, "kid"), ring.ActiveKeyID(); got != want {
+			t.Fatalf("access envelope kid = %q; want the active key %q", got, want)
+		}
+		sealer := crypto.NewTokenSealer(ring)
+		issuedRefresh, err := sealer.OpenRefreshToken("x", link.ID.String(), link.RefreshTokenCiphertext)
+		if err != nil {
+			t.Fatalf("open issued refresh token: %v", err)
+		}
+
+		// Force expiry: the next accessor call must renew exactly once and
+		// rewrite the stored pair with the rotated grant.
+		if err := dbConn.Model(&db.OAuthAccount{}).Where("id = ?", link.ID).
+			Update("token_expires_at", time.Now().Add(-time.Hour)).Error; err != nil {
+			t.Fatalf("expire x link: %v", err)
+		}
+		accessor := oauth.NewServiceWithRegistry(gormstore.New(dbConn), session.NewService(dbConn, &cfg), *pReg, &cfg)
+		token, err := accessor.LinkedAccountToken(context.Background(), seededUser.ID, "x")
+		if err != nil {
+			t.Fatalf("LinkedAccountToken: %v", err)
+		}
+		if token.AccessToken != "x-idp-access-token" || !strings.EqualFold(token.TokenType, "bearer") {
+			t.Fatalf("accessor token = %q %q; want the provider access token and a bearer type", token.AccessToken, token.TokenType)
+		}
+		if token.RefreshToken != "" {
+			t.Fatal("accessor must not return the refresh token")
+		}
+		if got := idp.RefreshCalls.Load(); got != 1 {
+			t.Fatalf("refresh POSTs at the IdP = %d; want exactly 1", got)
+		}
+
+		var rotated db.OAuthAccount
+		if err := dbConn.Where("id = ?", link.ID).First(&rotated).Error; err != nil {
+			t.Fatalf("reload x link: %v", err)
+		}
+		if rotated.AccessTokenCiphertext == link.AccessTokenCiphertext ||
+			rotated.RefreshTokenCiphertext == link.RefreshTokenCiphertext {
+			t.Fatal("refresh must rewrite both stored envelopes")
+		}
+		if rotated.TokenExpiresAt == nil || !rotated.TokenExpiresAt.After(time.Now()) {
+			t.Fatalf("refreshed expiry = %v; want a future timestamp", rotated.TokenExpiresAt)
+		}
+		rotatedRefresh, err := sealer.OpenRefreshToken("x", link.ID.String(), rotated.RefreshTokenCiphertext)
+		if err != nil {
+			t.Fatalf("open rotated refresh token: %v", err)
+		}
+		if rotatedRefresh == issuedRefresh {
+			t.Fatal("refresh must rotate the stored refresh token")
 		}
 	})
 

@@ -15,6 +15,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -469,7 +470,13 @@ type XIdP struct {
 	Username     string
 	Avatar       string
 
-	codes *authorizeCodes
+	// RefreshCalls counts every refresh_token grant that reached the token
+	// endpoint, accepted or replayed.
+	RefreshCalls atomic.Int64
+
+	mu           sync.Mutex
+	refreshToken string
+	codes        *authorizeCodes
 }
 
 // NewXIdP starts an X-shaped IdP.
@@ -482,6 +489,7 @@ func NewXIdP(redirectURI ...string) *XIdP {
 		UserID:       "x-idp-user-1",
 		Username:     "x_idp_user",
 		Avatar:       "https://pbs.twimg.com/idp_normal.jpg",
+		refreshToken: "x-idp-refresh-token",
 		codes:        newAuthorizeCodes(),
 	}
 	idp.codes.registerClient(
@@ -517,21 +525,59 @@ func (i *XIdP) token(w http.ResponseWriter, r *http.Request) {
 		writeOAuthError(w, "invalid_client")
 		return
 	}
-	if r.PostForm.Get("grant_type") != "authorization_code" {
+	switch r.PostForm.Get("grant_type") {
+	case "authorization_code":
+		i.exchangeCode(w, r)
+	case "refresh_token":
+		i.refreshGrant(w, r)
+	default:
 		writeOAuthError(w, "invalid_grant")
-		return
 	}
+}
+
+// exchangeCode issues the code's token pair. A refresh token is issued only for
+// a granted offline.access scope, the way X withholds it for online-only access.
+func (i *XIdP) exchangeCode(w http.ResponseWriter, r *http.Request) {
 	ac, ok := i.codes.complete(r.PostForm)
 	if !ok {
 		writeOAuthError(w, "invalid_grant")
 		return
 	}
-	writeJSON(w, grantedScope(map[string]any{
+	payload := map[string]any{
+		"token_type":   "bearer",
+		"access_token": i.accessToken(),
+		"expires_in":   7200,
+	}
+	if scopeGranted(ac.scope, "offline.access") {
+		i.mu.Lock()
+		payload["refresh_token"] = i.refreshToken
+		i.mu.Unlock()
+	}
+	writeJSON(w, grantedScope(payload, ac))
+}
+
+// refreshGrant redeems the current refresh token and rotates it. Replaying any
+// other value is invalid_grant, matching X's single-use rotation.
+func (i *XIdP) refreshGrant(w http.ResponseWriter, r *http.Request) {
+	i.RefreshCalls.Add(1)
+
+	presented := r.PostForm.Get("refresh_token")
+	i.mu.Lock()
+	if presented == "" || presented != i.refreshToken {
+		i.mu.Unlock()
+		writeOAuthError(w, "invalid_grant")
+		return
+	}
+	rotated := fmt.Sprintf("x-idp-refresh-token-%d", i.RefreshCalls.Load())
+	i.refreshToken = rotated
+	i.mu.Unlock()
+
+	writeJSON(w, map[string]any{
 		"token_type":    "bearer",
 		"access_token":  i.accessToken(),
 		"expires_in":    7200,
-		"refresh_token": "x-idp-refresh-token",
-	}, ac))
+		"refresh_token": rotated,
+	})
 }
 
 func (i *XIdP) me(w http.ResponseWriter, r *http.Request) {
@@ -718,6 +764,12 @@ func grantedScope(payload map[string]any, ac authorizeCode) map[string]any {
 		payload["scope"] = ac.scope
 	}
 	return payload
+}
+
+// scopeGranted reports whether scope carries want as a whole element, so
+// "xoffline.access" and "offline.access.read" do not match "offline.access".
+func scopeGranted(scope, want string) bool {
+	return slices.Contains(strings.Fields(scope), want)
 }
 
 func freshCode() (string, error) {

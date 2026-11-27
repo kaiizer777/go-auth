@@ -623,13 +623,31 @@ func TestOAuthSecurity_ZeroSecretLeakInLogs(t *testing.T) {
 	}
 
 	logs := sink.String()
+	_, encodedKey, ok := strings.Cut(secTokenKEK, ":")
+	if !ok {
+		t.Fatal("test keyring spec is missing its separator")
+	}
+	keyBytes, err := base64.StdEncoding.DecodeString(encodedKey)
+	if err != nil {
+		t.Fatalf("decode test key: %v", err)
+	}
+	var stored db.OAuthAccount
+	if err := database.Where("provider_id = ?", "apple").First(&stored).Error; err != nil {
+		t.Fatalf("load linked apple account: %v", err)
+	}
+	if stored.AccessTokenCiphertext == "" || stored.RefreshTokenCiphertext == "" {
+		t.Fatal("linked account must store both sealed token columns")
+	}
 	for name, secret := range map[string]string{
-		"access token":  m.AccessToken,
-		"refresh token": m.RefreshToken,
-		"id token":      m.IDToken,
-		"client secret": m.ClientSecret,
-		"code verifier": verifier,
-		"raw session":   sid.Value,
+		"access token":       m.AccessToken,
+		"refresh token":      m.RefreshToken,
+		"id token":           m.IDToken,
+		"client secret":      m.ClientSecret,
+		"code verifier":      verifier,
+		"raw session":        sid.Value,
+		"token key":          string(keyBytes),
+		"access ciphertext":  stored.AccessTokenCiphertext,
+		"refresh ciphertext": stored.RefreshTokenCiphertext,
 	} {
 		if secret != "" && strings.Contains(logs, secret) {
 			t.Errorf("log leaked %s", name)

@@ -47,6 +47,12 @@ go-auth/
 > **Breaking Change:** `OAuthAccountStore.GetByProvider` takes the identity's tenant alongside the provider user ID: `GetByProvider(ctx context.Context, providerID, providerTenantID, providerUserID string)`. A pairwise subject is only unique within the tenant that issued it, so `oauth_accounts` is now uniquely keyed on `(provider_id, provider_tenant_id, provider_user_id)`. Custom implementations must update the signature and the lookup predicate; providers without a tenant namespace pass an empty tenant.
 
 > [!NOTE]
+> **Breaking Change:** `OAuthAccountStore` gained `SaveOAuthTokens` and `SaveOAuthTokensCAS`, and `oauth.Service` gained `LinkedAccountToken`. Custom implementations must provide them. Provider tokens are persisted only as AES-256-GCM envelopes; with any provider enabled, a missing or malformed `GOAUTH_TOKEN_KEK` keyring stops startup. X defaults to `users.read offline.access`.
+
+> [!NOTE]
+> **Token keyring:** `GOAUTH_TOKEN_KEK` takes comma-separated `kid:base64key` entries whose keys each decode to 32 bytes (`k1:<base64>,k0:<base64>`). The first entry encrypts new values and every entry can decrypt; there is no plaintext mode and no generated fallback. To rotate, prepend the new key, keep the old one until logins and refreshes have rewritten every affected row, then remove it. There is no `kid` column, so a row still bound to a removed key surfaces only as a decryption error on first use. A dead provider grant (`OAUTH_REAUTH_REQUIRED`) does not invalidate the application session.
+
+> [!NOTE]
 > **Behavior Change:** Microsoft identities are stored with their verified tenant: the tenant segment of the `id_token` issuer, which is bound to the configured authority during verification. A token without an `id_token` can only be accepted under an authority that pins one tenant (a tenant GUID, domain, or `consumers`); the multi-tenant `common` and `organizations` authorities cannot prove a tenant from the unsigned `/userinfo` payload and reject the sign-in before the request.
 
 > [!NOTE]
