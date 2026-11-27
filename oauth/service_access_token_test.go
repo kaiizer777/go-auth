@@ -386,7 +386,7 @@ func TestLinkedAccountToken_Refresh(t *testing.T) {
 			return &OAuthToken{
 				AccessToken:  "rotated-access",
 				RefreshToken: "rotated-refresh",
-				TokenType:    "Bearer",
+				TokenType:    "bearer",
 				ExpiresIn:    7200,
 				Raw:          map[string]any{"access_token": "rotated-access", "refresh_token": "rotated-refresh"},
 			}, nil
@@ -400,8 +400,13 @@ func TestLinkedAccountToken_Refresh(t *testing.T) {
 		if presented != tokenTestRefresh {
 			t.Fatalf("presented refresh token = %q; want %q", presented, tokenTestRefresh)
 		}
-		if token.AccessToken != "rotated-access" || token.TokenType != "Bearer" || token.ExpiresIn != 7200 {
+		if token.AccessToken != "rotated-access" || token.ExpiresIn != 7200 {
 			t.Fatalf("token = %+v; want the rotated access token", token)
+		}
+		// Providers answer token_type in their own casing (X sends "bearer");
+		// the accessor reports one canonical scheme either way.
+		if token.TokenType != tokenTypeBearer {
+			t.Fatalf("TokenType = %q; want %q after a refresh", token.TokenType, tokenTypeBearer)
 		}
 		if token.ExpiresAt.Before(before.Add(7200*time.Second)) || token.ExpiresAt.After(time.Now().UTC().Add(7200*time.Second)) {
 			t.Fatalf("ExpiresAt = %v; want now+7200s", token.ExpiresAt)

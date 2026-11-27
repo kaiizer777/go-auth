@@ -503,14 +503,13 @@ func (s *service) refreshFailure(ctx context.Context, link db.OAuthAccount, err 
 
 // refreshedAccess projects a renewed grant onto the caller-facing value. Raw is
 // the provider's whole response body, which carries the refresh token, so it is
-// dropped along with every other credential the caller must not receive.
+// dropped along with every other credential the caller must not receive. The
+// token type is normalised to the canonical scheme so the answer does not depend
+// on whether a refresh happened.
 func refreshedAccess(tokens *OAuthToken) *OAuthToken {
 	token := &OAuthToken{
 		AccessToken: tokens.AccessToken,
-		TokenType:   tokens.TokenType,
-	}
-	if token.TokenType == "" {
-		token.TokenType = tokenTypeBearer
+		TokenType:   tokenTypeBearer,
 	}
 	if tokens.ExpiresIn > 0 {
 		token.ExpiresIn = tokens.ExpiresIn
