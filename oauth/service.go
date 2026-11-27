@@ -615,11 +615,12 @@ func (s *service) exchangeRefreshToken(ctx context.Context, link db.OAuthAccount
 	return refreshedAccess(refreshed), nil
 }
 
-// persistAttempts bounds the rotated-grant write. By the time it runs the
-// provider has already spent the presented refresh token, so a single transient
-// store fault would leave the account with no usable grant; repeating the
-// guarded write costs one statement and stays idempotent because the CAS can
-// only land once.
+// persistAttempts bounds the guarded writes that follow a spent refresh token:
+// the rotated pair and the pair recovered past a concurrent clear. By the time
+// either runs the provider has already spent the presented token, so a single
+// transient store fault would leave the account with no usable grant; repeating
+// the guarded write costs one statement and stays idempotent because each guard
+// can only land once.
 const persistAttempts = 2
 
 // persistRefreshed stores the rotated pair, CAS-guarded on the fingerprint that
@@ -644,7 +645,8 @@ func (s *service) persistRefreshed(ctx context.Context, link db.OAuthAccount, re
 // the presented token, so the pair in hand is the only grant left; dropping it
 // would force a re-login for a rotation that succeeded. The write is guarded
 // like any other first grant: a row that was filled after the reread holds the
-// newer grant and is served instead of being overwritten.
+// newer grant and is served instead of being overwritten. Only this store write
+// is retried; the exchange has already happened and is never repeated.
 func (s *service) persistPastClear(ctx context.Context, link db.OAuthAccount, rec db.OAuthTokenRecord, refreshed *OAuthToken) (*OAuthToken, error) {
 	current, err := s.rereadOwned(ctx, link)
 	if err != nil {
@@ -653,7 +655,14 @@ func (s *service) persistPastClear(ctx context.Context, link db.OAuthAccount, re
 	if current.AccessTokenCiphertext != "" || current.RefreshTokenFingerprint != "" {
 		return s.serveGrant(ctx, *current)
 	}
-	won, werr := s.store.OAuthAccounts().SaveOAuthTokensIfUnset(ctx, link.ID, rec)
+	var won bool
+	var werr error
+	for attempt := 0; attempt < persistAttempts; attempt++ {
+		won, werr = s.store.OAuthAccounts().SaveOAuthTokensIfUnset(ctx, link.ID, rec)
+		if werr == nil {
+			break
+		}
+	}
 	if werr != nil {
 		logTokenEvent(ctx, "oauth_token_refresh_persist_failed", link)
 		return nil, errors.ErrOAuthTokenExchangeFailed

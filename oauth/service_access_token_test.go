@@ -503,22 +503,39 @@ func (s *interceptReadOAuthStore) GetByProvider(ctx context.Context, providerID,
 	return row, err
 }
 
-// failingWriteOAuthStore rejects the next failures guarded token writes: the
+// failingWriteOAuthStore faults the next guarded token writes of each kind: the
 // shape of a transient store fault on the rotation path.
 type failingWriteOAuthStore struct {
 	db.OAuthAccountStore
-	mu       sync.Mutex
-	failures int
+	mu              sync.Mutex
+	casFailures     int
+	ifUnsetFailures int
 }
 
 func (s *failingWriteOAuthStore) SaveOAuthTokensCAS(ctx context.Context, id uuid.UUID, expectedFingerprint string, rec db.OAuthTokenRecord) (bool, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.failures > 0 {
-		s.failures--
+	if s.fail(&s.casFailures) {
 		return false, stderrors.New("simulated write failure")
 	}
 	return s.OAuthAccountStore.SaveOAuthTokensCAS(ctx, id, expectedFingerprint, rec)
+}
+
+func (s *failingWriteOAuthStore) SaveOAuthTokensIfUnset(ctx context.Context, id uuid.UUID, rec db.OAuthTokenRecord) (bool, error) {
+	if s.fail(&s.ifUnsetFailures) {
+		return false, stderrors.New("simulated write failure")
+	}
+	return s.OAuthAccountStore.SaveOAuthTokensIfUnset(ctx, id, rec)
+}
+
+// fail consumes one armed fault. Callers hold no lock: the mutex guards both the
+// counters and the decrement.
+func (s *failingWriteOAuthStore) fail(armed *int) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if *armed == 0 {
+		return false
+	}
+	*armed--
+	return true
 }
 
 func TestLinkedAccountToken_Refresh(t *testing.T) {
@@ -886,7 +903,7 @@ func TestLinkedAccountToken_Refresh(t *testing.T) {
 		base := svc.store
 		svc.store = &wrappedTxStore{Store: base, oauth: &failingWriteOAuthStore{
 			OAuthAccountStore: base.OAuthAccounts(),
-			failures:          1,
+			casFailures:       1,
 		}}
 		provider.refreshFn = func(context.Context, string) (*OAuthToken, error) {
 			return &OAuthToken{AccessToken: "rotated-access", RefreshToken: "rotated-refresh", ExpiresIn: 3600}, nil
@@ -900,6 +917,41 @@ func TestLinkedAccountToken_Refresh(t *testing.T) {
 			t.Fatalf("AccessToken = %q; want rotated-access", token.AccessToken)
 		}
 		requireStoredGrant(t, reloadTokenLink(t, database, link.ID), "rotated-access", "rotated-refresh")
+		// The retry repeats only the store write: the spent refresh token is
+		// never presented to the provider again.
+		if provider.calls() != 1 {
+			t.Fatalf("refresh calls = %d; want 1", provider.calls())
+		}
+	})
+
+	// A clear that won the CAS emptied the row before the pair was persisted, so
+	// the recovered pair is the only grant left and needs the same retry.
+	t.Run("a transient failure storing past a clear retries the rotated grant", func(t *testing.T) {
+		provider := &stubRefreshProvider{stubProvider: &stubProvider{id: "google"}}
+		database, svc, link, owner := tokenAccessEnv(t, provider, tokenTestGrant(), staleExpiry())
+		base := svc.store
+		svc.store = &wrappedTxStore{Store: base, oauth: &failingWriteOAuthStore{
+			OAuthAccountStore: base.OAuthAccounts(),
+			ifUnsetFailures:   1,
+		}}
+		provider.refreshFn = func(context.Context, string) (*OAuthToken, error) {
+			if err := clearGrant(svc, link); err != nil {
+				return nil, err
+			}
+			return &OAuthToken{AccessToken: "rotated-access", RefreshToken: "rotated-refresh", ExpiresIn: 3600}, nil
+		}
+
+		token, err := svc.LinkedAccountToken(ctx, owner.ID, "google")
+		if err != nil {
+			t.Fatalf("LinkedAccountToken = %v; want the retried persist", err)
+		}
+		if token.AccessToken != "rotated-access" {
+			t.Fatalf("AccessToken = %q; want rotated-access", token.AccessToken)
+		}
+		requireStoredGrant(t, reloadTokenLink(t, database, link.ID), "rotated-access", "rotated-refresh")
+		if provider.calls() != 1 {
+			t.Fatalf("refresh calls = %d; want 1", provider.calls())
+		}
 	})
 
 	// A write that keeps failing must not be "repaired" by clearing the grant:
@@ -910,7 +962,7 @@ func TestLinkedAccountToken_Refresh(t *testing.T) {
 		base := svc.store
 		svc.store = &wrappedTxStore{Store: base, oauth: &failingWriteOAuthStore{
 			OAuthAccountStore: base.OAuthAccounts(),
-			failures:          persistAttempts + 1,
+			casFailures:       persistAttempts + 1,
 		}}
 		before := reloadTokenLink(t, database, link.ID)
 		provider.refreshFn = func(context.Context, string) (*OAuthToken, error) {
