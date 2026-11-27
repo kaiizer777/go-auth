@@ -117,7 +117,6 @@ func TestFacebookProvider_AuthCodeURL_GraphVersionPrefix(t *testing.T) {
 		wantPath     string
 	}{
 		{name: "prefixed version unchanged", graphVersion: "v19.0", wantPath: "/v19.0/dialog/oauth"},
-		{name: "unprefixed version gets prefix", graphVersion: "19.0", wantPath: "/v19.0/dialog/oauth"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -138,6 +137,99 @@ func TestFacebookProvider_AuthCodeURL_GraphVersionPrefix(t *testing.T) {
 			if got != want {
 				t.Fatalf("authorize URL = %q; want %q", got, want)
 			}
+		})
+	}
+}
+
+func TestNewFacebookProviderChecked_GraphVersion(t *testing.T) {
+	t.Parallel()
+
+	accepted := []struct {
+		name        string
+		version     string
+		wantVersion string
+	}{
+		{name: "empty defaults", version: "", wantVersion: "v19.0"},
+		{name: "current version", version: "v19.0", wantVersion: "v19.0"},
+		{name: "newer version", version: "v22.0", wantVersion: "v22.0"},
+	}
+	for _, tt := range accepted {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			p, err := NewFacebookProviderChecked(config.FacebookConfig{GraphVersion: tt.version})
+			if err != nil {
+				t.Fatalf("NewFacebookProviderChecked(%q) error = %v; want nil", tt.version, err)
+			}
+			if p == nil {
+				t.Fatal("provider = nil; want non-nil")
+			}
+			wantAuthURL := "https://www.facebook.com/" + tt.wantVersion + "/dialog/oauth"
+			if p.authURL != wantAuthURL {
+				t.Fatalf("authURL = %q; want %q", p.authURL, wantAuthURL)
+			}
+			wantTokenURL := "https://graph.facebook.com/" + tt.wantVersion + "/oauth/access_token"
+			if p.tokenURL != wantTokenURL {
+				t.Fatalf("tokenURL = %q; want %q", p.tokenURL, wantTokenURL)
+			}
+			wantUserInfoURL := "https://graph.facebook.com/" + tt.wantVersion + "/me"
+			if p.userInfoURL != wantUserInfoURL {
+				t.Fatalf("userInfoURL = %q; want %q", p.userInfoURL, wantUserInfoURL)
+			}
+		})
+	}
+
+	rejected := []string{
+		"19.0", "v0x13", "v19.0 beta", "../x", "v18.9", "v19", "v19.0.1",
+		" v19.0", "v19.0 ", "V19.0", "v019.0",
+	}
+	for _, version := range rejected {
+		t.Run("rejects "+version, func(t *testing.T) {
+			t.Parallel()
+
+			p, err := NewFacebookProviderChecked(config.FacebookConfig{GraphVersion: version})
+			if p != nil {
+				t.Fatalf("provider = %+v; want nil", p)
+			}
+			if !errors.Is(err, errors.ErrOAuthGraphVersionInvalid) {
+				t.Fatalf("error = %v; want ErrOAuthGraphVersionInvalid", err)
+			}
+			if !strings.Contains(err.Error(), version) {
+				t.Fatalf("error = %q; want it to name %q", err, version)
+			}
+		})
+	}
+}
+
+func TestNewFacebookProvider_GraphVersion(t *testing.T) {
+	t.Parallel()
+
+	for _, version := range []string{"", "v19.0"} {
+		p := NewFacebookProvider(config.FacebookConfig{GraphVersion: version})
+		if p == nil {
+			t.Fatalf("provider = nil for %q; want non-nil", version)
+		}
+		if want := "https://www.facebook.com/v19.0/dialog/oauth"; p.authURL != want {
+			t.Fatalf("authURL = %q; want %q", p.authURL, want)
+		}
+	}
+
+	for _, version := range []string{"19.0", "../x", "v19.0 beta"} {
+		t.Run("panics on "+version, func(t *testing.T) {
+			t.Parallel()
+
+			defer func() {
+				recovered := recover()
+				msg, ok := recovered.(string)
+				if !ok {
+					t.Fatalf("panic = %v; want a string", recovered)
+				}
+				if !strings.Contains(msg, version) || !strings.Contains(msg, "NewFacebookProviderChecked") {
+					t.Fatalf("panic = %q; want it to name %q and NewFacebookProviderChecked", msg, version)
+				}
+			}()
+
+			NewFacebookProvider(config.FacebookConfig{GraphVersion: version})
 		})
 	}
 }

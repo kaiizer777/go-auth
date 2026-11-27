@@ -1038,14 +1038,11 @@ func isToken(s string) bool {
 }
 
 // ValidateGraphVersion reports whether version is an acceptable Facebook Graph
-// API version, accepting "" (which callers default to v19.0) and requiring
-// "<major>.<minor>" with an optional lowercase "v" prefix, no leading zeros, and
-// a major of at least 19. It is the single grammar shared by Config.Validate and
-// the oauth Facebook adapter, so the two cannot drift; do not reimplement it.
+// API version: a lowercase "v" prefix followed by "<major>.<minor>", no leading
+// zeros, and a major of at least 19. It is the single grammar shared by
+// Config.Validate and the oauth Facebook adapter, so the two cannot drift; do not
+// reimplement it. Callers that accept an unset version must default it first.
 func ValidateGraphVersion(version string) error {
-	if version == "" {
-		return nil
-	}
 	if !graphVersionRegex.MatchString(version) {
 		return errors.ErrOAuthGraphVersionInvalid
 	}
@@ -1092,7 +1089,7 @@ func isCookieDomain(s string) bool {
 
 var (
 	dsnParamRegex        = regexp.MustCompile(`(?i)\b(host|dbname)\b\s*=\s*(?:'(?:\\.|[^'\\])*'|"(?:\\.|[^"\\])*"|\S+)`)
-	graphVersionRegex    = regexp.MustCompile(`^v?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$`)
+	graphVersionRegex    = regexp.MustCompile(`^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$`)
 	urlSchemePrefixRegex = regexp.MustCompile(`^(?:[a-zA-Z][a-zA-Z0-9+.-]*:)?//`)
 	dsnSecretRegex       = regexp.MustCompile(`(?i)\b(password|pass|token|secret|api_key|apikey|sslpassword)\b(\s*=\s*)(?:'(?:\\.|[^'\\])*'|"(?:\\.|[^"\\])*"|\S+)`)
 	userinfoRegex        = regexp.MustCompile(`://([^:]+):([^@]+)@`)

@@ -202,10 +202,17 @@ func NewProvider(id string, cfg config.ProviderConfig, oCfg ...*config.OAuthConf
 		return NewMicrosoftProvider(mergeMicrosoftConfig(cfg, typed)), nil
 	case "facebook":
 		merged := mergeFacebookConfig(cfg, typed)
+		var p *FacebookProvider
+		var err error
 		if merged.AssertEmailVerified {
-			return NewFacebookProvider(merged, FacebookAssertEmailVerified()), nil
+			p, err = NewFacebookProviderChecked(merged, FacebookAssertEmailVerified())
+		} else {
+			p, err = NewFacebookProviderChecked(merged)
 		}
-		return NewFacebookProvider(merged), nil
+		if err != nil {
+			return nil, err
+		}
+		return p, nil
 	case "discord":
 		return NewDiscordProvider(config.DiscordConfig{
 			ClientID:     cfg.ClientID,
