@@ -78,6 +78,7 @@ func TestSecurity_PreHijackingAccountLinkConflict(t *testing.T) {
 
 	cfg := config.DefaultConfig()
 	cfg.OAuth.StateSecret = "super-secret-anti-hijack-test-state-key-32b"
+	cfg.OAuth.TokenKEK = secTokenKEK
 	sessSvc := session.NewService(database, &cfg)
 
 	// 1. Attacker pre-creates local account with victim's email (email_verified = false)
@@ -143,6 +144,7 @@ func TestSecurity_Microsoft_nOauth_UntrustedTenantTakeover(t *testing.T) {
 
 	cfg := config.DefaultConfig()
 	cfg.OAuth.StateSecret = "super-secret-anti-hijack-test-state-key-32b"
+	cfg.OAuth.TokenKEK = secTokenKEK
 	sessSvc := session.NewService(database, &cfg)
 
 	// External untrusted tenant ID attempting to claim victim@company.com without domain verification.
@@ -223,6 +225,7 @@ func TestSecurity_UntrustedTenantNotLinkedForActiveSession(t *testing.T) {
 
 	cfg := config.DefaultConfig()
 	cfg.OAuth.StateSecret = "super-secret-anti-hijack-test-state-key-32b"
+	cfg.OAuth.TokenKEK = secTokenKEK
 	sessSvc := session.NewService(database, &cfg)
 
 	active := db.User{ID: uuid.New(), Email: "active@company.com", PasswordHash: "hash", EmailVerified: true}
@@ -275,6 +278,7 @@ func TestSecurity_UntrustedTenantEvictsAndGatesExistingLink(t *testing.T) {
 
 	cfg := config.DefaultConfig()
 	cfg.OAuth.StateSecret = "super-secret-anti-hijack-test-state-key-32b"
+	cfg.OAuth.TokenKEK = secTokenKEK
 	sessSvc := session.NewService(database, &cfg)
 
 	owner := db.User{ID: uuid.New(), Email: "linked@company.com", PasswordHash: "hash", EmailVerified: true}
@@ -350,6 +354,7 @@ func TestSecurity_MissingEmailFailClosed(t *testing.T) {
 
 	cfg := config.DefaultConfig()
 	cfg.OAuth.StateSecret = "super-secret-anti-hijack-test-state-key-32b"
+	cfg.OAuth.TokenKEK = secTokenKEK
 	sessSvc := session.NewService(database, &cfg)
 
 	// Provider returns empty email
@@ -400,6 +405,7 @@ func TestSecurity_StateCookieTamperingAndReplay(t *testing.T) {
 
 	cfg := config.DefaultConfig()
 	cfg.OAuth.StateSecret = "super-secret-anti-hijack-test-state-key-32b"
+	cfg.OAuth.TokenKEK = secTokenKEK
 	sessSvc := session.NewService(database, &cfg)
 
 	mockGoogle := oauthmock.New("google", "google-sub-safe", "user@example.com", true)

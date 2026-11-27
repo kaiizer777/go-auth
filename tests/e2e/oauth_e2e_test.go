@@ -26,6 +26,9 @@ import (
 	"github.com/kaiizer777/go-auth/tests/oauthmock"
 )
 
+// testTokenKEK is the fixed valid keyring the OAuth service seals grants with.
+const testTokenKEK = "test-kid:AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
+
 func setupOAuthE2EStack(t *testing.T, mutate ...func(*config.Config)) (http.Handler, *gorm.DB, *oauth.Registry, config.Config) {
 	t.Helper()
 	name := fmt.Sprintf("file:oauth_e2e_%s?mode=memory&cache=shared", uuid.New().String())
@@ -52,6 +55,7 @@ func setupOAuthE2EStack(t *testing.T, mutate ...func(*config.Config)) (http.Hand
 	cfg.DatabaseURL = "postgres://postgres:postgres@localhost:5432/testdb"
 	cfg.BaseURL = "http://localhost:8080"
 	cfg.OAuth.StateSecret = "super-secret-e2e-state-signing-key-32b"
+	cfg.OAuth.TokenKEK = testTokenKEK
 	cfg.SessionCookieSecure = false
 	for _, fn := range mutate {
 		fn(&cfg)

@@ -4,16 +4,19 @@ import (
 	"context"
 	stderrors "errors"
 	"log/slog"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/go-sql-driver/mysql"
 	"github.com/google/uuid"
 	"gorm.io/gorm"
 
 	"github.com/kaiizer777/go-auth/config"
+	"github.com/kaiizer777/go-auth/crypto"
 	"github.com/kaiizer777/go-auth/db"
 	gormstore "github.com/kaiizer777/go-auth/db/gorm"
 	"github.com/kaiizer777/go-auth/errors"
@@ -69,6 +72,19 @@ type service struct {
 	registry   Registry
 	providers  map[string]Provider
 	cfg        *config.Config
+	sealer     *crypto.TokenSealer
+}
+
+// newTokenSealer builds the immutable token sealer from cfg.OAuth.TokenKEK. A
+// missing or unparsable keyring yields a nil sealer, so InitiateFlow and
+// HandleCallback fail closed instead of issuing an unusable login; config
+// validation already rejects a malformed specification at startup.
+func newTokenSealer(cfg *config.Config) *crypto.TokenSealer {
+	ring, err := crypto.ParseKeyring(cfg.OAuth.TokenKEK)
+	if err != nil {
+		return nil
+	}
+	return crypto.NewTokenSealer(ring)
 }
 
 // NewServiceWithRegistry wires the OAuth linking engine using an abstract db.Store and dynamic Registry.
@@ -77,7 +93,7 @@ func NewServiceWithRegistry(store db.Store, sessionSvc session.Service, registry
 		defaultCfg := config.DefaultConfig()
 		cfg = &defaultCfg
 	}
-	return &service{store: store, sessionSvc: sessionSvc, registry: registry, cfg: cfg}
+	return &service{store: store, sessionSvc: sessionSvc, registry: registry, cfg: cfg, sealer: newTokenSealer(cfg)}
 }
 
 // NewServiceWithStore wires the OAuth linking engine using an abstract db.Store.
@@ -86,7 +102,7 @@ func NewServiceWithStore(store db.Store, sessionSvc session.Service, providers m
 		defaultCfg := config.DefaultConfig()
 		cfg = &defaultCfg
 	}
-	return &service{store: store, sessionSvc: sessionSvc, providers: providers, cfg: cfg}
+	return &service{store: store, sessionSvc: sessionSvc, providers: providers, cfg: cfg, sealer: newTokenSealer(cfg)}
 }
 
 // NewService wires the OAuth linking engine. cfg is the full app config: state
@@ -216,6 +232,26 @@ func (s *service) checkLinkOwnerAlive(ctx context.Context, activeUserID string) 
 	return nil
 }
 
+// maxTokenLifetimeSeconds is the largest expires_in that still fits a
+// time.Duration: anything above it would overflow into a past timestamp.
+const maxTokenLifetimeSeconds = math.MaxInt64 / int64(time.Second)
+
+// tokenExpiry derives the absolute access-token expiry from the provider's
+// relative lifetime. ExpiresIn <= 0 stores no expiry. OAuthToken.ExpiresAt is
+// never populated by an adapter, so it is deliberately not consulted; an
+// oversized ExpiresIn is clamped to maxTokenLifetimeSeconds.
+func tokenExpiry(tokens *OAuthToken) *time.Time {
+	if tokens == nil || tokens.ExpiresIn <= 0 {
+		return nil
+	}
+	seconds := int64(tokens.ExpiresIn)
+	if seconds > maxTokenLifetimeSeconds {
+		seconds = maxTokenLifetimeSeconds
+	}
+	expiresAt := time.Now().UTC().Add(time.Duration(seconds) * time.Second)
+	return &expiresAt
+}
+
 // InitiateFlow generates PKCE, persists verifier+state in the signed state
 // cookie, and returns the provider authorization URL for a 302 redirect.
 func (s *service) InitiateFlow(w http.ResponseWriter, r *http.Request, providerID string) (string, error) {
@@ -226,6 +262,12 @@ func (s *service) InitiateFlow(w http.ResponseWriter, r *http.Request, providerI
 	p, err := s.providerFor(providerID)
 	if err != nil {
 		return "", err
+	}
+	// No keyring means no grant could ever be stored: refuse the flow before a
+	// state cookie is planted rather than sending the user through a login that
+	// cannot complete.
+	if s.sealer == nil {
+		return "", errors.ErrOAuthTokenKEKMissing
 	}
 	pkce, err := GeneratePKCE()
 	if err != nil {
@@ -333,6 +375,12 @@ func (s *service) HandleCallback(ctx context.Context, w http.ResponseWriter, r *
 	p, err := s.providerFor(providerID)
 	if err != nil {
 		return fail("provider_not_found", err)
+	}
+	// Fail closed before the exchange: without a keyring the grant cannot be
+	// stored, and burning the authorization code for an unusable login is worse
+	// than refusing the callback. No user, link, or session row is created.
+	if s.sealer == nil {
+		return fail("token_kek_missing", errors.ErrOAuthTokenKEKMissing)
 	}
 	if strings.TrimSpace(code) == "" {
 		return fail("code_invalid", errors.New(errors.CodeOAuthCodeInvalid, "oauth code is invalid", nil))

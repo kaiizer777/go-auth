@@ -24,6 +24,9 @@ import (
 	"github.com/kaiizer777/go-auth/tests/oauthmock"
 )
 
+// testTokenKEK is the fixed valid keyring the OAuth service seals grants with.
+const testTokenKEK = "test-kid:AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
+
 // setupOAuthFlow builds the full HTTP stack (auth + session + oauth routes)
 // over an isolated sqlite DB with mock providers wired by slug.
 func setupOAuthFlow(t *testing.T, mocks map[string]*oauthmock.Mock, modifyCfg ...func(*config.Config)) (http.Handler, *gorm.DB, config.Config) {
@@ -77,6 +80,7 @@ func setupOAuthFlow(t *testing.T, mocks map[string]*oauthmock.Mock, modifyCfg ..
 	cfg.DisableAsyncEmailDispatch = true
 	cfg.SessionCookieSecure = false
 	cfg.OAuth.StateSecret = "test-oauth-state-secret-32bytes!!"
+	cfg.OAuth.TokenKEK = testTokenKEK
 	for _, fn := range modifyCfg {
 		fn(&cfg)
 	}

@@ -31,6 +31,9 @@ import (
 	"github.com/kaiizer777/go-auth/tests/oauthmock"
 )
 
+// secTokenKEK is a fixed valid keyring: kid "test-kid" plus the 32 bytes 0x00-0x1f.
+const secTokenKEK = "test-kid:AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
+
 // setupOAuthSecurityApp builds the full HTTP stack over an isolated sqlite DB.
 func setupOAuthSecurityApp(t *testing.T, mocks map[string]*oauthmock.Mock, modifyCfg ...func(*config.Config)) (http.Handler, *gorm.DB, config.Config) {
 	t.Helper()
@@ -79,6 +82,7 @@ func setupOAuthSecurityApp(t *testing.T, mocks map[string]*oauthmock.Mock, modif
 	cfg.DisableAsyncEmailDispatch = true
 	cfg.SessionCookieSecure = true
 	cfg.OAuth.StateSecret = "test-oauth-state-secret-32bytes!!"
+	cfg.OAuth.TokenKEK = secTokenKEK
 	for _, fn := range modifyCfg {
 		fn(&cfg)
 	}
@@ -486,6 +490,7 @@ func secServiceDB(t *testing.T) (*gorm.DB, config.Config) {
 	cfg := config.DefaultConfig()
 	cfg.SessionCookieSecure = false
 	cfg.OAuth.StateSecret = "test-oauth-state-secret-32bytes!!"
+	cfg.OAuth.TokenKEK = secTokenKEK
 	return database, cfg
 }
 

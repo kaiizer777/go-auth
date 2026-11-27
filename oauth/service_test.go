@@ -38,6 +38,8 @@ type stubProvider struct {
 	exchErr    error
 	gotVerifer string
 	calls      int
+	exchanges  int
+	token      *TokenResponse
 	infoFunc   func() *UserInfo
 }
 
@@ -60,7 +62,11 @@ func (f *stubProvider) ExchangeCode(_ context.Context, code, codeVerifier string
 	if code == "" {
 		return nil, errors.New(errors.CodeOAuthProviderError, "oauth token exchange failed", nil)
 	}
+	f.exchanges++
 	f.gotVerifer = codeVerifier
+	if f.token != nil {
+		return f.token, nil
+	}
 	return &TokenResponse{AccessToken: "stub-access"}, nil
 }
 
@@ -77,12 +83,16 @@ func (f *stubProvider) FetchUserInfo(_ context.Context, _ *TokenResponse) (*User
 	return f.info, nil
 }
 
+// testTokenKEK is a fixed keyring: kid "test-kid" over the 32 bytes 0x00-0x1f.
+const testTokenKEK = "test-kid:AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
+
 func serviceTestConfig() *config.Config {
 	cfg := config.DefaultConfig()
 	cfg.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
 	cfg.BaseURL = "https://example.com"
 	cfg.SessionCookieSecure = false
 	cfg.OAuth.StateSecret = "test-state-secret-at-least-32-bytes!"
+	cfg.OAuth.TokenKEK = testTokenKEK
 	return &cfg
 }
 

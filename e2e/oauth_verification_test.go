@@ -24,6 +24,9 @@ import (
 	"github.com/kaiizer777/go-auth/tests/oauthmock"
 )
 
+// testTokenKEK is the fixed valid keyring the OAuth service seals grants with.
+const testTokenKEK = "test-kid:AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
+
 // TestOAuthVerification_UnverifiedLinkSeveredByPasswordSignup is the only e2e
 // journey that runs against the real embedded migrations (up) instead of a
 // sqlite DDL fixture. It proves 000009 exists and is used: the link insert and
@@ -33,6 +36,7 @@ func TestOAuthVerification_UnverifiedLinkSeveredByPasswordSignup(t *testing.T) {
 	cfg.DatabaseURL = resolveDatabaseURL()
 	cfg.BaseURL = "http://127.0.0.1:8080"
 	cfg.OAuth.StateSecret = "super-secret-e2e-postgres-state-key-32b"
+	cfg.OAuth.TokenKEK = testTokenKEK
 	cfg.SessionCookieSecure = false
 	cfg.DisableAsyncEmailDispatch = true
 	cfg.Argon2 = config.Argon2Config{

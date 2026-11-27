@@ -198,6 +198,7 @@ func TestIntegration_MultiProviderCallbackExecution(t *testing.T) {
 
 	cfg := config.DefaultConfig()
 	cfg.OAuth.StateSecret = "super-secret-integration-test-state-key-32b"
+	cfg.OAuth.TokenKEK = testTokenKEK
 	sessSvc := session.NewService(database, &cfg)
 
 	reg := oauth.NewRegistry()

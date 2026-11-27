@@ -61,6 +61,7 @@ func oauthTestConfig() config.Config {
 	cfg := testConfig()
 	cfg.SessionCookieSecure = false
 	cfg.OAuth.StateSecret = "test-state-secret-at-least-32-bytes!"
+	cfg.OAuth.TokenKEK = "test-kid:AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
 	return cfg
 }
 
