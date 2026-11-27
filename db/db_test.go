@@ -633,7 +633,7 @@ func TestMigration000012_AddsOAuthAccountTokens(t *testing.T) {
 	columns := []struct{ name, definition string }{
 		{"access_token_ciphertext", "TEXT NOT NULL DEFAULT ''"},
 		{"refresh_token_ciphertext", "TEXT NOT NULL DEFAULT ''"},
-		{"refresh_token_fingerprint", "CHAR(64) NOT NULL DEFAULT ''"},
+		{"refresh_token_fingerprint", "VARCHAR(64) NOT NULL DEFAULT ''"},
 		{"token_expires_at", "TIMESTAMPTZ"},
 		{"token_scope", "TEXT NOT NULL DEFAULT ''"},
 	}

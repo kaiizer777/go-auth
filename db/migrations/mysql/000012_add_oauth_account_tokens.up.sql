@@ -17,6 +17,6 @@
 -- only the missing columns by hand, then force version 12 (migrate force 12).
 ALTER TABLE oauth_accounts ADD COLUMN access_token_ciphertext TEXT NOT NULL;
 ALTER TABLE oauth_accounts ADD COLUMN refresh_token_ciphertext TEXT NOT NULL;
-ALTER TABLE oauth_accounts ADD COLUMN refresh_token_fingerprint CHAR(64) NOT NULL DEFAULT '';
+ALTER TABLE oauth_accounts ADD COLUMN refresh_token_fingerprint VARCHAR(64) NOT NULL DEFAULT '';
 ALTER TABLE oauth_accounts ADD COLUMN token_expires_at DATETIME(6) NULL;
 ALTER TABLE oauth_accounts ADD COLUMN token_scope TEXT NOT NULL;

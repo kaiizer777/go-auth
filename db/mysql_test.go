@@ -605,7 +605,7 @@ func TestMySQLMigration000012_AddsOAuthAccountTokens(t *testing.T) {
 	columns := []struct{ name, definition string }{
 		{"access_token_ciphertext", "TEXT NOT NULL"},
 		{"refresh_token_ciphertext", "TEXT NOT NULL"},
-		{"refresh_token_fingerprint", "CHAR(64) NOT NULL DEFAULT ''"},
+		{"refresh_token_fingerprint", "VARCHAR(64) NOT NULL DEFAULT ''"},
 		{"token_expires_at", "DATETIME(6) NULL"},
 		{"token_scope", "TEXT NOT NULL"},
 	}

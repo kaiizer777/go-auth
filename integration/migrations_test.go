@@ -832,13 +832,17 @@ func TestMigration000012_UpAndDown(t *testing.T) {
 		t.Fatalf("000012 re-up migration failed: %v", err)
 	}
 	requireOAuthTokenColumns(t, sqlDB)
-	var backfilled string
-	if err := sqlDB.QueryRow(`SELECT access_token_ciphertext || refresh_token_fingerprint || token_scope
-		FROM oauth_accounts WHERE user_id = $1`, userID).Scan(&backfilled); err != nil {
+	// Scan each re-added column on its own: concatenating in SQL would cast a
+	// CHAR column through text(bpchar), which trims the padding and hides the
+	// very thing this asserts: that an empty fingerprint reads back as "".
+	var reUpAccess, reUpFingerprint, reUpScope string
+	if err := sqlDB.QueryRow(`SELECT access_token_ciphertext, refresh_token_fingerprint, token_scope
+		FROM oauth_accounts WHERE user_id = $1`, userID).
+		Scan(&reUpAccess, &reUpFingerprint, &reUpScope); err != nil {
 		t.Fatalf("failed to read the re-added columns: %v", err)
 	}
-	if backfilled != "" {
-		t.Fatalf("re-added columns = %q; want the empty backfill", backfilled)
+	if reUpAccess != "" || reUpFingerprint != "" || reUpScope != "" {
+		t.Fatalf("re-added columns = (%q, %q, %q); want the empty backfill", reUpAccess, reUpFingerprint, reUpScope)
 	}
 
 	if err := m.Up(); err != nil && err != migrate.ErrNoChange {
@@ -847,15 +851,15 @@ func TestMigration000012_UpAndDown(t *testing.T) {
 }
 
 // requireOAuthTokenColumns asserts the five columns 000012 adds, with their
-// types and nullability: the fingerprint is exactly 64 chars and only the
-// expiry may be NULL.
+// types and nullability: the fingerprint is a VARCHAR(64) and only the expiry
+// may be NULL.
 func requireOAuthTokenColumns(t *testing.T, sqlDB *sql.DB) {
 	t.Helper()
 
 	want := map[string]string{
 		"access_token_ciphertext":   "text/NO/0",
 		"refresh_token_ciphertext":  "text/NO/0",
-		"refresh_token_fingerprint": "character/NO/64",
+		"refresh_token_fingerprint": "character varying/NO/64",
 		"token_expires_at":          "timestamp with time zone/YES/0",
 		"token_scope":               "text/NO/0",
 	}

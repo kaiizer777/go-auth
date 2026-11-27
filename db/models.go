@@ -161,7 +161,7 @@ type OAuthAccount struct {
 	Verified                bool      `gorm:"not null;default:false"`
 	AccessTokenCiphertext   string    `gorm:"type:text;not null;default:''" json:"-"`
 	RefreshTokenCiphertext  string    `gorm:"type:text;not null;default:''" json:"-"`
-	RefreshTokenFingerprint string    `gorm:"type:char(64);not null;default:''" json:"-"`
+	RefreshTokenFingerprint string    `gorm:"type:varchar(64);not null;default:''" json:"-"`
 	TokenExpiresAt          *time.Time
 	TokenScope              string `gorm:"type:text;not null;default:''"`
 	CreatedAt               time.Time
