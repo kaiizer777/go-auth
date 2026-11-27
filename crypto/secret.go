@@ -8,6 +8,11 @@ const (
 	secretEnvelopeLabel = "goauth.totp.secret/v1"
 	maxSecretPlaintext  = 1024
 	maxSecretEnvelope   = 4096
+	// maxSecretBlob bounds how much stored input is inspected for an envelope.
+	// It sits far above the largest legacy row this library wrote, so a
+	// pre-refactor blob over the envelope cap still reaches the legacy path
+	// instead of being refused as an oversized envelope.
+	maxSecretBlob = 64 << 10
 )
 
 // SecretSealer seals and opens secrets bound to an owning subject and a stable
@@ -25,13 +30,14 @@ func NewSecretSealer(ring *Keyring) *SecretSealer {
 		kind:         "secret",
 		maxPlaintext: maxSecretPlaintext,
 		maxEnvelope:  maxSecretEnvelope,
+		maxBlob:      maxSecretBlob,
 	}}
 }
 
 // Seal encrypts plaintext bound to subject and field. It only ever writes the
 // envelope format, under the ring's active key.
 func (s *SecretSealer) Seal(subject, field string, plaintext []byte) ([]byte, error) {
-	if s == nil {
+	if s == nil || s.sealer == nil {
 		return nil, ErrSealerUnconfigured
 	}
 	envelope, err := s.sealer.seal([]string{subject, field}, plaintext)
@@ -50,7 +56,7 @@ func (s *SecretSealer) Seal(subject, field string, plaintext []byte) ([]byte, er
 // rows begins with '{'. They are opened under every ring entry, because the
 // operator may have parked the old key under any kid.
 func (s *SecretSealer) Open(subject, field string, blob []byte) ([]byte, error) {
-	if s == nil {
+	if s == nil || s.sealer == nil {
 		return nil, ErrSealerUnconfigured
 	}
 	plaintext, err := s.sealer.open([]string{subject, field}, blob)
@@ -59,9 +65,10 @@ func (s *SecretSealer) Open(subject, field string, blob []byte) ([]byte, error) 
 	}
 	// Only "this is not an envelope" falls back. A well-formed envelope that
 	// fails authentication is terminal (a tampered envelope must never downgrade
-	// into the unauthenticated legacy path), and an envelope over the size cap or
-	// naming an absent kid is reported as such instead of being masked by the
-	// legacy attempt: no legacy blob exceeds the cap or parses as an envelope.
+	// into the unauthenticated legacy path), and an envelope that parses but is
+	// over the size cap or names an absent kid is reported as such instead of
+	// being masked by the legacy attempt. Legacy blobs were written without a
+	// size cap, so only the parse budget refuses one, never the envelope cap.
 	if !errors.Is(err, ErrEnvelopeMalformed) {
 		return nil, err
 	}
@@ -76,7 +83,7 @@ func (s *SecretSealer) Open(subject, field string, blob []byte) ([]byte, error) 
 // without authenticating it. ok is false for a legacy or corrupt blob, so
 // callers must not treat a hit as proof of readability.
 func (s *SecretSealer) EnvelopeKeyID(blob []byte) (string, bool) {
-	if s == nil || len(blob) > maxSecretEnvelope {
+	if s == nil || s.sealer == nil || len(blob) > maxSecretEnvelope {
 		return "", false
 	}
 	doc, _, _, ok := parseEnvelope(blob)
@@ -88,7 +95,7 @@ func (s *SecretSealer) EnvelopeKeyID(blob []byte) (string, bool) {
 
 // ActiveKeyID returns the kid Seal writes under, or "" when the ring is unset.
 func (s *SecretSealer) ActiveKeyID() string {
-	if s == nil {
+	if s == nil || s.sealer == nil {
 		return ""
 	}
 	return s.sealer.ring.ActiveKeyID()

@@ -283,9 +283,34 @@ func TestSecretOpenRejectsEnvelopeOverCapWithoutLegacyFallback(t *testing.T) {
 	t.Parallel()
 
 	sealer := newTestSecretSealer(t, keyringSpec("k1", 0x11))
-	oversized := `{"v":1,"alg":"A256GCM","kid":"k1","n":"` + strings.Repeat("A", maxSecretEnvelope) + `","ct":"AAAA"}`
-	if _, err := sealer.Open(testSecretSubject, testSecretField, []byte(oversized)); !errors.Is(err, ErrEnvelopeTooLarge) {
-		t.Fatalf("Open(oversized) error = %v, want ErrEnvelopeTooLarge", err)
+	// Structurally valid, so it parses as an envelope and the size cap judges it.
+	// Neither body authenticates, so reaching the legacy path would show up as a
+	// downgrade instead of the refusal.
+	overCap, err := json.Marshal(storedEnvelope{
+		Version:    tokenEnvelopeVersion,
+		Alg:        tokenEnvelopeAlg,
+		Kid:        "k1",
+		Nonce:      base64.RawURLEncoding.EncodeToString(make([]byte, gcmNonceSize)),
+		Ciphertext: base64.RawURLEncoding.EncodeToString(make([]byte, maxSecretEnvelope)),
+	})
+	if err != nil {
+		t.Fatalf("encode oversized envelope: %v", err)
+	}
+	if len(overCap) <= maxSecretEnvelope {
+		t.Fatalf("fixture is %d bytes, want over the %d-byte cap", len(overCap), maxSecretEnvelope)
+	}
+	if _, err := sealer.Open(testSecretSubject, testSecretField, overCap); !errors.Is(err, ErrEnvelopeTooLarge) {
+		t.Fatalf("Open(oversized envelope) error = %v, want ErrEnvelopeTooLarge", err)
+	}
+}
+
+func TestSecretOpenRejectsBlobOverParseBudget(t *testing.T) {
+	t.Parallel()
+
+	sealer := newTestSecretSealer(t, keyringSpec("k1", 0x11))
+	blob := bytes.Repeat([]byte{0x5a}, maxSecretBlob+1)
+	if _, err := sealer.Open(testSecretSubject, testSecretField, blob); !errors.Is(err, ErrEnvelopeTooLarge) {
+		t.Fatalf("Open(%d bytes) error = %v, want ErrEnvelopeTooLarge", len(blob), err)
 	}
 }
 
@@ -320,6 +345,29 @@ func TestSecretOpenReadsLegacyBlob(t *testing.T) {
 	// rewrap closes.
 	if _, err := sealer.Open(testSecretOther, testSecretField, legacy); err != nil {
 		t.Fatalf("legacy blob is unbound by design, got %v", err)
+	}
+}
+
+// The pre-refactor Encrypt had no size cap, so a legacy row can be larger than
+// the envelope cap. The cap must judge only blobs that parse as envelopes; a
+// legacy blob that big still has to decrypt.
+func TestSecretOpenReadsOversizedLegacyBlob(t *testing.T) {
+	t.Parallel()
+
+	key := testKeyBytes(t, 0x11)
+	sealer := newTestSecretSealer(t, keyringSpec("k1", 0x11))
+	plaintext := bytes.Repeat([]byte("A"), maxSecretEnvelope)
+	legacy := legacySeal(t, key, plaintext)
+	if len(legacy) <= maxSecretEnvelope {
+		t.Fatalf("legacy blob = %d bytes, want over the %d-byte envelope cap", len(legacy), maxSecretEnvelope)
+	}
+
+	got, err := sealer.Open(testSecretSubject, testSecretField, legacy)
+	if err != nil {
+		t.Fatalf("Open(%d-byte legacy blob) error = %v", len(legacy), err)
+	}
+	if !bytes.Equal(got, plaintext) {
+		t.Fatalf("Open(%d-byte legacy blob) returned %d bytes", len(legacy), len(got))
 	}
 }
 
@@ -381,6 +429,31 @@ func TestSecretSealerUnconfigured(t *testing.T) {
 	}
 	if _, err := empty.Open(testSecretSubject, testSecretField, legacySeal(t, testKeyBytes(t, 0x11), []byte("x"))); !errors.Is(err, ErrSealerUnconfigured) {
 		t.Fatalf("empty Open error = %v, want ErrSealerUnconfigured", err)
+	}
+}
+
+// A zero-value SecretSealer carries no envelope sealer; every exported method
+// must report "unconfigured" instead of nil-dereferencing.
+func TestSecretSealerZeroValue(t *testing.T) {
+	t.Parallel()
+
+	envelope, err := newTestSecretSealer(t, keyringSpec("k1", 0x11)).Seal(testSecretSubject, testSecretField, []byte("x"))
+	if err != nil {
+		t.Fatalf("Seal() error = %v", err)
+	}
+
+	zero := SecretSealer{}
+	if _, err := zero.Seal(testSecretSubject, testSecretField, []byte("x")); !errors.Is(err, ErrSealerUnconfigured) {
+		t.Fatalf("zero Seal error = %v, want ErrSealerUnconfigured", err)
+	}
+	if _, err := zero.Open(testSecretSubject, testSecretField, envelope); !errors.Is(err, ErrSealerUnconfigured) {
+		t.Fatalf("zero Open error = %v, want ErrSealerUnconfigured", err)
+	}
+	if kid, ok := zero.EnvelopeKeyID(envelope); ok || kid != "" {
+		t.Fatalf("zero EnvelopeKeyID = (%q, %v), want not ok", kid, ok)
+	}
+	if kid := zero.ActiveKeyID(); kid != "" {
+		t.Fatalf("zero ActiveKeyID = %q, want empty", kid)
 	}
 }
 

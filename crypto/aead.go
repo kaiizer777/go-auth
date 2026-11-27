@@ -61,6 +61,10 @@ type envelopeSealer struct {
 	kind         string
 	maxPlaintext int
 	maxEnvelope  int
+	// maxBlob bounds how much input is inspected for an envelope. It equals
+	// maxEnvelope for a column that only ever holds envelopes and sits above it
+	// for a column that still holds legacy blobs, which were never size-capped.
+	maxBlob int
 }
 
 // TokenSealer seals and opens OAuth token envelopes under a Keyring.
@@ -77,6 +81,7 @@ func NewTokenSealer(ring *Keyring) *TokenSealer {
 		kind:         "token",
 		maxPlaintext: maxTokenPlaintext,
 		maxEnvelope:  maxTokenEnvelope,
+		maxBlob:      maxTokenEnvelope,
 	}}
 }
 
@@ -179,14 +184,22 @@ func (e *envelopeSealer) open(components []string, envelope []byte) ([]byte, err
 	if _, err := e.active(); err != nil {
 		return nil, err
 	}
-	if len(envelope) > e.maxEnvelope {
-		return nil, errors.New(errors.CodeValidationError,
-			fmt.Sprintf("%s envelope must not exceed %d bytes", e.kind, e.maxEnvelope), ErrEnvelopeTooLarge)
+	// maxBlob is the parsing budget, checked before parseEnvelope so no
+	// unbounded input is unmarshalled. It is not an envelope judgement: a column
+	// that still holds legacy blobs sits far above maxEnvelope, so a blob
+	// between the two limits is parsed and, when it is not an envelope, reaches
+	// the caller's legacy path.
+	if len(envelope) > e.maxBlob {
+		return nil, e.tooLarge(e.maxBlob)
 	}
 
 	doc, nonce, ciphertext, ok := parseEnvelope(envelope)
 	if !ok {
 		return nil, ErrEnvelopeMalformed
+	}
+	// The cap judges only blobs that actually parse as envelopes.
+	if len(envelope) > e.maxEnvelope {
+		return nil, e.tooLarge(e.maxEnvelope)
 	}
 
 	key, ok := e.ring.lookup(doc.Kid)
@@ -204,6 +217,11 @@ func (e *envelopeSealer) open(components []string, envelope []byte) ([]byte, err
 		return nil, ErrAuthenticationFailed
 	}
 	return plaintext, nil
+}
+
+func (e *envelopeSealer) tooLarge(limit int) error {
+	return errors.New(errors.CodeValidationError,
+		fmt.Sprintf("%s envelope must not exceed %d bytes", e.kind, limit), ErrEnvelopeTooLarge)
 }
 
 // active returns the key that encrypts new envelopes.
