@@ -934,7 +934,7 @@ func (c *Config) validate() error {
 			return errors.ErrOAuthRedirectURLRequired
 		}
 		if id == "facebook" {
-			if err := validateGraphVersion(provider.GraphVersion); err != nil {
+			if err := ValidateGraphVersion(provider.GraphVersion); err != nil {
 				return err
 			}
 		}
@@ -1037,12 +1037,12 @@ func isToken(s string) bool {
 	return true
 }
 
-// validateGraphVersion accepts an empty value (defaulted after the merge) and
-// requires "<major>.<minor>" with an optional "v" prefix, no leading zeros, and
-// at least 19.0. Facebook serves no OAuth dialog below 19.0, and the raw value
-// is interpolated into URL paths, so shapes such as NaN, Inf, exponents, hex
-// floats or a missing minor version must not pass.
-func validateGraphVersion(version string) error {
+// ValidateGraphVersion reports whether version is an acceptable Facebook Graph
+// API version, accepting "" (which callers default to v19.0) and requiring
+// "<major>.<minor>" with an optional lowercase "v" prefix, no leading zeros, and
+// a major of at least 19. It is the single grammar shared by Config.Validate and
+// the oauth Facebook adapter, so the two cannot drift; do not reimplement it.
+func ValidateGraphVersion(version string) error {
 	if version == "" {
 		return nil
 	}

@@ -914,12 +914,12 @@ func TestValidateGraphVersion(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := validateGraphVersion(tt.version)
+			err := ValidateGraphVersion(tt.version)
 			if gotErr := err != nil; gotErr != tt.wantErr {
-				t.Fatalf("validateGraphVersion(%q) error = %v; wantErr %v", tt.version, err, tt.wantErr)
+				t.Fatalf("ValidateGraphVersion(%q) error = %v; wantErr %v", tt.version, err, tt.wantErr)
 			}
 			if tt.wantErr && !errors.Is(err, errors.ErrOAuthGraphVersionInvalid) {
-				t.Fatalf("validateGraphVersion(%q) error = %v; want ErrOAuthGraphVersionInvalid", tt.version, err)
+				t.Fatalf("ValidateGraphVersion(%q) error = %v; want ErrOAuthGraphVersionInvalid", tt.version, err)
 			}
 		})
 	}
