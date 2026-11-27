@@ -976,9 +976,204 @@ func TestOAuthTokenUpdates_NilExpiryVsZero(t *testing.T) {
 	}
 }
 
+// TestOAuthAccountStore_PartialColumnWrites pins the guarded writes that own a
+// single column group: each guard compares the field it writes, and the columns
+// another writer owns are never touched on a win or a miss.
+func TestOAuthAccountStore_PartialColumnWrites(t *testing.T) {
+	ctx := context.Background()
+	_, store := setupTestDB(t)
+	oauth := store.OAuthAccounts()
+	userID := uuid.New()
+	expiresAt := time.Now().UTC().Truncate(time.Millisecond)
+
+	accessOnly := db.OAuthTokenRecord{
+		AccessTokenCiphertext: "winner-access",
+		TokenScope:            "read:user",
+		TokenExpiresAt:        &expiresAt,
+	}
+	full := db.OAuthTokenRecord{
+		AccessTokenCiphertext:   "stored-access",
+		RefreshTokenCiphertext:  "stored-refresh",
+		RefreshTokenFingerprint: strings.Repeat("a", 64),
+		TokenScope:              "offline_access",
+		TokenExpiresAt:          &expiresAt,
+	}
+
+	// newLink seeds one account and returns it with the row reloaded.
+	reload := func(t *testing.T, sub string) *db.OAuthAccount {
+		t.Helper()
+		got, err := oauth.GetByProvider(ctx, "github", "", sub)
+		if err != nil {
+			t.Fatalf("reload link %s: %v", sub, err)
+		}
+		return got
+	}
+	newLink := func(t *testing.T, sub string, rec db.OAuthTokenRecord) *db.OAuthAccount {
+		t.Helper()
+		acc := &db.OAuthAccount{
+			UserID:         userID,
+			ProviderID:     "github",
+			ProviderUserID: sub,
+			Email:          sub + "@example.com",
+		}
+		if err := oauth.Create(ctx, acc); err != nil {
+			t.Fatalf("create link %s: %v", sub, err)
+		}
+		if rec != (db.OAuthTokenRecord{}) {
+			if err := oauth.SaveOAuthTokens(ctx, acc.ID, rec); err != nil {
+				t.Fatalf("seed tokens for %s: %v", sub, err)
+			}
+		}
+		return reload(t, sub)
+	}
+
+	t.Run("refresh clear is guarded on the fingerprint", func(t *testing.T) {
+		acc := newLink(t, "clear", full)
+
+		if won, err := oauth.ClearOAuthRefresh(ctx, acc.ID, ""); err != nil || won {
+			t.Fatalf("empty expectation clear = (%v, %v); want (false, nil)", won, err)
+		}
+		if won, err := oauth.ClearOAuthRefresh(ctx, acc.ID, strings.Repeat("b", 64)); err != nil || won {
+			t.Fatalf("stale expectation clear = (%v, %v); want (false, nil)", won, err)
+		}
+		unchanged := reload(t, "clear")
+		if unchanged.AccessTokenCiphertext != "stored-access" || unchanged.RefreshTokenCiphertext != "stored-refresh" {
+			t.Fatalf("a missed clear mutated the row: %+v", unchanged)
+		}
+
+		if won, err := oauth.ClearOAuthRefresh(ctx, acc.ID, strings.Repeat("a", 64)); err != nil || !won {
+			t.Fatalf("matching clear = (%v, %v); want (true, nil)", won, err)
+		}
+		cleared := reload(t, "clear")
+		if cleared.RefreshTokenCiphertext != "" || cleared.RefreshTokenFingerprint != "" {
+			t.Fatalf("refresh columns = (%q, %q); want cleared", cleared.RefreshTokenCiphertext, cleared.RefreshTokenFingerprint)
+		}
+		if cleared.AccessTokenCiphertext != "stored-access" || cleared.TokenScope != "offline_access" ||
+			cleared.TokenExpiresAt == nil || !cleared.TokenExpiresAt.Equal(expiresAt) {
+			t.Fatalf("access columns = %+v; want them untouched", cleared)
+		}
+
+		if won, err := oauth.ClearOAuthRefresh(ctx, uuid.New(), strings.Repeat("a", 64)); err != nil || won {
+			t.Fatalf("missing-account clear = (%v, %v); want (false, nil)", won, err)
+		}
+	})
+
+	t.Run("refresh-if-unset keeps a concurrent access-only winner", func(t *testing.T) {
+		acc := newLink(t, "recover-access-only", accessOnly)
+		rotated := db.OAuthTokenRecord{
+			AccessTokenCiphertext:   "rotated-access",
+			RefreshTokenCiphertext:  "rotated-refresh",
+			RefreshTokenFingerprint: strings.Repeat("c", 64),
+			TokenScope:              "offline_access",
+			TokenExpiresAt:          &expiresAt,
+		}
+
+		if won, err := oauth.SaveOAuthRefreshIfUnset(ctx, acc.ID, rotated); err != nil || !won {
+			t.Fatalf("refresh-if-unset over an access-only row = (%v, %v); want (true, nil)", won, err)
+		}
+		stored := reload(t, "recover-access-only")
+		if stored.RefreshTokenCiphertext != "rotated-refresh" || stored.RefreshTokenFingerprint != strings.Repeat("c", 64) {
+			t.Fatalf("refresh columns = (%q, %q); want the rotated pair",
+				stored.RefreshTokenCiphertext, stored.RefreshTokenFingerprint)
+		}
+		if stored.AccessTokenCiphertext != "winner-access" || stored.TokenScope != "read:user" {
+			t.Fatalf("access columns = (%+v); want the winner's untouched", stored)
+		}
+	})
+
+	t.Run("refresh-if-unset fills a tokenless row", func(t *testing.T) {
+		acc := newLink(t, "recover-empty", db.OAuthTokenRecord{})
+		rotated := db.OAuthTokenRecord{
+			AccessTokenCiphertext:   "rotated-access",
+			RefreshTokenCiphertext:  "rotated-refresh",
+			RefreshTokenFingerprint: strings.Repeat("d", 64),
+			TokenScope:              "offline_access",
+			TokenExpiresAt:          &expiresAt,
+		}
+
+		if won, err := oauth.SaveOAuthRefreshIfUnset(ctx, acc.ID, rotated); err != nil || !won {
+			t.Fatalf("refresh-if-unset over a tokenless row = (%v, %v); want (true, nil)", won, err)
+		}
+		stored := reload(t, "recover-empty")
+		if stored.AccessTokenCiphertext != "rotated-access" || stored.RefreshTokenCiphertext != "rotated-refresh" ||
+			stored.RefreshTokenFingerprint != strings.Repeat("d", 64) {
+			t.Fatalf("token columns = %+v; want the whole rotated pair", stored)
+		}
+		if stored.TokenScope != "offline_access" || stored.TokenExpiresAt == nil || !stored.TokenExpiresAt.Equal(expiresAt) {
+			t.Fatalf("access metadata = %+v; want the record's", stored)
+		}
+	})
+
+	t.Run("refresh-if-unset loses to a stored refresh grant", func(t *testing.T) {
+		acc := newLink(t, "recover-late", full)
+
+		if won, err := oauth.SaveOAuthRefreshIfUnset(ctx, acc.ID, db.OAuthTokenRecord{
+			RefreshTokenCiphertext:  "late-refresh",
+			RefreshTokenFingerprint: strings.Repeat("e", 64),
+			AccessTokenCiphertext:   "late-access",
+		}); err != nil || won {
+			t.Fatalf("refresh-if-unset over a stored grant = (%v, %v); want (false, nil)", won, err)
+		}
+		stored := reload(t, "recover-late")
+		if stored.AccessTokenCiphertext != "stored-access" || stored.RefreshTokenCiphertext != "stored-refresh" ||
+			stored.RefreshTokenFingerprint != strings.Repeat("a", 64) {
+			t.Fatalf("token columns = %+v; want the stored grant untouched", stored)
+		}
+		// A record without a fingerprint cannot prove anything and is refused.
+		if won, err := oauth.SaveOAuthRefreshIfUnset(ctx, uuid.New(), db.OAuthTokenRecord{
+			RefreshTokenCiphertext: "anonymous",
+		}); err != nil || won {
+			t.Fatalf("fingerprint-less record = (%v, %v); want (false, nil)", won, err)
+		}
+	})
+
+	t.Run("access CAS is guarded on the stored envelope", func(t *testing.T) {
+		acc := newLink(t, "access-cas", full)
+
+		if won, err := oauth.SaveOAuthAccessCAS(ctx, acc.ID, "stale-access", accessOnly); err != nil || won {
+			t.Fatalf("stale expectation = (%v, %v); want (false, nil)", won, err)
+		}
+		if won, err := oauth.SaveOAuthAccessCAS(ctx, acc.ID, "", accessOnly); err != nil || won {
+			t.Fatalf("empty expectation over a stored envelope = (%v, %v); want (false, nil)", won, err)
+		}
+		unchanged := reload(t, "access-cas")
+		if unchanged.AccessTokenCiphertext != "stored-access" {
+			t.Fatalf("a missed CAS wrote %q; want stored-access", unchanged.AccessTokenCiphertext)
+		}
+
+		if won, err := oauth.SaveOAuthAccessCAS(ctx, acc.ID, "stored-access", accessOnly); err != nil || !won {
+			t.Fatalf("matching expectation = (%v, %v); want (true, nil)", won, err)
+		}
+		stored := reload(t, "access-cas")
+		if stored.AccessTokenCiphertext != "winner-access" || stored.TokenScope != "read:user" ||
+			stored.TokenExpiresAt == nil || !stored.TokenExpiresAt.Equal(expiresAt) {
+			t.Fatalf("access columns = %+v; want the record's", stored)
+		}
+		if stored.RefreshTokenCiphertext != "stored-refresh" || stored.RefreshTokenFingerprint != strings.Repeat("a", 64) {
+			t.Fatalf("refresh columns = (%q, %q); want them untouched",
+				stored.RefreshTokenCiphertext, stored.RefreshTokenFingerprint)
+		}
+	})
+
+	t.Run("access CAS treats an empty envelope as a value", func(t *testing.T) {
+		acc := newLink(t, "access-cas-empty", db.OAuthTokenRecord{})
+
+		if won, err := oauth.SaveOAuthAccessCAS(ctx, acc.ID, "", accessOnly); err != nil || !won {
+			t.Fatalf("empty expectation over an empty envelope = (%v, %v); want (true, nil)", won, err)
+		}
+		if got := reload(t, "access-cas-empty"); got.AccessTokenCiphertext != "winner-access" {
+			t.Fatalf("access ciphertext = %q; want winner-access", got.AccessTokenCiphertext)
+		}
+		if won, err := oauth.SaveOAuthAccessCAS(ctx, uuid.New(), "", accessOnly); err != nil || won {
+			t.Fatalf("missing-account CAS = (%v, %v); want (false, nil)", won, err)
+		}
+	})
+}
+
 func TestOAuthAccountStore_TenantScopedKey(t *testing.T) {
 	_, store := setupTestDB(t)
 	ctx := context.Background()
+
 	oauth := store.OAuthAccounts()
 	userID := uuid.New()
 

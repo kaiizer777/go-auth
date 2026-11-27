@@ -100,6 +100,28 @@ type OAuthAccountStore interface {
 	// refresh token cannot erase one another writer stored. It reports the
 	// backend not-found error when no account holds id.
 	SaveOAuthAccess(ctx context.Context, id uuid.UUID, rec OAuthTokenRecord) error
+	// ClearOAuthRefresh empties only the refresh columns (ciphertext,
+	// fingerprint) when the stored fingerprint equals expectedFingerprint, and
+	// never writes the access, scope, or expiry columns, so a discard cannot
+	// restore an envelope another writer already replaced. A miss is
+	// (false, nil): another writer owns the grant. An empty expectation never
+	// matches.
+	ClearOAuthRefresh(ctx context.Context, id uuid.UUID, expectedFingerprint string) (bool, error)
+	// SaveOAuthRefreshIfUnset writes the record's refresh columns only while the
+	// account holds no refresh token, and its access columns only while the
+	// account holds no access token, so a concurrent access-only winner keeps
+	// its envelope. A miss is (false, nil): a refresh grant is already stored.
+	// An empty rec fingerprint never matches the guard and is never written. A
+	// backend that cannot apply both groups in one statement reports an error
+	// after the refresh pair landed as (true, error): the pair stands, and the
+	// caller retries or serves the stored grant.
+	SaveOAuthRefreshIfUnset(ctx context.Context, id uuid.UUID, rec OAuthTokenRecord) (bool, error)
+	// SaveOAuthAccessCAS writes only the access fields when the stored access
+	// ciphertext equals expectedCiphertext, so an older grant cannot replace a
+	// newer access envelope. An empty expectation asserts only that the access
+	// column is still empty, which is a value it can prove. A miss is
+	// (false, nil).
+	SaveOAuthAccessCAS(ctx context.Context, id uuid.UUID, expectedCiphertext string, rec OAuthTokenRecord) (bool, error)
 }
 
 // TotpStore defines storage operations for RFC 6238 TOTP two-factor authentication.

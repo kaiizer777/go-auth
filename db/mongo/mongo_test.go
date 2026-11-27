@@ -1004,3 +1004,63 @@ func TestOAuthTokenSetDoc(t *testing.T) {
 		t.Fatalf("null token_expires_at decoded as %v; want nil", roundTripped.TokenExpiresAt)
 	}
 }
+
+// TestOAuthPartialTokenWrites pins the payloads of the writes that own a single
+// column group: a refresh-only clear cannot blank the access columns, a rotated
+// pair leaves them to their own writer, and the absent-value filter also matches
+// documents written before the token columns existed.
+func TestOAuthPartialTokenWrites(t *testing.T) {
+	refreshColumns := []string{"refresh_token_ciphertext", "refresh_token_fingerprint", "updated_at"}
+
+	cleared := oauthRefreshClearSet()
+	if len(cleared) != len(refreshColumns) {
+		t.Fatalf("clear payload has %d keys; want %d: %v", len(cleared), len(refreshColumns), cleared)
+	}
+	for _, key := range refreshColumns[:2] {
+		if cleared[key] != "" {
+			t.Fatalf("cleared %q = %v; want empty", key, cleared[key])
+		}
+	}
+	if _, ok := cleared["updated_at"].(time.Time); !ok {
+		t.Fatalf("clear payload updated_at = %T; want time.Time", cleared["updated_at"])
+	}
+	for _, key := range []string{"access_token_ciphertext", "token_scope", "token_expires_at"} {
+		if _, ok := cleared[key]; ok {
+			t.Fatalf("refresh clear writes %q: %v", key, cleared)
+		}
+	}
+
+	rotated := oauthRefreshPairSet(db.OAuthTokenRecord{
+		AccessTokenCiphertext:   "rotated-access",
+		RefreshTokenCiphertext:  "rotated-refresh",
+		RefreshTokenFingerprint: strings.Repeat("a", 64),
+		TokenScope:              "offline_access",
+	})
+	if len(rotated) != len(refreshColumns) {
+		t.Fatalf("rotated payload has %d keys; want %d: %v", len(rotated), len(refreshColumns), rotated)
+	}
+	if rotated["refresh_token_ciphertext"] != "rotated-refresh" ||
+		rotated["refresh_token_fingerprint"] != strings.Repeat("a", 64) {
+		t.Fatalf("rotated payload = %v; want the refresh pair", rotated)
+	}
+	for _, key := range []string{"access_token_ciphertext", "token_scope", "token_expires_at"} {
+		if _, ok := rotated[key]; ok {
+			t.Fatalf("rotated payload writes %q: %v", key, rotated)
+		}
+	}
+
+	for _, field := range []string{"refresh_token_fingerprint", "access_token_ciphertext"} {
+		filter := bson.M{"_id": "id", "$or": oauthAbsentOr(field)}
+		or, ok := filter["$or"].([]bson.M)
+		if !ok || len(or) != 2 {
+			t.Fatalf("%s absent filter = %v; want two alternatives", field, filter["$or"])
+		}
+		if or[0][field] != "" {
+			t.Fatalf("%s absent filter does not match the empty column: %v", field, or[0])
+		}
+		exists, ok := or[1][field].(bson.M)
+		if !ok || exists["$exists"] != false {
+			t.Fatalf("%s absent filter does not match a missing column: %v", field, or[1])
+		}
+	}
+}

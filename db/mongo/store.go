@@ -803,13 +803,8 @@ func (s *oauthAccountStore) SaveOAuthTokensCAS(ctx context.Context, id uuid.UUID
 }
 
 func (s *oauthAccountStore) SaveOAuthTokensIfUnset(ctx context.Context, id uuid.UUID, rec db.OAuthTokenRecord) (bool, error) {
-	// A document written before the token columns existed has no fingerprint
-	// field at all, so an equality on "" alone would never match it.
 	res, err := s.collection().UpdateOne(s.store.resolveCtx(ctx),
-		bson.M{"_id": id.String(), "$or": []bson.M{
-			{"refresh_token_fingerprint": ""},
-			{"refresh_token_fingerprint": bson.M{"$exists": false}},
-		}},
+		bson.M{"_id": id.String(), "$or": oauthAbsentOr("refresh_token_fingerprint")},
 		bson.M{"$set": oauthTokenSetDoc(rec)},
 	)
 	if err != nil {
@@ -830,6 +825,93 @@ func (s *oauthAccountStore) SaveOAuthAccess(ctx context.Context, id uuid.UUID, r
 		return gorm.ErrRecordNotFound
 	}
 	return nil
+}
+
+// oauthAbsentOr matches a token column that holds no value, counting a document
+// written before that column existed as absent: it decodes to the empty string,
+// but an equality on "" alone would never match it.
+func oauthAbsentOr(field string) []bson.M {
+	return []bson.M{
+		{field: ""},
+		{field: bson.M{"$exists": false}},
+	}
+}
+
+func (s *oauthAccountStore) SaveOAuthAccessCAS(ctx context.Context, id uuid.UUID, expectedCiphertext string, rec db.OAuthTokenRecord) (bool, error) {
+	filter := bson.M{"_id": id.String()}
+	if expectedCiphertext == "" {
+		filter["$or"] = oauthAbsentOr("access_token_ciphertext")
+	} else {
+		filter["access_token_ciphertext"] = expectedCiphertext
+	}
+	res, err := s.collection().UpdateOne(s.store.resolveCtx(ctx), filter, bson.M{"$set": oauthAccessSetDoc(rec)})
+	if err != nil {
+		return false, NormalizeMongoError(err)
+	}
+	return res.MatchedCount > 0, nil
+}
+
+func (s *oauthAccountStore) ClearOAuthRefresh(ctx context.Context, id uuid.UUID, expectedFingerprint string) (bool, error) {
+	if expectedFingerprint == "" {
+		return false, nil
+	}
+	res, err := s.collection().UpdateOne(s.store.resolveCtx(ctx),
+		bson.M{"_id": id.String(), "refresh_token_fingerprint": expectedFingerprint},
+		bson.M{"$set": oauthRefreshClearSet()},
+	)
+	if err != nil {
+		return false, NormalizeMongoError(err)
+	}
+	return res.MatchedCount > 0, nil
+}
+
+// oauthRefreshClearSet is the payload for a refresh-only clear: the access
+// fields are absent so a discarded refresh grant leaves its envelope in place.
+func oauthRefreshClearSet() bson.M {
+	return bson.M{
+		"refresh_token_ciphertext":  "",
+		"refresh_token_fingerprint": "",
+		"updated_at":                time.Now().UTC(),
+	}
+}
+
+// oauthRefreshPairSet is the payload for a rotated pair that owns only the
+// refresh columns, leaving the access envelope to its own writers.
+func oauthRefreshPairSet(rec db.OAuthTokenRecord) bson.M {
+	return bson.M{
+		"refresh_token_ciphertext":  rec.RefreshTokenCiphertext,
+		"refresh_token_fingerprint": rec.RefreshTokenFingerprint,
+		"updated_at":                time.Now().UTC(),
+	}
+}
+
+// SaveOAuthRefreshIfUnset installs the rotated refresh pair over a row holding
+// none, then writes the access columns only while the row still holds no access
+// envelope. An update document cannot carry a per-field condition, so the access
+// write is its own statement guarded on the column it writes; the refresh pair
+// landed first, so a failed second statement leaves a usable grant behind.
+func (s *oauthAccountStore) SaveOAuthRefreshIfUnset(ctx context.Context, id uuid.UUID, rec db.OAuthTokenRecord) (bool, error) {
+	if rec.RefreshTokenFingerprint == "" {
+		return false, nil
+	}
+	filter := bson.M{"_id": id.String(), "$or": oauthAbsentOr("refresh_token_fingerprint")}
+	res, err := s.collection().UpdateOne(s.store.resolveCtx(ctx), filter, bson.M{"$set": oauthRefreshPairSet(rec)})
+	if err != nil {
+		return false, NormalizeMongoError(err)
+	}
+	if res.MatchedCount == 0 {
+		return false, nil
+	}
+	if rec.AccessTokenCiphertext == "" {
+		return true, nil
+	}
+	accessFilter := bson.M{"_id": id.String(), "$or": oauthAbsentOr("access_token_ciphertext")}
+	if _, err := s.collection().UpdateOne(s.store.resolveCtx(ctx), accessFilter,
+		bson.M{"$set": oauthAccessSetDoc(rec)},
+	); err != nil {
+		return true, NormalizeMongoError(err)
+	}
+	return true, nil
 }
 
 // ==========================================

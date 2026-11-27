@@ -362,6 +362,68 @@ func (s *oauthAccountStore) SaveOAuthAccess(ctx context.Context, id uuid.UUID, r
 	return nil
 }
 
+// SaveOAuthAccessCAS writes the access columns only while the stored access
+// ciphertext still matches the value the caller read. A miss reports false: a
+// newer access envelope is stored, and MySQL would also report one for a write
+// that changed nothing, which is the same outcome.
+func (s *oauthAccountStore) SaveOAuthAccessCAS(ctx context.Context, id uuid.UUID, expectedCiphertext string, rec db.OAuthTokenRecord) (bool, error) {
+	res := s.db.WithContext(ctx).Model(&db.OAuthAccount{}).
+		Where("id = ? AND access_token_ciphertext = ?", id, expectedCiphertext).
+		Updates(oauthAccessUpdates(rec))
+	if err := res.Error; err != nil {
+		return false, db.NormalizeMySQLError(err)
+	}
+	return res.RowsAffected > 0, nil
+}
+
+// ClearOAuthRefresh empties the refresh columns only, guarded on the fingerprint
+// the caller read: the access envelope has its own writers and is never touched.
+func (s *oauthAccountStore) ClearOAuthRefresh(ctx context.Context, id uuid.UUID, expectedFingerprint string) (bool, error) {
+	if expectedFingerprint == "" {
+		return false, nil
+	}
+	res := s.db.WithContext(ctx).Model(&db.OAuthAccount{}).
+		Where("id = ? AND refresh_token_fingerprint = ?", id, expectedFingerprint).
+		Updates(map[string]any{
+			"refresh_token_ciphertext":  "",
+			"refresh_token_fingerprint": "",
+			"updated_at":                time.Now().UTC(),
+		})
+	if err := res.Error; err != nil {
+		return false, db.NormalizeMySQLError(err)
+	}
+	return res.RowsAffected > 0, nil
+}
+
+// SaveOAuthRefreshIfUnset stores a rotated refresh pair over a row holding none.
+// The access columns are written in the same statement but only while the row
+// still holds no access envelope, so a concurrent access-only winner keeps it;
+// the CASE keeps that condition in the guarded write instead of a second
+// statement that could land between another writer's commit.
+func (s *oauthAccountStore) SaveOAuthRefreshIfUnset(ctx context.Context, id uuid.UUID, rec db.OAuthTokenRecord) (bool, error) {
+	if rec.RefreshTokenFingerprint == "" {
+		return false, nil
+	}
+	updates := map[string]any{
+		"refresh_token_ciphertext":  rec.RefreshTokenCiphertext,
+		"refresh_token_fingerprint": rec.RefreshTokenFingerprint,
+		"updated_at":                time.Now().UTC(),
+	}
+	if rec.AccessTokenCiphertext != "" {
+		const noAccess = "access_token_ciphertext = ''"
+		updates["access_token_ciphertext"] = gorm.Expr("CASE WHEN "+noAccess+" THEN ? ELSE access_token_ciphertext END", rec.AccessTokenCiphertext)
+		updates["token_scope"] = gorm.Expr("CASE WHEN "+noAccess+" THEN ? ELSE token_scope END", rec.TokenScope)
+		updates["token_expires_at"] = gorm.Expr("CASE WHEN "+noAccess+" THEN ? ELSE token_expires_at END", rec.TokenExpiresAt)
+	}
+	res := s.db.WithContext(ctx).Model(&db.OAuthAccount{}).
+		Where("id = ? AND refresh_token_fingerprint = ?", id, "").
+		Updates(updates)
+	if err := res.Error; err != nil {
+		return false, db.NormalizeMySQLError(err)
+	}
+	return res.RowsAffected > 0, nil
+}
+
 type totpStore struct {
 	db *gorm.DB
 }
