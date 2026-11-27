@@ -56,6 +56,7 @@ func setupTestDB(t *testing.T) *gorm.DB {
 		encrypted_secret BLOB NOT NULL,
 		backup_codes TEXT NOT NULL DEFAULT '[]',
 		enabled INTEGER NOT NULL DEFAULT 0,
+		secret_kid TEXT NOT NULL DEFAULT '',
 		created_at DATETIME,
 		updated_at DATETIME
 	);

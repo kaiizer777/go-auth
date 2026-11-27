@@ -6,6 +6,7 @@ import (
 	stderrors "errors"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -515,6 +516,10 @@ func TestMigrations_NoExplicitTransactionWrappers(t *testing.T) {
 		"migrations/000012_add_oauth_account_tokens.down.sql",
 		"migrations/mysql/000012_add_oauth_account_tokens.up.sql",
 		"migrations/mysql/000012_add_oauth_account_tokens.down.sql",
+		"migrations/000013_add_totp_secret_kid.up.sql",
+		"migrations/000013_add_totp_secret_kid.down.sql",
+		"migrations/mysql/000013_add_totp_secret_kid.up.sql",
+		"migrations/mysql/000013_add_totp_secret_kid.down.sql",
 	}
 
 	for _, file := range files {
@@ -670,6 +675,68 @@ func TestMigration000012_AddsOAuthAccountTokens(t *testing.T) {
 	if strings.Contains(down, "DROP TABLE") {
 		t.Error("migration 12 down must drop only the token columns, never the links table")
 	}
+}
+
+// TestMigration000013_AddsTotpSecretKid pins the bookkeeping column for #83: one
+// NOT NULL empty-default VARCHAR(32) in each dialect, exactly one column dropped
+// by the down files, and no UPDATE, key material or ciphertext in any of them.
+func TestMigration000013_AddsTotpSecretKid(t *testing.T) {
+	postgresUp := readMigration(t, "migrations/000013_add_totp_secret_kid.up.sql")
+	postgresDown := readMigration(t, "migrations/000013_add_totp_secret_kid.down.sql")
+	mysqlUp := readMigration(t, "migrations/mysql/000013_add_totp_secret_kid.up.sql")
+	mysqlDown := readMigration(t, "migrations/mysql/000013_add_totp_secret_kid.down.sql")
+
+	column := "secret_kid VARCHAR(32) NOT NULL DEFAULT ''"
+	postgresAdd := "ALTER TABLE totp_secrets ADD COLUMN IF NOT EXISTS " + column + ";"
+	if !strings.Contains(postgresUp, postgresAdd) {
+		t.Fatalf("migration 13 up must add the bookkeeping column: %q", postgresUp)
+	}
+	mysqlAdd := "ALTER TABLE totp_secrets ADD COLUMN " + column + ";"
+	if !strings.Contains(mysqlUp, mysqlAdd) {
+		t.Fatalf("mysql migration 13 up must add the bookkeeping column: %q", mysqlUp)
+	}
+	if !strings.Contains(mysqlUp, "not transactional") {
+		t.Error("mysql migration 13 up must carry the non-transactional DDL recovery note")
+	}
+
+	if drops := strings.Count(postgresDown, "DROP COLUMN IF EXISTS secret_kid;"); drops != 1 {
+		t.Fatalf("migration 13 down must drop exactly one column, got %d: %q", drops, postgresDown)
+	}
+	if !strings.Contains(mysqlDown, "ALTER TABLE totp_secrets DROP COLUMN secret_kid;") {
+		t.Fatalf("mysql migration 13 down must drop secret_kid: %q", mysqlDown)
+	}
+
+	for name, content := range map[string]string{
+		"postgres up":   postgresUp,
+		"postgres down": postgresDown,
+		"mysql up":      mysqlUp,
+		"mysql down":    mysqlDown,
+	} {
+		for _, keyword := range []string{"UPDATE ", "INSERT ", "DELETE "} {
+			if strings.Contains(content, keyword) {
+				t.Errorf("%s migration 13 must not contain %q", name, keyword)
+			}
+		}
+		if strings.Contains(content, "DROP TABLE") {
+			t.Errorf("%s migration 13 must never drop the secrets table", name)
+		}
+		if hexRun.MatchString(content) {
+			t.Errorf("%s migration 13 embeds something that looks like key material", name)
+		}
+	}
+}
+
+// hexRun matches 64 or more consecutive hex characters: a raw AES-256 key.
+var hexRun = regexp.MustCompile(`[0-9a-fA-F]{64,}`)
+
+func readMigration(t *testing.T, name string) string {
+	t.Helper()
+
+	data, err := defaultMigrationsFS.ReadFile(name)
+	if err != nil {
+		t.Fatalf("failed to read migration %s: %v", name, err)
+	}
+	return string(data)
 }
 
 // upToSemicolon returns the statement starting at raw, without its terminator.
