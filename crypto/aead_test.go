@@ -372,6 +372,91 @@ func TestTokenOpenDuplicateJSONKeysUseLastValue(t *testing.T) {
 	}
 }
 
+// nonCanonicalBase64URLVariant returns an encoding of the same bytes whose
+// trailing bits differ: the default decoder accepts it, the strict one rejects
+// it.
+func nonCanonicalBase64URLVariant(t *testing.T, encoded string) string {
+	t.Helper()
+
+	const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+	want, err := base64.RawURLEncoding.DecodeString(encoded)
+	if err != nil {
+		t.Fatalf("decode envelope body: %v", err)
+	}
+
+	last := len(encoded) - 1
+	for i := 0; i < len(alphabet); i++ {
+		variant := encoded[:last] + string(alphabet[i])
+		if variant == encoded {
+			continue
+		}
+		got, err := base64.RawURLEncoding.DecodeString(variant)
+		if err != nil || !bytes.Equal(got, want) {
+			continue
+		}
+		if _, err := base64.RawURLEncoding.Strict().DecodeString(variant); err == nil {
+			continue
+		}
+		return variant
+	}
+	t.Fatal("no non-canonical variant of the envelope body found")
+	return ""
+}
+
+func TestTokenOpenRejectsNonCanonicalEnvelopeEncoding(t *testing.T) {
+	t.Parallel()
+
+	sealer := newTestSealer(t, keyringSpec("k1", 0x11))
+	// Three plaintext bytes plus the tag give a body whose encoding ends in
+	// unused bits, which is where a non-strict decoder normalises.
+	envelope, err := sealer.SealAccessToken("github", "acct-1", "tok")
+	if err != nil {
+		t.Fatalf("SealAccessToken() error = %v", err)
+	}
+
+	doc := decodeTokenEnvelope(t, envelope)
+	body, _ := doc["ct"].(string)
+	if body == "" {
+		t.Fatal("envelope has no ciphertext body")
+	}
+	doc["ct"] = nonCanonicalBase64URLVariant(t, body)
+	mutated := encodeTokenEnvelope(t, doc)
+
+	got, err := sealer.OpenAccessToken("github", "acct-1", mutated)
+	if !errors.Is(err, ErrEnvelopeMalformed) {
+		t.Fatalf("open of a non-canonical body = (%q, %v), want ErrEnvelopeMalformed", got, err)
+	}
+}
+
+func TestTokenAADLengthPrefixesBlockShiftCollisions(t *testing.T) {
+	t.Parallel()
+
+	sealer := newTestSealer(t, keyringSpec("k1", 0x11))
+	// Each pair joins to the same string once the length prefixes are dropped,
+	// which is the collision the prefixes exist to prevent.
+	pairs := []struct {
+		provider      string
+		account       string
+		otherProvider string
+		otherAccount  string
+	}{
+		{provider: "a:b", account: "c", otherProvider: "a", otherAccount: "b:c"},
+		{provider: "a\x00b", account: "c", otherProvider: "a", otherAccount: "b\x00c"},
+	}
+
+	for _, pair := range pairs {
+		envelope, err := sealer.SealAccessToken(pair.provider, pair.account, "token")
+		if err != nil {
+			t.Fatalf("SealAccessToken(%q, %q) error = %v", pair.provider, pair.account, err)
+		}
+		got, err := sealer.OpenAccessToken(pair.otherProvider, pair.otherAccount, envelope)
+		if !errors.Is(err, ErrAuthenticationFailed) {
+			t.Fatalf("open under (%q, %q) = (%q, %v), want ErrAuthenticationFailed",
+				pair.otherProvider, pair.otherAccount, got, err)
+		}
+	}
+}
+
 func TestTokenRejectsCrossFieldAndCrossRowReplay(t *testing.T) {
 	t.Parallel()
 

@@ -152,7 +152,10 @@ func (s *TokenSealer) open(field, providerID, accountID, envelope string) (strin
 		return "", ErrEnvelopeMalformed
 	}
 
-	nonce, err := base64.RawURLEncoding.DecodeString(doc.Nonce)
+	// Strict decoding: the stored envelope is a canonical byte string, so a
+	// re-encoded body carrying non-zero trailing bits is rejected instead of
+	// normalised to the same bytes the way the default decoder does.
+	nonce, err := base64.RawURLEncoding.Strict().DecodeString(doc.Nonce)
 	if err != nil || len(nonce) != gcmNonceSize {
 		return "", ErrEnvelopeMalformed
 	}
@@ -162,7 +165,7 @@ func (s *TokenSealer) open(field, providerID, accountID, envelope string) (strin
 		return "", ErrUnknownKeyID
 	}
 
-	ciphertext, err := base64.RawURLEncoding.DecodeString(doc.Ciphertext)
+	ciphertext, err := base64.RawURLEncoding.Strict().DecodeString(doc.Ciphertext)
 	if err != nil || len(ciphertext) < gcmTagSize {
 		return "", ErrEnvelopeMalformed
 	}

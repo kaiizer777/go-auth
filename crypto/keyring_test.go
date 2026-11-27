@@ -3,6 +3,7 @@ package crypto
 import (
 	"bytes"
 	"encoding/base64"
+	"encoding/hex"
 	"fmt"
 	"strings"
 	"sync"
@@ -177,6 +178,9 @@ func TestParseKeyringErrorsDoNotLeakKeyMaterial(t *testing.T) {
 	}
 }
 
+// TestKeyringFormattingRedactsKeys pins the redaction marker as the only thing
+// any formatter receives: fmt renders a [32]byte as decimal, so grepping for
+// the base64 key text would pass even with String/GoString deleted.
 func TestKeyringFormattingRedactsKeys(t *testing.T) {
 	t.Parallel()
 
@@ -186,14 +190,33 @@ func TestKeyringFormattingRedactsKeys(t *testing.T) {
 		t.Fatalf("ParseKeyring() error = %v", err)
 	}
 
-	targets := []any{ring, *ring, ring.entries, ring.entries[0], ring.entries[0].key}
+	const marker = "[redacted]"
+	keyBytesDecimal := make([]int, len(ring.entries[0].key))
+	for i, b := range ring.entries[0].key {
+		keyBytesDecimal[i] = int(b)
+	}
+	keyDecimal := fmt.Sprint(keyBytesDecimal)
+	// Targets are the values reachable from outside this package plus the key
+	// material itself. fmt cannot call methods through an unexported field, so
+	// the entries slice and a single entry cannot be asserted; Keyring carries
+	// its own redacting formatters for exactly that reason.
+	targets := []any{ring, *ring, ring.entries[0].key, &ring.entries[0].key}
 	for _, verb := range []string{"%v", "%+v", "%#v", "%s"} {
 		for _, target := range targets {
 			out := fmt.Sprintf(verb, target)
-			if strings.Contains(out, key) || strings.Contains(out, strings.TrimRight(key, "=")) {
-				t.Fatalf("format %q of %T leaks key material: %s", verb, target, out)
+			if !strings.Contains(out, marker) {
+				t.Fatalf("format %q of %T = %q; want the %s marker", verb, target, out, marker)
+			}
+			if strings.Contains(out, keyDecimal) {
+				t.Fatalf("format %q of %T leaks the key bytes: %s", verb, target, out)
 			}
 		}
+	}
+
+	// %x hex-encodes a Stringer's text rather than the struct's bytes, so the
+	// key is still absent from the output.
+	if out := fmt.Sprintf("%x", ring.entries[0].key); out != hex.EncodeToString([]byte(marker)) {
+		t.Fatalf("format %%x of keyMaterial = %q; want the hex of %q", out, marker)
 	}
 }
 

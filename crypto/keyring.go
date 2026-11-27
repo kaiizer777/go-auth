@@ -38,6 +38,13 @@ type Keyring struct {
 	byID    map[string]int
 }
 
+// String and GoString redact the whole ring. Without them a caller formatting
+// the exported value would get the unexported entries field rendered by fmt,
+// which prints key bytes in decimal because fmt cannot call methods through an
+// unexported field.
+func (Keyring) String() string   { return "[redacted]" }
+func (Keyring) GoString() string { return "crypto.Keyring{[redacted]}" }
+
 // ParseKeyring validates a `kid:base64key[,kid:base64key...]` specification.
 // Empty input yields ErrKeyringMissing; any grammar violation yields an error
 // wrapping ErrKeyringMalformed and no partial keyring.

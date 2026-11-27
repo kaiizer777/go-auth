@@ -518,6 +518,10 @@ func TestE2E_FullBrowserOAuthJourneys(t *testing.T) {
 			t.Fatalf("access envelope kid = %q; want the active key %q", got, want)
 		}
 		sealer := crypto.NewTokenSealer(ring)
+		issuedAccess, err := sealer.OpenAccessToken("x", link.ID.String(), link.AccessTokenCiphertext)
+		if err != nil {
+			t.Fatalf("open issued access token: %v", err)
+		}
 		issuedRefresh, err := sealer.OpenRefreshToken("x", link.ID.String(), link.RefreshTokenCiphertext)
 		if err != nil {
 			t.Fatalf("open issued refresh token: %v", err)
@@ -530,18 +534,25 @@ func TestE2E_FullBrowserOAuthJourneys(t *testing.T) {
 			t.Fatalf("expire x link: %v", err)
 		}
 		accessor := oauth.NewServiceWithRegistry(gormstore.New(dbConn), session.NewService(dbConn, &cfg), *pReg, &cfg)
+		refreshedAt := time.Now()
 		token, err := accessor.LinkedAccountToken(context.Background(), seededUser.ID, "x")
 		if err != nil {
 			t.Fatalf("LinkedAccountToken: %v", err)
 		}
-		if token.AccessToken != "x-idp-access-token" || !strings.EqualFold(token.TokenType, "bearer") {
-			t.Fatalf("accessor token = %q %q; want the provider access token and a bearer type", token.AccessToken, token.TokenType)
+		if token.AccessToken == "" || token.AccessToken == issuedAccess || !strings.EqualFold(token.TokenType, "bearer") {
+			t.Fatalf("accessor token = %q %q; want the refreshed access token with a bearer type",
+				token.AccessToken, token.TokenType)
 		}
 		if token.RefreshToken != "" {
 			t.Fatal("accessor must not return the refresh token")
 		}
 		if got := idp.RefreshCalls.Load(); got != 1 {
 			t.Fatalf("refresh POSTs at the IdP = %d; want exactly 1", got)
+		}
+		// The IdP accepts only its newest access token, so a refresh that
+		// served or re-stored the login's token fails this call.
+		if _, err := provider.FetchUserInfo(context.Background(), token); err != nil {
+			t.Fatalf("refreshed access token rejected by the provider: %v", err)
 		}
 
 		var rotated db.OAuthAccount
@@ -552,8 +563,21 @@ func TestE2E_FullBrowserOAuthJourneys(t *testing.T) {
 			rotated.RefreshTokenCiphertext == link.RefreshTokenCiphertext {
 			t.Fatal("refresh must rewrite both stored envelopes")
 		}
-		if rotated.TokenExpiresAt == nil || !rotated.TokenExpiresAt.After(time.Now()) {
-			t.Fatalf("refreshed expiry = %v; want a future timestamp", rotated.TokenExpiresAt)
+		const expiryTolerance = 5 * time.Second
+		if rotated.TokenExpiresAt == nil ||
+			rotated.TokenExpiresAt.Before(refreshedAt.Add(7200*time.Second-expiryTolerance)) ||
+			rotated.TokenExpiresAt.After(time.Now().Add(7200*time.Second+expiryTolerance)) {
+			t.Fatalf("refreshed expiry = %v; want ≈ now+7200s", rotated.TokenExpiresAt)
+		}
+		rotatedAccess, err := sealer.OpenAccessToken("x", link.ID.String(), rotated.AccessTokenCiphertext)
+		if err != nil {
+			t.Fatalf("open rotated access token: %v", err)
+		}
+		if rotatedAccess != token.AccessToken {
+			t.Fatalf("stored access token = %q; want the served %q", rotatedAccess, token.AccessToken)
+		}
+		if rotatedAccess == issuedAccess {
+			t.Fatal("refresh re-stored the login's access token")
 		}
 		rotatedRefresh, err := sealer.OpenRefreshToken("x", link.ID.String(), rotated.RefreshTokenCiphertext)
 		if err != nil {

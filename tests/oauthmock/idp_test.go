@@ -243,6 +243,12 @@ func TestXIdPRequiresBasicAuthAndNoBodyClientID(t *testing.T) {
 		t.Fatalf("client_id in body status = %d; want 400", got)
 	}
 
+	wrongSecret := map[string]string{"Authorization": "Basic " + base64.StdEncoding.EncodeToString(
+		[]byte(url.QueryEscape(idp.ClientID)+":"+url.QueryEscape("wrong-client-secret")))}
+	if got := idpPostForm(t, tokenURL, form(idpAuthorizeScope(t, idp.Server.URL+"/i/oauth2/authorize", idp.ClientID, "users.read")), wrongSecret); got != http.StatusBadRequest {
+		t.Fatalf("wrong client secret status = %d; want 400", got)
+	}
+
 	noBasic := form(idpAuthorizeScope(t, idp.Server.URL+"/i/oauth2/authorize", idp.ClientID, "users.read"))
 	if got := idpPostForm(t, tokenURL, noBasic, nil); got != http.StatusBadRequest {
 		t.Fatalf("missing basic auth status = %d; want 400", got)
@@ -298,6 +304,9 @@ func TestXIdPRefreshGrantRotatesAndRejectsReplay(t *testing.T) {
 	if next == "" || next == pair["refresh_token"] {
 		t.Fatalf("refresh_token = %v; want a rotated value", rotated["refresh_token"])
 	}
+	if rotated["access_token"] == pair["access_token"] {
+		t.Fatal("refresh issued the exchange's access token; want a distinguishable one")
+	}
 
 	status, replayed := idpPostFormJSON(t, idp.Server.URL+"/2/oauth2/token", refreshForm("x-idp-refresh-token"), xBasicAuth(idp))
 	if status != http.StatusBadRequest || replayed["error"] != "invalid_grant" {
@@ -308,6 +317,17 @@ func TestXIdPRefreshGrantRotatesAndRejectsReplay(t *testing.T) {
 		t.Fatalf("refresh calls = %d; want 2", got)
 	}
 
+	// me() accepts only the newest access token, which is what makes a refresh
+	// that kept the stale one fail end to end.
+	oldAccess, _ := pair["access_token"].(string)
+	newAccess, _ := rotated["access_token"].(string)
+	if status := xMeStatus(t, idp, oldAccess); status != http.StatusBadRequest {
+		t.Fatalf("me with the exchanged access token = %d; want 400 after rotation", status)
+	}
+	if status := xMeStatus(t, idp, newAccess); status != http.StatusOK {
+		t.Fatalf("me with the refreshed access token = %d; want 200", status)
+	}
+
 	status, body := idpPostFormJSON(t, idp.Server.URL+"/2/oauth2/token", refreshForm(next), nil)
 	if status != http.StatusBadRequest || body["error"] != "invalid_client" {
 		t.Fatalf("refresh without basic auth = %d %v; want 400 invalid_client", status, body)
@@ -315,6 +335,23 @@ func TestXIdPRefreshGrantRotatesAndRejectsReplay(t *testing.T) {
 	if got := idp.RefreshCalls.Load(); got != 2 {
 		t.Fatalf("refresh calls after unauthenticated attempt = %d; want 2", got)
 	}
+}
+
+// xMeStatus calls the X IdP profile endpoint with one bearer token.
+func xMeStatus(t *testing.T, idp *XIdP, accessToken string) int {
+	t.Helper()
+
+	req, err := http.NewRequest(http.MethodGet, idp.Server.URL+"/2/users/me", nil)
+	if err != nil {
+		t.Fatalf("build me request: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("me: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	return resp.StatusCode
 }
 
 func TestScopeGrantedMatchesWholeElements(t *testing.T) {

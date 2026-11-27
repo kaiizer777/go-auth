@@ -475,6 +475,8 @@ type XIdP struct {
 	RefreshCalls atomic.Int64
 
 	mu           sync.Mutex
+	access       string
+	accessIssued int
 	refreshToken string
 	codes        *authorizeCodes
 }
@@ -510,7 +512,24 @@ func NewXIdP(redirectURI ...string) *XIdP {
 // Close shuts the IdP down.
 func (i *XIdP) Close() { i.Server.Close() }
 
-func (i *XIdP) accessToken() string { return "x-idp-access-token" }
+// accessToken returns the one token /2/users/me currently accepts.
+func (i *XIdP) accessToken() string {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	return i.access
+}
+
+// mintAccessToken issues a distinct access token per grant and retires the
+// previous one, so a stale token is rejected by me() the way a real provider
+// rejects it. A constant token would let a refresh that re-persisted the old
+// value pass unnoticed.
+func (i *XIdP) mintAccessToken() string {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	i.accessIssued++
+	i.access = fmt.Sprintf("x-idp-access-token-%d", i.accessIssued)
+	return i.access
+}
 
 func (i *XIdP) token(w http.ResponseWriter, r *http.Request) {
 	if err := r.ParseForm(); err != nil {
@@ -545,7 +564,7 @@ func (i *XIdP) exchangeCode(w http.ResponseWriter, r *http.Request) {
 	}
 	payload := map[string]any{
 		"token_type":   "bearer",
-		"access_token": i.accessToken(),
+		"access_token": i.mintAccessToken(),
 		"expires_in":   7200,
 	}
 	if scopeGranted(ac.scope, "offline.access") {
@@ -574,7 +593,7 @@ func (i *XIdP) refreshGrant(w http.ResponseWriter, r *http.Request) {
 
 	writeJSON(w, map[string]any{
 		"token_type":    "bearer",
-		"access_token":  i.accessToken(),
+		"access_token":  i.mintAccessToken(),
 		"expires_in":    7200,
 		"refresh_token": rotated,
 	})
