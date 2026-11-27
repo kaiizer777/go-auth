@@ -86,6 +86,14 @@ func (s *SecretSealer) EnvelopeKeyID(blob []byte) (string, bool) {
 	return doc.Kid, true
 }
 
+// ActiveKeyID returns the kid Seal writes under, or "" when the ring is unset.
+func (s *SecretSealer) ActiveKeyID() string {
+	if s == nil {
+		return ""
+	}
+	return s.sealer.ring.ActiveKeyID()
+}
+
 // openLegacy opens the pre-envelope nonce||ciphertext||tag layout, trying every
 // ring entry. Only package crypto can reach the ring entries.
 func (k *Keyring) openLegacy(blob []byte) ([]byte, error) {

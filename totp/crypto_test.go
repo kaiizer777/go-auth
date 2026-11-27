@@ -2,20 +2,58 @@ package totp
 
 import (
 	"bytes"
-	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/pquerna/otp"
 	ptotp "github.com/pquerna/otp/totp"
 
+	"github.com/kaiizer777/go-auth/config"
+	"github.com/kaiizer777/go-auth/crypto"
 	"github.com/kaiizer777/go-auth/errors"
 )
 
+// legacyFixtureSecret is the plaintext inside the pre-envelope fixtures in
+// testdata, captured from the AES-only implementation before it was removed.
+const legacyFixtureSecret = "JBSWY3DPEHPK3PXP"
+
 func validTestHexKey() string {
 	return "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+}
+
+func testKeyringSpec(kid string, fill byte) string {
+	return kid + ":" + base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{fill}, 32))
+}
+
+func newTestTOTPCrypto(t *testing.T, cfg config.TOTPConfig) *Crypto {
+	t.Helper()
+
+	c, err := NewCrypto(cfg)
+	if err != nil {
+		t.Fatalf("NewCrypto() error = %v", err)
+	}
+	return c
+}
+
+func readLegacyFixture(t *testing.T, name string) []byte {
+	t.Helper()
+
+	encoded, err := os.ReadFile(filepath.Join("testdata", name))
+	if err != nil {
+		t.Fatalf("read fixture %s: %v", name, err)
+	}
+	blob, err := hex.DecodeString(strings.TrimSpace(string(encoded)))
+	if err != nil {
+		t.Fatalf("decode fixture %s: %v", name, err)
+	}
+	return blob
 }
 
 func TestNewCrypto_Validation(t *testing.T) {
@@ -23,195 +61,307 @@ func TestNewCrypto_Validation(t *testing.T) {
 
 	tests := []struct {
 		name    string
-		hexKey  string
-		wantErr bool
+		cfg     config.TOTPConfig
+		wantErr error
 	}{
+		{name: "hex key only", cfg: config.TOTPConfig{EncryptionKey: validTestHexKey()}},
+		{name: "keyring only", cfg: config.TOTPConfig{Keyring: testKeyringSpec("k1", 0x42)}},
+		{name: "keyring beside the hex key", cfg: config.TOTPConfig{EncryptionKey: validTestHexKey(), Keyring: testKeyringSpec("k1", 0x42)}},
+		{name: "too short key", cfg: config.TOTPConfig{EncryptionKey: "0123456789abcdef"}, wantErr: errors.ErrTOTPEncryptionKeyInvalid},
+		{name: "too long key", cfg: config.TOTPConfig{EncryptionKey: strings.Repeat("a", 66)}, wantErr: errors.ErrTOTPEncryptionKeyInvalid},
+		{name: "non-hex characters", cfg: config.TOTPConfig{EncryptionKey: strings.Repeat("z", 64)}, wantErr: errors.ErrTOTPEncryptionKeyInvalid},
+		{name: "empty key and keyring", cfg: config.TOTPConfig{}, wantErr: errors.ErrTOTPEncryptionKeyInvalid},
+		{name: "malformed keyring", cfg: config.TOTPConfig{Keyring: "k1:not-base64"}, wantErr: errors.ErrTOTPKeyringInvalid},
 		{
-			name:    "valid 64 hex characters (32 bytes)",
-			hexKey:  validTestHexKey(),
-			wantErr: false,
-		},
-		{
-			name:    "too short key",
-			hexKey:  "0123456789abcdef",
-			wantErr: true,
-		},
-		{
-			name:    "too long key",
-			hexKey:  strings.Repeat("a", 66),
-			wantErr: true,
-		},
-		{
-			name:    "non-hex characters",
-			hexKey:  strings.Repeat("z", 64),
-			wantErr: true,
-		},
-		{
-			name:    "empty key",
-			hexKey:  "",
-			wantErr: true,
+			name:    "keyring reusing the legacy kid",
+			cfg:     config.TOTPConfig{EncryptionKey: validTestHexKey(), Keyring: testKeyringSpec(legacyKeyID, 0x42)},
+			wantErr: errors.ErrTOTPKeyringInvalid,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			c, err := NewCrypto(tt.hexKey)
-			if tt.wantErr {
-				if err == nil {
-					t.Errorf("expected error, got nil")
-				}
-				if !errors.Is(err, errors.ErrTOTPEncryptionKeyInvalid) {
-					t.Errorf("expected ErrTOTPEncryptionKeyInvalid, got %v", err)
+
+			c, err := NewCrypto(tt.cfg)
+			if tt.wantErr != nil {
+				if !errors.Is(err, tt.wantErr) {
+					t.Fatalf("NewCrypto() error = %v, want %v", err, tt.wantErr)
 				}
 				if c != nil {
-					t.Errorf("expected nil Crypto, got %+v", c)
+					t.Fatalf("expected nil Crypto, got %+v", c)
 				}
-			} else {
-				if err != nil {
-					t.Errorf("unexpected error: %v", err)
-				}
-				if c == nil {
-					t.Fatalf("expected non-nil Crypto")
-				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("NewCrypto() error = %v", err)
+			}
+			if c == nil {
+				t.Fatal("expected non-nil Crypto")
 			}
 		})
 	}
 }
 
-func TestNewCryptoFromBytes(t *testing.T) {
+func TestCryptoActiveKeyID(t *testing.T) {
 	t.Parallel()
 
-	raw := make([]byte, 32)
-	_, _ = rand.Read(raw)
-
-	c, err := NewCryptoFromBytes(raw)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if c == nil {
-		t.Fatal("expected non-nil crypto")
+	hexOnly := newTestTOTPCrypto(t, config.TOTPConfig{EncryptionKey: validTestHexKey()})
+	if got := hexOnly.ActiveKeyID(); got != legacyKeyID {
+		t.Errorf("hex-only active kid = %q, want %q", got, legacyKeyID)
 	}
 
-	short := make([]byte, 16)
-	_, err = NewCryptoFromBytes(short)
-	if !errors.Is(err, errors.ErrTOTPEncryptionKeyInvalid) {
-		t.Errorf("expected ErrTOTPEncryptionKeyInvalid for short byte key, got %v", err)
+	both := newTestTOTPCrypto(t, config.TOTPConfig{EncryptionKey: validTestHexKey(), Keyring: testKeyringSpec("k2", 0x42)})
+	if got := both.ActiveKeyID(); got != "k2" {
+		t.Errorf("keyring-plus-hex active kid = %q, want k2", got)
 	}
 }
 
 func TestEncryptDecryptRoundTrip(t *testing.T) {
 	t.Parallel()
 
-	c, err := NewCrypto(validTestHexKey())
-	if err != nil {
-		t.Fatalf("failed to init crypto: %v", err)
-	}
-
+	c := newTestTOTPCrypto(t, config.TOTPConfig{EncryptionKey: validTestHexKey()})
+	owner := uuid.New()
 	messages := [][]byte{
-		[]byte("JBSWY3DPEHPK3PXP"),
+		[]byte(legacyFixtureSecret),
 		[]byte("short"),
 		[]byte(""),
 		bytes.Repeat([]byte("A"), 1024),
 	}
 
 	for _, original := range messages {
-		encrypted, err := c.Encrypt(original)
+		encrypted, err := c.Encrypt(owner, original)
 		if err != nil {
-			t.Fatalf("encryption failed: %v", err)
+			t.Fatalf("encrypt(%d bytes) failed: %v", len(original), err)
 		}
 
-		decrypted, err := c.Decrypt(encrypted)
+		decrypted, err := c.Decrypt(owner, encrypted)
 		if err != nil {
-			t.Fatalf("decryption failed: %v", err)
+			t.Fatalf("decrypt(%d bytes) failed: %v", len(original), err)
 		}
-
 		if !bytes.Equal(original, decrypted) {
 			t.Errorf("got %q, want %q", decrypted, original)
 		}
 	}
 }
 
-func TestEncryptProducesUniqueNonce(t *testing.T) {
+func TestEncryptWritesEnvelopeBoundToOwner(t *testing.T) {
 	t.Parallel()
 
-	c, err := NewCrypto(validTestHexKey())
+	owner := uuid.New()
+	c := newTestTOTPCrypto(t, config.TOTPConfig{EncryptionKey: validTestHexKey()})
+	blob, err := c.Encrypt(owner, []byte(legacyFixtureSecret))
 	if err != nil {
-		t.Fatalf("failed to init crypto: %v", err)
+		t.Fatalf("encrypt failed: %v", err)
+	}
+	if bytes.Contains(blob, []byte(legacyFixtureSecret)) {
+		t.Fatal("stored blob contains the plaintext secret")
 	}
 
-	plaintext := []byte("JBSWY3DPEHPK3PXP")
-	enc1, err := c.Encrypt(plaintext)
-	if err != nil {
-		t.Fatalf("enc1 failed: %v", err)
+	var doc map[string]any
+	if err := json.Unmarshal(blob, &doc); err != nil {
+		t.Fatalf("stored secret is not a JSON envelope: %v", err)
 	}
-	enc2, err := c.Encrypt(plaintext)
-	if err != nil {
-		t.Fatalf("enc2 failed: %v", err)
+	if doc["v"] != float64(1) || doc["alg"] != "A256GCM" {
+		t.Fatalf("envelope header = (%v, %v)", doc["v"], doc["alg"])
 	}
-
-	if bytes.Equal(enc1, enc2) {
-		t.Fatal("subsequent encryptions of identical plaintext produced identical ciphertexts (nonce reuse)")
+	if doc["kid"] != legacyKeyID {
+		t.Errorf("envelope kid = %v, want %q", doc["kid"], legacyKeyID)
 	}
-
-	// 12-byte nonces must differ
-	nonce1 := enc1[:12]
-	nonce2 := enc2[:12]
-	if bytes.Equal(nonce1, nonce2) {
-		t.Fatal("nonces were identical across encryptions")
+	for _, field := range []string{"n", "ct"} {
+		value, ok := doc[field].(string)
+		if !ok || value == "" {
+			t.Fatalf("%s = %v", field, doc[field])
+		}
+		if strings.Contains(value, "=") {
+			t.Errorf("%s is not unpadded base64url: %q", field, value)
+		}
+	}
+	if strings.Contains(string(blob), owner.String()) {
+		t.Error("envelope embeds the owner id; the binding must live in the AAD only")
 	}
 }
 
-func TestDecryptTamperedCiphertext(t *testing.T) {
+func TestEncryptProducesUniqueNonce(t *testing.T) {
 	t.Parallel()
 
-	c, err := NewCrypto(validTestHexKey())
-	if err != nil {
-		t.Fatalf("failed to init crypto: %v", err)
+	c := newTestTOTPCrypto(t, config.TOTPConfig{EncryptionKey: validTestHexKey()})
+	owner := uuid.New()
+	plaintext := []byte(legacyFixtureSecret)
+
+	nonceOf := func(blob []byte) string {
+		t.Helper()
+		var doc map[string]any
+		if err := json.Unmarshal(blob, &doc); err != nil {
+			t.Fatalf("decode envelope: %v", err)
+		}
+		value, _ := doc["n"].(string)
+		return value
 	}
 
-	plaintext := []byte("top-secret-totp-seed")
-	blob, err := c.Encrypt(plaintext)
+	first, err := c.Encrypt(owner, plaintext)
+	if err != nil {
+		t.Fatalf("first encrypt failed: %v", err)
+	}
+	second, err := c.Encrypt(owner, plaintext)
+	if err != nil {
+		t.Fatalf("second encrypt failed: %v", err)
+	}
+
+	if nonceOf(first) == nonceOf(second) {
+		t.Fatal("nonces were identical across encryptions")
+	}
+	if bytes.Equal(first, second) {
+		t.Fatal("subsequent encryptions of identical plaintext produced identical blobs")
+	}
+}
+
+func TestDecryptCrossUserTransplantFails(t *testing.T) {
+	t.Parallel()
+
+	c := newTestTOTPCrypto(t, config.TOTPConfig{EncryptionKey: validTestHexKey()})
+	owner := uuid.New()
+	other := uuid.New()
+
+	blob, err := c.Encrypt(owner, []byte(legacyFixtureSecret))
+	if err != nil {
+		t.Fatalf("encrypt failed: %v", err)
+	}
+
+	plaintext, err := c.Decrypt(other, blob)
+	if err == nil {
+		t.Fatalf("cross-user transplant opened to %q; AAD binding is missing", plaintext)
+	}
+}
+
+func TestDecryptUppercaseUUIDOwner(t *testing.T) {
+	t.Parallel()
+
+	c := newTestTOTPCrypto(t, config.TOTPConfig{EncryptionKey: validTestHexKey()})
+	owner := uuid.New()
+	blob, err := c.Encrypt(owner, []byte(legacyFixtureSecret))
+	if err != nil {
+		t.Fatalf("encrypt failed: %v", err)
+	}
+
+	upper, err := uuid.Parse(strings.ToUpper(owner.String()))
+	if err != nil {
+		t.Fatalf("parse uppercase uuid: %v", err)
+	}
+	plaintext, err := c.Decrypt(upper, blob)
+	if err != nil {
+		t.Fatalf("decrypt with uppercase-derived owner failed: %v", err)
+	}
+	if string(plaintext) != legacyFixtureSecret {
+		t.Fatalf("decrypt = %q, want %q", plaintext, legacyFixtureSecret)
+	}
+}
+
+func TestDecryptTamperedEnvelope(t *testing.T) {
+	t.Parallel()
+
+	c := newTestTOTPCrypto(t, config.TOTPConfig{EncryptionKey: validTestHexKey()})
+	owner := uuid.New()
+	blob, err := c.Encrypt(owner, []byte("top-secret-totp-seed"))
 	if err != nil {
 		t.Fatalf("encryption failed: %v", err)
 	}
 
-	// Tamper in nonce region
-	tamperedNonce := make([]byte, len(blob))
-	copy(tamperedNonce, blob)
-	tamperedNonce[0] ^= 0x01
-	if _, err := c.Decrypt(tamperedNonce); err == nil {
-		t.Error("tampered nonce decrypted successfully; expected authentication failure")
+	var sealed map[string]any
+	if err := json.Unmarshal(blob, &sealed); err != nil {
+		t.Fatalf("decode envelope: %v", err)
+	}
+	flip := func(value string) string {
+		raw, err := base64.RawURLEncoding.DecodeString(value)
+		if err != nil {
+			t.Fatalf("decode %q: %v", value, err)
+		}
+		raw[0] ^= 0x01
+		return base64.RawURLEncoding.EncodeToString(raw)
 	}
 
-	// Tamper in ciphertext region
-	tamperedCipher := make([]byte, len(blob))
-	copy(tamperedCipher, blob)
-	tamperedCipher[len(tamperedCipher)-1] ^= 0xFF
-	if _, err := c.Decrypt(tamperedCipher); err == nil {
-		t.Error("tampered ciphertext decrypted successfully; expected authentication failure")
+	tests := []struct {
+		name   string
+		mutate func(map[string]any)
+	}{
+		{name: "ciphertext", mutate: func(doc map[string]any) { doc["ct"] = flip(sealed["ct"].(string)) }},
+		{name: "nonce", mutate: func(doc map[string]any) { doc["n"] = flip(sealed["n"].(string)) }},
+		{name: "version", mutate: func(doc map[string]any) { doc["v"] = 2 }},
+		{name: "algorithm", mutate: func(doc map[string]any) { doc["alg"] = "A128GCM" }},
+		{name: "kid", mutate: func(doc map[string]any) { doc["kid"] = "rotated" }},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			doc := make(map[string]any, len(sealed))
+			for key, value := range sealed {
+				doc[key] = value
+			}
+			tt.mutate(doc)
+			tampered, err := json.Marshal(doc)
+			if err != nil {
+				t.Fatalf("re-encode envelope: %v", err)
+			}
+			if _, err := c.Decrypt(owner, tampered); err == nil {
+				t.Fatalf("tampered %s decrypted successfully; expected failure", tt.name)
+			}
+		})
+	}
+
+	for _, blob := range [][]byte{nil, {}, []byte("too-short")} {
+		if _, err := c.Decrypt(owner, blob); err == nil {
+			t.Errorf("decrypting short blob of len %d succeeded, expected error", len(blob))
+		}
 	}
 }
 
-func TestDecryptCiphertextTooShort(t *testing.T) {
+func TestDecryptLegacyFixture(t *testing.T) {
 	t.Parallel()
 
-	c, err := NewCrypto(validTestHexKey())
-	if err != nil {
-		t.Fatalf("failed to init crypto: %v", err)
-	}
+	c := newTestTOTPCrypto(t, config.TOTPConfig{EncryptionKey: validTestHexKey()})
+	owner := uuid.New()
 
-	shortBlobs := [][]byte{
-		nil,
-		{},
-		[]byte("too-short"),
-		make([]byte, 11),
-	}
-
-	for _, b := range shortBlobs {
-		if _, err := c.Decrypt(b); err == nil {
-			t.Errorf("decrypting short blob of len %d succeeded, expected error", len(b))
+	for _, name := range []string{"legacy_secret.hex", "legacy_secret_brace.hex"} {
+		blob := readLegacyFixture(t, name)
+		plaintext, err := c.Decrypt(owner, blob)
+		if err != nil {
+			t.Fatalf("decrypt %s failed: %v", name, err)
 		}
+		if string(plaintext) != legacyFixtureSecret {
+			t.Fatalf("decrypt %s = %q, want %q", name, plaintext, legacyFixtureSecret)
+		}
+	}
+}
+
+func TestDecryptLegacyFixtureUnderParkedKey(t *testing.T) {
+	t.Parallel()
+
+	// The old hex key is not the active key, but it still opens legacy rows.
+	c := newTestTOTPCrypto(t, config.TOTPConfig{
+		Keyring:       testKeyringSpec("rotated", 0x42),
+		EncryptionKey: validTestHexKey(),
+	})
+	if c.ActiveKeyID() != "rotated" {
+		t.Fatalf("active kid = %q, want rotated", c.ActiveKeyID())
+	}
+
+	plaintext, err := c.Decrypt(uuid.New(), readLegacyFixture(t, "legacy_secret.hex"))
+	if err != nil {
+		t.Fatalf("decrypt legacy row under a rotated ring failed: %v", err)
+	}
+	if string(plaintext) != legacyFixtureSecret {
+		t.Fatalf("decrypt = %q, want %q", plaintext, legacyFixtureSecret)
+	}
+}
+
+func TestEncryptRejectsOversizedPlaintext(t *testing.T) {
+	t.Parallel()
+
+	c := newTestTOTPCrypto(t, config.TOTPConfig{EncryptionKey: validTestHexKey()})
+	if _, err := c.Encrypt(uuid.New(), bytes.Repeat([]byte("A"), 1025)); !errors.Is(err, crypto.ErrPlaintextTooLarge) {
+		t.Fatalf("Encrypt over cap error = %v, want ErrPlaintextTooLarge", err)
 	}
 }
 
