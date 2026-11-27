@@ -595,15 +595,38 @@ func (s *service) exchangeRefreshToken(ctx context.Context, link db.OAuthAccount
 	if rec.TokenScope == "" {
 		rec.TokenScope = link.TokenScope
 	}
-	won, err := s.store.OAuthAccounts().SaveOAuthTokensCAS(ctx, link.ID, link.RefreshTokenFingerprint, rec)
+	wrote, err := s.persistRefreshed(ctx, link, rec)
 	if err != nil {
-		logTokenEvent(ctx, "oauth_token_refresh_persist_failed", link)
 		return nil, errors.ErrOAuthTokenExchangeFailed
 	}
-	if !won {
+	if !wrote {
 		return s.persistPastClear(ctx, link, rec, refreshed)
 	}
 	return refreshedAccess(refreshed), nil
+}
+
+// persistAttempts bounds the rotated-grant write. By the time it runs the
+// provider has already spent the presented refresh token, so a single transient
+// store fault would leave the account with no usable grant; repeating the
+// guarded write costs one statement and stays idempotent because the CAS can
+// only land once.
+const persistAttempts = 2
+
+// persistRefreshed stores the rotated pair, CAS-guarded on the fingerprint that
+// was read. A lost CAS is reported as (false, nil) for the caller to serve the
+// winner. A write that keeps failing leaves the stored grant untouched and
+// reports the error: the previous value stands rather than being cleared.
+func (s *service) persistRefreshed(ctx context.Context, link db.OAuthAccount, rec db.OAuthTokenRecord) (bool, error) {
+	var err error
+	for attempt := 0; attempt < persistAttempts; attempt++ {
+		var won bool
+		won, err = s.store.OAuthAccounts().SaveOAuthTokensCAS(ctx, link.ID, link.RefreshTokenFingerprint, rec)
+		if err == nil {
+			return won, nil
+		}
+	}
+	logTokenEvent(ctx, "oauth_token_refresh_persist_failed", link)
+	return false, err
 }
 
 // persistPastClear stores a pair the provider just issued when the persist CAS
@@ -646,21 +669,33 @@ func (s *service) refreshFailure(ctx context.Context, link db.OAuthAccount, err 
 	return nil, errors.ErrOAuthTokenExchangeFailed
 }
 
+// maxRefreshedLifetime is the longest lifetime reported for a renewed access
+// token. A provider answering an absurd expires_in would otherwise hand the
+// caller a credential it caches past any real expiry, so the reported lifetime
+// is capped at 24h — the ceiling the Retry-After parsing already uses. The
+// stored expiry keeps the provider's own value, which is what schedules the next
+// renewal.
+const maxRefreshedLifetime = 24 * time.Hour
+
 // refreshedAccess projects a renewed grant onto the caller-facing value. Raw is
 // the provider's whole response body, which carries the refresh token, so it is
 // dropped along with every other credential the caller must not receive. The
 // token type is normalised to the canonical scheme so the answer does not depend
-// on whether a refresh happened.
+// on whether a refresh happened, and the lifetime is capped at
+// maxRefreshedLifetime.
 func refreshedAccess(tokens *OAuthToken) *OAuthToken {
 	token := &OAuthToken{
 		AccessToken: tokens.AccessToken,
 		TokenType:   tokenTypeBearer,
 	}
 	if tokens.ExpiresIn > 0 {
-		token.ExpiresIn = tokens.ExpiresIn
-	}
-	if expiresAt := tokenExpiry(tokens); expiresAt != nil {
-		token.ExpiresAt = *expiresAt
+		seconds := tokens.ExpiresIn
+		if limit := int(maxRefreshedLifetime / time.Second); seconds > limit {
+			seconds = limit
+		}
+		lifetime := time.Duration(seconds) * time.Second
+		token.ExpiresIn = seconds
+		token.ExpiresAt = time.Now().UTC().Add(lifetime)
 	}
 	return token
 }

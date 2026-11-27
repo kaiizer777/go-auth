@@ -503,6 +503,24 @@ func (s *interceptReadOAuthStore) GetByProvider(ctx context.Context, providerID,
 	return row, err
 }
 
+// failingWriteOAuthStore rejects the next failures guarded token writes: the
+// shape of a transient store fault on the rotation path.
+type failingWriteOAuthStore struct {
+	db.OAuthAccountStore
+	mu       sync.Mutex
+	failures int
+}
+
+func (s *failingWriteOAuthStore) SaveOAuthTokensCAS(ctx context.Context, id uuid.UUID, expectedFingerprint string, rec db.OAuthTokenRecord) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.failures > 0 {
+		s.failures--
+		return false, stderrors.New("simulated write failure")
+	}
+	return s.OAuthAccountStore.SaveOAuthTokensCAS(ctx, id, expectedFingerprint, rec)
+}
+
 func TestLinkedAccountToken_Refresh(t *testing.T) {
 	ctx := context.Background()
 
@@ -560,6 +578,45 @@ func TestLinkedAccountToken_Refresh(t *testing.T) {
 		}
 		if provider.calls() != 1 {
 			t.Fatalf("refresh calls = %d; want 1", provider.calls())
+		}
+	})
+
+	// A provider that answers an absurd expires_in must not hand the caller a
+	// credential it caches past any real expiry.
+	t.Run("reported lifetime is capped at 24h", func(t *testing.T) {
+		provider := &stubRefreshProvider{stubProvider: &stubProvider{id: "google"}}
+		_, svc, _, owner := tokenAccessEnv(t, provider, tokenTestGrant(), staleExpiry())
+		provider.refreshFn = func(context.Context, string) (*OAuthToken, error) {
+			return &OAuthToken{AccessToken: "long-access", RefreshToken: "long-refresh", ExpiresIn: 10 * 365 * 24 * 60 * 60}, nil
+		}
+
+		before := time.Now().UTC()
+		token, err := svc.LinkedAccountToken(ctx, owner.ID, "google")
+		if err != nil {
+			t.Fatalf("LinkedAccountToken = %v", err)
+		}
+		if token.ExpiresIn != int(maxRefreshedLifetime/time.Second) {
+			t.Fatalf("ExpiresIn = %d; want %d", token.ExpiresIn, int(maxRefreshedLifetime/time.Second))
+		}
+		if token.ExpiresAt.Before(before.Add(maxRefreshedLifetime)) ||
+			token.ExpiresAt.After(time.Now().UTC().Add(maxRefreshedLifetime)) {
+			t.Fatalf("ExpiresAt = %v; want now+%v", token.ExpiresAt, maxRefreshedLifetime)
+		}
+	})
+
+	t.Run("reported lifetime below the cap is exact", func(t *testing.T) {
+		provider := &stubRefreshProvider{stubProvider: &stubProvider{id: "google"}}
+		_, svc, _, owner := tokenAccessEnv(t, provider, tokenTestGrant(), staleExpiry())
+		provider.refreshFn = func(context.Context, string) (*OAuthToken, error) {
+			return &OAuthToken{AccessToken: "short-access", RefreshToken: "short-refresh", ExpiresIn: 900}, nil
+		}
+
+		token, err := svc.LinkedAccountToken(ctx, owner.ID, "google")
+		if err != nil {
+			t.Fatalf("LinkedAccountToken = %v", err)
+		}
+		if token.ExpiresIn != 900 {
+			t.Fatalf("ExpiresIn = %d; want 900", token.ExpiresIn)
 		}
 	})
 
@@ -790,6 +847,50 @@ func TestLinkedAccountToken_Refresh(t *testing.T) {
 		}
 		requireSanitized(t, token)
 		requireStoredGrant(t, reloadTokenLink(t, database, link.ID), "callback-access", "callback-refresh")
+	})
+
+	// The provider has already spent the presented refresh token when the write
+	// runs, so a single store fault must not throw the rotated pair away.
+	t.Run("a transient persist failure retries the rotated grant", func(t *testing.T) {
+		provider := &stubRefreshProvider{stubProvider: &stubProvider{id: "google"}}
+		database, svc, link, owner := tokenAccessEnv(t, provider, tokenTestGrant(), staleExpiry())
+		base := svc.store
+		svc.store = &wrappedTxStore{Store: base, oauth: &failingWriteOAuthStore{
+			OAuthAccountStore: base.OAuthAccounts(),
+			failures:          1,
+		}}
+		provider.refreshFn = func(context.Context, string) (*OAuthToken, error) {
+			return &OAuthToken{AccessToken: "rotated-access", RefreshToken: "rotated-refresh", ExpiresIn: 3600}, nil
+		}
+
+		token, err := svc.LinkedAccountToken(ctx, owner.ID, "google")
+		if err != nil {
+			t.Fatalf("LinkedAccountToken = %v; want the retried persist", err)
+		}
+		if token.AccessToken != "rotated-access" {
+			t.Fatalf("AccessToken = %q; want rotated-access", token.AccessToken)
+		}
+		requireStoredGrant(t, reloadTokenLink(t, database, link.ID), "rotated-access", "rotated-refresh")
+	})
+
+	// A write that keeps failing must not be "repaired" by clearing the grant:
+	// the previous value stands and the error surfaces.
+	t.Run("a persist that keeps failing keeps the previous grant", func(t *testing.T) {
+		provider := &stubRefreshProvider{stubProvider: &stubProvider{id: "google"}}
+		database, svc, link, owner := tokenAccessEnv(t, provider, tokenTestGrant(), staleExpiry())
+		base := svc.store
+		svc.store = &wrappedTxStore{Store: base, oauth: &failingWriteOAuthStore{
+			OAuthAccountStore: base.OAuthAccounts(),
+			failures:          persistAttempts + 1,
+		}}
+		before := reloadTokenLink(t, database, link.ID)
+		provider.refreshFn = func(context.Context, string) (*OAuthToken, error) {
+			return &OAuthToken{AccessToken: "rotated-access", RefreshToken: "rotated-refresh", ExpiresIn: 3600}, nil
+		}
+
+		_, err := svc.LinkedAccountToken(ctx, owner.ID, "google")
+		requireCode(t, err, errors.CodeOAuthTokenExchangeFailed, http.StatusBadGateway)
+		requireSameGrant(t, before, reloadTokenLink(t, database, link.ID))
 	})
 
 	t.Run("transport failure keeps the grant and reports exchange failed", func(t *testing.T) {
