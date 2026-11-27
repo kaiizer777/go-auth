@@ -83,7 +83,7 @@ func TestTokenExpiry(t *testing.T) {
 	})
 
 	t.Run("clamps an absurd expires_in to the duration limit instead of overflowing", func(t *testing.T) {
-		huge := math.MaxInt64 / 2
+		huge := int64(math.MaxInt64 / 2)
 		if int64(int(huge)) != int64(huge) {
 			t.Skip("expires_in cannot exceed the clamp on this platform")
 		}
@@ -278,6 +278,93 @@ func TestTokenPersistence(t *testing.T) {
 		if stored.AccessTokenCiphertext != won.AccessTokenCiphertext {
 			t.Fatal("login overwrote the winner's grant")
 		}
+	})
+
+	// The row this callback read had no refresh token, so there is no fingerprint
+	// to CAS on. A concurrent login may still add the credential the provider
+	// issues only once; the access-only write must leave it in place.
+	t.Run("refresh-less login keeps a refresh token added after its read", func(t *testing.T) {
+		provider := &stubRefreshProvider{stubProvider: &stubProvider{id: "google"}}
+		database, svc, link, _ := tokenAccessEnv(t, provider, &OAuthToken{AccessToken: tokenTestAccess}, nil)
+		rec, err := svc.sealedTokens(link.ProviderID, link.ID.String(), tokenTestGrant())
+		if err != nil {
+			t.Fatalf("seal concurrent grant: %v", err)
+		}
+		if err := svc.store.OAuthAccounts().SaveOAuthTokens(context.Background(), link.ID, rec); err != nil {
+			t.Fatalf("store concurrent grant: %v", err)
+		}
+		storedGrant := reloadTokenLink(t, database, link.ID)
+
+		svc.persistTokens(context.Background(), link, &OAuthToken{AccessToken: "relogin-access", ExpiresIn: 600})
+
+		stored := reloadTokenLink(t, database, link.ID)
+		requireStoredGrant(t, stored, "relogin-access", tokenTestRefresh)
+		if stored.RefreshTokenCiphertext != storedGrant.RefreshTokenCiphertext ||
+			stored.RefreshTokenFingerprint != storedGrant.RefreshTokenFingerprint {
+			t.Fatal("login zeroed the refresh token a concurrent writer stored")
+		}
+	})
+
+	// A concurrent signup that lands without a refresh credential leaves a row
+	// this login is the only one able to complete: the presented grant has to be
+	// stored, guarded so it cannot overwrite a newer one.
+	t.Run("unverified signup convergence stores the presented grant", func(t *testing.T) {
+		database, _, _, rawSvc := setupServiceTest(t, nil)
+		svc := rawSvc.(*service)
+		const addr = "raced-pending@example.com"
+		pending := db.User{ID: uuid.New(), Email: addr}
+		if err := database.Create(&pending).Error; err != nil {
+			t.Fatalf("seed pending user: %v", err)
+		}
+		winner := db.OAuthAccount{ID: uuid.New(), UserID: pending.ID, ProviderID: "google",
+			ProviderUserID: "sub-raced-grant", Email: addr}
+		rec, err := svc.sealedTokens("google", winner.ID.String(), &OAuthToken{AccessToken: "winner-access", ExpiresIn: 3600})
+		if err != nil {
+			t.Fatalf("seal winner grant: %v", err)
+		}
+		applyTokenRecord(&winner, rec)
+		if err := database.Create(&winner).Error; err != nil {
+			t.Fatalf("seed winner link: %v", err)
+		}
+
+		info := &UserInfo{ProviderID: "google", ProviderUserID: "sub-raced-grant", Email: addr}
+		got, _, created, err := svc.createUserAndLink(context.Background(), "google", info, tokenTestGrant())
+		if err != nil {
+			t.Fatalf("createUserAndLink = %v; want convergence", err)
+		}
+		if created || got.ID != pending.ID {
+			t.Fatalf("converged on %v (created=%v); want %v", got.ID, created, pending.ID)
+		}
+
+		requireStoredGrant(t, loadTokenLink(t, database, "sub-raced-grant"), tokenTestAccess, tokenTestRefresh)
+	})
+
+	t.Run("unverified signup convergence keeps an already stored grant", func(t *testing.T) {
+		database, _, _, rawSvc := setupServiceTest(t, nil)
+		svc := rawSvc.(*service)
+		const addr = "raced-stored@example.com"
+		pending := db.User{ID: uuid.New(), Email: addr}
+		if err := database.Create(&pending).Error; err != nil {
+			t.Fatalf("seed pending user: %v", err)
+		}
+		winner := db.OAuthAccount{ID: uuid.New(), UserID: pending.ID, ProviderID: "google",
+			ProviderUserID: "sub-raced-stored", Email: addr}
+		rec, err := svc.sealedTokens("google", winner.ID.String(),
+			&OAuthToken{AccessToken: "winner-access", RefreshToken: "winner-refresh", ExpiresIn: 3600})
+		if err != nil {
+			t.Fatalf("seal winner grant: %v", err)
+		}
+		applyTokenRecord(&winner, rec)
+		if err := database.Create(&winner).Error; err != nil {
+			t.Fatalf("seed winner link: %v", err)
+		}
+
+		info := &UserInfo{ProviderID: "google", ProviderUserID: "sub-raced-stored", Email: addr}
+		if _, _, _, err := svc.createUserAndLink(context.Background(), "google", info, tokenTestGrant()); err != nil {
+			t.Fatalf("createUserAndLink = %v; want convergence", err)
+		}
+
+		requireStoredGrant(t, loadTokenLink(t, database, "sub-raced-stored"), "winner-access", "winner-refresh")
 	})
 
 	t.Run("merge path stores the sealed grant", func(t *testing.T) {

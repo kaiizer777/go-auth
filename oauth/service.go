@@ -417,46 +417,83 @@ func (s *service) discardGrant(ctx context.Context, link db.OAuthAccount) (*OAut
 	return s.converge(ctx, link)
 }
 
+// rereadOwned re-reads the identity of stale and refuses a row that no longer
+// belongs to the same link and owner. The identity is unique per backend, but a
+// delete plus relink can move it to another row or user while a request is in
+// flight; serving that row would hand one user's credential to another caller.
+func (s *service) rereadOwned(ctx context.Context, stale db.OAuthAccount) (*db.OAuthAccount, error) {
+	row, err := s.store.OAuthAccounts().GetByProvider(ctx, stale.ProviderID, stale.ProviderTenantID, stale.ProviderUserID)
+	if err != nil || row == nil {
+		logTokenEvent(ctx, "oauth_token_reread_failed", stale)
+		return nil, errors.New(errors.CodeInternalError, "failed to reload oauth account", nil)
+	}
+	if row.ID != stale.ID || row.UserID != stale.UserID {
+		logTokenEvent(ctx, "oauth_token_owner_mismatch", stale)
+		return nil, errors.ErrOAuthReauthRequired
+	}
+	return row, nil
+}
+
+// serveGrant serves the access token a row holds. A row that is tokenless or
+// stale yields the retryable exchange failure, because the next request reads it
+// afresh; a malformed envelope is as dead as a rejected grant.
+func (s *service) serveGrant(ctx context.Context, row db.OAuthAccount) (*OAuthToken, error) {
+	now := time.Now().UTC()
+	if row.AccessTokenCiphertext == "" || !tokenFresh(row.TokenExpiresAt, now) {
+		return nil, errors.ErrOAuthTokenExchangeFailed
+	}
+	token, oerr := s.openAccessToken(row, now)
+	if oerr != nil {
+		if isMalformedEnvelope(oerr) {
+			return nil, errors.ErrOAuthReauthRequired
+		}
+		return nil, s.decryptFailure(ctx, row, oerr)
+	}
+	return token, nil
+}
+
 // converge re-reads the row once after a lost CAS and serves the winner's access
 // token. It never mutates: a second write could destroy a grant another writer
 // already proved valid. A winner that is still stale or tokenless yields the
 // retryable exchange failure, because the next request will read it afresh.
 func (s *service) converge(ctx context.Context, stale db.OAuthAccount) (*OAuthToken, error) {
-	winner, err := s.store.OAuthAccounts().GetByProvider(ctx, stale.ProviderID, stale.ProviderTenantID, stale.ProviderUserID)
-	if err != nil || winner == nil {
-		logTokenEvent(ctx, "oauth_token_reread_failed", stale)
-		return nil, errors.New(errors.CodeInternalError, "failed to reload oauth account", nil)
-	}
-	now := time.Now().UTC()
-	if winner.AccessTokenCiphertext == "" || !tokenFresh(winner.TokenExpiresAt, now) {
-		return nil, errors.ErrOAuthTokenExchangeFailed
-	}
-	token, oerr := s.openAccessToken(*winner, now)
-	if oerr != nil {
-		if isMalformedEnvelope(oerr) {
-			return nil, errors.ErrOAuthReauthRequired
-		}
-		return nil, s.decryptFailure(ctx, *winner, oerr)
-	}
-	return token, nil
-}
-
-// refreshAccessToken renews an expired grant on demand. Concurrent callers for
-// one account share a single exchange; the shared result is copied so no two
-// callers receive the same mutable value.
-func (s *service) refreshAccessToken(ctx context.Context, link db.OAuthAccount) (*OAuthToken, error) {
-	value, err, _ := s.refreshFlight.Do(link.ID.String(), func() (any, error) {
-		return s.exchangeRefreshToken(ctx, link)
-	})
+	winner, err := s.rereadOwned(ctx, stale)
 	if err != nil {
 		return nil, err
 	}
-	token, ok := value.(*OAuthToken)
-	if !ok || token == nil {
-		return nil, errors.New(errors.CodeInternalError, "oauth token refresh produced no token", nil)
+	return s.serveGrant(ctx, *winner)
+}
+
+// refreshFlightTimeout bounds the shared exchange. It covers the provider call
+// plus the store writes that follow a successful rotation, so a bounded flight
+// can never abandon a grant the provider already spent.
+const refreshFlightTimeout = oauthHTTPTimeout + 5*time.Second
+
+// refreshAccessToken renews an expired grant on demand. Concurrent callers for
+// one account share a single exchange; the shared result is copied so no two
+// callers receive the same mutable value. Each caller waits on its own context,
+// and the shared exchange runs detached from the caller that started it: a
+// canceled request may abandon its own wait, never the flight's write.
+func (s *service) refreshAccessToken(ctx context.Context, link db.OAuthAccount) (*OAuthToken, error) {
+	result := s.refreshFlight.DoChan(link.ID.String(), func() (any, error) {
+		flightCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), refreshFlightTimeout)
+		defer cancel()
+		return s.exchangeRefreshToken(flightCtx, link)
+	})
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case shared := <-result:
+		if shared.Err != nil {
+			return nil, shared.Err
+		}
+		token, ok := shared.Val.(*OAuthToken)
+		if !ok || token == nil {
+			return nil, errors.New(errors.CodeInternalError, "oauth token refresh produced no token", nil)
+		}
+		view := *token
+		return &view, nil
 	}
-	view := *token
-	return &view, nil
 }
 
 // exchangeRefreshToken renews a grant against the provider. The request runs
@@ -466,6 +503,22 @@ func (s *service) refreshAccessToken(ctx context.Context, link db.OAuthAccount) 
 func (s *service) exchangeRefreshToken(ctx context.Context, link db.OAuthAccount) (*OAuthToken, error) {
 	if link.RefreshTokenCiphertext == "" || link.RefreshTokenFingerprint == "" {
 		return nil, errors.ErrOAuthReauthRequired
+	}
+	// The snapshot comes from the caller's pre-read and another instance may have
+	// used the grant since. X invalidates a refresh token on use, so presenting a
+	// stale one is a guaranteed invalid_grant and a pointless clear attempt:
+	// re-read and serve a row that already moved on.
+	current, err := s.rereadOwned(ctx, link)
+	if err != nil {
+		return nil, err
+	}
+	if current.RefreshTokenFingerprint != link.RefreshTokenFingerprint ||
+		current.RefreshTokenCiphertext != link.RefreshTokenCiphertext {
+		return s.serveGrant(ctx, *current)
+	}
+	if current.AccessTokenCiphertext != "" && tokenFresh(current.TokenExpiresAt, time.Now().UTC()) {
+		// The same grant was rewritten with a usable access token in the window.
+		return s.serveGrant(ctx, *current)
 	}
 	provider, err := s.providerFor(link.ProviderID)
 	if err != nil {
@@ -511,7 +564,29 @@ func (s *service) exchangeRefreshToken(ctx context.Context, link db.OAuthAccount
 		return nil, errors.ErrOAuthTokenExchangeFailed
 	}
 	if !won {
-		return s.converge(ctx, link)
+		return s.persistPastClear(ctx, link, rec, refreshed)
+	}
+	return refreshedAccess(refreshed), nil
+}
+
+// persistPastClear stores a pair the provider just issued when the persist CAS
+// lost because a concurrent clear emptied the row. The provider already spent
+// the presented token, so the pair in hand is the only grant left; dropping it
+// would force a re-login for a rotation that succeeded. The unconditional write
+// is safe against the clear that just landed (it CASed on the old fingerprint,
+// which no longer matches) and against another clear that follows; a row holding
+// any other grant is served instead of overwritten.
+func (s *service) persistPastClear(ctx context.Context, link db.OAuthAccount, rec db.OAuthTokenRecord, refreshed *OAuthToken) (*OAuthToken, error) {
+	current, err := s.rereadOwned(ctx, link)
+	if err != nil {
+		return nil, err
+	}
+	if current.AccessTokenCiphertext != "" || current.RefreshTokenFingerprint != "" {
+		return s.serveGrant(ctx, *current)
+	}
+	if werr := s.store.OAuthAccounts().SaveOAuthTokens(ctx, link.ID, rec); werr != nil {
+		logTokenEvent(ctx, "oauth_token_refresh_persist_failed", link)
+		return nil, errors.ErrOAuthTokenExchangeFailed
 	}
 	return refreshedAccess(refreshed), nil
 }
@@ -1249,6 +1324,11 @@ func (s *service) mergeOrConverge(ctx context.Context, providerID string, existi
 				}
 			}
 			if found && link.UserID == existing.ID {
+				// The concurrent signup wrote the row this callback converges on.
+				// Its grant is the one the login just obtained, so store it — but
+				// only while the row still holds no grant, or a later login's
+				// token set would be overwritten by this older exchange.
+				s.keepFirstGrant(ctx, link, tokens)
 				return existing, false, false, nil
 			}
 		}
@@ -1340,6 +1420,19 @@ func (s *service) createUserAndLink(ctx context.Context, providerID string, info
 	return user, info.EmailVerified, true, nil
 }
 
+// grantForRow seals the grant for link, keeping the stored scope when the
+// provider omitted one (RFC 6749 §4.1.4 makes it optional on both paths).
+func (s *service) grantForRow(link db.OAuthAccount, tokens *OAuthToken) (db.OAuthTokenRecord, error) {
+	rec, err := s.sealedTokens(link.ProviderID, link.ID.String(), tokens)
+	if err != nil {
+		return db.OAuthTokenRecord{}, err
+	}
+	if rec.TokenScope == "" {
+		rec.TokenScope = link.TokenScope
+	}
+	return rec, nil
+}
+
 // persistTokens overwrites the stored grant for an already-linked identity. A
 // failure is swallowed by design: the login's identity decision is already
 // valid, so refusing it would punish a user for a transient store fault that
@@ -1347,14 +1440,26 @@ func (s *service) createUserAndLink(ctx context.Context, providerID string, info
 // error may echo row values, and no envelope, fingerprint, or token is ever
 // logged.
 func (s *service) persistTokens(ctx context.Context, link db.OAuthAccount, tokens *OAuthToken) {
-	rec, err := s.sealedTokens(link.ProviderID, link.ID.String(), tokens)
+	rec, err := s.grantForRow(link, tokens)
 	if err == nil {
-		// RFC 6749 §4.1.4 makes the code exchange's scope optional; an omitted
-		// value must not blank a granted scope the row still describes.
-		if rec.TokenScope == "" {
-			rec.TokenScope = link.TokenScope
-		}
 		err = s.writeGrant(ctx, link, rec, tokens)
+	}
+	if err != nil {
+		slog.ErrorContext(ctx, "oauth_token_persist_failed",
+			"provider", link.ProviderID,
+			"account_id", link.ID.String(),
+		)
+	}
+}
+
+// keepFirstGrant stores the grant a login just obtained for a row a concurrent
+// signup created, guarded so it wins only while that row still holds no refresh
+// token. Losing the guard leaves the newer stored grant alone; a failure is
+// swallowed like any other token write on the login path.
+func (s *service) keepFirstGrant(ctx context.Context, link db.OAuthAccount, tokens *OAuthToken) {
+	rec, err := s.grantForRow(link, tokens)
+	if err == nil {
+		_, err = s.store.OAuthAccounts().SaveOAuthTokensIfUnset(ctx, link.ID, rec)
 	}
 	if err != nil {
 		slog.ErrorContext(ctx, "oauth_token_persist_failed",
@@ -1367,13 +1472,17 @@ func (s *service) persistTokens(ctx context.Context, link db.OAuthAccount, token
 // writeGrant stores rec for an existing row, keeping a stored refresh envelope
 // the new grant did not replace: providers that issue a refresh token on first
 // consent only would otherwise lose the credential a re-login never re-issues.
-// The preserving write is a CAS on the stored fingerprint, so a concurrent
-// rotation wins instead of being overwritten by the older grant.
+// A grant that carries no refresh token never touches the refresh columns, so it
+// cannot erase one another callback stored after this one read the row. When the
+// row it read already holds a refresh envelope, that write is a CAS on the
+// stored fingerprint, so a concurrent rotation wins instead of being overwritten
+// by the older grant.
 func (s *service) writeGrant(ctx context.Context, link db.OAuthAccount, rec db.OAuthTokenRecord, tokens *OAuthToken) error {
-	keepStoredRefresh := tokens != nil && tokens.RefreshToken == "" &&
-		link.RefreshTokenCiphertext != "" && link.RefreshTokenFingerprint != ""
-	if !keepStoredRefresh {
+	if tokens != nil && tokens.RefreshToken != "" {
 		return s.store.OAuthAccounts().SaveOAuthTokens(ctx, link.ID, rec)
+	}
+	if link.RefreshTokenCiphertext == "" || link.RefreshTokenFingerprint == "" {
+		return s.store.OAuthAccounts().SaveOAuthAccess(ctx, link.ID, rec)
 	}
 	rec.RefreshTokenCiphertext = link.RefreshTokenCiphertext
 	rec.RefreshTokenFingerprint = link.RefreshTokenFingerprint

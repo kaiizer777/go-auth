@@ -406,14 +406,39 @@ func staleExpiry() *time.Time {
 // missed rotation for convergence.
 func rotateGrant(t *testing.T, svc *service, link db.OAuthAccount, grant *OAuthToken) {
 	t.Helper()
+	if err := rotateGrantFromCallback(svc, link, grant); err != nil {
+		t.Fatalf("rotate grant: %v", err)
+	}
+}
+
+// rotateGrantFromCallback is rotateGrant for a provider callback, which runs on
+// the shared flight goroutine: it reports the failure to the caller instead of
+// calling t.Fatalf off the test goroutine.
+func rotateGrantFromCallback(svc *service, link db.OAuthAccount, grant *OAuthToken) error {
 	rec, err := svc.sealedTokens(link.ProviderID, link.ID.String(), grant)
 	if err != nil {
-		t.Fatalf("seal winner grant: %v", err)
+		return err
 	}
 	won, err := svc.store.OAuthAccounts().SaveOAuthTokensCAS(context.Background(), link.ID, link.RefreshTokenFingerprint, rec)
-	if err != nil || !won {
-		t.Fatalf("rotate grant: won=%v err=%v", won, err)
+	if err != nil {
+		return err
 	}
+	if !won {
+		return stderrors.New("rotation lost the CAS")
+	}
+	return nil
+}
+
+// clearGrant wipes the stored grant the way a concurrent invalid_grant does.
+func clearGrant(svc *service, link db.OAuthAccount) error {
+	won, err := svc.store.OAuthAccounts().SaveOAuthTokensCAS(context.Background(), link.ID, link.RefreshTokenFingerprint, db.OAuthTokenRecord{})
+	if err != nil {
+		return err
+	}
+	if !won {
+		return stderrors.New("clear lost the CAS")
+	}
+	return nil
 }
 
 func requireClearedGrant(t *testing.T, link db.OAuthAccount) {
@@ -604,7 +629,9 @@ func TestLinkedAccountToken_Refresh(t *testing.T) {
 		provider := &stubRefreshProvider{stubProvider: &stubProvider{id: "google"}}
 		database, svc, link, owner := tokenAccessEnv(t, provider, tokenTestGrant(), staleExpiry())
 		provider.refreshFn = func(context.Context, string) (*OAuthToken, error) {
-			rotateGrant(t, svc, link, &OAuthToken{AccessToken: "winner-access", RefreshToken: "winner-refresh", ExpiresIn: 3600})
+			if err := rotateGrantFromCallback(svc, link, &OAuthToken{AccessToken: "winner-access", RefreshToken: "winner-refresh", ExpiresIn: 3600}); err != nil {
+				return nil, err
+			}
 			return nil, errors.ErrOAuthGrantRejected
 		}
 
@@ -632,7 +659,9 @@ func TestLinkedAccountToken_Refresh(t *testing.T) {
 		provider := &stubRefreshProvider{stubProvider: &stubProvider{id: "google"}}
 		database, svc, link, owner := tokenAccessEnv(t, provider, tokenTestGrant(), staleExpiry())
 		provider.refreshFn = func(context.Context, string) (*OAuthToken, error) {
-			rotateGrant(t, svc, link, &OAuthToken{AccessToken: "winner-access", RefreshToken: "winner-refresh", ExpiresIn: 3600})
+			if err := rotateGrantFromCallback(svc, link, &OAuthToken{AccessToken: "winner-access", RefreshToken: "winner-refresh", ExpiresIn: 3600}); err != nil {
+				return nil, err
+			}
 			return &OAuthToken{AccessToken: "loser-access", RefreshToken: "loser-refresh", ExpiresIn: 3600}, nil
 		}
 
@@ -649,6 +678,38 @@ func TestLinkedAccountToken_Refresh(t *testing.T) {
 		requireStoredGrant(t, stored, "winner-access", "winner-refresh")
 		if stored.RefreshTokenFingerprint == link.RefreshTokenFingerprint {
 			t.Fatal("fingerprint unchanged; the loser's write landed")
+		}
+	})
+
+	// A clear that wins the CAS before the rotated pair is persisted empties the
+	// row: the pair in hand is then the only grant left and must not be dropped.
+	t.Run("a clear that wins before the persist keeps the rotated pair", func(t *testing.T) {
+		provider := &stubRefreshProvider{stubProvider: &stubProvider{id: "google"}}
+		database, svc, link, owner := tokenAccessEnv(t, provider, tokenTestGrant(), staleExpiry())
+		provider.refreshFn = func(context.Context, string) (*OAuthToken, error) {
+			if err := clearGrant(svc, link); err != nil {
+				return nil, err
+			}
+			return &OAuthToken{AccessToken: "rotated-access", RefreshToken: "rotated-refresh", ExpiresIn: 3600}, nil
+		}
+
+		token, err := svc.LinkedAccountToken(ctx, owner.ID, "google")
+		if err != nil {
+			t.Fatalf("LinkedAccountToken = %v; want the rotated pair", err)
+		}
+		if token.AccessToken != "rotated-access" {
+			t.Fatalf("AccessToken = %q; want rotated-access", token.AccessToken)
+		}
+		requireSanitized(t, token)
+
+		stored := reloadTokenLink(t, database, link.ID)
+		requireStoredGrant(t, stored, "rotated-access", "rotated-refresh")
+		want, ferr := tokenTestSealer(t).RefreshTokenFingerprint("rotated-refresh")
+		if ferr != nil {
+			t.Fatalf("fingerprint: %v", ferr)
+		}
+		if stored.RefreshTokenFingerprint != want {
+			t.Fatalf("fingerprint = %q; want the rotated %q", stored.RefreshTokenFingerprint, want)
 		}
 	})
 
@@ -783,6 +844,170 @@ func TestLinkedAccountToken_Refresh(t *testing.T) {
 		}
 		if provider.calls() != 1 {
 			t.Fatalf("refresh calls = %d; want 1", provider.calls())
+		}
+	})
+}
+
+// TestRefreshFlightCallerDeadline pins the flight's contract with its waiters: a
+// joiner waits under its own context, so an expired caller returns immediately
+// and cannot abandon the shared exchange other callers are depending on.
+func TestRefreshFlightCallerDeadline(t *testing.T) {
+	provider := &stubRefreshProvider{stubProvider: &stubProvider{id: "google"}}
+	_, svc, link, _ := tokenAccessEnv(t, provider, tokenTestGrant(), staleExpiry())
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	provider.refreshFn = func(context.Context, string) (*OAuthToken, error) {
+		once.Do(func() { close(entered) })
+		<-release
+		return &OAuthToken{AccessToken: "shared-access", RefreshToken: "shared-refresh", ExpiresIn: 3600}, nil
+	}
+
+	type outcome struct {
+		token *OAuthToken
+		err   error
+	}
+	leader := make(chan outcome, 1)
+	go func() {
+		token, err := svc.refreshAccessToken(context.Background(), link)
+		leader <- outcome{token: token, err: err}
+	}()
+	<-entered
+
+	expired, cancel := context.WithCancel(context.Background())
+	cancel()
+	joined := make(chan error, 1)
+	go func() {
+		_, err := svc.refreshAccessToken(expired, link)
+		joined <- err
+	}()
+	select {
+	case err := <-joined:
+		if !stderrors.Is(err, context.Canceled) {
+			t.Fatalf("joiner err = %v; want context.Canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("joiner waited for the shared exchange instead of its own context")
+	}
+
+	close(release)
+	got := <-leader
+	if got.err != nil {
+		t.Fatalf("leader = %v; want the shared token", got.err)
+	}
+	if got.token == nil || got.token.AccessToken != "shared-access" {
+		t.Fatalf("leader token = %+v; want the shared exchange result", got.token)
+	}
+	if provider.calls() != 1 {
+		t.Fatalf("refresh calls = %d; want one shared exchange", provider.calls())
+	}
+}
+
+// TestConvergeRejectsForeignGrant pins the owner check on convergence: a lost
+// CAS must never serve a row that is not the caller's own link, because a delete
+// plus relink can move the provider identity to another row or another user.
+func TestConvergeRejectsForeignGrant(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("identity relinked to another user", func(t *testing.T) {
+		provider := &stubRefreshProvider{stubProvider: &stubProvider{id: "google"}}
+		database, svc, link, _ := tokenAccessEnv(t, provider, tokenTestGrant(), nil)
+		other := db.User{ID: uuid.New(), Email: "other-owner@example.com", PasswordHash: "hash", EmailVerified: true}
+		if err := database.Create(&other).Error; err != nil {
+			t.Fatalf("seed other user: %v", err)
+		}
+		rotateGrant(t, svc, link, &OAuthToken{AccessToken: "other-user-access", RefreshToken: "other-refresh", ExpiresIn: 3600})
+		if err := database.Model(&db.OAuthAccount{}).Where("id = ?", link.ID.String()).Update("user_id", other.ID.String()).Error; err != nil {
+			t.Fatalf("move link owner: %v", err)
+		}
+
+		token, err := svc.converge(ctx, link)
+		if token != nil {
+			t.Fatalf("converge served %+v; want no token for a foreign owner", token)
+		}
+		requireCode(t, err, errors.CodeOAuthReauthRequired, http.StatusUnauthorized)
+	})
+
+	t.Run("identity moved to another row", func(t *testing.T) {
+		provider := &stubRefreshProvider{stubProvider: &stubProvider{id: "google"}}
+		database, svc, link, _ := tokenAccessEnv(t, provider, tokenTestGrant(), nil)
+		if err := database.Delete(&db.OAuthAccount{}, "id = ?", link.ID.String()).Error; err != nil {
+			t.Fatalf("delete stale link: %v", err)
+		}
+		replacement := db.OAuthAccount{
+			ID:               uuid.New(),
+			UserID:           link.UserID,
+			ProviderID:       link.ProviderID,
+			ProviderTenantID: link.ProviderTenantID,
+			ProviderUserID:   link.ProviderUserID,
+			Email:            link.Email,
+			Verified:         true,
+		}
+		rec, err := svc.sealedTokens(replacement.ProviderID, replacement.ID.String(),
+			&OAuthToken{AccessToken: "replacement-access", RefreshToken: "replacement-refresh", ExpiresIn: 3600})
+		if err != nil {
+			t.Fatalf("seal replacement grant: %v", err)
+		}
+		applyTokenRecord(&replacement, rec)
+		if err := database.Create(&replacement).Error; err != nil {
+			t.Fatalf("seed replacement link: %v", err)
+		}
+
+		token, err := svc.converge(ctx, link)
+		if token != nil {
+			t.Fatalf("converge served %+v; want no token for a different row", token)
+		}
+		requireCode(t, err, errors.CodeOAuthReauthRequired, http.StatusUnauthorized)
+	})
+}
+
+// TestExchangeRefreshTokenStaleSnapshot pins the in-flight re-read: a snapshot
+// another writer already replaced must be served instead of spent, because X
+// invalidates a refresh token on use and the stale POST can only be rejected.
+func TestExchangeRefreshTokenStaleSnapshot(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("a rotated row is served without spending the stale token", func(t *testing.T) {
+		provider := &stubRefreshProvider{stubProvider: &stubProvider{id: "google"}}
+		_, svc, link, _ := tokenAccessEnv(t, provider, tokenTestGrant(), staleExpiry())
+		rotateGrant(t, svc, link, &OAuthToken{AccessToken: "winner-access", RefreshToken: "winner-refresh", ExpiresIn: 3600})
+
+		token, err := svc.exchangeRefreshToken(ctx, link)
+		if err != nil {
+			t.Fatalf("exchangeRefreshToken = %v; want the winner's token", err)
+		}
+		if token.AccessToken != "winner-access" {
+			t.Fatalf("AccessToken = %q; want winner-access", token.AccessToken)
+		}
+		if provider.calls() != 0 {
+			t.Fatalf("refresh calls = %d; want none for a replaced snapshot", provider.calls())
+		}
+	})
+
+	t.Run("a row rewritten with a usable access token is served", func(t *testing.T) {
+		provider := &stubRefreshProvider{stubProvider: &stubProvider{id: "google"}}
+		_, svc, link, _ := tokenAccessEnv(t, provider, tokenTestGrant(), staleExpiry())
+		expiresAt := time.Now().UTC().Add(time.Hour)
+		rec, err := svc.sealedTokens(link.ProviderID, link.ID.String(),
+			&OAuthToken{AccessToken: "inplace-access", RefreshToken: tokenTestRefresh, ExpiresIn: 3600})
+		if err != nil {
+			t.Fatalf("seal rewritten grant: %v", err)
+		}
+		rec.TokenExpiresAt = &expiresAt
+		if err := svc.store.OAuthAccounts().SaveOAuthTokens(ctx, link.ID, rec); err != nil {
+			t.Fatalf("rewrite grant: %v", err)
+		}
+
+		token, err := svc.exchangeRefreshToken(ctx, link)
+		if err != nil {
+			t.Fatalf("exchangeRefreshToken = %v; want the rewritten token", err)
+		}
+		if token.AccessToken != "inplace-access" {
+			t.Fatalf("AccessToken = %q; want inplace-access", token.AccessToken)
+		}
+		if provider.calls() != 0 {
+			t.Fatalf("refresh calls = %d; want none for a fresh row", provider.calls())
 		}
 	})
 }
