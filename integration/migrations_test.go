@@ -106,7 +106,7 @@ func TestMigrations_Lifecycle(t *testing.T) {
 	}
 
 	// Clean tables before downing all migrations to ensure no non-zero credential_version rows block 000006 down
-	_, _ = sqlDB.Exec("TRUNCATE TABLE sessions, verification_tokens, password_reset_tokens, oauth_accounts, totp_secrets, totp_used_codes, two_factor_tokens, users CASCADE")
+	_, _ = sqlDB.Exec("TRUNCATE TABLE sessions, verification_tokens, password_reset_tokens, oauth_accounts, totp_secrets, totp_used_codes, two_factor_tokens, claimed_emails, users CASCADE")
 
 	// 4. Down all migrations cleanly
 	if err := m.Down(); err != nil {
@@ -118,7 +118,7 @@ func TestMigrations_Lifecycle(t *testing.T) {
 	err = sqlDB.QueryRow(`
 		SELECT COUNT(*) FROM information_schema.tables 
 		WHERE table_schema = 'public' 
-		  AND table_name IN ('users', 'sessions', 'verification_tokens', 'password_reset_tokens', 'oauth_accounts', 'totp_secrets', 'totp_used_codes', 'two_factor_tokens')
+		  AND table_name IN ('users', 'sessions', 'verification_tokens', 'password_reset_tokens', 'oauth_accounts', 'totp_secrets', 'totp_used_codes', 'two_factor_tokens', 'claimed_emails')
 	`).Scan(&tableCount)
 	if err != nil {
 		t.Fatalf("querying tables failed: %v", err)
@@ -135,13 +135,13 @@ func TestMigrations_Lifecycle(t *testing.T) {
 	err = sqlDB.QueryRow(`
 		SELECT COUNT(*) FROM information_schema.tables 
 		WHERE table_schema = 'public' 
-		  AND table_name IN ('users', 'sessions', 'verification_tokens', 'password_reset_tokens', 'oauth_accounts', 'totp_secrets', 'totp_used_codes', 'two_factor_tokens')
+		  AND table_name IN ('users', 'sessions', 'verification_tokens', 'password_reset_tokens', 'oauth_accounts', 'totp_secrets', 'totp_used_codes', 'two_factor_tokens', 'claimed_emails')
 	`).Scan(&tableCount)
 	if err != nil {
 		t.Fatalf("querying tables failed: %v", err)
 	}
-	if tableCount != 8 {
-		t.Fatalf("expected 8 application tables after re-Up, found %d", tableCount)
+	if tableCount != 9 {
+		t.Fatalf("expected 9 application tables after re-Up, found %d", tableCount)
 	}
 }
 
@@ -1056,3 +1056,4 @@ func TestMigration000013_UpAndDown(t *testing.T) {
 		t.Fatalf("restoring head failed: %v", err)
 	}
 }
+

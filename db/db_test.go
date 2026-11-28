@@ -520,6 +520,10 @@ func TestMigrations_NoExplicitTransactionWrappers(t *testing.T) {
 		"migrations/000013_add_totp_secret_kid.down.sql",
 		"migrations/mysql/000013_add_totp_secret_kid.up.sql",
 		"migrations/mysql/000013_add_totp_secret_kid.down.sql",
+		"migrations/000014_create_claimed_emails.up.sql",
+		"migrations/000014_create_claimed_emails.down.sql",
+		"migrations/mysql/000014_create_claimed_emails.up.sql",
+		"migrations/mysql/000014_create_claimed_emails.down.sql",
 	}
 
 	for _, file := range files {
@@ -674,6 +678,75 @@ func TestMigration000012_AddsOAuthAccountTokens(t *testing.T) {
 	}
 	if strings.Contains(down, "DROP TABLE") {
 		t.Error("migration 12 down must drop only the token columns, never the links table")
+	}
+}
+
+// TestMigration000014_ClaimsEmailAddresses pins the claim table for #94: one row
+// per normalised address, populated before the unique key is created, aborting
+// rather than picking a winner when existing rows disagree, and a down path that
+// only drops the table.
+func TestMigration000014_ClaimsEmailAddresses(t *testing.T) {
+	postgresUp := readMigration(t, "migrations/000014_create_claimed_emails.up.sql")
+	postgresDown := readMigration(t, "migrations/000014_create_claimed_emails.down.sql")
+	mysqlUp := readMigration(t, "migrations/mysql/000014_create_claimed_emails.up.sql")
+	mysqlDown := readMigration(t, "migrations/mysql/000014_create_claimed_emails.down.sql")
+
+	for name, up := range map[string]string{"postgres": postgresUp, "mysql": mysqlUp} {
+		for _, want := range []string{
+			"CREATE TABLE IF NOT EXISTS claimed_emails",
+			"owner_user_id",
+			"REFERENCES users(id) ON DELETE CASCADE",
+			"INSERT INTO claimed_emails",
+			"TRIM(email) <> ''",
+		} {
+			if !strings.Contains(up, want) {
+				t.Errorf("%s migration 14 up must contain %q", name, want)
+			}
+		}
+	}
+	if !strings.Contains(postgresUp, "email          VARCHAR(255) NOT NULL") {
+		t.Error("postgres migration 14 must store the claim key as a plain NOT NULL VARCHAR(255)")
+	}
+	if !strings.Contains(mysqlUp, "CHARACTER SET utf8mb4 COLLATE utf8mb4_bin") {
+		t.Error("mysql migration 14 must compare the claim key byte for byte")
+	}
+	if !strings.Contains(mysqlUp, "PRIMARY KEY (email)") {
+		t.Error("mysql migration 14 must key the claim table on the address")
+	}
+	if !strings.Contains(mysqlUp, "not transactional") {
+		t.Error("mysql migration 14 up must carry the non-transactional DDL recovery note")
+	}
+
+	// The populated column is unique by construction, so the unique key is created
+	// last and can never be half-applied behind a wrong population.
+	if populate, index := strings.Index(postgresUp, "INSERT INTO claimed_emails"), strings.Index(postgresUp, "CREATE UNIQUE INDEX"); populate == -1 || index == -1 || index < populate {
+		t.Error("postgres migration 14 must populate the table before creating the unique key")
+	}
+
+	// A cross-account collision aborts instead of electing a winner, and names the
+	// key plus every competing account.
+	if !strings.Contains(postgresUp, "RAISE EXCEPTION") {
+		t.Error("postgres migration 14 must abort on a cross-account collision")
+	}
+	if !strings.Contains(postgresUp, "COUNT(DISTINCT h.owner_user_id) > 1") {
+		t.Error("postgres migration 14 must detect a key held by more than one account")
+	}
+	if !strings.Contains(postgresUp, "string_agg") {
+		t.Error("postgres migration 14 must name the competing accounts in its diagnostic")
+	}
+	if !strings.Contains(mysqlUp, "GROUP BY h.claim_key, h.owner_user_id") {
+		t.Error("mysql migration 14 must collapse one account's duplicate links before the primary key rejects a foreign holder")
+	}
+
+	for name, down := range map[string]string{"postgres": postgresDown, "mysql": mysqlDown} {
+		if drops := strings.Count(sqlWithoutComments(down), "DROP TABLE IF EXISTS claimed_emails;"); drops != 1 {
+			t.Errorf("%s migration 14 down must drop the claim table exactly once, got %d: %q", name, drops, down)
+		}
+		for _, forbidden := range []string{"ALTER TABLE", "INSERT ", "DELETE ", "UPDATE "} {
+			if strings.Contains(sqlWithoutComments(down), forbidden) {
+				t.Errorf("%s migration 14 down must not contain %q", name, forbidden)
+			}
+		}
 	}
 }
 

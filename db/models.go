@@ -43,6 +43,31 @@ func (u User) LogValue() slog.Value {
 // TableName returns the table name for User.
 func (User) TableName() string { return "users" }
 
+// ClaimedEmail is the cross-table reservation of one normalised address. The
+// per-table keys cannot serialise a signup against an OAuth link, so the unique
+// key on Email is the lock both writers take with an insert inside their own
+// transaction. Email is db.NormalizeEmail output and is compared byte for byte:
+// the key never depends on a database collation.
+//
+// A claim does not imply users.email. A provider-attested address is claimed by
+// the account that linked it even when that is not the account's own address.
+//
+// Verified records that the holder proved the mailbox: either locally through
+// verification, or through a provider that attested the address. An unverified
+// claim is a reservation by a credential nobody proved yet, so a provider that
+// attests the address may take the account over; a verified claim cannot be
+// taken over and keeps reporting a conflict.
+type ClaimedEmail struct {
+	Email       string    `gorm:"primaryKey;type:varchar(255)"`
+	OwnerUserID uuid.UUID `gorm:"column:owner_user_id;type:varchar(36);not null;index:idx_claimed_emails_owner_user_id"`
+	Verified    bool      `gorm:"not null;default:false"`
+	CreatedAt   time.Time `gorm:"not null"`
+	UpdatedAt   time.Time `gorm:"not null"`
+}
+
+// TableName returns the table name for ClaimedEmail.
+func (ClaimedEmail) TableName() string { return "claimed_emails" }
+
 // SessionType represents the session transport type enum.
 type SessionType string
 

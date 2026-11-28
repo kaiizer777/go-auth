@@ -93,7 +93,7 @@ func setupDB(t *testing.T) (*gorm.DB, config.Config) {
 // truncateTables clears all test tables with CASCADE between tests.
 func truncateTables(t *testing.T, database *gorm.DB) {
 	t.Helper()
-	err := database.Exec("TRUNCATE TABLE users, sessions, verification_tokens, password_reset_tokens, oauth_accounts, totp_secrets, totp_used_codes, two_factor_tokens CASCADE").Error
+	err := database.Exec("TRUNCATE TABLE users, sessions, verification_tokens, password_reset_tokens, oauth_accounts, totp_secrets, totp_used_codes, two_factor_tokens, claimed_emails CASCADE").Error
 	if err != nil {
 		t.Fatalf("failed to truncate test tables: %v", err)
 	}

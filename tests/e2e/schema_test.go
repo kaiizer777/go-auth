@@ -43,6 +43,7 @@ func TestE2E_SQLiteSchemaMatchesModels(t *testing.T) {
 	for _, model := range []any{
 		&db.User{}, &db.Session{}, &db.VerificationToken{}, &db.PasswordResetToken{},
 		&db.OAuthAccount{}, &db.TotpSecret{}, &db.TotpUsedCode{}, &db.TwoFactorToken{},
+		&db.ClaimedEmail{},
 	} {
 		parsed, err := schema.Parse(model, cache, namer)
 		if err != nil {
