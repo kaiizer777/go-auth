@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	gormsqlite "github.com/glebarez/sqlite"
 	"github.com/google/uuid"
@@ -12,17 +14,54 @@ import (
 	"gorm.io/gorm/logger"
 )
 
+// wantPageSize mirrors the documented page size (500 rows per page). It is a
+// literal so a mutation of claimBackfillBatchSize cannot move the expectation with
+// it: the test must fail when paging stops happening.
+const wantPageSize = 500
+
 func setupClaimBackfillDB(t *testing.T) *gorm.DB {
 	t.Helper()
+	database, _ := setupClaimBackfillDBWithCounter(t)
+	return database
+}
+
+// claimPageCounter counts the keyset page reads the import issues, so a test can
+// prove it actually pages instead of loading everything in one query.
+type claimPageCounter struct {
+	logger.Interface
+	mu    sync.Mutex
+	pages int
+}
+
+func (c *claimPageCounter) LogMode(logger.LogLevel) logger.Interface { return c }
+
+func (c *claimPageCounter) Trace(_ context.Context, _ time.Time, fc func() (string, int64), _ error) {
+	sql, _ := fc()
+	if strings.Contains(sql, "ORDER BY id ASC LIMIT") {
+		c.mu.Lock()
+		c.pages++
+		c.mu.Unlock()
+	}
+}
+
+func (c *claimPageCounter) count() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.pages
+}
+
+func setupClaimBackfillDBWithCounter(t *testing.T) (*gorm.DB, *claimPageCounter) {
+	t.Helper()
+	counter := &claimPageCounter{Interface: logger.Discard}
 	database, err := gorm.Open(gormsqlite.Open("file:claim_backfill_"+uuid.New().String()+"?mode=memory&cache=shared"),
-		&gorm.Config{Logger: logger.Discard})
+		&gorm.Config{Logger: counter})
 	if err != nil {
 		t.Fatalf("open sqlite: %v", err)
 	}
 	if err := database.AutoMigrate(&User{}, &OAuthAccount{}, &ClaimedEmail{}); err != nil {
 		t.Fatalf("automigrate: %v", err)
 	}
-	return database
+	return database, counter
 }
 
 // claimTestID returns a UUID whose string form sorts in numeric order, so paging
@@ -138,10 +177,10 @@ func TestBackfillClaimedEmails_WritesTheApplicationKey(t *testing.T) {
 // in both sources and proves every address is imported, then that a second run
 // changes nothing.
 func TestBackfillClaimedEmails_PagesAcrossBatches(t *testing.T) {
-	database := setupClaimBackfillDB(t)
+	database, counter := setupClaimBackfillDBWithCounter(t)
 	ctx := context.Background()
 
-	const rows = 2*claimBackfillBatchSize + 5
+	const rows = 2*wantPageSize + 5
 	users := make([]User, 0, rows)
 	links := make([]OAuthAccount, 0, rows)
 	for i := 0; i < rows; i++ {
@@ -168,6 +207,13 @@ func TestBackfillClaimedEmails_PagesAcrossBatches(t *testing.T) {
 	result, err := BackfillClaimedEmails(ctx, database)
 	if err != nil {
 		t.Fatalf("backfill: %v", err)
+	}
+	// Paging is the property under test, not just completion: each source must be
+	// read once per batch, so a loader that ignores the limit (or a batch size that
+	// swallows the fixtures) fails here.
+	wantPages := 2 * ((rows + wantPageSize - 1) / wantPageSize)
+	if got := counter.count(); got != wantPages {
+		t.Fatalf("page reads = %d; want %d for %d rows at %d per page", got, wantPages, rows, wantPageSize)
 	}
 	if result.Claims != 2*rows {
 		t.Fatalf("claims written = %d; want %d", result.Claims, 2*rows)
@@ -202,7 +248,7 @@ func TestBackfillClaimedEmails_MidRunFailureWritesNothingAtTheBatchBoundary(t *t
 	database := setupClaimBackfillDB(t)
 	ctx := context.Background()
 
-	const rows = 2*claimBackfillBatchSize + 5
+	const rows = 2*wantPageSize + 5
 	users := make([]User, 0, rows)
 	for i := 0; i < rows; i++ {
 		users = append(users, User{
@@ -227,8 +273,8 @@ func TestBackfillClaimedEmails_MidRunFailureWritesNothingAtTheBatchBoundary(t *t
 	if _, err := BackfillClaimedEmails(ctx, database); err == nil {
 		t.Fatal("backfill reported success while a claim insert was rejected")
 	}
-	if got := countClaims(t, database); got != claimBackfillBatchSize {
-		t.Fatalf("claim rows after the failed run = %d; want the first page only (%d)", got, claimBackfillBatchSize)
+	if got := countClaims(t, database); got != wantPageSize {
+		t.Fatalf("claim rows after the failed run = %d; want the first page only (%d)", got, wantPageSize)
 	}
 	var boomClaims int64
 	if err := database.Model(&ClaimedEmail{}).Where("email = ?", boom).Count(&boomClaims).Error; err != nil {
@@ -245,8 +291,8 @@ func TestBackfillClaimedEmails_MidRunFailureWritesNothingAtTheBatchBoundary(t *t
 	if err != nil {
 		t.Fatalf("retry: %v", err)
 	}
-	if result.Claims != rows-claimBackfillBatchSize {
-		t.Fatalf("retry claimed %d addresses; want %d", result.Claims, rows-claimBackfillBatchSize)
+	if result.Claims != rows-wantPageSize {
+		t.Fatalf("retry claimed %d addresses; want %d", result.Claims, rows-wantPageSize)
 	}
 	if got := countClaims(t, database); got != int64(rows) {
 		t.Fatalf("claim rows after the retry = %d; want %d", got, rows)
@@ -278,6 +324,46 @@ func TestBackfillClaimedEmails_AbortsOnCrossAccountConflict(t *testing.T) {
 	claim := loadClaim(t, database, "dave@example.com")
 	if claim.OwnerUserID != dave.ID {
 		t.Fatalf("claim owner = %v; the existing holder %v must not be overwritten", claim.OwnerUserID, dave.ID)
+	}
+}
+
+// TestBackfillClaimedEmails_AbortsOnInPageOwnerConflict pins the branch that
+// decides ownership when two different accounts in the same page claim one
+// normalised address: the page must abort before writing, naming both accounts,
+// instead of electing whichever row was read first.
+func TestBackfillClaimedEmails_AbortsOnInPageOwnerConflict(t *testing.T) {
+	database := setupClaimBackfillDB(t)
+	ctx := context.Background()
+
+	first := seedLegacyUser(t, database, claimTestID(0), "conflict-first@example.com", false)
+	second := seedLegacyUser(t, database, claimTestID(1), "conflict-second@example.com", false)
+	// Two links of different owners, same address, case- and padding-variant, both
+	// inside one links page.
+	seedLegacyLink(t, database, claimTestID(2), first.ID, "shared@example.com", true)
+	seedLegacyLink(t, database, claimTestID(3), second.ID, " Shared@Example.com ", true)
+
+	_, err := BackfillClaimedEmails(ctx, database)
+	if err == nil {
+		t.Fatal("backfill accepted one address claimed by two accounts in the same page")
+	}
+	for _, want := range []string{"backfill aborted", "shared@example.com", first.ID.String(), second.ID.String()} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %q", err.Error(), want)
+		}
+	}
+	var written int64
+	if cerr := database.Model(&ClaimedEmail{}).Where("email = ?", "shared@example.com").Count(&written).Error; cerr != nil {
+		t.Fatalf("count claims: %v", cerr)
+	}
+	if written != 0 {
+		t.Fatalf("claim rows for the conflicting address = %d; want none", written)
+	}
+	// Neither holder is overwritten: the users page still owns its own addresses.
+	for _, owner := range []User{first, second} {
+		claim := loadClaim(t, database, owner.Email)
+		if claim.OwnerUserID != owner.ID {
+			t.Errorf("claim for %q owner = %v; want %v", owner.Email, claim.OwnerUserID, owner.ID)
+		}
 	}
 }
 
