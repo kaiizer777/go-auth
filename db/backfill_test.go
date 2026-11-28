@@ -1,22 +1,35 @@
-package gormstore
+package db
 
 import (
 	"context"
 	"strings"
 	"testing"
 
+	gormsqlite "github.com/glebarez/sqlite"
 	"github.com/google/uuid"
 	"gorm.io/gorm"
-
-	"github.com/kaiizer777/go-auth/db"
+	"gorm.io/gorm/logger"
 )
+
+func setupClaimBackfillDB(t *testing.T) *gorm.DB {
+	t.Helper()
+	database, err := gorm.Open(gormsqlite.Open("file:claim_backfill_"+uuid.New().String()+"?mode=memory&cache=shared"),
+		&gorm.Config{Logger: logger.Discard})
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	if err := database.AutoMigrate(&User{}, &OAuthAccount{}, &ClaimedEmail{}); err != nil {
+		t.Fatalf("automigrate: %v", err)
+	}
+	return database
+}
 
 // seedLegacyUser inserts a row without the store, standing in for an address
 // written before the claim table existed: its case and padding are whatever the
 // caller supplied.
-func seedLegacyUser(t *testing.T, database *gorm.DB, email string, verified bool) db.User {
+func seedLegacyUser(t *testing.T, database *gorm.DB, email string, verified bool) User {
 	t.Helper()
-	user := db.User{ID: uuid.New(), Email: email, EmailVerified: verified}
+	user := User{ID: uuid.New(), Email: email, EmailVerified: verified}
 	if err := database.Create(&user).Error; err != nil {
 		t.Fatalf("seed user %q: %v", email, err)
 	}
@@ -26,7 +39,7 @@ func seedLegacyUser(t *testing.T, database *gorm.DB, email string, verified bool
 // seedLegacyLink inserts a provider row whose address is not its owner's own.
 func seedLegacyLink(t *testing.T, database *gorm.DB, userID uuid.UUID, email string, verified bool) {
 	t.Helper()
-	link := db.OAuthAccount{
+	link := OAuthAccount{
 		ID:             uuid.New(),
 		UserID:         userID,
 		ProviderID:     "google",
@@ -44,7 +57,7 @@ func seedLegacyLink(t *testing.T, database *gorm.DB, userID uuid.UUID, email str
 // write paths look up, that the verified flag follows the holders, and that a
 // second run changes nothing.
 func TestBackfillClaimedEmails_WritesTheApplicationKey(t *testing.T) {
-	database, store := setupTestDB(t)
+	database := setupClaimBackfillDB(t)
 	ctx := context.Background()
 
 	alice := seedLegacyUser(t, database, "  Alice@Example.COM\t", false)
@@ -67,7 +80,7 @@ func TestBackfillClaimedEmails_WritesTheApplicationKey(t *testing.T) {
 		{lookup: "Bob@Example.Com", owner: bob.ID, verified: true},
 		{lookup: "CAROL@example.com", owner: carol.ID, verified: false},
 	} {
-		claim, err := store.ClaimedEmails().Get(ctx, tc.lookup)
+		claim, err := readClaim(ctx, database, NormalizeEmail(tc.lookup))
 		if err != nil {
 			t.Fatalf("claim for %q: %v", tc.lookup, err)
 		}
@@ -77,7 +90,7 @@ func TestBackfillClaimedEmails_WritesTheApplicationKey(t *testing.T) {
 		}
 	}
 	// The stored key is the application's key, not the raw column value.
-	var rows []db.ClaimedEmail
+	var rows []ClaimedEmail
 	if err := database.Order("email").Find(&rows).Error; err != nil {
 		t.Fatalf("load claims: %v", err)
 	}
@@ -103,7 +116,7 @@ func TestBackfillClaimedEmails_WritesTheApplicationKey(t *testing.T) {
 // accounts parsing to one address block the run and are named, and nothing is
 // written, so no account silently loses its attribution.
 func TestBackfillClaimedEmails_AbortsOnCrossAccountConflict(t *testing.T) {
-	database, _ := setupTestDB(t)
+	database := setupClaimBackfillDB(t)
 	ctx := context.Background()
 
 	dave := seedLegacyUser(t, database, "dave@example.com", true)
@@ -121,7 +134,7 @@ func TestBackfillClaimedEmails_AbortsOnCrossAccountConflict(t *testing.T) {
 		}
 	}
 	var claims int64
-	if err := database.Model(&db.ClaimedEmail{}).Count(&claims).Error; err != nil {
+	if err := database.Model(&ClaimedEmail{}).Count(&claims).Error; err != nil {
 		t.Fatalf("count claims: %v", err)
 	}
 	if claims != 0 {
@@ -133,12 +146,12 @@ func TestBackfillClaimedEmails_AbortsOnCrossAccountConflict(t *testing.T) {
 // a claim row already belongs to a third account: the run must refuse it rather
 // than overwrite or ignore it.
 func TestBackfillClaimedEmails_AbortsOnForeignExistingClaim(t *testing.T) {
-	database, store := setupTestDB(t)
+	database := setupClaimBackfillDB(t)
 	ctx := context.Background()
 
 	erin := seedLegacyUser(t, database, "erin@example.com", false)
 	holder := seedLegacyUser(t, database, "holder@example.com", true)
-	if err := store.ClaimedEmails().Claim(ctx, "erin@example.com", holder.ID, true); err != nil {
+	if err := ClaimWithin(ctx, database, "erin@example.com", holder.ID, true); err != nil {
 		t.Fatalf("seed claim: %v", err)
 	}
 
@@ -149,11 +162,40 @@ func TestBackfillClaimedEmails_AbortsOnForeignExistingClaim(t *testing.T) {
 	if !strings.Contains(err.Error(), erin.ID.String()) || !strings.Contains(err.Error(), holder.ID.String()) {
 		t.Errorf("error %q must name both competing accounts", err)
 	}
-	claim, gerr := store.ClaimedEmails().Get(ctx, "erin@example.com")
+	claim, gerr := readClaim(ctx, database, "erin@example.com")
 	if gerr != nil {
 		t.Fatalf("load claim: %v", gerr)
 	}
 	if claim.OwnerUserID != holder.ID {
 		t.Fatalf("claim owner = %v; the existing holder must be left untouched", claim.OwnerUserID)
+	}
+}
+
+// TestImportClaimsAtConnect_SkipsWhenClaimsExist pins the connect gate: a
+// non-empty claim table means the import already ran (or this version wrote it),
+// so the connect path must not re-scan.
+func TestImportClaimsAtConnect_SkipsWhenClaimsExist(t *testing.T) {
+	database := setupClaimBackfillDB(t)
+	ctx := context.Background()
+
+	owner := seedLegacyUser(t, database, "present@example.com", true)
+	if err := ClaimWithin(ctx, database, "present@example.com", owner.ID, true); err != nil {
+		t.Fatalf("seed claim: %v", err)
+	}
+	legacy := seedLegacyUser(t, database, "legacy@example.com", false)
+
+	result, err := importClaimsAtConnect(ctx, database)
+	if err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	if result.Claims != 0 {
+		t.Fatalf("import ran on a non-empty table and wrote %d claims", result.Claims)
+	}
+	var claims int64
+	if err := database.Model(&ClaimedEmail{}).Where("email = ?", legacy.Email).Count(&claims).Error; err != nil {
+		t.Fatalf("count claims: %v", err)
+	}
+	if claims != 0 {
+		t.Fatal("connect gate imported a row into a table that was already populated")
 	}
 }

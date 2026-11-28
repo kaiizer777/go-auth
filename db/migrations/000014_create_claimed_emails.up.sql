@@ -14,16 +14,21 @@
 -- reservation by an unproved credential, so a provider that attests the address
 -- may take the account over; a verified claim cannot be taken over.
 --
--- This migration is DDL only: it deliberately backfills nothing. SQL lower() and
--- trim() cannot reproduce db.NormalizeEmail. lower() is collation-dependent (on a
--- C/POSIX database it leaves 'É' unchanged where Go yields 'é') and trim() strips
--- only spaces where strings.TrimSpace also drops tabs and newlines. A row computed
--- in SQL would therefore be stored under a key the application can never produce
--- or match, leaving exactly the race this table closes for the addresses meant to
--- be migrated. Importing existing rows is a one-shot Go job instead:
--- gormstore.BackfillClaimedEmails normalises with db.NormalizeEmail, is
--- idempotent, and aborts naming every address held by more than one account
--- rather than picking a winner. No production data existed when 000014 shipped.
+-- This migration is DDL only: the table ships empty and nothing is imported here.
+-- SQL lower() and trim() cannot reproduce db.NormalizeEmail. lower() is
+-- collation-dependent (on a C/POSIX database it leaves 'É' unchanged where Go
+-- yields 'é') and trim() strips only spaces where strings.TrimSpace also drops
+-- tabs and newlines. A row computed in SQL would therefore be stored under a key
+-- the application can never produce or match, leaving exactly the race this table
+-- closes for the addresses meant to be migrated.
+--
+-- The import runs from the connection path instead: db.Connect calls
+-- db.BackfillClaimedEmails on the first connection to a database whose claim table
+-- is empty. It keys with db.NormalizeEmail, is idempotent, and aborts naming every
+-- address held by more than one account instead of picking a winner. A conflict
+-- fails the connection on purpose: running with an unimported claim table is the
+-- unprotected state this migration exists to remove. Remedy: resolve the links the
+-- error names, then reconnect. See docs/email-claims.md.
 CREATE TABLE IF NOT EXISTS claimed_emails (
     email          VARCHAR(255) NOT NULL,
     owner_user_id  UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,

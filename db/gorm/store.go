@@ -22,12 +22,6 @@ func lockForUpdate(tx *gorm.DB) *gorm.DB {
 	return tx.Clauses(clause.Locking{Strength: "UPDATE"})
 }
 
-// dialectorIs reports whether the connection speaks the named dialect, so a
-// statement with no portable form can be written per dialect instead of guessed.
-func dialectorIs(tx *gorm.DB, name string) bool {
-	return tx.Dialector != nil && strings.Contains(strings.ToLower(tx.Name()), name)
-}
-
 type userStore struct {
 	db *gorm.DB
 }
@@ -717,42 +711,8 @@ type claimedEmailStore struct {
 	db *gorm.DB
 }
 
-// claimInsertStatement builds the idempotent claim insert. A duplicate must not
-// fail the statement: PostgreSQL aborts the whole transaction on a constraint
-// error, so "insert, then inspect the error" cannot work there. MySQL needs its
-// own no-op on-duplicate form; GORM's clause translation is not relied on.
-func claimInsertStatement(tx *gorm.DB) string {
-	const columns = "(email, owner_user_id, verified, created_at, updated_at) VALUES (?, ?, ?, ?, ?)"
-	if dialectorIs(tx, "mysql") {
-		return "INSERT INTO claimed_emails " + columns + " ON DUPLICATE KEY UPDATE email = email"
-	}
-	return "INSERT INTO claimed_emails " + columns + " ON CONFLICT (email) DO NOTHING"
-}
-
 func (s *claimedEmailStore) Claim(ctx context.Context, email string, ownerID uuid.UUID, verified bool) error {
-	key := db.NormalizeEmail(email)
-	if key == "" {
-		return nil
-	}
-	tx := s.db.WithContext(ctx)
-	now := time.Now().UTC()
-	if err := tx.Exec(claimInsertStatement(tx), key, ownerID, verified, now, now).Error; err != nil {
-		return db.NormalizeMySQLError(err)
-	}
-	// Locking read: under MySQL's default REPEATABLE READ a plain SELECT reuses
-	// the snapshot an earlier statement in this transaction took, so it would miss
-	// the claim a competing writer committed while this insert was blocked.
-	var claim db.ClaimedEmail
-	if err := lockForUpdate(tx).Where("email = ?", key).First(&claim).Error; err != nil {
-		return err
-	}
-	if claim.OwnerUserID != ownerID {
-		return apperrors.ErrEmailClaimed
-	}
-	if verified && !claim.Verified {
-		return tx.Model(&db.ClaimedEmail{}).Where("email = ? AND owner_user_id = ?", key, ownerID).Update("verified", true).Error
-	}
-	return nil
+	return db.ClaimWithin(ctx, s.db, email, ownerID, verified)
 }
 
 func (s *claimedEmailStore) Get(ctx context.Context, email string) (*db.ClaimedEmail, error) {

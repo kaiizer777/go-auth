@@ -114,6 +114,17 @@ func Connect(cfg config.Config) (*gorm.DB, error) {
 		return nil, errors.New(errors.CodeDatabaseUnavailable, "db ping failed", err)
 	}
 
+	// 4. Import addresses written before 000014 into the claim table. The table
+	// ships empty and no SQL migration backfills it, so skipping this would leave
+	// an upgraded database unprotected while looking healthy. A conflict fails the
+	// connection on purpose: running with an empty or partially imported claim
+	// table is the silent state this import exists to remove.
+	importCtx, importCancel := context.WithTimeout(context.Background(), defaultMigrationTimeout)
+	defer importCancel()
+	if _, err := importClaimsAtConnect(importCtx, db); err != nil {
+		return nil, errors.New(errors.CodeDatabaseError, "failed to backfill claimed emails", err)
+	}
+
 	success = true
 	return db, nil
 }

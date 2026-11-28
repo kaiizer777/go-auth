@@ -1,17 +1,14 @@
-package gormstore
+package db
 
 import (
 	"context"
-	"errors"
+	stderrors "errors"
 	"fmt"
 	"sort"
 	"strings"
 
 	"github.com/google/uuid"
 	"gorm.io/gorm"
-
-	"github.com/kaiizer777/go-auth/db"
-	apperrors "github.com/kaiizer777/go-auth/errors"
 )
 
 // ClaimBackfillResult reports what BackfillClaimedEmails did.
@@ -29,14 +26,14 @@ type claimHolder struct {
 // BackfillClaimedEmails imports the addresses already stored in users.email and
 // oauth_accounts.email into claimed_emails. It is the only supported import path:
 // no SQL migration backfills, because SQL lower()/trim() cannot reproduce
-// db.NormalizeEmail (lower() folds by collation, trim() strips only spaces).
+// NormalizeEmail (lower() folds by collation, trim() strips only spaces).
 //
-// Keys are db.NormalizeEmail output, so the rows are reachable by the same
+// Keys are NormalizeEmail output, so the rows are reachable by the same
 // ClaimedEmails().Claim/Get the write paths use. The run is idempotent. When an
-// address is held by more than one account it aborts, listing every such address
-// and its competing accounts, instead of choosing a winner: electing one strips
-// the other account's address attribution while its rows keep pointing at an
-// address it no longer claims.
+// address is held by more than one account it aborts before writing anything,
+// listing every such address and its competing accounts, instead of choosing a
+// winner: electing one strips the other account's address attribution while its
+// rows keep pointing at an address it no longer claims.
 func BackfillClaimedEmails(ctx context.Context, database *gorm.DB) (ClaimBackfillResult, error) {
 	if database == nil {
 		return ClaimBackfillResult{}, fmt.Errorf("claimed_emails backfill: nil database")
@@ -46,7 +43,6 @@ func BackfillClaimedEmails(ctx context.Context, database *gorm.DB) (ClaimBackfil
 		return ClaimBackfillResult{}, fmt.Errorf("claimed_emails backfill: %w", err)
 	}
 
-	store := New(database)
 	conflicts := make(map[string][]uuid.UUID, len(sourceConflicts))
 	for key, owners := range sourceConflicts {
 		conflicts[key] = owners
@@ -54,11 +50,11 @@ func BackfillClaimedEmails(ctx context.Context, database *gorm.DB) (ClaimBackfil
 	keys := make([]string, 0, len(holders))
 	for key, holder := range holders {
 		keys = append(keys, key)
-		claim, gerr := store.ClaimedEmails().Get(ctx, key)
+		claim, gerr := readClaim(ctx, database, key)
 		switch {
 		case gerr == nil && claim.OwnerUserID != holder.owner:
 			conflicts[key] = appendUnique(appendUnique(conflicts[key], holder.owner), claim.OwnerUserID)
-		case gerr != nil && !isNotFound(gerr):
+		case gerr != nil && !stderrors.Is(gerr, gorm.ErrRecordNotFound):
 			return ClaimBackfillResult{}, fmt.Errorf("claimed_emails backfill: read %q: %w", key, gerr)
 		}
 	}
@@ -70,30 +66,56 @@ func BackfillClaimedEmails(ctx context.Context, database *gorm.DB) (ClaimBackfil
 	var result ClaimBackfillResult
 	for _, key := range keys {
 		holder := holders[key]
-		claim, gerr := store.ClaimedEmails().Get(ctx, key)
+		claim, gerr := readClaim(ctx, database, key)
 		switch {
-		case gerr != nil && !isNotFound(gerr):
+		case gerr != nil && !stderrors.Is(gerr, gorm.ErrRecordNotFound):
 			return result, fmt.Errorf("claimed_emails backfill: read %q: %w", key, gerr)
 		case gerr != nil:
 			result.Claims++
 		case holder.verified && !claim.Verified:
 			result.Promoted++
 		}
-		if cerr := store.ClaimedEmails().Claim(ctx, key, holder.owner, holder.verified); cerr != nil {
+		if cerr := ClaimWithin(ctx, database, key, holder.owner, holder.verified); cerr != nil {
 			return result, fmt.Errorf("claimed_emails backfill: claim %q: %w", key, cerr)
 		}
 	}
 	return result, nil
 }
 
+// importClaimsAtConnect runs the import on the first connection to a database
+// whose claim table is still empty. MongoDB gates its equivalent with a
+// schema_migrations marker; SQL has no per-data-migration marker, and an empty
+// table is the same signal: the table is created empty and only becomes non-empty
+// through a completed import or a write from this version, so a non-empty table
+// means nothing is left to import.
+func importClaimsAtConnect(ctx context.Context, database *gorm.DB) (ClaimBackfillResult, error) {
+	var existing int64
+	if err := database.WithContext(ctx).Model(&ClaimedEmail{}).Count(&existing).Error; err != nil {
+		return ClaimBackfillResult{}, err
+	}
+	if existing > 0 {
+		return ClaimBackfillResult{}, nil
+	}
+	return BackfillClaimedEmails(ctx, database)
+}
+
+// readClaim returns the claim for key, or gorm.ErrRecordNotFound.
+func readClaim(ctx context.Context, database *gorm.DB, key string) (*ClaimedEmail, error) {
+	var claim ClaimedEmail
+	if err := database.WithContext(ctx).Where("email = ?", key).First(&claim).Error; err != nil {
+		return nil, err
+	}
+	return &claim, nil
+}
+
 // collectClaimHolders groups users.email and oauth_accounts.email by the key the
 // application will look them up with, and reports the keys whose owners disagree.
 func collectClaimHolders(ctx context.Context, database *gorm.DB) (map[string]claimHolder, map[string][]uuid.UUID, error) {
-	var users []db.User
+	var users []User
 	if err := database.WithContext(ctx).Select("id", "email", "email_verified").Find(&users).Error; err != nil {
 		return nil, nil, err
 	}
-	var links []db.OAuthAccount
+	var links []OAuthAccount
 	if err := database.WithContext(ctx).Select("user_id", "email", "verified").Find(&links).Error; err != nil {
 		return nil, nil, err
 	}
@@ -101,7 +123,7 @@ func collectClaimHolders(ctx context.Context, database *gorm.DB) (map[string]cla
 	holders := make(map[string]claimHolder, len(users)+len(links))
 	conflicts := make(map[string][]uuid.UUID)
 	add := func(email string, owner uuid.UUID, verified bool) {
-		key := db.NormalizeEmail(email)
+		key := NormalizeEmail(email)
 		if key == "" {
 			return
 		}
@@ -126,11 +148,6 @@ func collectClaimHolders(ctx context.Context, database *gorm.DB) (map[string]cla
 		add(link.Email, link.UserID, link.Verified)
 	}
 	return holders, conflicts, nil
-}
-
-// isNotFound reports the store's ordinary "no claim row" result.
-func isNotFound(err error) bool {
-	return errors.Is(err, gorm.ErrRecordNotFound) || errors.Is(err, apperrors.ErrUserNotFound)
 }
 
 func appendUnique(ids []uuid.UUID, id uuid.UUID) []uuid.UUID {

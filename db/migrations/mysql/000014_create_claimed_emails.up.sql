@@ -15,15 +15,20 @@
 -- reservation by an unproved credential, so a provider that attests the address
 -- may take the account over; a verified claim cannot be taken over.
 --
--- This migration is DDL only: it deliberately backfills nothing. SQL LOWER() and
--- TRIM() cannot reproduce db.NormalizeEmail. LOWER() folds by collation (here
--- utf8mb4_unicode_ci) and TRIM() strips only spaces where strings.TrimSpace also
--- drops tabs and newlines, so a row computed in SQL would be stored under a key
--- the application can never produce or match and the race would survive for the
--- addresses meant to be migrated. Importing existing rows is a one-shot Go job
--- instead: gormstore.BackfillClaimedEmails normalises with db.NormalizeEmail, is
--- idempotent, and aborts naming every address held by more than one account
--- rather than picking a winner. No production data existed when 000014 shipped.
+-- This migration is DDL only: the table ships empty and nothing is imported here.
+-- SQL LOWER() and TRIM() cannot reproduce db.NormalizeEmail. LOWER() folds by
+-- collation (here utf8mb4_unicode_ci) and TRIM() strips only spaces where
+-- strings.TrimSpace also drops tabs and newlines, so a row computed in SQL would
+-- be stored under a key the application can never produce or match and the race
+-- would survive for the addresses meant to be migrated.
+--
+-- The import runs from the connection path instead: db.Connect calls
+-- db.BackfillClaimedEmails on the first connection to a database whose claim table
+-- is empty. It keys with db.NormalizeEmail, is idempotent, and aborts naming every
+-- address held by more than one account instead of picking a winner. A conflict
+-- fails the connection on purpose: running with an unimported claim table is the
+-- unprotected state this migration exists to remove. Remedy: resolve the links the
+-- error names, then reconnect. See docs/email-claims.md.
 --
 -- MySQL DDL is not transactional, so a failed run needs manual recovery:
 -- check for claimed_emails, then `migrate force 13` and re-run 000014.
