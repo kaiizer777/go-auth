@@ -125,6 +125,13 @@ func setupTestDB(t *testing.T) *gorm.DB {
 		expires_at DATETIME NOT NULL,
 		created_at DATETIME
 	);
+	CREATE TABLE IF NOT EXISTS claimed_emails (
+		email VARCHAR(255) PRIMARY KEY,
+		owner_user_id TEXT NOT NULL,
+		verified INTEGER NOT NULL DEFAULT 0,
+		created_at DATETIME,
+		updated_at DATETIME
+	);
 	CREATE TABLE IF NOT EXISTS oauth_accounts (
 		id TEXT PRIMARY KEY,
 		user_id TEXT NOT NULL,

@@ -17,6 +17,7 @@ import (
 	"github.com/kaiizer777/go-auth/config"
 	"github.com/kaiizer777/go-auth/crypto"
 	"github.com/kaiizer777/go-auth/db"
+	gormstore "github.com/kaiizer777/go-auth/db/gorm"
 	"github.com/kaiizer777/go-auth/email"
 	"github.com/kaiizer777/go-auth/errors"
 )
@@ -80,6 +81,13 @@ func setupTestDB(t testing.TB) *gorm.DB {
 		last_active_at DATETIME NOT NULL,
 		absolute_expires_at DATETIME NOT NULL,
 		created_at DATETIME
+	);
+	CREATE TABLE IF NOT EXISTS claimed_emails (
+		email VARCHAR(255) PRIMARY KEY,
+		owner_user_id TEXT NOT NULL,
+		verified INTEGER NOT NULL DEFAULT 0,
+		created_at DATETIME,
+		updated_at DATETIME
 	);
 	CREATE TABLE IF NOT EXISTS oauth_accounts (
 		id TEXT PRIMARY KEY,
@@ -1988,6 +1996,118 @@ func TestService_Signup_UnverifiedRecovery_AttackerCredentialBinding_ConcurrentR
 	})
 	if err == nil {
 		t.Fatal("expected attacker login to fail")
+	}
+}
+
+func TestService_Signup_SilentSuccessWhenAddressClaimedElsewhere(t *testing.T) {
+	database := setupTestDB(t)
+	cfg := testConfig()
+	store := gormstore.New(database)
+	dispatched := make(chan string, 4)
+	hooks := email.Hooks{
+		SendVerificationEmail: func(_ context.Context, recipient, _ string) error {
+			dispatched <- recipient
+			return nil
+		},
+	}
+	svc, err := NewWithStore(cfg, store, hooks)
+	if err != nil {
+		t.Fatalf("NewWithStore: %v", err)
+	}
+	ctx := context.Background()
+
+	holder := db.User{ID: uuid.New(), Email: "holder@work.example", PasswordHash: "hash"}
+	if err := store.Users().Create(ctx, &holder); err != nil {
+		t.Fatalf("seed holder: %v", err)
+	}
+	// The address is reserved by that account's provider link, so no users row
+	// carries it: the signup loser has nothing to converge on.
+	const addr = "taken@example.com"
+	if err := store.ClaimedEmails().Claim(ctx, addr, holder.ID, true); err != nil {
+		t.Fatalf("seed claim: %v", err)
+	}
+
+	user, token, err := svc.Signup(ctx, db.SignupRequest{Email: "Taken@Example.com", Password: "SignupPass#2026!"})
+	if err != nil {
+		t.Fatalf("signup = %v; a lost claim must stay silent", err)
+	}
+	if user != nil || token != "" {
+		t.Fatalf("signup returned user=%v token=%q; want the silent-success shape", user, token)
+	}
+	if _, gerr := store.Users().GetByEmail(ctx, addr); !errors.Is(gerr, gorm.ErrRecordNotFound) {
+		t.Fatalf("account created for a claimed address, err = %v", gerr)
+	}
+	select {
+	case recipient := <-dispatched:
+		t.Fatalf("verification email dispatched to %q for a lost claim", recipient)
+	default:
+	}
+	claim, cerr := store.ClaimedEmails().Get(ctx, addr)
+	if cerr != nil {
+		t.Fatalf("load claim: %v", cerr)
+	}
+	if claim.OwnerUserID != holder.ID {
+		t.Fatalf("claim owner = %v; want the seeded holder %v", claim.OwnerUserID, holder.ID)
+	}
+}
+
+func TestService_VerifyEmail_FailsWhenAddressClaimedByAnotherAccount(t *testing.T) {
+	database := setupTestDB(t)
+	cfg := testConfig()
+	store := gormstore.New(database)
+	tokens := make(chan string, 1)
+	hooks := email.Hooks{
+		SendVerificationEmail: func(_ context.Context, _ string, token string) error {
+			tokens <- token
+			return nil
+		},
+	}
+	svc, err := NewWithStore(cfg, store, hooks)
+	if err != nil {
+		t.Fatalf("NewWithStore: %v", err)
+	}
+	ctx := context.Background()
+
+	const addr = "verify@example.com"
+	user, _, err := svc.Signup(ctx, db.SignupRequest{Email: addr, Password: "VerifyPass#2026!"})
+	if err != nil || user == nil {
+		t.Fatalf("signup = %v, %v", user, err)
+	}
+	var raw string
+	select {
+	case raw = <-tokens:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the verification email")
+	}
+
+	// The claim moves to another account before verification runs.
+	rival := db.User{ID: uuid.New(), Email: "rival@work.example", PasswordHash: "hash"}
+	if err := store.Users().Create(ctx, &rival); err != nil {
+		t.Fatalf("seed rival: %v", err)
+	}
+	if err := store.ClaimedEmails().Release(ctx, addr, user.ID); err != nil {
+		t.Fatalf("release claim: %v", err)
+	}
+	if err := store.ClaimedEmails().Claim(ctx, addr, rival.ID, false); err != nil {
+		t.Fatalf("re-claim: %v", err)
+	}
+
+	if _, verr := svc.VerifyEmail(ctx, db.VerifyEmailRequest{Token: raw}); !errors.Is(verr, errors.ErrEmailClaimed) {
+		t.Fatalf("VerifyEmail = %v; want ErrEmailClaimed", verr)
+	}
+	reloaded, rerr := store.Users().GetByID(ctx, user.ID)
+	if rerr != nil {
+		t.Fatalf("reload account: %v", rerr)
+	}
+	if reloaded.EmailVerified {
+		t.Fatal("verification reported a conflict but the account was marked verified")
+	}
+	claim, cerr := store.ClaimedEmails().Get(ctx, addr)
+	if cerr != nil {
+		t.Fatalf("load claim: %v", cerr)
+	}
+	if claim.OwnerUserID != rival.ID || claim.Verified {
+		t.Fatalf("claim = %+v; the conflicting claim must be left untouched", claim)
 	}
 }
 

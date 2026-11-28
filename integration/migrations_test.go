@@ -17,6 +17,7 @@ import (
 	"github.com/golang-migrate/migrate/v4"
 	pgmigrate "github.com/golang-migrate/migrate/v4/database/postgres"
 	"github.com/golang-migrate/migrate/v4/source/iofs"
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgconn"
 	_ "github.com/jackc/pgx/v5/stdlib"
 
@@ -142,6 +143,97 @@ func TestMigrations_Lifecycle(t *testing.T) {
 	}
 	if tableCount != 9 {
 		t.Fatalf("expected 9 application tables after re-Up, found %d", tableCount)
+	}
+}
+
+// TestMigrations_Claim000014BackfillAndDown pins the claim table on the real
+// dialect: the down path drops it (so no stale claim can block an address), and a
+// re-applied up rebuilds it from users.email and oauth_accounts.email with the
+// holder and the proved flag derived from those rows.
+func TestMigrations_Claim000014BackfillAndDown(t *testing.T) {
+	dbURL := resolveDatabaseURL()
+	sqlDB, err := sql.Open("pgx", dbURL)
+	if err != nil {
+		if os.Getenv("CI") != "" {
+			t.Fatalf("CI: failed to open postgres connection: %v", err)
+		}
+		t.Skipf("Postgres not available, skipping: %v", err)
+	}
+	defer func() { _ = sqlDB.Close() }()
+	pingCtx, pingCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer pingCancel()
+	if err := sqlDB.PingContext(pingCtx); err != nil {
+		if os.Getenv("CI") != "" {
+			t.Fatalf("CI: PostgreSQL connection failed: %v", err)
+		}
+		t.Skipf("Postgres not available, skipping: %v", err)
+	}
+
+	m, migrateDB := newMigrator(t, dbURL)
+	defer func() {
+		_, _ = m.Close()
+		_ = migrateDB.Close()
+	}()
+	if err := m.Up(); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("m.Up() failed: %v", err)
+	}
+	_, _ = migrateDB.Exec("TRUNCATE TABLE sessions, verification_tokens, password_reset_tokens, oauth_accounts, totp_secrets, totp_used_codes, two_factor_tokens, claimed_emails, users CASCADE")
+
+	ownerID := uuid.New()
+	linkerID := uuid.New()
+	if _, err := migrateDB.Exec(`INSERT INTO users (id, email, password_hash, email_verified) VALUES ($1, $2, 'hash', TRUE)`,
+		ownerID, "claim-owner@example.test"); err != nil {
+		t.Fatalf("seed owner: %v", err)
+	}
+	if _, err := migrateDB.Exec(`INSERT INTO users (id, email, password_hash, email_verified) VALUES ($1, $2, 'hash', FALSE)`,
+		linkerID, "claim-linker@example.test"); err != nil {
+		t.Fatalf("seed linker: %v", err)
+	}
+	// A link whose address is not its owner's own address, and which the provider
+	// attested: the claim it produces is verified.
+	if _, err := migrateDB.Exec(`INSERT INTO oauth_accounts (id, user_id, provider_id, provider_tenant_id, provider_user_id, email, verified)
+		VALUES ($1, $2, 'google', '', 'sub-claim', $3, TRUE)`, uuid.New(), linkerID, "claim-link@example.test"); err != nil {
+		t.Fatalf("seed link: %v", err)
+	}
+
+	if err := m.Steps(-1); err != nil {
+		t.Fatalf("000014 down failed: %v", err)
+	}
+	var exists bool
+	if err := migrateDB.QueryRow(`SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'claimed_emails')`).Scan(&exists); err != nil {
+		t.Fatalf("query table: %v", err)
+	}
+	if exists {
+		t.Fatal("000014 down left claimed_emails in place")
+	}
+
+	if err := m.Up(); err != nil {
+		t.Fatalf("re-applying 000014 failed: %v", err)
+	}
+	for _, tc := range []struct {
+		email    string
+		owner    uuid.UUID
+		verified bool
+	}{
+		{email: "claim-owner@example.test", owner: ownerID, verified: true},
+		{email: "claim-link@example.test", owner: linkerID, verified: true},
+	} {
+		var gotOwner uuid.UUID
+		var gotVerified bool
+		if err := migrateDB.QueryRow(`SELECT owner_user_id, verified FROM claimed_emails WHERE email = $1`, tc.email).
+			Scan(&gotOwner, &gotVerified); err != nil {
+			t.Fatalf("claim for %s: %v", tc.email, err)
+		}
+		if gotOwner != tc.owner || gotVerified != tc.verified {
+			t.Errorf("claim for %s = (%v, %v); want (%v, %v)", tc.email, gotOwner, gotVerified, tc.owner, tc.verified)
+		}
+	}
+	var claimsFromUnverifiedAccount int
+	if err := migrateDB.QueryRow(`SELECT COUNT(*) FROM claimed_emails WHERE email = 'claim-linker@example.test'`).Scan(&claimsFromUnverifiedAccount); err != nil {
+		t.Fatalf("count claim: %v", err)
+	}
+	if claimsFromUnverifiedAccount != 1 {
+		t.Fatalf("unverified account claims = %d; want 1", claimsFromUnverifiedAccount)
 	}
 }
 

@@ -212,10 +212,24 @@ func (s *authService) Signup(ctx context.Context, req db.SignupRequest) (*db.Use
 		if err := txStore.Users().Create(ctx, &user); err != nil {
 			return err
 		}
+		// The claim is the only object that serialises a signup against an OAuth
+		// link, and it is taken after the insert so the foreign key holds. An
+		// unverified claim matches the account this row creates.
+		if cerr := txStore.ClaimedEmails().Claim(ctx, user.Email, user.ID, false); cerr != nil {
+			return cerr
+		}
 		tok.UserID = user.ID
 		return txStore.VerificationTokens().Create(ctx, &tok)
 	})
 	if err != nil {
+		// A claim held by another account is indistinguishable from a duplicate
+		// signup and must stay silent. It is decided here, unconditionally: the
+		// re-query below only recognises a loser that has a users row, and a claim
+		// held by another account's link has none.
+		if errors.Is(err, errors.ErrEmailClaimed) {
+			_, _ = crypto.HashPassword(req.Password, s.hashParams)
+			return nil, "", nil
+		}
 		if existingUser, queryErr := s.store.Users().GetByEmail(ctx, req.Email); queryErr == nil && existingUser != nil {
 			// Anti-enumeration parity: concurrent signup succeeded
 			_, _ = crypto.HashPassword(req.Password, s.hashParams)
@@ -320,6 +334,16 @@ func (s *authService) VerifyEmail(ctx context.Context, req db.VerifyEmailRequest
 		if err := txStore.Users().SetEmailVerified(ctx, tok.UserID, true); err != nil {
 			return err
 		}
+		// Promotion, never takeover: the claim is this account's, and a claim a
+		// different account already proved fails the whole verification instead of
+		// being moved.
+		owner, oerr := txStore.Users().GetByID(ctx, tok.UserID)
+		if oerr != nil {
+			return oerr
+		}
+		if cerr := txStore.ClaimedEmails().Claim(ctx, owner.Email, tok.UserID, true); cerr != nil {
+			return cerr
+		}
 		if _, err := txStore.Users().IncrementCredentialVersion(ctx, tok.UserID); err != nil {
 			return err
 		}
@@ -343,6 +367,9 @@ func (s *authService) VerifyEmail(ctx context.Context, req db.VerifyEmailRequest
 		var appErr *errors.Error
 		if errors.As(err, &appErr) && (appErr.Code() == errors.CodeInvalidToken || appErr.Code() == errors.CodeTokenExpired) {
 			return nil, err
+		}
+		if errors.Is(err, errors.ErrEmailClaimed) {
+			return nil, errors.ErrEmailClaimed
 		}
 		return nil, errors.Wrap(err, errors.CodeDatabaseError, "failed to verify email")
 	}
@@ -518,6 +545,9 @@ func purgeUnverifiedLinks(ctx context.Context, store db.Store, userID uuid.UUID)
 			continue
 		}
 		if err := store.OAuthAccounts().Delete(ctx, link.ID); err != nil {
+			return err
+		}
+		if err := db.ReleaseLinkClaim(ctx, store, *link); err != nil {
 			return err
 		}
 	}
