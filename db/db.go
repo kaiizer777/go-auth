@@ -310,6 +310,11 @@ func NormalizeMySQLError(err error) error {
 	}
 
 	switch {
+	case strings.Contains(msg, "claimed_emails"):
+		// Explicit and before the table cases below: the claim key must never
+		// normalise to ErrEmailAlreadyExists, which the signup and link paths
+		// classify differently.
+		return errors.ErrEmailClaimed
 	case strings.Contains(msg, "idx_users_email") || strings.Contains(msg, "users"):
 		return errors.ErrEmailAlreadyExists
 	case strings.Contains(msg, "totp_used_codes") || strings.Contains(msg, "uq_totp_used_codes"):

@@ -391,6 +391,11 @@ var (
 	ErrEmailNotVerified   = New(CodeEmailNotVerified, "email address not verified", nil)
 	ErrUserAlreadyExists  = New(CodeUserAlreadyExists, "user already exists", nil)
 	ErrEmailAlreadyExists = New(CodeEmailAlreadyExists, "email already exists", nil)
+	// ErrEmailClaimed reports an address reserved by a different account. It is a
+	// distinct value from ErrEmailAlreadyExists on purpose: the signup path treats
+	// a lost claim as silent success, and the OAuth link path maps it to its own
+	// conflict code, so neither may collapse into the other's sentinel.
+	ErrEmailClaimed       = New(CodeEmailAlreadyExists, "email address is claimed by another account", nil)
 	ErrUserNotFound       = New(CodeUserNotFound, "user not found", nil)
 	ErrInvalidToken       = New(CodeInvalidToken, "token is invalid or malformed", nil)
 	ErrTokenExpired       = New(CodeTokenExpired, "token has expired", nil)

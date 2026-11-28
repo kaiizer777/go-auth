@@ -34,6 +34,7 @@ type MongoStore struct {
 	passwordReset      *passwordResetTokenStore
 	oauthAccounts      *oauthAccountStore
 	totp               *totpStore
+	claimedEmails      *claimedEmailStore
 }
 
 // New creates a new MongoStore instance wrapping a MongoDB client and database.
@@ -49,6 +50,7 @@ func New(client *mongo.Client, database *mongo.Database, allowNonTransactional b
 	store.passwordReset = &passwordResetTokenStore{store: store}
 	store.oauthAccounts = &oauthAccountStore{store: store}
 	store.totp = &totpStore{store: store}
+	store.claimedEmails = &claimedEmailStore{store: store}
 	return store
 }
 
@@ -65,6 +67,7 @@ func (s *MongoStore) withSession(sess *mongo.Session) *MongoStore {
 	store.passwordReset = &passwordResetTokenStore{store: store}
 	store.oauthAccounts = &oauthAccountStore{store: store}
 	store.totp = &totpStore{store: store}
+	store.claimedEmails = &claimedEmailStore{store: store}
 	return store
 }
 
@@ -81,6 +84,7 @@ func (s *MongoStore) VerificationTokens() db.VerificationTokenStore   { return s
 func (s *MongoStore) PasswordResetTokens() db.PasswordResetTokenStore { return s.passwordReset }
 func (s *MongoStore) OAuthAccounts() db.OAuthAccountStore             { return s.oauthAccounts }
 func (s *MongoStore) Totp() db.TotpStore                              { return s.totp }
+func (s *MongoStore) ClaimedEmails() db.ClaimedEmailStore             { return s.claimedEmails }
 
 func (s *MongoStore) Client() *mongo.Client     { return s.client }
 func (s *MongoStore) Database() *mongo.Database { return s.database }
@@ -233,6 +237,9 @@ func Connect(cfg config.Config) (*MongoStore, error) {
 		return nil, err
 	}
 	if err := initOp(BackfillMicrosoftOIDLinks, "failed to backfill microsoft oid links"); err != nil {
+		return nil, err
+	}
+	if err := initOp(BackfillClaimedEmails, "failed to backfill claimed emails"); err != nil {
 		return nil, err
 	}
 
@@ -390,6 +397,12 @@ func (s *userStore) Delete(ctx context.Context, id uuid.UUID) error {
 			if _, err := mTx.database.Collection(col).DeleteMany(cCtx, bson.M{"user_id": uidStr}); err != nil {
 				return err
 			}
+		}
+		// The claim collection names its owner column owner_user_id, so it is not
+		// covered by the user_id sweep above: these rows are what release an
+		// address for re-registration after the account is gone.
+		if _, err := mTx.database.Collection("claimed_emails").DeleteMany(cCtx, bson.M{"owner_user_id": uidStr}); err != nil {
+			return err
 		}
 		_, err := mTx.database.Collection("users").DeleteOne(cCtx, bson.M{"_id": uidStr})
 		return err
@@ -1261,5 +1274,91 @@ func (s *totpStore) DeleteTwoFactorToken(ctx context.Context, id uuid.UUID) (int
 
 func (s *totpStore) DeleteTwoFactorTokensByUserID(ctx context.Context, userID uuid.UUID) error {
 	_, err := s.twoFactorTokens().DeleteMany(s.store.resolveCtx(ctx), bson.M{"user_id": userID.String()})
+	return err
+}
+
+// ==========================================
+// ClaimedEmailStore implementation
+// ==========================================
+
+type claimedEmailStore struct {
+	store *MongoStore
+}
+
+func (s *claimedEmailStore) collection() *mongo.Collection {
+	return s.store.database.Collection("claimed_emails")
+}
+
+// Claim mirrors the SQL implementation: an upsert that cannot fail the call on a
+// duplicate, followed by a read of the holder. Mongo does not abort a transaction
+// on a duplicate key, but the same order keeps both backends observably equal.
+func (s *claimedEmailStore) Claim(ctx context.Context, email string, ownerID uuid.UUID, verified bool) error {
+	key := db.NormalizeEmail(email)
+	if key == "" {
+		return nil
+	}
+	now := time.Now().UTC()
+	_, err := s.collection().UpdateOne(s.store.resolveCtx(ctx),
+		bson.M{"_id": key},
+		bson.M{"$setOnInsert": bson.M{
+			"owner_user_id": ownerID.String(),
+			"verified":      verified,
+			"created_at":    now,
+			"updated_at":    now,
+		}},
+		options.UpdateOne().SetUpsert(true),
+	)
+	// A concurrent upsert of the same _id can lose with a duplicate key; the read
+	// below resolves the winner, which is the answer this call needs.
+	if err != nil && !mongo.IsDuplicateKeyError(err) {
+		return NormalizeMongoError(err)
+	}
+	var doc ClaimedEmailDoc
+	if derr := s.collection().FindOne(s.store.resolveCtx(ctx), bson.M{"_id": key}).Decode(&doc); derr != nil {
+		if errors.Is(derr, mongo.ErrNoDocuments) {
+			return errors.ErrEmailClaimed
+		}
+		return derr
+	}
+	claim := doc.toDomain()
+	if claim.OwnerUserID != ownerID {
+		return errors.ErrEmailClaimed
+	}
+	if verified && !claim.Verified {
+		_, uerr := s.collection().UpdateOne(s.store.resolveCtx(ctx),
+			bson.M{"_id": key, "owner_user_id": ownerID.String()},
+			bson.M{"$set": bson.M{"verified": true, "updated_at": now}},
+		)
+		return uerr
+	}
+	return nil
+}
+
+func (s *claimedEmailStore) Get(ctx context.Context, email string) (*db.ClaimedEmail, error) {
+	key := db.NormalizeEmail(email)
+	if key == "" {
+		return nil, gorm.ErrRecordNotFound
+	}
+	var doc ClaimedEmailDoc
+	if err := s.collection().FindOne(s.store.resolveCtx(ctx), bson.M{"_id": key}).Decode(&doc); err != nil {
+		if errors.Is(err, mongo.ErrNoDocuments) {
+			return nil, gorm.ErrRecordNotFound
+		}
+		return nil, err
+	}
+	return doc.toDomain(), nil
+}
+
+func (s *claimedEmailStore) Release(ctx context.Context, email string, ownerID uuid.UUID) error {
+	key := db.NormalizeEmail(email)
+	if key == "" {
+		return nil
+	}
+	_, err := s.collection().DeleteOne(s.store.resolveCtx(ctx), bson.M{"_id": key, "owner_user_id": ownerID.String()})
+	return err
+}
+
+func (s *claimedEmailStore) ReleaseByUserID(ctx context.Context, ownerID uuid.UUID) error {
+	_, err := s.collection().DeleteMany(s.store.resolveCtx(ctx), bson.M{"owner_user_id": ownerID.String()})
 	return err
 }

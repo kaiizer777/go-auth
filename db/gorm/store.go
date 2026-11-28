@@ -22,6 +22,12 @@ func lockForUpdate(tx *gorm.DB) *gorm.DB {
 	return tx.Clauses(clause.Locking{Strength: "UPDATE"})
 }
 
+// dialectorIs reports whether the connection speaks the named dialect, so a
+// statement with no portable form can be written per dialect instead of guessed.
+func dialectorIs(tx *gorm.DB, name string) bool {
+	return tx.Dialector != nil && strings.Contains(strings.ToLower(tx.Name()), name)
+}
+
 type userStore struct {
 	db *gorm.DB
 }
@@ -97,7 +103,16 @@ func (s *userStore) SetEmailVerified(ctx context.Context, id uuid.UUID, verified
 }
 
 func (s *userStore) Delete(ctx context.Context, id uuid.UUID) error {
-	return s.db.WithContext(ctx).Where("id = ?", id).Delete(&db.User{}).Error
+	// One transaction so a failure cannot release the account's addresses while
+	// the account survives. The schema FK already cascades; the explicit delete
+	// keeps the invariant true for a store whose schema was built by AutoMigrate,
+	// which creates no foreign keys.
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Where("id = ?", id).Delete(&db.User{}).Error; err != nil {
+			return err
+		}
+		return tx.Where("owner_user_id = ?", id).Delete(&db.ClaimedEmail{}).Error
+	})
 }
 
 type sessionStore struct {
@@ -698,6 +713,72 @@ func (s *totpStore) DeleteTwoFactorTokensByUserID(ctx context.Context, userID uu
 	return s.db.WithContext(ctx).Where("user_id = ?", userID).Delete(&db.TwoFactorToken{}).Error
 }
 
+type claimedEmailStore struct {
+	db *gorm.DB
+}
+
+// claimInsertStatement builds the idempotent claim insert. A duplicate must not
+// fail the statement: PostgreSQL aborts the whole transaction on a constraint
+// error, so "insert, then inspect the error" cannot work there. MySQL needs its
+// own no-op on-duplicate form; GORM's clause translation is not relied on.
+func claimInsertStatement(tx *gorm.DB) string {
+	const columns = "(email, owner_user_id, verified, created_at, updated_at) VALUES (?, ?, ?, ?, ?)"
+	if dialectorIs(tx, "mysql") {
+		return "INSERT INTO claimed_emails " + columns + " ON DUPLICATE KEY UPDATE email = email"
+	}
+	return "INSERT INTO claimed_emails " + columns + " ON CONFLICT (email) DO NOTHING"
+}
+
+func (s *claimedEmailStore) Claim(ctx context.Context, email string, ownerID uuid.UUID, verified bool) error {
+	key := db.NormalizeEmail(email)
+	if key == "" {
+		return nil
+	}
+	tx := s.db.WithContext(ctx)
+	now := time.Now().UTC()
+	if err := tx.Exec(claimInsertStatement(tx), key, ownerID, verified, now, now).Error; err != nil {
+		return db.NormalizeMySQLError(err)
+	}
+	// Locking read: under MySQL's default REPEATABLE READ a plain SELECT reuses
+	// the snapshot an earlier statement in this transaction took, so it would miss
+	// the claim a competing writer committed while this insert was blocked.
+	var claim db.ClaimedEmail
+	if err := lockForUpdate(tx).Where("email = ?", key).First(&claim).Error; err != nil {
+		return err
+	}
+	if claim.OwnerUserID != ownerID {
+		return apperrors.ErrEmailClaimed
+	}
+	if verified && !claim.Verified {
+		return tx.Model(&db.ClaimedEmail{}).Where("email = ? AND owner_user_id = ?", key, ownerID).Update("verified", true).Error
+	}
+	return nil
+}
+
+func (s *claimedEmailStore) Get(ctx context.Context, email string) (*db.ClaimedEmail, error) {
+	key := db.NormalizeEmail(email)
+	if key == "" {
+		return nil, gorm.ErrRecordNotFound
+	}
+	var claim db.ClaimedEmail
+	if err := s.db.WithContext(ctx).Where("email = ?", key).First(&claim).Error; err != nil {
+		return nil, err
+	}
+	return &claim, nil
+}
+
+func (s *claimedEmailStore) Release(ctx context.Context, email string, ownerID uuid.UUID) error {
+	key := db.NormalizeEmail(email)
+	if key == "" {
+		return nil
+	}
+	return s.db.WithContext(ctx).Where("email = ? AND owner_user_id = ?", key, ownerID).Delete(&db.ClaimedEmail{}).Error
+}
+
+func (s *claimedEmailStore) ReleaseByUserID(ctx context.Context, ownerID uuid.UUID) error {
+	return s.db.WithContext(ctx).Where("owner_user_id = ?", ownerID).Delete(&db.ClaimedEmail{}).Error
+}
+
 type gormStore struct {
 	db                 *gorm.DB
 	users              *userStore
@@ -706,6 +787,7 @@ type gormStore struct {
 	passwordReset      *passwordResetTokenStore
 	oauthAccounts      *oauthAccountStore
 	totp               *totpStore
+	claimedEmails      *claimedEmailStore
 }
 
 // New constructs a GORM-backed implementation of db.Store.
@@ -721,6 +803,7 @@ func New(database *gorm.DB) db.Store {
 		passwordReset:      &passwordResetTokenStore{db: database},
 		oauthAccounts:      &oauthAccountStore{db: database},
 		totp:               &totpStore{db: database},
+		claimedEmails:      &claimedEmailStore{db: database},
 	}
 }
 
@@ -730,6 +813,7 @@ func (s *gormStore) VerificationTokens() db.VerificationTokenStore   { return s.
 func (s *gormStore) PasswordResetTokens() db.PasswordResetTokenStore { return s.passwordReset }
 func (s *gormStore) OAuthAccounts() db.OAuthAccountStore             { return s.oauthAccounts }
 func (s *gormStore) Totp() db.TotpStore                              { return s.totp }
+func (s *gormStore) ClaimedEmails() db.ClaimedEmailStore             { return s.claimedEmails }
 
 func (s *gormStore) Transaction(ctx context.Context, fn func(txStore db.Store) error) error {
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {

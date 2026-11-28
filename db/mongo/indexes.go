@@ -63,6 +63,12 @@ func IndexSpecifications() map[string][]mongo.IndexModel {
 				Options: options.Index().SetName("ttl_password_reset_tokens_expiry").SetExpireAfterSeconds(0),
 			},
 		},
+		"claimed_emails": {
+			{
+				Keys:    bson.D{{Key: "owner_user_id", Value: 1}},
+				Options: options.Index().SetName("idx_claimed_emails_owner_user_id"),
+			},
+		},
 		"oauth_accounts": {
 			{
 				Keys: bson.D{
