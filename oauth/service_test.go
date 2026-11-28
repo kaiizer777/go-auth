@@ -1523,6 +1523,137 @@ func TestHandleCallbackLinkRefusesEmailClaimedByAnotherLink(t *testing.T) {
 	}
 }
 
+// TestRegistrationClaimsTheAddress pins the third account-creating path:
+// createUserAndLink must claim the address it registers, or every OAuth-only
+// account is missing the row the table exists to hold.
+func TestRegistrationClaimsTheAddress(t *testing.T) {
+	const addr = "register-claim@example.test"
+	database, cfg, _, rawSvc := setupServiceTest(t, &UserInfo{
+		ProviderID: "google", ProviderUserID: "sub-register-claim",
+		Email: addr, EmailVerified: true,
+	})
+	ctx := context.Background()
+
+	sess, err := loginViaGoogle(t, rawSvc, cfg)
+	if err != nil || sess == nil {
+		t.Fatalf("registration = %v, %v; want a session", sess, err)
+	}
+	claim, cerr := rawSvc.(*service).store.ClaimedEmails().Get(ctx, addr)
+	if cerr != nil {
+		t.Fatalf("load claim: %v", cerr)
+	}
+	if claim.OwnerUserID != sess.UserID || !claim.Verified {
+		t.Fatalf("claim = %+v; want holder %v, verified", claim, sess.UserID)
+	}
+	if n := countRows(t, database, &db.OAuthAccount{}); n != 1 {
+		t.Fatalf("oauth_accounts = %d; want the registration's single link", n)
+	}
+}
+
+// TestRegistrationRefusesAddressClaimedByAnotherLink drives the claimConflict arm:
+// the address has no users row, so the registration user insert succeeds and only
+// the claim insert can reject it. The rejection must be the 409, and the rolled-back
+// transaction must leave no user or link behind.
+func TestRegistrationRefusesAddressClaimedByAnotherLink(t *testing.T) {
+	const addr = "register-held@example.test"
+	database, cfg, _, rawSvc := setupServiceTest(t, &UserInfo{
+		ProviderID: "google", ProviderUserID: "sub-register-held",
+		Email: addr, EmailVerified: true,
+	})
+	ctx := context.Background()
+	base := rawSvc.(*service).store
+
+	holder := db.User{ID: uuid.New(), Email: "register-holder@work.example", PasswordHash: "hash", EmailVerified: true}
+	if err := base.Users().Create(ctx, &holder); err != nil {
+		t.Fatalf("seed holder: %v", err)
+	}
+	if err := base.ClaimedEmails().Claim(ctx, addr, holder.ID, true); err != nil {
+		t.Fatalf("seed claim: %v", err)
+	}
+
+	sess, err := loginViaGoogle(t, rawSvc, cfg)
+	if sess != nil {
+		t.Fatalf("session minted for %v; the address is claimed by another account", sess.UserID)
+	}
+	requireCode(t, err, errors.CodeOAuthAccountLinkConflict, http.StatusConflict)
+	if n := countRows(t, database, &db.User{}); n != 1 {
+		t.Fatalf("users = %d; want only the holder", n)
+	}
+	if n := countRows(t, database, &db.OAuthAccount{}); n != 0 {
+		t.Fatalf("oauth_accounts = %d; want the registration's link rolled back", n)
+	}
+	claim, cerr := base.ClaimedEmails().Get(ctx, addr)
+	if cerr != nil {
+		t.Fatalf("load claim: %v", cerr)
+	}
+	if claim.OwnerUserID != holder.ID {
+		t.Fatalf("claim owner = %v; want the seeded holder %v", claim.OwnerUserID, holder.ID)
+	}
+}
+
+// createRejectsUserStore makes the registration's user insert look like a lost
+// create race while the address has no users row: the window linkRacedUser runs in
+// when the winner is a link-only claim rather than an account.
+type createRejectsUserStore struct {
+	db.Store
+	email string
+}
+
+type createRejectsUser struct {
+	db.UserStore
+	email string
+}
+
+func (s *createRejectsUser) Create(ctx context.Context, user *db.User) error {
+	if db.NormalizeEmail(user.Email) == s.email {
+		return errors.ErrEmailAlreadyExists
+	}
+	return s.UserStore.Create(ctx, user)
+}
+
+func (s *createRejectsUserStore) Users() db.UserStore {
+	return &createRejectsUser{UserStore: s.Store.Users(), email: s.email}
+}
+
+func (s *createRejectsUserStore) Transaction(ctx context.Context, fn func(db.Store) error) error {
+	return s.Store.Transaction(ctx, func(tx db.Store) error {
+		return fn(&createRejectsUserStore{Store: tx, email: s.email})
+	})
+}
+
+// TestRegistrationRaceRejectsLinkOnlyClaim pins linkRacedUser: losing the user
+// insert to a race whose address is held by another account's link must return the
+// documented 409, not a 500.
+func TestRegistrationRaceRejectsLinkOnlyClaim(t *testing.T) {
+	const addr = "race-link-claim@example.test"
+	database, cfg, stub, rawSvc := setupServiceTest(t, &UserInfo{
+		ProviderID: "google", ProviderUserID: "sub-race-link",
+		Email: addr, EmailVerified: true,
+	})
+	ctx := context.Background()
+	base := rawSvc.(*service).store
+
+	holder := db.User{ID: uuid.New(), Email: "race-holder@work.example", PasswordHash: "hash", EmailVerified: true}
+	if err := base.Users().Create(ctx, &holder); err != nil {
+		t.Fatalf("seed holder: %v", err)
+	}
+	if err := base.ClaimedEmails().Claim(ctx, addr, holder.ID, true); err != nil {
+		t.Fatalf("seed claim: %v", err)
+	}
+	svc := NewServiceWithStore(
+		&createRejectsUserStore{Store: base, email: db.NormalizeEmail(addr)},
+		session.NewService(database, cfg), map[string]Provider{"google": stub}, cfg)
+
+	sess, err := loginViaGoogle(t, svc, cfg)
+	if sess != nil {
+		t.Fatalf("session minted for %v; the address is claimed by another account", sess.UserID)
+	}
+	requireCode(t, err, errors.CodeOAuthAccountLinkConflict, http.StatusConflict)
+	if n := countRows(t, database, &db.OAuthAccount{}); n != 0 {
+		t.Fatalf("oauth_accounts = %d; want 0", n)
+	}
+}
+
 // TestTakeoverRefusedWhenClaimAlreadyVerified pins the guard's hard edge: a claim
 // that is already proved is never handed over, even when the account row itself
 // still looks unverified. The address stays blocked and no credential is touched.
