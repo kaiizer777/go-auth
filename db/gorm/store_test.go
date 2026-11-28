@@ -1968,3 +1968,31 @@ func TestUserStore_DeleteReleasesEveryClaim(t *testing.T) {
 		t.Errorf("claim for a surviving account was released: %v", err)
 	}
 }
+
+// TestClaimedEmailStore_RejectsInvalidAddress pins the claim key space: an
+// address the key grammar cannot represent is rejected before it reaches a query,
+// and the rejection is a validation error rather than a database failure.
+func TestClaimedEmailStore_RejectsInvalidAddress(t *testing.T) {
+	database, store := setupTestDB(t)
+	ctx := context.Background()
+	owner := seedClaimUsers(t, store, "invalid-probe@example.com")[0]
+
+	for _, addr := range []string{"bad$@example.com", "bad{@example.com", "bad|@example.com"} {
+		if err := store.ClaimedEmails().Claim(ctx, addr, owner.ID, true); !errors.Is(err, apperrors.ErrInvalidEmail) {
+			t.Errorf("Claim(%q) err = %v; want ErrInvalidEmail", addr, err)
+		}
+		if _, err := store.ClaimedEmails().Get(ctx, addr); !errors.Is(err, gormdriver.ErrRecordNotFound) {
+			t.Errorf("Get(%q) err = %v; want not found", addr, err)
+		}
+		if err := store.ClaimedEmails().Release(ctx, addr, owner.ID); err != nil {
+			t.Errorf("Release(%q) = %v; want a no-op", addr, err)
+		}
+	}
+	var rows int64
+	if err := database.Model(&db.ClaimedEmail{}).Count(&rows).Error; err != nil {
+		t.Fatalf("count claims: %v", err)
+	}
+	if rows != 0 {
+		t.Fatalf("claim rows = %d; an invalid address must never be stored", rows)
+	}
+}

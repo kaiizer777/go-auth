@@ -1291,6 +1291,11 @@ func (s *service) attachLink(ctx context.Context, ownerID uuid.UUID, providerID 
 				if errors.Is(cerr, errors.ErrEmailClaimed) {
 					return errLinkEmailOwnedByAnother
 				}
+				// An address the claim key cannot represent is a validation
+				// failure, not a database failure.
+				if errors.Is(cerr, errors.ErrInvalidEmail) {
+					return cerr
+				}
 				return errors.New(errors.CodeInternalError, "failed to claim link email", cerr)
 			}
 		}
@@ -1305,7 +1310,7 @@ func (s *service) attachLink(ctx context.Context, ownerID uuid.UUID, providerID 
 			user, _, _, rerr := s.relinkExisting(ctx, providerID, info.ProviderTenantID, info.ProviderUserID)
 			return user, false, rerr
 		}
-		if errors.Is(err, errors.ErrOAuthAccountNotLinked) || errors.Is(err, errors.ErrOAuthAccountLinkConflict) || errors.Is(err, errLinkEmailOwnedByAnother) {
+		if errors.Is(err, errors.ErrOAuthAccountNotLinked) || errors.Is(err, errors.ErrOAuthAccountLinkConflict) || errors.Is(err, errLinkEmailOwnedByAnother) || errors.Is(err, errors.ErrInvalidEmail) {
 			return db.User{}, false, err
 		}
 		return db.User{}, false, errors.New(errors.CodeInternalError, "failed to link oauth account", err)
@@ -1640,6 +1645,11 @@ func (s *service) createUserAndLink(ctx context.Context, providerID string, info
 		}
 		if linkConflict {
 			return s.relinkExisting(ctx, providerID, info.ProviderTenantID, info.ProviderUserID)
+		}
+		// An address the claim key cannot represent is a validation failure, not a
+		// database failure.
+		if errors.Is(txErr, errors.ErrInvalidEmail) {
+			return db.User{}, false, false, txErr
 		}
 		return db.User{}, false, false, errors.New(errors.CodeInternalError, op, txErr)
 	}

@@ -69,12 +69,64 @@ func claimInsertStatement(tx *gorm.DB) string {
 	return "INSERT INTO claimed_emails " + columns + " ON CONFLICT (email) DO NOTHING"
 }
 
-// ClaimWithin takes the claim for email on behalf of ownerID inside the caller's
-// transaction. It is the single arbiter both the store and the connect-time import
-// use: the insert blocks a competing writer, and the ownership decision is read
-// back under a row lock.
-func ClaimWithin(ctx context.Context, database *gorm.DB, email string, ownerID uuid.UUID, verified bool) error {
+// ClaimKey normalises email and validates the result against the claim key
+// grammar. It is the only way a claim key may be produced: the key is a primary
+// key (SQL) or a collection _id (MongoDB), so the value must be a real address and
+// not an arbitrary string.
+//
+// An empty or whitespace-only address yields ("", nil): such an address is never
+// claimable and callers keep their existing no-op behaviour. Anything else that is
+// not a normalised ASCII address of at most 255 bytes yields ErrInvalidEmail.
+func ClaimKey(email string) (string, error) {
 	key := NormalizeEmail(email)
+	if key == "" {
+		return "", nil
+	}
+	if len(key) > claimKeyMaxLength || !validClaimKey(key) {
+		return "", errors.ErrInvalidEmail
+	}
+	return key, nil
+}
+
+const claimKeyMaxLength = 255
+
+// validClaimKey accepts lowercase ASCII addresses built only from letters,
+// digits, '.', '-', '_', '+' and the double quote used by quoted local parts,
+// with exactly one '@', a non-empty local part and a dotted domain. Everything
+// else is rejected: control characters, Mongo operators ('$'), braces, non-ASCII,
+// and multiple '@'.
+func validClaimKey(key string) bool {
+	at := strings.IndexByte(key, '@')
+	if at <= 0 || at != strings.LastIndexByte(key, '@') || at == len(key)-1 {
+		return false
+	}
+	domain := key[at+1:]
+	if !strings.Contains(domain, ".") ||
+		domain[0] == '.' || domain[0] == '-' ||
+		domain[len(domain)-1] == '.' || domain[len(domain)-1] == '-' {
+		return false
+	}
+	for i := 0; i < len(key); i++ {
+		c := key[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= '0' && c <= '9':
+		case c == '@' || c == '.' || c == '-' || c == '_' || c == '+' || c == '"':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// ClaimWithin takes the claim for email on behalf of ownerID inside the caller's
+// transaction. It is the single arbiter both the store and the explicit import use:
+// the insert blocks a competing writer, and the ownership decision is read back
+// under a row lock.
+func ClaimWithin(ctx context.Context, database *gorm.DB, email string, ownerID uuid.UUID, verified bool) error {
+	key, err := ClaimKey(email)
+	if err != nil {
+		return err
+	}
 	if key == "" {
 		return nil
 	}

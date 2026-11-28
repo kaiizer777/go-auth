@@ -230,6 +230,11 @@ func (s *authService) Signup(ctx context.Context, req db.SignupRequest) (*db.Use
 			_, _ = crypto.HashPassword(req.Password, s.hashParams)
 			return nil, "", nil
 		}
+		// An address the claim key cannot represent is a request error, not a
+		// database failure.
+		if errors.Is(err, errors.ErrInvalidEmail) {
+			return nil, "", err
+		}
 		if existingUser, queryErr := s.store.Users().GetByEmail(ctx, req.Email); queryErr == nil && existingUser != nil {
 			// Anti-enumeration parity: concurrent signup succeeded
 			_, _ = crypto.HashPassword(req.Password, s.hashParams)

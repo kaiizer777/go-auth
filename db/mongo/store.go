@@ -1286,17 +1286,34 @@ func (s *claimedEmailStore) collection() *mongo.Collection {
 	return s.store.database.Collection("claimed_emails")
 }
 
+// claimFilter addresses one claim row. It is a typed struct rather than a map
+// literal so the query document has exactly one field the driver can serialise,
+// and it is only ever constructed from a key db.ClaimKey has validated as a
+// normalised ASCII address: the value is data, never a query operator.
+type claimFilter struct {
+	ID string `bson:"_id"`
+}
+
+// claimOwnerFilter scopes a write to the account that holds the claim.
+type claimOwnerFilter struct {
+	ID      string `bson:"_id"`
+	OwnerID string `bson:"owner_user_id"`
+}
+
 // Claim mirrors the SQL implementation: an upsert that cannot fail the call on a
 // duplicate, followed by a read of the holder. Mongo does not abort a transaction
 // on a duplicate key, but the same order keeps both backends observably equal.
 func (s *claimedEmailStore) Claim(ctx context.Context, email string, ownerID uuid.UUID, verified bool) error {
-	key := db.NormalizeEmail(email)
+	key, kerr := db.ClaimKey(email)
+	if kerr != nil {
+		return kerr
+	}
 	if key == "" {
 		return nil
 	}
 	now := time.Now().UTC()
 	_, err := s.collection().UpdateOne(s.store.resolveCtx(ctx),
-		bson.M{"_id": key},
+		claimFilter{ID: key},
 		bson.M{"$setOnInsert": bson.M{
 			"owner_user_id": ownerID.String(),
 			"verified":      verified,
@@ -1311,7 +1328,7 @@ func (s *claimedEmailStore) Claim(ctx context.Context, email string, ownerID uui
 		return NormalizeMongoError(err)
 	}
 	var doc ClaimedEmailDoc
-	if derr := s.collection().FindOne(s.store.resolveCtx(ctx), bson.M{"_id": key}).Decode(&doc); derr != nil {
+	if derr := s.collection().FindOne(s.store.resolveCtx(ctx), claimFilter{ID: key}).Decode(&doc); derr != nil {
 		if errors.Is(derr, mongo.ErrNoDocuments) {
 			return errors.ErrEmailClaimed
 		}
@@ -1323,7 +1340,7 @@ func (s *claimedEmailStore) Claim(ctx context.Context, email string, ownerID uui
 	}
 	if verified && !claim.Verified {
 		_, uerr := s.collection().UpdateOne(s.store.resolveCtx(ctx),
-			bson.M{"_id": key, "owner_user_id": ownerID.String()},
+			claimOwnerFilter{ID: key, OwnerID: ownerID.String()},
 			bson.M{"$set": bson.M{"verified": true, "updated_at": now}},
 		)
 		return uerr
@@ -1332,12 +1349,12 @@ func (s *claimedEmailStore) Claim(ctx context.Context, email string, ownerID uui
 }
 
 func (s *claimedEmailStore) Get(ctx context.Context, email string) (*db.ClaimedEmail, error) {
-	key := db.NormalizeEmail(email)
-	if key == "" {
+	key, kerr := db.ClaimKey(email)
+	if kerr != nil || key == "" {
 		return nil, gorm.ErrRecordNotFound
 	}
 	var doc ClaimedEmailDoc
-	if err := s.collection().FindOne(s.store.resolveCtx(ctx), bson.M{"_id": key}).Decode(&doc); err != nil {
+	if err := s.collection().FindOne(s.store.resolveCtx(ctx), claimFilter{ID: key}).Decode(&doc); err != nil {
 		if errors.Is(err, mongo.ErrNoDocuments) {
 			return nil, gorm.ErrRecordNotFound
 		}
@@ -1347,11 +1364,11 @@ func (s *claimedEmailStore) Get(ctx context.Context, email string) (*db.ClaimedE
 }
 
 func (s *claimedEmailStore) Release(ctx context.Context, email string, ownerID uuid.UUID) error {
-	key := db.NormalizeEmail(email)
-	if key == "" {
+	key, kerr := db.ClaimKey(email)
+	if kerr != nil || key == "" {
 		return nil
 	}
-	_, err := s.collection().DeleteOne(s.store.resolveCtx(ctx), bson.M{"_id": key, "owner_user_id": ownerID.String()})
+	_, err := s.collection().DeleteOne(s.store.resolveCtx(ctx), claimOwnerFilter{ID: key, OwnerID: ownerID.String()})
 	return err
 }
 

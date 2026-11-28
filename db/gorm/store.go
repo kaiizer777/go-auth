@@ -716,8 +716,8 @@ func (s *claimedEmailStore) Claim(ctx context.Context, email string, ownerID uui
 }
 
 func (s *claimedEmailStore) Get(ctx context.Context, email string) (*db.ClaimedEmail, error) {
-	key := db.NormalizeEmail(email)
-	if key == "" {
+	key, kerr := db.ClaimKey(email)
+	if kerr != nil || key == "" {
 		return nil, gorm.ErrRecordNotFound
 	}
 	var claim db.ClaimedEmail
@@ -728,8 +728,8 @@ func (s *claimedEmailStore) Get(ctx context.Context, email string) (*db.ClaimedE
 }
 
 func (s *claimedEmailStore) Release(ctx context.Context, email string, ownerID uuid.UUID) error {
-	key := db.NormalizeEmail(email)
-	if key == "" {
+	key, kerr := db.ClaimKey(email)
+	if kerr != nil || key == "" {
 		return nil
 	}
 	return s.db.WithContext(ctx).Where("email = ? AND owner_user_id = ?", key, ownerID).Delete(&db.ClaimedEmail{}).Error
