@@ -82,7 +82,7 @@ func (ClaimedEmail) TableName() string { return "claimed_emails" }
 // PostgreSQL and SQLite compare a varchar equality byte for byte, so they keep the
 // plain type.
 func (ClaimedEmail) GormDBDataType(database *gorm.DB, _ *schema.Field) string {
-	if database != nil && database.Dialector != nil && database.Dialector.Name() == "mysql" {
+	if database != nil && database.Dialector != nil && database.Name() == "mysql" {
 		return "varchar(255) COLLATE utf8mb4_bin"
 	}
 	return "varchar(255)"
