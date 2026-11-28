@@ -332,6 +332,21 @@ func TestNormalizeMySQLError(t *testing.T) {
 			wantErr: errors.ErrOAuthAccountAlreadyLinked,
 		},
 		{
+			name:    "claimed email duplicate via MySQLError",
+			err:     &mysqlDriver.MySQLError{Number: 1062, Message: "Duplicate entry 'a@b.example' for key 'claimed_emails.PRIMARY'"},
+			wantErr: errors.ErrEmailClaimed,
+		},
+		{
+			name:    "claimed email duplicate via postgres string",
+			err:     stderrors.New("ERROR: duplicate key value violates unique constraint \"uq_claimed_emails_email\" (SQLSTATE 23505)"),
+			wantErr: errors.ErrEmailClaimed,
+		},
+		{
+			name:    "claimed email foreign key is not a claim conflict",
+			err:     stderrors.New("ERROR: insert or update on table \"claimed_emails\" violates foreign key constraint \"fk_claimed_emails_owner_user_id\" (SQLSTATE 23503)"),
+			wantErr: errors.ErrUserNotFound,
+		},
+		{
 			name:    "unmapped 1062 key returns original error",
 			err:     stderrors.New("Error 1062 (23000): Duplicate entry 'foo' for key 'other_table.idx_foo'"),
 			wantErr: stderrors.New("Error 1062 (23000): Duplicate entry 'foo' for key 'other_table.idx_foo'"),
