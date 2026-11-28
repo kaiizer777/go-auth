@@ -114,20 +114,9 @@ func Connect(cfg config.Config) (*gorm.DB, error) {
 		return nil, errors.New(errors.CodeDatabaseUnavailable, "db ping failed", err)
 	}
 
-	// 4. Import addresses written before 000014 into the claim table. The table
-	// ships empty and no SQL migration backfills it. This runs on every connect
-	// inside one transaction, with no "already imported" gate: any gate keyed on a
-	// non-empty table or a marker can silently skip rows written after it, and this
-	// project cannot tell a completed import from an out-of-band row. A conflict or
-	// any write failure rolls the whole import back, so the next boot retries from
-	// the same empty state instead of inheriting a half-imported table. A conflict
-	// fails the connection on purpose: starting without the claims is the silent
-	// unprotected state this import exists to remove.
-	importCtx, importCancel := context.WithTimeout(context.Background(), defaultMigrationTimeout)
-	defer importCancel()
-	if _, err := BackfillClaimedEmails(importCtx, db); err != nil {
-		return nil, errors.New(errors.CodeDatabaseError, "failed to backfill claimed emails", err)
-	}
+	// 4. Boot never scans the account tables. claimed_emails ships empty and the
+	// import of pre-000014 addresses is an explicit operator step
+	// (db.BackfillClaimedEmails); see docs/email-claims.md.
 
 	success = true
 	return db, nil

@@ -14,25 +14,21 @@
 -- reservation by an unproved credential, so a provider that attests the address
 -- may take the account over; a verified claim cannot be taken over.
 --
--- This migration is DDL only: the table ships empty and nothing is imported here.
--- SQL lower() and trim() cannot reproduce db.NormalizeEmail. lower() is
--- collation-dependent (on a C/POSIX database it leaves 'É' unchanged where Go
--- yields 'é') and trim() strips only spaces where strings.TrimSpace also drops
--- tabs and newlines. A row computed in SQL would therefore be stored under a key
--- the application can never produce or match, leaving exactly the race this table
--- closes for the addresses meant to be migrated.
+-- This migration creates the table empty. From the first write after deploy,
+-- signup, OAuth registration and link attachment claim addresses inside their own
+-- transactions, so the table is complete for every account created by this
+-- version.
 --
--- The import runs from the connection path instead: db.Connect calls
--- db.BackfillClaimedEmails on every connection. It keys with db.NormalizeEmail, is
--- idempotent, and runs all-or-nothing inside one transaction, so a failure commits
--- nothing and the next boot retries. When an address is held by more than one
--- account it aborts before writing, naming every such address instead of picking a
--- winner; the connection then fails on purpose, because starting with an
--- unimported claim table is the unprotected state this migration exists to remove.
--- There is no "already imported" gate: an address written after a run (a restore,
--- or an older instance still serving during a rollout) is picked up by the next
--- connect instead of staying unclaimed forever. Remedy: resolve the links the error
--- names, then reconnect. See docs/email-claims.md.
+-- Nothing imports existing addresses automatically: booting never scans the
+-- account tables. SQL lower() and trim() cannot reproduce db.NormalizeEmail
+-- (lower() is collation-dependent; trim() strips only spaces), so a SQL backfill
+-- would store keys the application can never match. An embedder upgrading a
+-- database that already has users or links must call db.BackfillClaimedEmails
+-- once after migrating. It pages users and oauth_accounts by primary key (500 rows
+-- per page), writes one short transaction per page, is idempotent and safe to
+-- re-run. When an address is held by more than one account it aborts that page
+-- before writing, naming every conflicting address and account ID instead of
+-- picking a winner; resolve those rows and re-run. See docs/email-claims.md.
 CREATE TABLE IF NOT EXISTS claimed_emails (
     email          VARCHAR(255) NOT NULL,
     owner_user_id  UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,

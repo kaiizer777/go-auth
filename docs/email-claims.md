@@ -23,35 +23,37 @@ SQL is not guaranteed to equal the Go key the application looks up.
   sweep on MongoDB). Deleting a link releases its address only when no other row
   of that account still holds it.
 
-## Claim import at connect
+## Importing existing data
 
-`000014` ships the table empty and contains no data backfill. The import runs from
-the connection path instead, on **every** connection, identically for both stores:
+`000014` creates the table empty and nothing imports automatically: booting never
+scans the account tables. From the first write after deploy, signup, OAuth
+registration and link attachment claim addresses as they go.
 
-- SQL: `db.Connect` calls `db.BackfillClaimedEmails` after migrations, inside one
-  transaction. Validation runs first; then every claim is written; any error rolls
-  the whole run back, so the table contains either none or all of the import and
-  the next boot retries from a known state.
-- MongoDB: `mongostore.Connect` runs the equivalent backfill as an init step. It
-  records the `000014_create_claimed_emails` marker when a run completes, but the
-  marker is not a gate: MongoDB cannot make the multi-document write atomic on a
-  standalone deployment, so a partial run must be retried, and every connect does.
+An embedder upgrading a database that already contains users or links must run the
+import once, after migrating:
 
-Both read `users.email` and `oauth_accounts.email`, key with `db.NormalizeEmail`,
-and use the same claim write the runtime uses. Running twice is a no-op.
+```go
+if _, err := db.BackfillClaimedEmails(ctx, gormDB); err != nil {
+	// resolve the conflicts named in the error, then re-run
+}
+```
 
-There is deliberately no "already imported" gate. A marker or a non-empty table
-cannot distinguish "the import completed" from "someone wrote a claim", so it would
-silently skip addresses added afterwards — a restore, or a row written by an older
-instance still serving during a rolling rollout. Re-running at connect is
-idempotent and bounded by one scan of the account tables.
+- SQL: `db.BackfillClaimedEmails` pages `users` and `oauth_accounts` by primary
+  key (500 rows per page), reads the page's existing claims in one statement, and
+  writes each page inside one short transaction. A failed page commits nothing.
+- MongoDB: `mongostore.BackfillClaimedEmails(ctx, database)` is the equivalent
+  explicit call. It records the `000014_create_claimed_emails` marker when a run
+  completes.
+
+Both key with `db.NormalizeEmail`, use the same claim write the runtime uses, and
+are idempotent: re-running after success changes nothing, and a re-run picks up
+rows added after the previous run. Neither is called from `Connect`.
 
 ## Conflicts
 
 One address held by more than one account is not resolvable automatically. The
-import aborts before writing anything, lists every such address with its competing
-account IDs, and the connection fails — the process does not start, so it cannot
-run silently without the protection:
+run stops at the page that contains it, before writing that page, and lists every
+conflicting address in the page with the competing account IDs:
 
 ```
 claimed_emails backfill aborted: 1 address(es) held by more than one account:
@@ -63,4 +65,5 @@ Remedy:
 1. Decide which account owns the address.
 2. Delete the losing `oauth_accounts` rows (or correct their `email`), or correct
    the offending `users.email` if that is the stale one.
-3. Reconnect. The import re-runs because the table is still empty, and converges.
+3. Re-run `db.BackfillClaimedEmails`. Pages already imported are a no-op, and the
+   run continues from there.

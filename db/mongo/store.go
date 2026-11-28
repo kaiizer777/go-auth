@@ -239,9 +239,6 @@ func Connect(cfg config.Config) (*MongoStore, error) {
 	if err := initOp(BackfillMicrosoftOIDLinks, "failed to backfill microsoft oid links"); err != nil {
 		return nil, err
 	}
-	if err := initOp(BackfillClaimedEmails, "failed to backfill claimed emails"); err != nil {
-		return nil, err
-	}
 
 	return New(client, database, cfg.MongoDB.AllowNonTransactionalMongo), nil
 }

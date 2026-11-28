@@ -11,6 +11,10 @@ import (
 	"gorm.io/gorm"
 )
 
+// claimBackfillBatchSize is the number of source rows read per page and written
+// per transaction. One page of users plus one page of links is the unit of work.
+const claimBackfillBatchSize = 500
+
 // ClaimBackfillResult reports what BackfillClaimedEmails did.
 type ClaimBackfillResult struct {
 	Claims   int
@@ -23,129 +27,211 @@ type claimHolder struct {
 	verified bool
 }
 
+// claimConflictError names every address one page proved to have competing
+// owners, with the account IDs involved.
+type claimConflictError struct {
+	conflicts map[string][]uuid.UUID
+}
+
+func (e *claimConflictError) Error() string {
+	keys := make([]string, 0, len(e.conflicts))
+	for key := range e.conflicts {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, key := range keys {
+		owners := e.conflicts[key]
+		names := make([]string, 0, len(owners))
+		for _, owner := range owners {
+			names = append(names, owner.String())
+		}
+		parts = append(parts, fmt.Sprintf("%s held by %s", key, strings.Join(names, ", ")))
+	}
+	return fmt.Sprintf("claimed_emails backfill aborted: %d address(es) held by more than one account: %s",
+		len(keys), strings.Join(parts, "; "))
+}
+
 // BackfillClaimedEmails imports the addresses already stored in users.email and
-// oauth_accounts.email into claimed_emails. It is the only supported import path:
-// no SQL migration backfills, because SQL lower()/trim() cannot reproduce
-// NormalizeEmail (lower() folds by collation, trim() strips only spaces).
+// oauth_accounts.email into claimed_emails. It is an explicit operator/embedder
+// utility, not a startup step: nothing in this package calls it, because booting
+// must never scan the account tables. An embedder upgrading a database that may
+// contain accounts must call it once after migrating.
 //
 // Keys are NormalizeEmail output, so the rows are reachable by the same
-// ClaimedEmails().Claim/Get the write paths use. The run is idempotent and
-// all-or-nothing: it validates every address, then writes inside one transaction,
-// so a failure commits nothing. When an address is held by more than one account
-// it aborts before writing anything, listing every such address and its competing
-// accounts, instead of choosing a winner: electing one strips the other account's
-// address attribution while its rows keep pointing at an address it no longer
-// claims.
+// ClaimedEmails().Claim/Get the write paths use. Rows are paged by primary key and
+// each page is written in one short transaction: memory stays bounded, and a
+// failed page commits nothing, so re-running continues from a known state. It is
+// idempotent, so re-running after success changes nothing.
+//
+// When an address is held by more than one account, the page aborts before writing
+// anything and the error names every conflicting address and account: electing a
+// winner would strip the other account's attribution while its rows keep pointing
+// at an address it no longer claims. Resolve the listed rows and re-run.
 func BackfillClaimedEmails(ctx context.Context, database *gorm.DB) (ClaimBackfillResult, error) {
 	if database == nil {
 		return ClaimBackfillResult{}, fmt.Errorf("claimed_emails backfill: nil database")
 	}
-	var (
-		result      ClaimBackfillResult
-		conflictErr error
-	)
-	err := database.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		holders, sourceConflicts, err := collectClaimHolders(ctx, tx)
+	var total ClaimBackfillResult
+	for _, load := range []claimPageLoader{loadUserClaimRows, loadLinkClaimRows} {
+		result, err := backfillClaimSource(ctx, database, load)
+		total.Claims += result.Claims
+		total.Promoted += result.Promoted
 		if err != nil {
-			return err
+			return total, err
 		}
-
-		conflicts := make(map[string][]uuid.UUID, len(sourceConflicts))
-		for key, owners := range sourceConflicts {
-			conflicts[key] = owners
-		}
-		keys := make([]string, 0, len(holders))
-		for key, holder := range holders {
-			keys = append(keys, key)
-			claim, gerr := readClaim(ctx, tx, key)
-			switch {
-			case gerr == nil && claim.OwnerUserID != holder.owner:
-				conflicts[key] = appendUnique(appendUnique(conflicts[key], holder.owner), claim.OwnerUserID)
-			case gerr != nil && !stderrors.Is(gerr, gorm.ErrRecordNotFound):
-				return fmt.Errorf("read %q: %w", key, gerr)
-			}
-		}
-		if len(conflicts) > 0 {
-			conflictErr = conflictError(conflicts)
-			return conflictErr
-		}
-
-		sort.Strings(keys)
-		for _, key := range keys {
-			holder := holders[key]
-			claim, gerr := readClaim(ctx, tx, key)
-			switch {
-			case gerr != nil && !stderrors.Is(gerr, gorm.ErrRecordNotFound):
-				return fmt.Errorf("read %q: %w", key, gerr)
-			case gerr != nil:
-				result.Claims++
-			case holder.verified && !claim.Verified:
-				result.Promoted++
-			}
-			if cerr := ClaimWithin(ctx, tx, key, holder.owner, holder.verified); cerr != nil {
-				return fmt.Errorf("claim %q: %w", key, cerr)
-			}
-		}
-		return nil
-	})
-	if conflictErr != nil {
-		return ClaimBackfillResult{}, conflictErr
 	}
-	if err != nil {
-		return ClaimBackfillResult{}, fmt.Errorf("claimed_emails backfill: %w", err)
-	}
-	return result, nil
+	return total, nil
 }
 
-// readClaim returns the claim for key, or gorm.ErrRecordNotFound.
-func readClaim(ctx context.Context, database *gorm.DB, key string) (*ClaimedEmail, error) {
-	var claim ClaimedEmail
-	if err := database.WithContext(ctx).Where("email = ?", key).First(&claim).Error; err != nil {
+// claimPageLoader reads one keyset page of source rows after cursor.
+type claimPageLoader func(tx *gorm.DB, cursor uuid.UUID, limit int) ([]claimRow, error)
+
+// claimRow is one source row reduced to what the import needs.
+type claimRow struct {
+	id       uuid.UUID
+	owner    uuid.UUID
+	key      string
+	verified bool
+}
+
+func loadUserClaimRows(tx *gorm.DB, cursor uuid.UUID, limit int) ([]claimRow, error) {
+	var users []User
+	if err := tx.Select("id", "email", "email_verified").
+		Where("id > ?", cursor).Order("id ASC").Limit(limit).Find(&users).Error; err != nil {
 		return nil, err
 	}
-	return &claim, nil
+	rows := make([]claimRow, 0, len(users))
+	for _, user := range users {
+		rows = append(rows, claimRow{
+			id:       user.ID,
+			owner:    user.ID,
+			key:      NormalizeEmail(user.Email),
+			verified: user.EmailVerified,
+		})
+	}
+	return rows, nil
 }
 
-// collectClaimHolders groups users.email and oauth_accounts.email by the key the
-// application will look them up with, and reports the keys whose owners disagree.
-func collectClaimHolders(ctx context.Context, database *gorm.DB) (map[string]claimHolder, map[string][]uuid.UUID, error) {
-	var users []User
-	if err := database.WithContext(ctx).Select("id", "email", "email_verified").Find(&users).Error; err != nil {
-		return nil, nil, err
-	}
+func loadLinkClaimRows(tx *gorm.DB, cursor uuid.UUID, limit int) ([]claimRow, error) {
 	var links []OAuthAccount
-	if err := database.WithContext(ctx).Select("user_id", "email", "verified").Find(&links).Error; err != nil {
-		return nil, nil, err
+	if err := tx.Select("id", "user_id", "email", "verified").
+		Where("id > ?", cursor).Order("id ASC").Limit(limit).Find(&links).Error; err != nil {
+		return nil, err
+	}
+	rows := make([]claimRow, 0, len(links))
+	for _, link := range links {
+		rows = append(rows, claimRow{
+			id:       link.ID,
+			owner:    link.UserID,
+			key:      NormalizeEmail(link.Email),
+			verified: link.Verified,
+		})
+	}
+	return rows, nil
+}
+
+func backfillClaimSource(ctx context.Context, database *gorm.DB, load claimPageLoader) (ClaimBackfillResult, error) {
+	var total ClaimBackfillResult
+	cursor := uuid.Nil
+	for {
+		if err := ctx.Err(); err != nil {
+			return total, err
+		}
+		var (
+			batchResult ClaimBackfillResult
+			lastID      uuid.UUID
+			pageSize    int
+		)
+		err := database.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			page, lerr := load(tx, cursor, claimBackfillBatchSize)
+			if lerr != nil {
+				return lerr
+			}
+			pageSize = len(page)
+			if pageSize == 0 {
+				return nil
+			}
+			lastID = page[pageSize-1].id
+			batchResult, lerr = applyClaimPage(ctx, tx, page)
+			return lerr
+		})
+		var conflict *claimConflictError
+		if stderrors.As(err, &conflict) {
+			return total, conflict
+		}
+		if err != nil {
+			return total, fmt.Errorf("claimed_emails backfill: %w", err)
+		}
+		total.Claims += batchResult.Claims
+		total.Promoted += batchResult.Promoted
+		if pageSize < claimBackfillBatchSize {
+			return total, nil
+		}
+		cursor = lastID
+	}
+}
+
+// applyClaimPage writes one page of source rows inside the caller's transaction.
+// It reads the page's existing claims in one statement, aborts the page before any
+// write when an address has a competing owner, then applies the claims.
+func applyClaimPage(ctx context.Context, tx *gorm.DB, page []claimRow) (ClaimBackfillResult, error) {
+	holders := make(map[string]claimHolder, len(page))
+	conflicts := make(map[string][]uuid.UUID)
+	keys := make([]string, 0, len(page))
+	for _, row := range page {
+		if row.key == "" {
+			continue
+		}
+		current, ok := holders[row.key]
+		switch {
+		case !ok:
+			holders[row.key] = claimHolder{owner: row.owner, verified: row.verified}
+			keys = append(keys, row.key)
+		case current.owner != row.owner:
+			// Two accounts in this page parsed the same address.
+			conflicts[row.key] = appendUnique(appendUnique(conflicts[row.key], current.owner), row.owner)
+		default:
+			current.verified = current.verified || row.verified
+			holders[row.key] = current
+		}
+	}
+	if len(keys) == 0 {
+		return ClaimBackfillResult{}, nil
 	}
 
-	holders := make(map[string]claimHolder, len(users)+len(links))
-	conflicts := make(map[string][]uuid.UUID)
-	add := func(email string, owner uuid.UUID, verified bool) {
-		key := NormalizeEmail(email)
-		if key == "" {
-			return
-		}
-		current, ok := holders[key]
-		if !ok {
-			holders[key] = claimHolder{owner: owner, verified: verified}
-			return
-		}
-		if current.owner != owner {
-			// More than one account parsed the same address: the caller must
-			// resolve it, so keep only the conflict, not a winner.
-			conflicts[key] = appendUnique(appendUnique(conflicts[key], current.owner), owner)
-			return
-		}
-		current.verified = current.verified || verified
-		holders[key] = current
+	// One read for the page, so every conflict is reported and nothing is written
+	// when one exists.
+	var existing []ClaimedEmail
+	if err := tx.Select("email", "owner_user_id", "verified").
+		Where("email IN ?", keys).Find(&existing).Error; err != nil {
+		return ClaimBackfillResult{}, err
 	}
-	for _, user := range users {
-		add(user.Email, user.ID, user.EmailVerified)
+	existingByKey := make(map[string]ClaimedEmail, len(existing))
+	for _, claim := range existing {
+		existingByKey[claim.Email] = claim
+		if claim.OwnerUserID != holders[claim.Email].owner {
+			conflicts[claim.Email] = appendUnique(appendUnique(conflicts[claim.Email], holders[claim.Email].owner), claim.OwnerUserID)
+		}
 	}
-	for _, link := range links {
-		add(link.Email, link.UserID, link.Verified)
+	if len(conflicts) > 0 {
+		return ClaimBackfillResult{}, &claimConflictError{conflicts: conflicts}
 	}
-	return holders, conflicts, nil
+
+	sort.Strings(keys)
+	var result ClaimBackfillResult
+	for _, key := range keys {
+		holder := holders[key]
+		if claim, ok := existingByKey[key]; !ok {
+			result.Claims++
+		} else if holder.verified && !claim.Verified {
+			result.Promoted++
+		}
+		if err := ClaimWithin(ctx, tx, key, holder.owner, holder.verified); err != nil {
+			return result, fmt.Errorf("claim %q: %w", key, err)
+		}
+	}
+	return result, nil
 }
 
 func appendUnique(ids []uuid.UUID, id uuid.UUID) []uuid.UUID {
@@ -155,24 +241,4 @@ func appendUnique(ids []uuid.UUID, id uuid.UUID) []uuid.UUID {
 		}
 	}
 	return append(ids, id)
-}
-
-// conflictError names every conflicting address and its competing accounts.
-func conflictError(conflicts map[string][]uuid.UUID) error {
-	keys := make([]string, 0, len(conflicts))
-	for key := range conflicts {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	parts := make([]string, 0, len(keys))
-	for _, key := range keys {
-		owners := conflicts[key]
-		names := make([]string, 0, len(owners))
-		for _, owner := range owners {
-			names = append(names, owner.String())
-		}
-		parts = append(parts, fmt.Sprintf("%s held by %s", key, strings.Join(names, ", ")))
-	}
-	return fmt.Errorf("claimed_emails backfill aborted: %d address(es) held by more than one account: %s",
-		len(keys), strings.Join(parts, "; "))
 }

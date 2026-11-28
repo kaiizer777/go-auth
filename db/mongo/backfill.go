@@ -162,9 +162,12 @@ func BackfillOAuthAccountVerified(ctx context.Context, database *mongo.Database)
 const claimedEmailsBackfillID = "000014_create_claimed_emails"
 
 // BackfillClaimedEmails populates the claimed_emails collection from users.email
-// and oauth_accounts.email, mirroring SQL migration 000014. The key is
-// db.NormalizeEmail, computed here so it is byte-identical to every Go write path;
-// empty and whitespace-only addresses are skipped.
+// and oauth_accounts.email. It is an explicit operator/embedder utility, not a
+// startup step: nothing calls it from Connect, because booting must never scan the
+// account tables. An embedder upgrading a database that already has users or links
+// must call it once. The key is db.NormalizeEmail, computed here so it is
+// byte-identical to every Go write path; empty and whitespace-only addresses are
+// skipped.
 //
 // It aborts, naming the address and both accounts, when the existing rows already
 // disagree about who owns one: electing a winner strips the losing account's
@@ -172,9 +175,8 @@ const claimedEmailsBackfillID = "000014_create_claimed_emails"
 // The insert is an idempotent $setOnInsert, so a run that aborted on the operator's
 // data converges when re-run after the offending links are removed.
 //
-// It runs on every connect, with no completed-marker gate: a marker would silently
-// skip addresses written after it, and a failed run would inherit partial reads.
-// The marker below records that a run completed; it is not used to skip.
+// Runs are safe to repeat: the completion marker below is recorded for operators,
+// but it does not gate, so a re-run also picks up rows added after the last run.
 func BackfillClaimedEmails(ctx context.Context, database *mongo.Database) error {
 	if database == nil {
 		return nil
