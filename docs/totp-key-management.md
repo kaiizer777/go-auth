@@ -11,8 +11,8 @@ here. Rows still in the pre-envelope layout are covered below.
 ## Configuration
 
 Both fields live under `TOTP`, and either one wires two-factor authentication up.
-A surface that is configured but unusable fails closed instead of silently
-serving 2FA-less logins (see below).
+A surface that is configured but unusable never becomes a silent 2FA-less login;
+where it surfaces depends on how the service is built (see below).
 
 | Field | Meaning |
 |---|---|
@@ -34,18 +34,25 @@ well. Consequences:
   row it cannot open instead of leaving it behind.
 
 `legacy` is a reserved kid. A `Keyring` that already defines it, combined with a
-non-empty `EncryptionKey`, fails configuration validation
-(`ErrTOTPKeyringInvalid`) at startup instead of passing and leaving every TOTP
-operation unusable. Give the pre-existing key a different kid and list it in
-`Keyring` instead. A `Keyring` that defines `legacy` with no `EncryptionKey` set
-composes no duplicate and is accepted.
+non-empty `EncryptionKey`, composes a duplicate entry: `Config.Validate` rejects
+it with `ErrTOTPKeyringInvalid`, while a service built straight from that
+`TOTPConfig` cannot initialize its crypto (see below). Give the pre-existing key
+a different kid and list it in `Keyring` instead. A `Keyring` that defines
+`legacy` with no `EncryptionKey` set composes no duplicate and is accepted.
 
-A configured-but-unusable key surface is never a silent "2FA off": the service
-is wired, startup logs `totp_crypto_config_invalid`, and every operation that
-seals or opens a secret fails closed (status reads need no key). A composed ring
-that does not parse, or that defines `legacy` while a non-empty `EncryptionKey`
-also joins the ring under that kid, fails `Validate` (`ErrTOTPKeyringInvalid`)
-before a config-built service starts.
+An unusable key surface is never silent, but the two ways of building the service
+guard it differently:
+
+- Through `Config.Validate` — called directly, or by `goauth.New`/`NewWithStore`,
+  which validate before the TOTP service is constructed — an unusable composed
+  ring (one that does not parse, or that collides with the reserved `legacy` kid)
+  returns `ErrTOTPKeyringInvalid` before any service exists. Nothing logs
+  `totp_crypto_config_invalid` on this path, because the constructor never runs.
+- `totp.NewServiceWithStore` (or `totp.New`) called directly with a
+  `config.TOTPConfig` performs no validation. The service is constructed with the
+  construction error recorded, the constructor logs a warning with event
+  `totp_crypto_config_invalid`, and every operation that seals or opens a secret
+  returns that error. Status reads need no key and keep working.
 
 ## Stored format and the legacy read path
 
