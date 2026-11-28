@@ -51,8 +51,10 @@ if _, err := db.BackfillClaimedEmails(ctx, gormDB); err != nil {
   of imported accounts. It writes its own idempotent `$setOnInsert` with
   `verified=false` and promotes in a second pass; it does not call the runtime
   `Claim`, whose `verified` argument carries the caller's attestation. Rows whose
-  address `ClaimKey` rejects are counted as skipped. It records the
-  `000014_create_claimed_emails` marker when a run completes.
+  address `ClaimKey` rejects are skipped; the MongoDB utility returns only an
+  error, so the count is reported as `claims_skipped` in its completion log, not to
+  the caller. It records the `000014_create_claimed_emails` marker when a run
+  completes.
 
 Both key with `db.NormalizeEmail` and are idempotent: re-running after success
 changes nothing, and a re-run picks up rows added after the previous run. Neither
