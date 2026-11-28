@@ -13,30 +13,20 @@
 --
 -- verified records that the holder proved the mailbox. An unverified claim is a
 -- reservation by an unproved credential, so a provider that attests the address
--- may take the account over; a verified claim cannot be taken over. Existing rows
--- are backfilled as verified only when they can already be trusted: a users row is
--- verified, and a link is verified when the provider attested it.
+-- may take the account over; a verified claim cannot be taken over.
 --
--- Unlike PostgreSQL, the primary key has to exist before the backfill here: it is
--- what aborts a cross-account collision, by rejecting the second row for the key.
--- The error names the address but not both accounts; MySQL cannot raise a custom
--- diagnostic without a stored routine and extra grants, which this migration set
--- does not require.
---
--- Backfill collision policy: abort rather than pick a winner. Electing one silently
--- strips the losing account's address attribution while leaving its rows pointing
--- at an address it does not claim, which is exactly the corruption this table
--- exists to prevent. Deploy stays blocked until an operator deletes the offending
--- links. A key held by one account through several links is not a collision: the
--- GROUP BY collapses it into one row.
+-- This migration is DDL only: it deliberately backfills nothing. SQL LOWER() and
+-- TRIM() cannot reproduce db.NormalizeEmail. LOWER() folds by collation (here
+-- utf8mb4_unicode_ci) and TRIM() strips only spaces where strings.TrimSpace also
+-- drops tabs and newlines, so a row computed in SQL would be stored under a key
+-- the application can never produce or match and the race would survive for the
+-- addresses meant to be migrated. Importing existing rows is a one-shot Go job
+-- instead: gormstore.BackfillClaimedEmails normalises with db.NormalizeEmail, is
+-- idempotent, and aborts naming every address held by more than one account
+-- rather than picking a winner. No production data existed when 000014 shipped.
 --
 -- MySQL DDL is not transactional, so a failed run needs manual recovery:
---   * Backfill aborted (Duplicate entry ... for key 'claimed_emails.PRIMARY'):
---     the table exists but is only partially populated. Resolve the duplicate
---     links, `migrate force 13` and re-run 000014; the insert is keyed, so
---     re-running it against the surviving rows converges.
---   * Failed after the backfill: do NOT re-run this file blindly. Check the table,
---     then `migrate force 13` and re-run 000014.
+-- check for claimed_emails, then `migrate force 13` and re-run 000014.
 CREATE TABLE IF NOT EXISTS claimed_emails (
     email         VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
     owner_user_id VARCHAR(36) NOT NULL,
@@ -47,19 +37,3 @@ CREATE TABLE IF NOT EXISTS claimed_emails (
     CONSTRAINT fk_claimed_emails_owner_user_id FOREIGN KEY (owner_user_id) REFERENCES users(id) ON DELETE CASCADE,
     INDEX idx_claimed_emails_owner_user_id (owner_user_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-
--- MAX(verified) aggregates the flag per key, never per row, so a key whose only
--- holders are unverified links stays unverified. The GROUP BY also collapses the
--- legitimate multi-provider case into one row.
-INSERT INTO claimed_emails (email, owner_user_id, verified)
-SELECT h.claim_key, h.owner_user_id, MAX(h.verified)
-  FROM (
-        SELECT LOWER(TRIM(email)) AS claim_key, id AS owner_user_id, email_verified AS verified
-          FROM users
-         WHERE TRIM(email) <> ''
-        UNION ALL
-        SELECT LOWER(TRIM(email)) AS claim_key, user_id, verified
-          FROM oauth_accounts
-         WHERE TRIM(email) <> ''
-       ) h
- GROUP BY h.claim_key, h.owner_user_id;

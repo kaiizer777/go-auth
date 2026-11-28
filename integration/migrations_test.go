@@ -146,11 +146,12 @@ func TestMigrations_Lifecycle(t *testing.T) {
 	}
 }
 
-// TestMigrations_Claim000014BackfillAndDown pins the claim table on the real
-// dialect: the down path drops it (so no stale claim can block an address), and a
-// re-applied up rebuilds it from users.email and oauth_accounts.email with the
-// holder and the proved flag derived from those rows.
-func TestMigrations_Claim000014BackfillAndDown(t *testing.T) {
+// TestMigrations_Claim000014IsDDLOnly pins the claim table on the real dialect:
+// the down path drops it (so a rollback cannot leave a stale claim blocking an
+// address), the up creates it empty even though addresses already exist (the
+// import is a Go job: SQL lower()/trim() cannot reproduce db.NormalizeEmail), and
+// the unique key holds one row per claim key.
+func TestMigrations_Claim000014IsDDLOnly(t *testing.T) {
 	dbURL := resolveDatabaseURL()
 	sqlDB, err := sql.Open("pgx", dbURL)
 	if err != nil {
@@ -178,165 +179,48 @@ func TestMigrations_Claim000014BackfillAndDown(t *testing.T) {
 		t.Fatalf("m.Up() failed: %v", err)
 	}
 	_, _ = migrateDB.Exec("TRUNCATE TABLE sessions, verification_tokens, password_reset_tokens, oauth_accounts, totp_secrets, totp_used_codes, two_factor_tokens, claimed_emails, users CASCADE")
-
-	ownerID := uuid.New()
-	linkerID := uuid.New()
-	if _, err := migrateDB.Exec(`INSERT INTO users (id, email, password_hash, email_verified) VALUES ($1, $2, 'hash', TRUE)`,
-		ownerID, "claim-owner@example.test"); err != nil {
-		t.Fatalf("seed owner: %v", err)
-	}
-	if _, err := migrateDB.Exec(`INSERT INTO users (id, email, password_hash, email_verified) VALUES ($1, $2, 'hash', FALSE)`,
-		linkerID, "claim-linker@example.test"); err != nil {
-		t.Fatalf("seed linker: %v", err)
-	}
-	// A link whose address is not its owner's own address, and which the provider
-	// attested: the claim it produces is verified.
-	if _, err := migrateDB.Exec(`INSERT INTO oauth_accounts (id, user_id, provider_id, provider_tenant_id, provider_user_id, email, verified)
-		VALUES ($1, $2, 'google', '', 'sub-claim', $3, TRUE)`, uuid.New(), linkerID, "claim-link@example.test"); err != nil {
-		t.Fatalf("seed link: %v", err)
-	}
-
 	if err := m.Steps(-1); err != nil {
 		t.Fatalf("000014 down failed: %v", err)
 	}
-	var exists bool
-	if err := migrateDB.QueryRow(`SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'claimed_emails')`).Scan(&exists); err != nil {
-		t.Fatalf("query table: %v", err)
+
+	// Legacy rows that a SQL backfill would have folded differently: mixed case
+	// and a leading tab that only Go's TrimSpace strips.
+	ownerID := uuid.New()
+	if _, err := migrateDB.Exec(`INSERT INTO users (id, email, password_hash, email_verified) VALUES ($1, $2, 'hash', FALSE)`,
+		ownerID, "  Claim.Owner@Example.Test\t"); err != nil {
+		t.Fatalf("seed owner: %v", err)
 	}
-	if exists {
-		t.Fatal("000014 down left claimed_emails in place")
+	if _, err := migrateDB.Exec(`INSERT INTO oauth_accounts (id, user_id, provider_id, provider_tenant_id, provider_user_id, email, verified)
+		VALUES ($1, $2, 'google', '', 'sub-ddl-only', 'CLAIM.OWNER@example.test', FALSE)`, uuid.New(), ownerID); err != nil {
+		t.Fatalf("seed link: %v", err)
 	}
 
 	if err := m.Up(); err != nil {
 		t.Fatalf("re-applying 000014 failed: %v", err)
 	}
-	for _, tc := range []struct {
-		email    string
-		owner    uuid.UUID
-		verified bool
-	}{
-		{email: "claim-owner@example.test", owner: ownerID, verified: true},
-		{email: "claim-link@example.test", owner: linkerID, verified: true},
-	} {
-		var gotOwner uuid.UUID
-		var gotVerified bool
-		if err := migrateDB.QueryRow(`SELECT owner_user_id, verified FROM claimed_emails WHERE email = $1`, tc.email).
-			Scan(&gotOwner, &gotVerified); err != nil {
-			t.Fatalf("claim for %s: %v", tc.email, err)
-		}
-		if gotOwner != tc.owner || gotVerified != tc.verified {
-			t.Errorf("claim for %s = (%v, %v); want (%v, %v)", tc.email, gotOwner, gotVerified, tc.owner, tc.verified)
-		}
+	var claims int
+	if err := migrateDB.QueryRow(`SELECT COUNT(*) FROM claimed_emails`).Scan(&claims); err != nil {
+		t.Fatalf("count claims: %v", err)
 	}
-	var claimsFromUnverifiedAccount int
-	if err := migrateDB.QueryRow(`SELECT COUNT(*) FROM claimed_emails WHERE email = 'claim-linker@example.test'`).Scan(&claimsFromUnverifiedAccount); err != nil {
-		t.Fatalf("count claim: %v", err)
-	}
-	if claimsFromUnverifiedAccount != 1 {
-		t.Fatalf("unverified account claims = %d; want 1", claimsFromUnverifiedAccount)
-	}
-	// Leave the shared database as this test found it: the next migration test
-	// only rolls back to 000007 cleanly when oauth_accounts is empty.
-	if _, err := migrateDB.Exec(`DELETE FROM oauth_accounts WHERE user_id IN ($1, $2)`, ownerID, linkerID); err != nil {
-		t.Fatalf("remove seeded links: %v", err)
-	}
-	if _, err := migrateDB.Exec(`DELETE FROM users WHERE id IN ($1, $2)`, ownerID, linkerID); err != nil {
-		t.Fatalf("remove seeded users: %v", err)
-	}
-}
-
-// TestMigrations_Claim000014AbortsOnCrossAccountCollision proves the backfill
-// refuses to elect a winner: when a link of one account carries an address owned
-// by another, deploying 000014 fails and names both accounts instead of silently
-// stripping one of them.
-func TestMigrations_Claim000014AbortsOnCrossAccountCollision(t *testing.T) {
-	dbURL := resolveDatabaseURL()
-	sqlDB, err := sql.Open("pgx", dbURL)
-	if err != nil {
-		if os.Getenv("CI") != "" {
-			t.Fatalf("CI: failed to open postgres connection: %v", err)
-		}
-		t.Skipf("Postgres not available, skipping: %v", err)
-	}
-	defer func() { _ = sqlDB.Close() }()
-	pingCtx, pingCancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer pingCancel()
-	if err := sqlDB.PingContext(pingCtx); err != nil {
-		if os.Getenv("CI") != "" {
-			t.Fatalf("CI: PostgreSQL connection failed: %v", err)
-		}
-		t.Skipf("Postgres not available, skipping: %v", err)
+	if claims != 0 {
+		t.Fatalf("000014 wrote %d claims; the migration must not backfill", claims)
 	}
 
-	m, migrateDB := newMigrator(t, dbURL)
-	if err := m.Up(); err != nil && err != migrate.ErrNoChange {
-		t.Fatalf("m.Up() failed: %v", err)
+	// The application's key is the only key: one row per key, byte for byte.
+	key := db.NormalizeEmail("  Claim.Owner@Example.Test\t")
+	if _, err := migrateDB.Exec(`INSERT INTO claimed_emails (email, owner_user_id, verified) VALUES ($1, $2, FALSE)`, key, ownerID); err != nil {
+		t.Fatalf("insert app-keyed claim: %v", err)
 	}
-	_, _ = migrateDB.Exec("TRUNCATE TABLE sessions, verification_tokens, password_reset_tokens, oauth_accounts, totp_secrets, totp_used_codes, two_factor_tokens, claimed_emails, users CASCADE")
-	if err := m.Steps(-1); err != nil {
-		t.Fatalf("000014 down failed: %v", err)
-	}
-	_, _ = m.Close()
-	_ = migrateDB.Close()
-
-	// Two accounts disagree about who owns one address: users.email says owner,
-	// another account's link says holder.
-	ownerID, holderID := uuid.New(), uuid.New()
-	seedDB, err := sql.Open("pgx", dbURL)
-	if err != nil {
-		t.Fatalf("reopen: %v", err)
-	}
-	if _, err := seedDB.Exec(`INSERT INTO users (id, email, password_hash, email_verified) VALUES ($1, 'collision@example.test', 'hash', TRUE)`, ownerID); err != nil {
-		t.Fatalf("seed owner: %v", err)
-	}
-	if _, err := seedDB.Exec(`INSERT INTO users (id, email, password_hash, email_verified) VALUES ($1, 'collision-holder@example.test', 'hash', TRUE)`, holderID); err != nil {
-		t.Fatalf("seed holder: %v", err)
-	}
-	if _, err := seedDB.Exec(`INSERT INTO oauth_accounts (id, user_id, provider_id, provider_tenant_id, provider_user_id, email, verified)
-		VALUES ($1, $2, 'google', '', 'sub-collision', 'collision@example.test', TRUE)`, uuid.New(), holderID); err != nil {
-		t.Fatalf("seed colliding link: %v", err)
-	}
-	_ = seedDB.Close()
-
-	m2, migrateDB2 := newMigrator(t, dbURL)
-	upErr := m2.Up()
-	if upErr == nil {
-		t.Fatal("000014 applied over a cross-account collision; the backfill must abort")
-	}
-	msg := upErr.Error()
-	if !strings.Contains(msg, "claimed_emails backfill aborted") {
-		t.Fatalf("abort message = %q; want it to name the backfill", msg)
-	}
-	if !strings.Contains(msg, ownerID.String()) || !strings.Contains(msg, holderID.String()) {
-		t.Fatalf("abort message = %q; want both competing accounts named", msg)
+	if _, err := migrateDB.Exec(`INSERT INTO claimed_emails (email, owner_user_id, verified) VALUES ($1, $2, TRUE)`, key, ownerID); err == nil {
+		t.Fatal("a second claim row for the same key was accepted; the unique key is missing")
 	}
 
-	// Recovery: the aborted migration is a rolled-back transaction, so the table
-	// is absent; re-pin 13, remove the offending link, and deploy cleanly.
-	_, _ = m2.Close()
-	_ = migrateDB2.Close()
-	m3, migrateDB3 := newMigrator(t, dbURL)
-	if ferr := m3.Force(13); ferr != nil {
-		t.Fatalf("m3.Force(13) failed: %v", ferr)
+	if _, err := migrateDB.Exec(`DELETE FROM oauth_accounts WHERE user_id = $1`, ownerID); err != nil {
+		t.Fatalf("remove seeded link: %v", err)
 	}
-	if _, err := migrateDB3.Exec(`DELETE FROM oauth_accounts WHERE provider_user_id = 'sub-collision'`); err != nil {
-		t.Fatalf("remove colliding link: %v", err)
+	if _, err := migrateDB.Exec(`DELETE FROM users WHERE id = $1`, ownerID); err != nil {
+		t.Fatalf("remove seeded user: %v", err)
 	}
-	if err := m3.Up(); err != nil {
-		t.Fatalf("re-applying 000014 after the collision was resolved failed: %v", err)
-	}
-	var gotHolder uuid.UUID
-	if err := migrateDB3.QueryRow(`SELECT owner_user_id FROM claimed_emails WHERE email = 'collision@example.test'`).Scan(&gotHolder); err != nil {
-		t.Fatalf("claim after recovery: %v", err)
-	}
-	if gotHolder != ownerID {
-		t.Fatalf("claim owner = %v; want the surviving account %v", gotHolder, ownerID)
-	}
-	if _, err := migrateDB3.Exec(`DELETE FROM users WHERE id IN ($1, $2)`, ownerID, holderID); err != nil {
-		t.Fatalf("remove seeded users: %v", err)
-	}
-	_, _ = m3.Close()
-	_ = migrateDB3.Close()
 }
 
 func TestMigrations_DownRefusedOnSeededDB(t *testing.T) {
