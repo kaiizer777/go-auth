@@ -2191,6 +2191,62 @@ func TestService_ResetPassword_PromotesClaimToVerified(t *testing.T) {
 	}
 }
 
+func TestService_ResetPassword_ReleasesClaimOfPurgedLink(t *testing.T) {
+	database := setupTestDB(t)
+	cfg := testConfig()
+	store := gormstore.New(database)
+	svc, err := NewWithStore(cfg, store, email.Hooks{})
+	if err != nil {
+		t.Fatalf("NewWithStore: %v", err)
+	}
+	ctx := context.Background()
+
+	const addr = "purge-owner@example.com"
+	const legacyAddr = "purge-legacy@example.com"
+	user, _, serr := svc.Signup(ctx, db.SignupRequest{Email: addr, Password: "SignupPass#2026!"})
+	if serr != nil || user == nil {
+		t.Fatalf("signup = %v, %v", user, serr)
+	}
+	// A pre-#92-era row: the account's unverified link carries an address that is
+	// not its own, and the account claims that address.
+	link := db.OAuthAccount{ID: uuid.New(), UserID: user.ID, ProviderID: "github",
+		ProviderUserID: "sub-legacy-purge", Email: legacyAddr}
+	if err := database.Create(&link).Error; err != nil {
+		t.Fatalf("seed legacy link: %v", err)
+	}
+	if err := store.ClaimedEmails().Claim(ctx, legacyAddr, user.ID, false); err != nil {
+		t.Fatalf("seed claim: %v", err)
+	}
+
+	raw, rerr := svc.RequestPasswordReset(ctx, db.PasswordResetRequest{Email: addr})
+	if rerr != nil {
+		t.Fatalf("RequestPasswordReset: %v", rerr)
+	}
+	if _, err := svc.ResetPassword(ctx, db.PasswordResetConfirmRequest{Token: raw, NewPassword: "ResetClaim#2026!"}); err != nil {
+		t.Fatalf("ResetPassword: %v", err)
+	}
+
+	// The purge removed the untrusted link and released the address it held, so the
+	// address is not permanently blocked.
+	var links int64
+	if err := database.Model(&db.OAuthAccount{}).Where("user_id = ?", user.ID).Count(&links).Error; err != nil {
+		t.Fatalf("count links: %v", err)
+	}
+	if links != 0 {
+		t.Fatalf("unverified links surviving the purge = %d; want 0", links)
+	}
+	if _, gerr := store.ClaimedEmails().Get(ctx, legacyAddr); !errors.Is(gerr, gorm.ErrRecordNotFound) {
+		t.Fatalf("claim for the purged link survived, err = %v", gerr)
+	}
+	rival := db.User{ID: uuid.New(), Email: "purge-rival@work.example", PasswordHash: "hash"}
+	if err := store.Users().Create(ctx, &rival); err != nil {
+		t.Fatalf("seed rival: %v", err)
+	}
+	if err := store.ClaimedEmails().Claim(ctx, legacyAddr, rival.ID, false); err != nil {
+		t.Fatalf("re-claim after release: %v", err)
+	}
+}
+
 func TestService_DispatchEmailAsync_SaturationOverflowAndPendingRelease(t *testing.T) {
 	database := setupTestDB(t)
 	cfg := testConfig()
