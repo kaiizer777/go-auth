@@ -1598,6 +1598,57 @@ func TestTakeoverRefusedForUnverifiedProviderEmail(t *testing.T) {
 	}
 }
 
+// TestTakeoverRefusedWithoutProviderAttestation drives the guard directly: the
+// public callback rejects an unattested address before it can reach the handover,
+// so this pins the guard's own contract — no credential is touched and nothing is
+// promoted when the provider did not attest the mailbox.
+func TestTakeoverRefusedWithoutProviderAttestation(t *testing.T) {
+	const addr = "direct-unattested@example.test"
+	database, cfg, _, rawSvc := setupServiceTest(t, &UserInfo{
+		ProviderID: "google", ProviderUserID: "sub-direct", Email: addr, EmailVerified: false,
+	})
+	ctx := context.Background()
+	svc := rawSvc.(*service)
+	base := svc.store
+
+	squatter := db.User{ID: uuid.New(), Email: addr, PasswordHash: "hash"}
+	if err := base.Users().Create(ctx, &squatter); err != nil {
+		t.Fatalf("seed squatter: %v", err)
+	}
+	if err := base.ClaimedEmails().Claim(ctx, addr, squatter.ID, false); err != nil {
+		t.Fatalf("seed claim: %v", err)
+	}
+	if _, _, err := session.NewService(database, cfg).
+		CreateSession(ctx, squatter.ID, squatter.CredentialVersion, db.SessionTypeCookie, "127.0.0.1", "ua"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	owner, err := base.Users().GetByID(ctx, squatter.ID)
+	if err != nil {
+		t.Fatalf("load owner: %v", err)
+	}
+	terr := svc.takeoverUnverifiedAccount(ctx, base, owner,
+		&UserInfo{ProviderID: "google", Email: addr, EmailVerified: false})
+	if !errors.Is(terr, errors.ErrOAuthAccountLinkConflict) {
+		t.Fatalf("takeover = %v; want ErrOAuthAccountLinkConflict", terr)
+	}
+
+	after, err := base.Users().GetByID(ctx, squatter.ID)
+	if err != nil {
+		t.Fatalf("reload owner: %v", err)
+	}
+	if after.PasswordHash != squatter.PasswordHash || after.EmailVerified {
+		t.Errorf("account changed (password=%q verified=%v); want it untouched",
+			after.PasswordHash, after.EmailVerified)
+	}
+	if claim, cerr := base.ClaimedEmails().Get(ctx, addr); cerr != nil || claim.Verified {
+		t.Fatalf("claim = %+v, %v; want it left unverified", claim, cerr)
+	}
+	if sessions, serr := base.Sessions().ListByUserID(ctx, squatter.ID); serr != nil || len(sessions) != 1 {
+		t.Fatalf("sessions = %d, %v; want the existing session untouched", len(sessions), serr)
+	}
+}
+
 // TestTakeoverIsRetryable pins that repeating the proving callback is safe: the
 // identity resolves its own link, no second account or link appears, and the
 // account stays proved.
