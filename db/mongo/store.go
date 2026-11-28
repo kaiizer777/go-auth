@@ -1345,11 +1345,17 @@ func (s *claimedEmailStore) Claim(ctx context.Context, email string, ownerID uui
 		// promotion can be applied here. With a session the transaction is already
 		// dead; the winner's own flow (or a later claim) promotes it.
 		if s.store.session == nil && verified && !winner.Verified {
-			_, uerr := s.collection().UpdateOne(ctx,
+			res, uerr := s.collection().UpdateOne(ctx,
 				claimOwnerFilter{ID: key, OwnerID: ownerID.String()},
 				bson.M{"$set": bson.M{"verified": true, "updated_at": now}},
 			)
-			return uerr
+			if uerr != nil {
+				return uerr
+			}
+			if res.MatchedCount == 0 {
+				return errors.ErrEmailClaimed
+			}
+			return nil
 		}
 		return nil
 	}
@@ -1365,11 +1371,18 @@ func (s *claimedEmailStore) Claim(ctx context.Context, email string, ownerID uui
 		return errors.ErrEmailClaimed
 	}
 	if verified && !claim.Verified {
-		_, uerr := s.collection().UpdateOne(sessionCtx,
+		res, uerr := s.collection().UpdateOne(sessionCtx,
 			claimOwnerFilter{ID: key, OwnerID: ownerID.String()},
 			bson.M{"$set": bson.M{"verified": true, "updated_at": now}},
 		)
-		return uerr
+		if uerr != nil {
+			return uerr
+		}
+		if res.MatchedCount == 0 {
+			// Released or reowned between the read and the promotion: the caller no
+			// longer holds the claim and must treat it as a lost race.
+			return errors.ErrEmailClaimed
+		}
 	}
 	return nil
 }
@@ -1390,9 +1403,9 @@ func (s *claimedEmailStore) Get(ctx context.Context, email string) (*db.ClaimedE
 }
 
 // Release deletes the holder's claim. It keys on NormalizeEmail rather than
-// ClaimKey so it can remove a row that a legacy or manual write stored under an
-// address the current rule would not create; an invalid address simply matches
-// nothing. The filter is still a typed struct, so the value is data only.
+// ClaimKey, so a legacy row stored under an address the current rule would not
+// create is still matched and removed; a value that matches no row is a no-op.
+// The filter is still a typed struct, so the value is data only.
 func (s *claimedEmailStore) Release(ctx context.Context, email string, ownerID uuid.UUID) error {
 	key := db.NormalizeEmail(email)
 	if key == "" {

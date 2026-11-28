@@ -16,10 +16,10 @@ import (
 // It enforces non-empty, max 255 length, no spaces, RFC 5322 compliance via net/mail,
 // and domain structure (at least one dot, no empty labels, no trailing/leading dots).
 //
-// This is the authenticity rule: login, password-reset requests and refresh only
-// need to recognise an existing address, so they must keep accepting a stored
-// address even if it would no longer fit a new claim key. Use ValidateClaimableEmail
-// where a claim is about to be created.
+// This is the authenticity rule: login and password-reset requests only need to
+// recognise an existing address, so they must keep accepting a stored address even
+// if it would no longer fit a new claim key. Use ValidateClaimableEmail where a
+// claim is about to be created.
 func ValidateEmail(email string) error {
 	if email == "" || strings.TrimSpace(email) == "" {
 		return errors.New(errors.CodeInvalidEmail, "email is required", nil)

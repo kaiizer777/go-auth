@@ -44,13 +44,15 @@ if _, err := db.BackfillClaimedEmails(ctx, gormDB); err != nil {
   Rows whose address `ClaimKey` rejects are counted in `Skipped`, not imported.
 - MongoDB: `mongostore.BackfillClaimedEmails(ctx, database)` is the equivalent
   explicit call. It reads each collection through a cursor with an explicit batch
-  size (500 documents per fetch), so it holds one bounded page at a time and is not
+  size (500 documents per fetch), so cursor buffering is bounded; it is not
   keyset-paged like the SQL one: an existing account costs one read round trip and
-  a new one costs three (probe, upsert, re-read). It writes its own idempotent
-  `$setOnInsert` with `verified=false` and promotes in a second pass; it does not
-  call the runtime `Claim`, whose `verified` argument carries the caller's
-  attestation. Rows whose address `ClaimKey` rejects are counted as skipped. It
-  records the `000014_create_claimed_emails` marker when a run completes.
+  a new one costs three (probe, upsert, re-read). The run also retains the keys it
+  inserted so a later conflict can roll them back, so that set grows with the number
+  of imported accounts. It writes its own idempotent `$setOnInsert` with
+  `verified=false` and promotes in a second pass; it does not call the runtime
+  `Claim`, whose `verified` argument carries the caller's attestation. Rows whose
+  address `ClaimKey` rejects are counted as skipped. It records the
+  `000014_create_claimed_emails` marker when a run completes.
 
 Both key with `db.NormalizeEmail` and are idempotent: re-running after success
 changes nothing, and a re-run picks up rows added after the previous run. Neither

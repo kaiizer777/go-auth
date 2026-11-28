@@ -728,9 +728,8 @@ func (s *claimedEmailStore) Get(ctx context.Context, email string) (*db.ClaimedE
 }
 
 // Release deletes the holder's claim. It keys on NormalizeEmail rather than
-// ClaimKey so it can remove a row that a legacy or manual write stored under an
-// address the current rule would not create; an invalid address simply matches
-// nothing.
+// ClaimKey, so a legacy row stored under an address the current rule would not
+// create is still matched and removed; a value that matches no row is a no-op.
 func (s *claimedEmailStore) Release(ctx context.Context, email string, ownerID uuid.UUID) error {
 	key := db.NormalizeEmail(email)
 	if key == "" {
