@@ -13,6 +13,7 @@ import (
 	"github.com/kaiizer777/go-auth/auth"
 	"github.com/kaiizer777/go-auth/config"
 	"github.com/kaiizer777/go-auth/db"
+	gormstore "github.com/kaiizer777/go-auth/db/gorm"
 	"github.com/kaiizer777/go-auth/email"
 	"github.com/kaiizer777/go-auth/errors"
 	"github.com/kaiizer777/go-auth/session"
@@ -74,19 +75,20 @@ func signupPasswordVerified(t *testing.T, database *gorm.DB, cfg *config.Config,
 	}
 }
 
-// TestPasswordSquatCannotAttachLink is the squat chain end to end: an attacker
-// binds a password to an address it does not own, the explicit ?link=true attach
-// is refused because a caller-set password is not proof, and the owner's reset
-// leaves no attacker link behind.
-func TestPasswordSquatCannotAttachLink(t *testing.T) {
+// TestPasswordSquatLosesAccountToProviderProof is the pre-hijacking handover end
+// to end: an attacker binds a password to an address it does not own, and the
+// identity that proves the mailbox takes the account back. Nothing is deleted and
+// no second account appears; every credential the squatter held stops working.
+func TestPasswordSquatLosesAccountToProviderProof(t *testing.T) {
 	const addr = "squatted@example.test"
+	const squatterPassword = "CorrectHorseBattery9!"
 	database, cfg, _, svc := setupServiceTest(t, &UserInfo{
 		ProviderID: "google", ProviderUserID: "sub-squat",
 		Email: addr, EmailVerified: true,
 	})
 	ctx := context.Background()
 
-	signupPassword(t, database, cfg, addr, "CorrectHorseBattery9!")
+	signupPassword(t, database, cfg, addr, squatterPassword)
 	var squatter db.User
 	if err := database.Where("email = ?", addr).First(&squatter).Error; err != nil {
 		t.Fatalf("load squatted account: %v", err)
@@ -95,49 +97,70 @@ func TestPasswordSquatCannotAttachLink(t *testing.T) {
 		t.Fatalf("squatted account verified=%v hasPassword=%v; want an unverified password row",
 			squatter.EmailVerified, squatter.PasswordHash != "")
 	}
-	_, rawSession, err := session.NewService(database, cfg).
-		CreateSession(ctx, squatter.ID, squatter.CredentialVersion, db.SessionTypeCookie, "127.0.0.1", "ua")
+	sessSvc := session.NewService(database, cfg)
+	_, squatterSession, err := sessSvc.CreateSession(ctx, squatter.ID, squatter.CredentialVersion, db.SessionTypeCookie, "127.0.0.1", "ua")
 	if err != nil {
 		t.Fatalf("create session: %v", err)
 	}
-
-	state, cookie := initiateLinked(t, svc, cfg, "google", rawSession)
-	rec, req := callbackRequestWithSession(state, cookie, cfg, rawSession)
-	sess, _, _, err := svc.HandleCallback(ctx, rec, req, "google", "code-1", state, db.SessionTypeCookie)
-	if sess != nil {
-		t.Fatalf("session minted for %v; the squat must not authorize the link", sess.UserID)
-	}
-	requireCode(t, err, errors.CodeOAuthAccountLinkConflict, http.StatusConflict)
-	requireIdentityRows(t, database, 1, 0, 1)
-
-	// A link planted by the pre-hardening ?link=true path would be sitting on the
-	// squatted row unverified; the owner's reset must remove it instead of
-	// leaving it to mint sessions.
+	// A link the squatter planted earlier must not survive as a usable grant.
 	planted := db.OAuthAccount{ID: uuid.New(), UserID: squatter.ID, ProviderID: "github",
 		ProviderUserID: "sub-planted", Email: addr}
 	if err := database.Create(&planted).Error; err != nil {
 		t.Fatalf("seed planted link: %v", err)
 	}
-	authSvc, err := auth.New(*cfg, database, email.Hooks{})
+	if err := gormstore.New(database).OAuthAccounts().SaveOAuthTokens(ctx, planted.ID,
+		db.OAuthTokenRecord{AccessTokenCiphertext: "sealed-access", RefreshTokenCiphertext: "sealed-refresh", RefreshTokenFingerprint: "fp"}); err != nil {
+		t.Fatalf("seed planted grant: %v", err)
+	}
+
+	sess, err := linkIdentity(t, svc, cfg, "google", squatterSession)
 	if err != nil {
-		t.Fatalf("auth.New: %v", err)
+		t.Fatalf("provider-proven link = %v; want the account handed over", err)
 	}
-	rawToken, err := authSvc.RequestPasswordReset(ctx, db.PasswordResetRequest{Email: addr})
-	if err != nil {
-		t.Fatalf("RequestPasswordReset: %v", err)
+	if sess == nil || sess.UserID != squatter.ID {
+		t.Fatalf("session user = %v; want the proved account %v", sess, squatter.ID)
 	}
-	owner, err := authSvc.ResetPassword(ctx, db.PasswordResetConfirmRequest{
-		Token: rawToken, NewPassword: "OwnerPassword#2026!",
-	})
-	if err != nil {
-		t.Fatalf("ResetPassword: %v", err)
+
+	var after db.User
+	if err := database.Where("id = ?", squatter.ID).First(&after).Error; err != nil {
+		t.Fatalf("reload account: %v", err)
 	}
-	if !owner.EmailVerified {
-		t.Fatal("reset must mark the recovered address verified")
+	if after.PasswordHash != "" {
+		t.Error("the squatter's password hash must be cleared")
 	}
-	if n := countRows(t, database, &db.OAuthAccount{}); n != 0 {
-		t.Fatalf("oauth_accounts = %d; want 0 (the attacker's links must be purged)", n)
+	if !after.EmailVerified {
+		t.Error("the proved account must end up verified")
 	}
+	if after.CredentialVersion <= squatter.CredentialVersion {
+		t.Errorf("credential version = %d; want it bumped past %d", after.CredentialVersion, squatter.CredentialVersion)
+	}
+	authSvc, aerr := auth.New(*cfg, database, email.Hooks{})
+	if aerr != nil {
+		t.Fatalf("auth.New: %v", aerr)
+	}
+	if _, lerr := authSvc.Login(ctx, db.LoginRequest{Email: addr, Password: squatterPassword}); lerr == nil {
+		t.Fatal("the squatter's password still authenticates")
+	}
+	if _, serr := sessSvc.GetSession(ctx, squatterSession); serr == nil {
+		t.Fatal("the squatter's session survived the handover")
+	}
+	var plantedAfter db.OAuthAccount
+	if err := database.Where("id = ?", planted.ID).First(&plantedAfter).Error; err != nil {
+		t.Fatalf("reload planted link: %v", err)
+	}
+	if plantedAfter.RefreshTokenCiphertext != "" || plantedAfter.AccessTokenCiphertext != "" || plantedAfter.RefreshTokenFingerprint != "" {
+		t.Error("the squatter's provider grants must be revoked in place")
+	}
+
+	claim, cerr := svc.(*service).store.ClaimedEmails().Get(ctx, addr)
+	if cerr != nil {
+		t.Fatalf("load claim: %v", cerr)
+	}
+	if claim.OwnerUserID != squatter.ID || !claim.Verified {
+		t.Fatalf("claim = %+v; want it proved and held by %v", claim, squatter.ID)
+	}
+	// One account and the identity that proved it; nothing was merged or deleted.
+	requireIdentityRows(t, database, 1, 2, 1)
 }
 
 // signIn mints a cookie session for the account owning addr, standing in for
