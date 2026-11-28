@@ -1,6 +1,7 @@
 package gormstore
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -46,6 +47,12 @@ func setupTestDB(t *testing.T) (*gormdriver.DB, db.Store) {
 	)
 	if err != nil {
 		t.Fatalf("failed to auto-migrate models: %v", err)
+	}
+
+	// secret_kid is deliberately not on db.TotpSecret, so AutoMigrate cannot
+	// create it; add what migration 000013 adds.
+	if err := database.Exec("ALTER TABLE totp_secrets ADD COLUMN secret_kid VARCHAR(32) NOT NULL DEFAULT ''").Error; err != nil {
+		t.Fatalf("failed to add totp_secrets.secret_kid: %v", err)
 	}
 
 	store := New(database)
@@ -1712,4 +1719,113 @@ func TestStore_ContextCanceledErrors(t *testing.T) {
 	if err := store.Totp().RecordUsedCode(ctx, &db.TotpUsedCode{UserID: uid}); err == nil {
 		t.Fatal("expected error on RecordUsedCode with canceled ctx")
 	}
+}
+
+// TestTotpStore_RewrapPair covers the keyset read and the CAS write the sweep is
+// built on: pages ordered by id, pending and enabled rows alike, one statement
+// writing ciphertext and hint, and a stale expectation reported as a miss.
+func TestTotpStore_RewrapPair(t *testing.T) {
+	database, store := setupTestDB(t)
+	ctx := context.Background()
+	totpStore := store.Totp()
+
+	rows, err := totpStore.ListSecretsForRewrap(ctx, uuid.Nil, 10)
+	if err != nil {
+		t.Fatalf("empty ListSecretsForRewrap: %v", err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("empty table returned %d rows", len(rows))
+	}
+
+	blobs := make(map[uuid.UUID][]byte)
+	ids := make([]uuid.UUID, 0, 3)
+	for i := 0; i < 3; i++ {
+		secret := &db.TotpSecret{
+			UserID:          uuid.New(),
+			EncryptedSecret: []byte(fmt.Sprintf("blob-%d", i)),
+			BackupCodes:     []byte("[]"),
+			Enabled:         i%2 == 0,
+		}
+		if err := totpStore.CreateSecret(ctx, secret); err != nil {
+			t.Fatalf("CreateSecret: %v", err)
+		}
+		ids = append(ids, secret.ID)
+		blobs[secret.ID] = secret.EncryptedSecret
+	}
+
+	var paged []db.TotpSecretRewrap
+	cursor := uuid.Nil
+	for {
+		page, err := totpStore.ListSecretsForRewrap(ctx, cursor, 2)
+		if err != nil {
+			t.Fatalf("ListSecretsForRewrap: %v", err)
+		}
+		paged = append(paged, page...)
+		if len(page) < 2 {
+			break
+		}
+		cursor = page[len(page)-1].ID
+	}
+	if len(paged) != len(ids) {
+		t.Fatalf("paged %d rows, want %d", len(paged), len(ids))
+	}
+	for i, row := range paged {
+		if i > 0 && paged[i-1].ID.String() >= row.ID.String() {
+			t.Fatalf("rows are not ordered by id at %d", i)
+		}
+		if row.UserID == uuid.Nil {
+			t.Errorf("row %s lost its user id", row.ID)
+		}
+		if !equalsBytes(row.EncryptedSecret, blobs[row.ID]) {
+			t.Errorf("row %s ciphertext mismatch", row.ID)
+		}
+		if row.SecretKid != "" {
+			t.Errorf("row %s hint = %q, want empty for a fresh enrolment", row.ID, row.SecretKid)
+		}
+	}
+
+	if page, err := totpStore.ListSecretsForRewrap(ctx, uuid.Nil, 0); err != nil || len(page) != 0 {
+		t.Fatalf("limit 0 returned (%d rows, %v)", len(page), err)
+	}
+
+	target := ids[0]
+	updated, err := totpStore.UpdateSecretForRewrap(ctx, target, blobs[target], []byte("new-blob"), "k2")
+	if err != nil {
+		t.Fatalf("UpdateSecretForRewrap: %v", err)
+	}
+	if !updated {
+		t.Fatal("CAS update with the current ciphertext reported a miss")
+	}
+
+	var hint string
+	if err := database.Raw("SELECT secret_kid FROM totp_secrets WHERE id = ?", target.String()).Scan(&hint).Error; err != nil {
+		t.Fatalf("read hint: %v", err)
+	}
+	if hint != "k2" {
+		t.Fatalf("hint = %q, want k2", hint)
+	}
+
+	stale, err := totpStore.UpdateSecretForRewrap(ctx, target, blobs[target], []byte("stale-blob"), "k1")
+	if err != nil {
+		t.Fatalf("stale UpdateSecretForRewrap: %v", err)
+	}
+	if stale {
+		t.Fatal("CAS update with a stale ciphertext reported a hit")
+	}
+
+	var ciphertext []byte
+	var hintAfterStale string
+	if err := database.Raw("SELECT encrypted_secret, secret_kid FROM totp_secrets WHERE id = ?", target.String()).Row().Scan(&ciphertext, &hintAfterStale); err != nil {
+		t.Fatalf("read row after stale CAS: %v", err)
+	}
+	if !equalsBytes(ciphertext, []byte("new-blob")) {
+		t.Fatalf("ciphertext = %q, want new-blob", ciphertext)
+	}
+	if hintAfterStale != "k2" {
+		t.Fatalf("hint after a missed CAS = %q, want k2", hintAfterStale)
+	}
+}
+
+func equalsBytes(a, b []byte) bool {
+	return bytes.Equal(a, b)
 }

@@ -124,6 +124,15 @@ type OAuthAccountStore interface {
 	SaveOAuthAccessCAS(ctx context.Context, id uuid.UUID, expectedCiphertext string, rec OAuthTokenRecord) (bool, error)
 }
 
+// TotpSecretRewrap is one stored TOTP secret as the rewrap sweep needs it: the
+// ciphertext plus the recorded key-id hint, which is "" when unknown.
+type TotpSecretRewrap struct {
+	ID              uuid.UUID
+	UserID          uuid.UUID
+	EncryptedSecret []byte
+	SecretKid       string
+}
+
 // TotpStore defines storage operations for RFC 6238 TOTP two-factor authentication.
 type TotpStore interface {
 	CreateSecret(ctx context.Context, secret *TotpSecret) error
@@ -136,6 +145,16 @@ type TotpStore interface {
 	DeleteSecret(ctx context.Context, userID uuid.UUID) error
 	DeleteUnconfirmedSecret(ctx context.Context, userID uuid.UUID) error
 	IsTotpEnabled(ctx context.Context, userID uuid.UUID) (bool, error)
+
+	// ListSecretsForRewrap returns up to limit secrets ordered by id, starting
+	// after afterID; uuid.Nil starts at the first row and limit <= 0 selects
+	// nothing. Both enabled and pending rows are returned.
+	ListSecretsForRewrap(ctx context.Context, afterID uuid.UUID, limit int) ([]TotpSecretRewrap, error)
+	// UpdateSecretForRewrap replaces one row's ciphertext and key-id hint in a
+	// single statement, but only while the ciphertext still equals
+	// expectedCiphertext. A miss means a concurrent writer owns the row and is
+	// reported as (false, nil).
+	UpdateSecretForRewrap(ctx context.Context, id uuid.UUID, expectedCiphertext, newCiphertext []byte, newKid string) (bool, error)
 
 	HasUsedCode(ctx context.Context, userID uuid.UUID, codeHash []byte, since time.Time) (bool, error)
 	RecordUsedCode(ctx context.Context, usedCode *TotpUsedCode) error

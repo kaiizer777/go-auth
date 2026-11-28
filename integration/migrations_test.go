@@ -3,8 +3,10 @@
 package integration
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"reflect"
@@ -15,6 +17,7 @@ import (
 	"github.com/golang-migrate/migrate/v4"
 	pgmigrate "github.com/golang-migrate/migrate/v4/database/postgres"
 	"github.com/golang-migrate/migrate/v4/source/iofs"
+	"github.com/jackc/pgx/v5/pgconn"
 	_ "github.com/jackc/pgx/v5/stdlib"
 
 	"github.com/kaiizer777/go-auth/db"
@@ -247,8 +250,8 @@ func TestMigrations_DownRefusedOnSeededDB(t *testing.T) {
 	if _, err := sqlDB2.Exec(`DELETE FROM users WHERE email = 'down-rollback@example.com'`); err != nil {
 		t.Fatalf("failed to remove seed row: %v", err)
 	}
-	if verr, ddirty, verr2 := m2.Version(); verr2 != nil || verr != 12 || ddirty {
-		t.Fatalf("expected version 12 clean after re-up, got version=%d dirty=%v err=%v", verr, ddirty, verr2)
+	if verr, ddirty, verr2 := m2.Version(); verr2 != nil || verr != 13 || ddirty {
+		t.Fatalf("expected version 13 clean after re-up, got version=%d dirty=%v err=%v", verr, ddirty, verr2)
 	}
 }
 
@@ -936,4 +939,120 @@ func postgresConstraintExists(t *testing.T, sqlDB *sql.DB, name string) bool {
 		t.Fatalf("query constraint %s: %v", name, err)
 	}
 	return exists
+}
+
+// TestMigration000013_UpAndDown proves the key-id hint is bookkeeping the ciphertext
+// survives: up adds one NOT NULL empty-default column, down drops exactly that
+// column without touching stored secrets, and re-applying up backfills the hint
+// to unknown for rows that predate it.
+func TestMigration000013_UpAndDown(t *testing.T) {
+	dbURL := resolveDatabaseURL()
+	testDB, err := sql.Open("pgx", dbURL)
+	if err != nil {
+		if os.Getenv("CI") != "" {
+			t.Fatalf("CI: failed to open postgres connection: %v", err)
+		}
+		t.Skipf("Postgres not available, skipping: %v", err)
+	}
+	pingCtx, pingCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer pingCancel()
+	if err := testDB.PingContext(pingCtx); err != nil {
+		_ = testDB.Close()
+		if os.Getenv("CI") != "" {
+			t.Fatalf("CI: PostgreSQL connection failed: %v", err)
+		}
+		t.Skipf("Postgres not available, skipping: %v", err)
+	}
+	_ = testDB.Close()
+
+	m, sqlDB := newMigrator(t, dbURL)
+	t.Cleanup(func() {
+		_, _ = m.Close()
+		_ = sqlDB.Close()
+	})
+
+	if err := m.Migrate(12); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("m.Migrate(12) failed: %v", err)
+	}
+
+	var userID string
+	if err := sqlDB.QueryRow(`INSERT INTO users (email, password_hash, credential_version, email_verified) VALUES
+		('totp-kid-013@example.com', 'hash', 1, true) RETURNING id`).Scan(&userID); err != nil {
+		t.Fatalf("failed to seed user: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = sqlDB.Exec(`DELETE FROM totp_secrets WHERE user_id = $1`, userID)
+		_, _ = sqlDB.Exec(`DELETE FROM users WHERE id = $1`, userID)
+	})
+
+	// A pre-envelope row: 12-byte nonce || ciphertext || 16-byte tag.
+	ciphertext := []byte("013-nonce||ciphertext||tag-payload")
+	if _, err := sqlDB.Exec(`INSERT INTO totp_secrets (user_id, encrypted_secret, backup_codes, enabled) VALUES ($1, $2, '[]', true)`, userID, ciphertext); err != nil {
+		t.Fatalf("failed to seed totp secret: %v", err)
+	}
+
+	if err := m.Steps(1); err != nil {
+		t.Fatalf("000013 up migration failed: %v", err)
+	}
+
+	requireHint := func(t *testing.T, want string) {
+		t.Helper()
+		var (
+			nullable   bool
+			columnType string
+			columnLen  int
+			hint       string
+			stored     []byte
+		)
+		if err := sqlDB.QueryRow(`
+			SELECT is_nullable = 'YES', data_type, character_maximum_length
+			FROM information_schema.columns
+			WHERE table_schema = 'public' AND table_name = 'totp_secrets' AND column_name = 'secret_kid'
+		`).Scan(&nullable, &columnType, &columnLen); err != nil {
+			t.Fatalf("failed to inspect secret_kid column: %v", err)
+		}
+		if nullable || columnType != "character varying" || columnLen != 32 {
+			t.Fatalf("secret_kid = (%s(%d), nullable %v); want varchar(32) NOT NULL", columnType, columnLen, nullable)
+		}
+		if err := sqlDB.QueryRow(`SELECT secret_kid, encrypted_secret FROM totp_secrets WHERE user_id = $1`, userID).Scan(&hint, &stored); err != nil {
+			t.Fatalf("failed to read totp row: %v", err)
+		}
+		if hint != want {
+			t.Fatalf("secret_kid = %q; want %q", hint, want)
+		}
+		if !bytes.Equal(stored, ciphertext) {
+			t.Fatalf("000013 changed the stored ciphertext")
+		}
+	}
+	requireHint(t, "")
+
+	if err := m.Steps(-1); err != nil {
+		t.Fatalf("000013 down migration failed: %v", err)
+	}
+	// Probing the column directly is the property under test: an information_schema
+	// lookup can pass on a schema mismatch, a read of a dropped column cannot.
+	var (
+		probeHint string
+		pgErr     *pgconn.PgError
+	)
+	err = sqlDB.QueryRow(`SELECT secret_kid FROM totp_secrets LIMIT 0`).Scan(&probeHint)
+	if !errors.As(err, &pgErr) || pgErr.Code != "42703" {
+		t.Fatalf("reading secret_kid after down = %v; want undefined_column (42703)", err)
+	}
+	var storedAfterDown []byte
+	if err := sqlDB.QueryRow(`SELECT encrypted_secret FROM totp_secrets WHERE user_id = $1`, userID).Scan(&storedAfterDown); err != nil {
+		t.Fatalf("failed to read totp row after down: %v", err)
+	}
+	if !bytes.Equal(storedAfterDown, ciphertext) {
+		t.Fatal("000013 down changed the stored ciphertext")
+	}
+
+	if err := m.Steps(1); err != nil {
+		t.Fatalf("re-applying 000013 failed: %v", err)
+	}
+	requireHint(t, "")
+
+	if err := m.Up(); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("restoring head failed: %v", err)
+	}
 }

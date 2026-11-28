@@ -1563,6 +1563,7 @@ func TestConfigSecretsMaskedUnderFormatVerbs(t *testing.T) {
 		clientSecret  = "provider-super-secret"
 		privateKey    = "private-key-super-secret"
 		totpKey       = "totp-super-secret"
+		totpKeyring   = "totp-keyring-super-secret"
 		msSecret      = "microsoft-super-secret"
 		fbSecret      = "facebook-super-secret"
 		discordSecret = "discord-super-secret"
@@ -1594,7 +1595,7 @@ func TestConfigSecretsMaskedUnderFormatVerbs(t *testing.T) {
 	cfg := Config{
 		DatabaseURL: "postgres://admin:" + dbPassword + "@localhost:5432/auth",
 		OAuth:       oauthCfg,
-		TOTP:        TOTPConfig{EncryptionKey: totpKey},
+		TOTP:        TOTPConfig{EncryptionKey: totpKey, Keyring: totpKeyring},
 	}
 
 	cases := []struct {
@@ -1602,10 +1603,10 @@ func TestConfigSecretsMaskedUnderFormatVerbs(t *testing.T) {
 		value   any
 		secrets []string
 	}{
-		{"Config", cfg, []string{dbPassword, stateSecret, tokenKEK, clientSecret, privateKey, totpKey}},
+		{"Config", cfg, []string{dbPassword, stateSecret, tokenKEK, clientSecret, privateKey, totpKey, totpKeyring}},
 		{"OAuthConfig", oauthCfg, []string{stateSecret, tokenKEK, clientSecret, privateKey, msSecret, fbSecret, discordSecret, xSecret}},
 		{"ProviderConfig", provider, []string{clientSecret, privateKey}},
-		{"TOTPConfig", cfg.TOTP, []string{totpKey}},
+		{"TOTPConfig", cfg.TOTP, []string{totpKey, totpKeyring}},
 		{"MicrosoftConfig", *oauthCfg.Microsoft, []string{msSecret}},
 		{"FacebookConfig", *oauthCfg.Facebook, []string{fbSecret}},
 		{"DiscordConfig", *oauthCfg.Discord, []string{discordSecret}},

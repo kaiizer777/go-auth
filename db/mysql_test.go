@@ -57,8 +57,8 @@ func TestMySQLDefaultMigrationsEmbedded(t *testing.T) {
 		current = next
 	}
 
-	if count != 12 {
-		t.Fatalf("expected 12 mysql migration versions, found %d", count)
+	if count != 13 {
+		t.Fatalf("expected 13 mysql migration versions, found %d", count)
 	}
 }
 

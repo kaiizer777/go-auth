@@ -27,7 +27,9 @@ const (
 	maxTokenEnvelope        = 8192
 )
 
-// Predefined sentinel errors for token envelope operations.
+// Predefined sentinel errors for envelope operations. The texts are the
+// observable surface of a public API, so they keep their original wording;
+// callers branch on the sentinel, never on the message.
 var (
 	ErrSealerUnconfigured   = errors.New(errors.CodeInternalError, "token sealer is not configured", nil)
 	ErrPlaintextTooLarge    = errors.New(errors.CodeValidationError, "token plaintext exceeds size limit", nil)
@@ -39,7 +41,10 @@ var (
 	ErrEmptyRefreshToken    = errors.New(errors.CodeValidationError, "refresh token is empty", nil)
 )
 
-type tokenEnvelope struct {
+// storedEnvelope is the one persisted envelope shape, shared by OAuth tokens and
+// owner-bound secrets. The layout is a stored-data contract: do not reorder or
+// rename fields.
+type storedEnvelope struct {
 	Version    int    `json:"v"`
 	Alg        string `json:"alg"`
 	Kid        string `json:"kid"`
@@ -47,15 +52,37 @@ type tokenEnvelope struct {
 	Ciphertext string `json:"ct"`
 }
 
+// envelopeSealer is the single envelope encoder/decoder. label is the domain
+// separator baked into the AAD, so an envelope sealed for one domain never
+// authenticates in another.
+type envelopeSealer struct {
+	ring         *Keyring
+	label        string
+	kind         string
+	maxPlaintext int
+	maxEnvelope  int
+	// maxBlob bounds how much input is inspected for an envelope. It equals
+	// maxEnvelope for a column that only ever holds envelopes and sits above it
+	// for a column that still holds legacy blobs, which were never size-capped.
+	maxBlob int
+}
+
 // TokenSealer seals and opens OAuth token envelopes under a Keyring.
 // The sealer owns the AAD label and field names so callers only supply row identity.
 type TokenSealer struct {
-	keyring *Keyring
+	sealer *envelopeSealer
 }
 
 // NewTokenSealer returns a sealer bound to ring. A nil or empty ring fails every seal and open.
 func NewTokenSealer(ring *Keyring) *TokenSealer {
-	return &TokenSealer{keyring: ring}
+	return &TokenSealer{sealer: &envelopeSealer{
+		ring:         ring,
+		label:        tokenAADLabel,
+		kind:         "token",
+		maxPlaintext: maxTokenPlaintext,
+		maxEnvelope:  maxTokenEnvelope,
+		maxBlob:      maxTokenEnvelope,
+	}}
 }
 
 // SealAccessToken encrypts an access token bound to the given provider and account.
@@ -98,16 +125,37 @@ func (s *TokenSealer) RefreshTokenFingerprint(token string) (string, error) {
 }
 
 func (s *TokenSealer) seal(field, providerID, accountID, plaintext string) (string, error) {
-	entry, err := s.entry()
+	if s == nil {
+		return "", ErrSealerUnconfigured
+	}
+	plaintextBytes := []byte(plaintext)
+	defer wipeBytes(plaintextBytes)
+	return s.sealer.seal([]string{providerID, accountID, field}, plaintextBytes)
+}
+
+func (s *TokenSealer) open(field, providerID, accountID, envelope string) (string, error) {
+	if s == nil {
+		return "", ErrSealerUnconfigured
+	}
+	plaintext, err := s.sealer.open([]string{providerID, accountID, field}, []byte(envelope))
 	if err != nil {
 		return "", err
 	}
-	if len(plaintext) > maxTokenPlaintext {
+	defer wipeBytes(plaintext)
+	return string(plaintext), nil
+}
+
+func (e *envelopeSealer) seal(components []string, plaintext []byte) (string, error) {
+	entry, err := e.active()
+	if err != nil {
+		return "", err
+	}
+	if len(plaintext) > e.maxPlaintext {
 		return "", errors.New(errors.CodeValidationError,
-			fmt.Sprintf("token plaintext must not exceed %d bytes", maxTokenPlaintext), ErrPlaintextTooLarge)
+			fmt.Sprintf("%s plaintext must not exceed %d bytes", e.kind, e.maxPlaintext), ErrPlaintextTooLarge)
 	}
 
-	aead, err := newTokenAEAD(entry.key)
+	aead, err := newEnvelopeAEAD(entry.key)
 	if err != nil {
 		return "", ErrSealFailed
 	}
@@ -117,12 +165,9 @@ func (s *TokenSealer) seal(field, providerID, accountID, plaintext string) (stri
 		return "", ErrSealFailed
 	}
 
-	plaintextBytes := []byte(plaintext)
-	defer wipeBytes(plaintextBytes)
+	ciphertext := aead.Seal(nil, nonce, plaintext, envelopeAAD(e.label, entry.kid, components))
 
-	ciphertext := aead.Seal(nil, nonce, plaintextBytes, tokenAAD(entry.kid, providerID, accountID, field))
-
-	encoded, err := json.Marshal(tokenEnvelope{
+	encoded, err := json.Marshal(storedEnvelope{
 		Version:    tokenEnvelopeVersion,
 		Alg:        tokenEnvelopeAlg,
 		Kid:        entry.kid,
@@ -135,21 +180,72 @@ func (s *TokenSealer) seal(field, providerID, accountID, plaintext string) (stri
 	return string(encoded), nil
 }
 
-func (s *TokenSealer) open(field, providerID, accountID, envelope string) (string, error) {
-	if _, err := s.entry(); err != nil {
-		return "", err
+func (e *envelopeSealer) open(components []string, envelope []byte) ([]byte, error) {
+	if _, err := e.active(); err != nil {
+		return nil, err
 	}
-	if len(envelope) > maxTokenEnvelope {
-		return "", errors.New(errors.CodeValidationError,
-			fmt.Sprintf("token envelope must not exceed %d bytes", maxTokenEnvelope), ErrEnvelopeTooLarge)
+	// maxBlob is the parsing budget, checked before parseEnvelope so no
+	// unbounded input is unmarshalled. It is not an envelope judgement: a column
+	// that still holds legacy blobs sits far above maxEnvelope, so a blob
+	// between the two limits is parsed and, when it is not an envelope, reaches
+	// the caller's legacy path.
+	if len(envelope) > e.maxBlob {
+		return nil, e.tooLarge(e.maxBlob)
 	}
 
-	var doc tokenEnvelope
-	if err := json.Unmarshal([]byte(envelope), &doc); err != nil {
-		return "", ErrEnvelopeMalformed
+	doc, nonce, ciphertext, ok := parseEnvelope(envelope)
+	if !ok {
+		return nil, ErrEnvelopeMalformed
+	}
+	// The cap judges only blobs that actually parse as envelopes.
+	if len(envelope) > e.maxEnvelope {
+		return nil, e.tooLarge(e.maxEnvelope)
+	}
+
+	key, ok := e.ring.lookup(doc.Kid)
+	if !ok {
+		return nil, ErrUnknownKeyID
+	}
+
+	aead, err := newEnvelopeAEAD(key)
+	if err != nil {
+		return nil, ErrEnvelopeMalformed
+	}
+
+	plaintext, err := aead.Open(nil, nonce, ciphertext, envelopeAAD(e.label, doc.Kid, components))
+	if err != nil {
+		return nil, ErrAuthenticationFailed
+	}
+	return plaintext, nil
+}
+
+func (e *envelopeSealer) tooLarge(limit int) error {
+	return errors.New(errors.CodeValidationError,
+		fmt.Sprintf("%s envelope must not exceed %d bytes", e.kind, limit), ErrEnvelopeTooLarge)
+}
+
+// active returns the key that encrypts new envelopes.
+func (e *envelopeSealer) active() (keyringEntry, error) {
+	if e == nil {
+		return keyringEntry{}, ErrSealerUnconfigured
+	}
+	entry, ok := e.ring.active()
+	if !ok {
+		return keyringEntry{}, ErrSealerUnconfigured
+	}
+	return entry, nil
+}
+
+// parseEnvelope validates the envelope structure and decodes its bodies.
+// It neither authenticates nor looks keys up, so a structurally valid envelope
+// can be inspected without opening it.
+func parseEnvelope(raw []byte) (storedEnvelope, []byte, []byte, bool) {
+	var doc storedEnvelope
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		return storedEnvelope{}, nil, nil, false
 	}
 	if doc.Version != tokenEnvelopeVersion || doc.Alg != tokenEnvelopeAlg || doc.Kid == "" {
-		return "", ErrEnvelopeMalformed
+		return storedEnvelope{}, nil, nil, false
 	}
 
 	// Strict decoding: the stored envelope is a canonical byte string, so a
@@ -157,44 +253,17 @@ func (s *TokenSealer) open(field, providerID, accountID, envelope string) (strin
 	// normalised to the same bytes the way the default decoder does.
 	nonce, err := base64.RawURLEncoding.Strict().DecodeString(doc.Nonce)
 	if err != nil || len(nonce) != gcmNonceSize {
-		return "", ErrEnvelopeMalformed
-	}
-
-	key, ok := s.keyring.lookup(doc.Kid)
-	if !ok {
-		return "", ErrUnknownKeyID
+		return storedEnvelope{}, nil, nil, false
 	}
 
 	ciphertext, err := base64.RawURLEncoding.Strict().DecodeString(doc.Ciphertext)
 	if err != nil || len(ciphertext) < gcmTagSize {
-		return "", ErrEnvelopeMalformed
+		return storedEnvelope{}, nil, nil, false
 	}
-
-	aead, err := newTokenAEAD(key)
-	if err != nil {
-		return "", ErrEnvelopeMalformed
-	}
-
-	plaintext, err := aead.Open(nil, nonce, ciphertext, tokenAAD(doc.Kid, providerID, accountID, field))
-	if err != nil {
-		return "", ErrAuthenticationFailed
-	}
-	defer wipeBytes(plaintext)
-	return string(plaintext), nil
+	return doc, nonce, ciphertext, true
 }
 
-func (s *TokenSealer) entry() (keyringEntry, error) {
-	if s == nil {
-		return keyringEntry{}, ErrSealerUnconfigured
-	}
-	entry, ok := s.keyring.active()
-	if !ok {
-		return keyringEntry{}, ErrSealerUnconfigured
-	}
-	return entry, nil
-}
-
-func newTokenAEAD(key keyMaterial) (cipher.AEAD, error) {
+func newEnvelopeAEAD(key keyMaterial) (cipher.AEAD, error) {
 	block, err := aes.NewCipher(key[:])
 	if err != nil {
 		return nil, err
@@ -202,22 +271,26 @@ func newTokenAEAD(key keyMaterial) (cipher.AEAD, error) {
 	return cipher.NewGCM(block)
 }
 
-// tokenAAD builds the fixed-order length-prefixed additional data:
-// label ‖ len(kid) ‖ kid ‖ len(providerID) ‖ providerID ‖ len(accountID) ‖ accountID ‖ len(field) ‖ field.
-func tokenAAD(kid, providerID, accountID, field string) []byte {
-	components := [4]string{kid, providerID, accountID, field}
-	size := len(tokenAADLabel)
+// envelopeAAD builds the fixed-order length-prefixed additional data:
+// label ‖ len(kid) ‖ kid ‖ len(component) ‖ component….
+func envelopeAAD(label, kid string, components []string) []byte {
+	size := len(label) + 4 + len(kid)
 	for _, component := range components {
 		size += 4 + len(component)
 	}
 
 	aad := make([]byte, 0, size)
-	aad = append(aad, tokenAADLabel...)
+	aad = append(aad, label...)
+	aad = appendLengthPrefixed(aad, kid)
 	for _, component := range components {
-		var length [4]byte
-		binary.BigEndian.PutUint32(length[:], uint32(len(component)))
-		aad = append(aad, length[:]...)
-		aad = append(aad, component...)
+		aad = appendLengthPrefixed(aad, component)
 	}
 	return aad
+}
+
+func appendLengthPrefixed(dst []byte, value string) []byte {
+	var length [4]byte
+	binary.BigEndian.PutUint32(length[:], uint32(len(value)))
+	dst = append(dst, length[:]...)
+	return append(dst, value...)
 }

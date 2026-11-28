@@ -464,6 +464,56 @@ func (s *totpStore) GetSecretByUserIDForUpdate(ctx context.Context, userID uuid.
 	return &sec, nil
 }
 
+// totpRewrapRow is the explicit projection the sweep reads. secret_kid is not on
+// db.TotpSecret on purpose: a modelled field would join every SELECT and every
+// INSERT, and a down-migrated database would then break all TOTP traffic.
+type totpRewrapRow struct {
+	ID              uuid.UUID `gorm:"column:id"`
+	UserID          uuid.UUID `gorm:"column:user_id"`
+	EncryptedSecret []byte    `gorm:"column:encrypted_secret"`
+	SecretKid       string    `gorm:"column:secret_kid"`
+}
+
+func (s *totpStore) ListSecretsForRewrap(ctx context.Context, afterID uuid.UUID, limit int) ([]db.TotpSecretRewrap, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+
+	var rows []totpRewrapRow
+	err := s.db.WithContext(ctx).
+		Table("totp_secrets").
+		Select("id, user_id, encrypted_secret, secret_kid").
+		Where("id > ?", afterID.String()).
+		Order("id ASC").
+		Limit(limit).
+		Scan(&rows).Error
+	if err != nil {
+		return nil, db.NormalizeMySQLError(err)
+	}
+
+	secrets := make([]db.TotpSecretRewrap, 0, len(rows))
+	for _, row := range rows {
+		secrets = append(secrets, db.TotpSecretRewrap{
+			ID:              row.ID,
+			UserID:          row.UserID,
+			EncryptedSecret: row.EncryptedSecret,
+			SecretKid:       row.SecretKid,
+		})
+	}
+	return secrets, nil
+}
+
+func (s *totpStore) UpdateSecretForRewrap(ctx context.Context, id uuid.UUID, expectedCiphertext, newCiphertext []byte, newKid string) (bool, error) {
+	res := s.db.WithContext(ctx).Exec(
+		"UPDATE totp_secrets SET encrypted_secret = ?, secret_kid = ?, updated_at = ? WHERE id = ? AND encrypted_secret = ?",
+		newCiphertext, newKid, time.Now().UTC(), id.String(), expectedCiphertext,
+	)
+	if res.Error != nil {
+		return false, db.NormalizeMySQLError(res.Error)
+	}
+	return res.RowsAffected > 0, nil
+}
+
 func (s *totpStore) EnableSecret(ctx context.Context, secretID uuid.UUID, backupCodesJSON []byte) error {
 	res := s.db.WithContext(ctx).Model(&db.TotpSecret{}).Where("id = ? AND enabled = false", secretID).Updates(map[string]any{
 		"enabled":      true,

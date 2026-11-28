@@ -967,6 +967,81 @@ func (s *totpStore) GetSecretByUserIDForUpdate(ctx context.Context, userID uuid.
 	return doc.toDomain(), nil
 }
 
+// totpRewrapDoc is the stored shape the sweep reads; secret_kid is bookkeeping
+// only and absent on documents written before the sweep first touched them.
+type totpRewrapDoc struct {
+	ID              string `bson:"_id"`
+	UserID          string `bson:"user_id"`
+	EncryptedSecret []byte `bson:"encrypted_secret"`
+	SecretKid       string `bson:"secret_kid"`
+}
+
+func (s *totpStore) ListSecretsForRewrap(ctx context.Context, afterID uuid.UUID, limit int) ([]db.TotpSecretRewrap, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+
+	filter := bson.M{}
+	if afterID != uuid.Nil {
+		filter["_id"] = bson.M{"$gt": afterID.String()}
+	}
+	opts := options.Find().
+		SetSort(bson.D{{Key: "_id", Value: 1}}).
+		SetLimit(int64(limit))
+
+	resolveCtx := s.store.resolveCtx(ctx)
+	cursor, err := s.secrets().Find(resolveCtx, filter, opts)
+	if err != nil {
+		return nil, NormalizeMongoError(err)
+	}
+	defer func() {
+		_ = cursor.Close(resolveCtx)
+	}()
+
+	var docs []totpRewrapDoc
+	if err := cursor.All(resolveCtx, &docs); err != nil {
+		return nil, NormalizeMongoError(err)
+	}
+
+	secrets := make([]db.TotpSecretRewrap, 0, len(docs))
+	for _, doc := range docs {
+		id, err := uuid.Parse(doc.ID)
+		if err != nil {
+			return nil, errors.New(errors.CodeDatabaseError, "totp secret has a malformed id", err)
+		}
+		userID, err := uuid.Parse(doc.UserID)
+		if err != nil {
+			return nil, errors.New(errors.CodeDatabaseError, "totp secret has a malformed user id", err)
+		}
+		secrets = append(secrets, db.TotpSecretRewrap{
+			ID:              id,
+			UserID:          userID,
+			EncryptedSecret: doc.EncryptedSecret,
+			SecretKid:       doc.SecretKid,
+		})
+	}
+	return secrets, nil
+}
+
+func (s *totpStore) UpdateSecretForRewrap(ctx context.Context, id uuid.UUID, expectedCiphertext, newCiphertext []byte, newKid string) (bool, error) {
+	filter := bson.M{
+		"_id":              id.String(),
+		"encrypted_secret": expectedCiphertext,
+	}
+	update := bson.M{
+		"$set": bson.M{
+			"encrypted_secret": newCiphertext,
+			"secret_kid":       newKid,
+			"updated_at":       time.Now().UTC(),
+		},
+	}
+	res, err := s.secrets().UpdateOne(s.store.resolveCtx(ctx), filter, update)
+	if err != nil {
+		return false, NormalizeMongoError(err)
+	}
+	return res.MatchedCount > 0, nil
+}
+
 func (s *totpStore) EnableSecret(ctx context.Context, secretID uuid.UUID, backupCodesJSON []byte) error {
 	filter := bson.M{
 		"_id":     secretID.String(),

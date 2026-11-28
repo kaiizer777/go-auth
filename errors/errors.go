@@ -376,6 +376,7 @@ var (
 	ErrOAuthStateCookieNameCollision   = New(CodeInvalidConfig, "oauth state cookie name must not match session or CSRF cookie name", nil)
 	ErrOAuthGraphVersionInvalid        = New(CodeInvalidConfig, "facebook graph version must be v<major>.<minor> with no leading zeros and a major of at least 19", nil)
 	ErrTOTPEncryptionKeyInvalid        = New(CodeInvalidConfig, "totp encryption key must be 64 hex chars (32 bytes)", nil)
+	ErrTOTPKeyringInvalid              = New(CodeInvalidConfig, "totp keyring must be comma-separated kid:base64 entries with 32-byte keys", nil)
 	ErrTOTPChallengeTokenTTLInvalid    = New(CodeInvalidConfig, "totp challenge token TTL must be between 1m and 30m", nil)
 	ErrTOTPMaxAttemptsInvalid          = New(CodeInvalidConfig, "totp max attempts must be at least 1", nil)
 	ErrTOTPAttemptWindowInvalid        = New(CodeInvalidConfig, "totp attempt window must be at least 1m", nil)

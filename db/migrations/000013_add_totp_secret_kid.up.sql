@@ -1,0 +1,11 @@
+-- 000013 records which key id last rewrote each stored TOTP secret envelope.
+-- The column is bookkeeping only: it holds no key material and no ciphertext,
+-- the read path never consults it, and it is deliberately absent from the
+-- db.TotpSecret model so a down-migrated database keeps serving every read and
+-- write. '' means unknown — every row enrolled before this column existed, and
+-- every row an enrolment wrote without touching the hint.
+--
+-- The rewrap sweep sets the hint in the same statement that rewrites the
+-- ciphertext, CAS-guarded on the previous bytes, so the hint can never disagree
+-- with the envelope's own kid for longer than one statement.
+ALTER TABLE totp_secrets ADD COLUMN IF NOT EXISTS secret_kid VARCHAR(32) NOT NULL DEFAULT '';

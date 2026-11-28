@@ -22,6 +22,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   config validation and at provider construction: `NewFacebookProviderChecked`
   returns the error, `NewProvider` propagates it, and `NewFacebookProvider`
   panics on an invalid version.
+- `db.TotpStore` gained `ListSecretsForRewrap(ctx, afterID, limit)` and
+  `UpdateSecretForRewrap(ctx, id, expectedCiphertext, newCiphertext, newKid)` for
+  the TOTP rewrap sweep. External or custom store implementations must provide
+  both.
+- `totp.NewCrypto` now takes `config.TOTPConfig` (so it can build the keyring
+  from both key surfaces), `Crypto.Encrypt`/`Crypto.Decrypt` take the owning
+  `uuid.UUID`, and `totp.NewCryptoFromBytes` is removed. The stored format is the
+  shared envelope; the legacy `nonce||ciphertext||tag` layout is still read.
 
 ### Added
 
@@ -53,6 +61,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `grant_type=refresh_token` and treats `invalid_grant` as a dead grant. Other
   provider errors keep the stored grant. Providers without refresh support
   report `OAUTH_REFRESH_UNSUPPORTED`.
+- TOTP secrets are sealed through the same envelope as OAuth tokens, under a
+  distinct AAD label and bound to the owning user id plus the
+  `encrypted_secret` field, so a sealed envelope cannot be transplanted onto
+  another user's row or another column. Rows still in the pre-envelope
+  `nonce||ciphertext||tag` layout carry neither binding and keep opening for any
+  owner until `totp.RewrapSecrets` replaces them. `TOTP.Keyring` adds an optional
+  `kid:base64key[,…]` ring; `TOTP.EncryptionKey` joins it under the fixed kid
+  `legacy`, so an unchanged deployment keeps reading its rows and a rotation only
+  needs a new ring head. With no `Keyring` set, the hex key is the ring's only
+  entry and encrypts. Either surface enables TOTP. That composition reserves
+  `legacy`: a `Keyring` that already defines it together with a non-empty
+  `EncryptionKey` is rejected by configuration validation at startup instead of
+  failing every TOTP operation at runtime.
+- `totp.RewrapSecrets` rewrites stored secrets onto the active key: keyset-batched,
+  idempotent, resumable, one CAS-guarded `UPDATE` per row that writes ciphertext
+  and the new `totp_secrets.secret_kid` hint together. It is an explicit call,
+  never a startup hook. Migration 000013 adds the hint column; it carries no key
+  material, no ciphertext, and no data `UPDATE`. See
+  `docs/totp-key-management.md` for the rollout order.
 
 ### Changed
 
@@ -119,6 +146,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `OAUTH_REAUTH_REQUIRED`; the user must go through the provider again. The
   application session stays valid: a dead provider grant does not sign the user
   out.
+- TOTP rotation is not automatic. Deploy a binary that can read envelopes to the
+  whole fleet, verify it, and only then run `totp.RewrapSecrets`. A rewrapped row
+  is unreadable to the previous binary, so rolling back after a partial sweep
+  locks out the users it already migrated. Migration 000013 is additive and its
+  down file drops only the key-id hint, so a rollback of the schema never changes
+  a stored secret.
 
 - Migration 000011 adds `oauth_accounts.provider_tenant_id` as `NOT NULL`
   without a default and rolls the unique key over to

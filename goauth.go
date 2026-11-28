@@ -183,7 +183,7 @@ func NewWithStore(store db.Store, cfg config.Config) (*Auth, error) {
 
 	var totpSvc totp.Service
 	var totpLimiter *ratelimit.Limiter
-	if cfg.TOTP.EncryptionKey != "" {
+	if cfg.TOTP.EncryptionKey != "" || cfg.TOTP.Keyring != "" {
 		window := cfg.TOTP.AttemptWindow
 		if window <= 0 {
 			window = 5 * time.Minute

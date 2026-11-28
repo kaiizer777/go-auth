@@ -3,6 +3,7 @@ package totp
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -55,6 +56,7 @@ func setupTestDB(t *testing.T) *gorm.DB {
 		encrypted_secret BLOB NOT NULL,
 		backup_codes TEXT NOT NULL DEFAULT '[]',
 		enabled INTEGER NOT NULL DEFAULT 0,
+		secret_kid TEXT NOT NULL DEFAULT '',
 		created_at DATETIME,
 		updated_at DATETIME
 	);
@@ -1321,5 +1323,103 @@ func TestConsumeChallengeToken_ExhaustedAndExpired(t *testing.T) {
 	consumedUser, err = svc.ConsumeChallengeToken(context.Background(), "expired_token_literal")
 	if consumedUser != nil || !errors.Is(err, apperrors.ErrTwoFactorTokenExpired) {
 		t.Fatalf("expected ErrTwoFactorTokenExpired, got user=%v, err=%v", consumedUser, err)
+	}
+}
+
+// TestVerifyCode_LegacySecretRow proves the dual-read path end to end: a row
+// written by the AES-only implementation still verifies a live code.
+func TestVerifyCode_LegacySecretRow(t *testing.T) {
+	t.Parallel()
+
+	database := setupTestDB(t)
+	svc := NewService(database, config.TOTPConfig{EncryptionKey: validTestHexKey()}, nil, nil)
+	user := createTestUser(t, database, "legacy-enabled@example.com", true)
+
+	record := db.TotpSecret{
+		ID:              uuid.New(),
+		UserID:          user.ID,
+		EncryptedSecret: readLegacyFixture(t, "legacy_secret.hex"),
+		BackupCodes:     []byte("[]"),
+		Enabled:         true,
+	}
+	if err := svc.(*totpService).store.Totp().CreateSecret(context.Background(), &record); err != nil {
+		t.Fatalf("seed legacy row: %v", err)
+	}
+
+	code, err := ptotp.GenerateCode(legacyFixtureSecret, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("generate code: %v", err)
+	}
+	if err := svc.VerifyCode(context.Background(), user.ID.String(), code, ""); err != nil {
+		t.Fatalf("VerifyCode on a legacy row failed: %v", err)
+	}
+}
+
+// TestConfirmEnrollment_LegacyPendingRow proves the pending-enrolment read path
+// still opens a pre-envelope blob.
+func TestConfirmEnrollment_LegacyPendingRow(t *testing.T) {
+	t.Parallel()
+
+	database := setupTestDB(t)
+	svc := NewService(database, config.TOTPConfig{EncryptionKey: validTestHexKey()}, nil, nil)
+	user := createTestUser(t, database, "legacy-pending@example.com", true)
+
+	record := db.TotpSecret{
+		ID:              uuid.New(),
+		UserID:          user.ID,
+		EncryptedSecret: readLegacyFixture(t, "legacy_secret_brace.hex"),
+		BackupCodes:     []byte("[]"),
+		Enabled:         false,
+	}
+	if err := svc.(*totpService).store.Totp().CreateSecret(context.Background(), &record); err != nil {
+		t.Fatalf("seed legacy row: %v", err)
+	}
+
+	code, err := ptotp.GenerateCode(legacyFixtureSecret, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("generate code: %v", err)
+	}
+	backupCodes, err := svc.ConfirmEnrollment(context.Background(), user.ID.String(), code)
+	if err != nil {
+		t.Fatalf("ConfirmEnrollment on a legacy row failed: %v", err)
+	}
+	if len(backupCodes) == 0 {
+		t.Fatal("expected backup codes")
+	}
+}
+
+// TestEnroll_WritesOwnerBoundEnvelope proves new enrolments never write the
+// legacy layout and bind the row to its owner.
+func TestEnroll_WritesOwnerBoundEnvelope(t *testing.T) {
+	t.Parallel()
+
+	database := setupTestDB(t)
+	svc := NewService(database, config.TOTPConfig{EncryptionKey: validTestHexKey()}, nil, nil)
+	user := createTestUser(t, database, "envelope-write@example.com", true)
+	other := createTestUser(t, database, "envelope-other@example.com", true)
+
+	if _, err := svc.Enroll(context.Background(), user.ID.String()); err != nil {
+		t.Fatalf("Enroll failed: %v", err)
+	}
+	record, err := svc.(*totpService).store.Totp().GetSecretByUserID(context.Background(), user.ID)
+	if err != nil {
+		t.Fatalf("load pending row: %v", err)
+	}
+
+	var envelope map[string]any
+	if err := json.Unmarshal(record.EncryptedSecret, &envelope); err != nil {
+		t.Fatalf("new enrolment is not an envelope: %v", err)
+	}
+	if envelope["kid"] != legacyKeyID {
+		t.Errorf("enrolment kid = %v, want %q", envelope["kid"], legacyKeyID)
+	}
+
+	// The ciphertext opens for its owner only.
+	crypt, err := NewCrypto(config.TOTPConfig{EncryptionKey: validTestHexKey()})
+	if err != nil {
+		t.Fatalf("NewCrypto: %v", err)
+	}
+	if _, err := crypt.Decrypt(other.ID, record.EncryptedSecret); err == nil {
+		t.Fatal("enrolment row opened for another user; AAD binding is missing")
 	}
 }

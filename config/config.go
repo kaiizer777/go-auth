@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"log/slog"
@@ -204,6 +205,7 @@ type SecurityHeadersConfig struct {
 // TOTPConfig groups configuration settings for RFC 6238 TOTP two-factor authentication.
 type TOTPConfig struct {
 	EncryptionKey        string        // 64-hex AES-256 key (32 bytes)
+	Keyring              string        // Optional `kid:base64key[,…]` ring; the hex key joins it under kid "legacy"
 	Issuer               string        // App name / issuer for OTP URI; default "go-auth"
 	ChallengeTokenTTL    time.Duration // Default: 10m; valid range: 1m–30m
 	AttemptWindow        time.Duration // Default: 5m; min: 1m
@@ -212,12 +214,9 @@ type TOTPConfig struct {
 
 // LogValue implements slog.LogValuer to prevent secret encryption key leakage in logs.
 func (t TOTPConfig) LogValue() slog.Value {
-	keyMasked := "[REDACTED]"
-	if t.EncryptionKey == "" {
-		keyMasked = ""
-	}
 	return slog.GroupValue(
-		slog.String("encryption_key", keyMasked),
+		slog.String("encryption_key", maskSecret(t.EncryptionKey)),
+		slog.String("keyring", maskSecret(t.Keyring)),
 		slog.String("issuer", t.Issuer),
 		slog.Duration("challenge_token_ttl", t.ChallengeTokenTTL),
 		slog.Duration("attempt_window", t.AttemptWindow),
@@ -227,16 +226,19 @@ func (t TOTPConfig) LogValue() slog.Value {
 
 // String implements fmt.Stringer to ensure EncryptionKey is masked when formatted.
 func (t TOTPConfig) String() string {
-	keyMasked := "[REDACTED]"
-	if t.EncryptionKey == "" {
-		keyMasked = ""
-	}
-	return fmt.Sprintf("TOTPConfig{EncryptionKey: %s, Issuer: %s, ChallengeTokenTTL: %v, AttemptWindow: %v, MaxAttemptsPerWindow: %d}",
-		keyMasked, t.Issuer, t.ChallengeTokenTTL, t.AttemptWindow, t.MaxAttemptsPerWindow)
+	return fmt.Sprintf("TOTPConfig{EncryptionKey: %s, Keyring: %s, Issuer: %s, ChallengeTokenTTL: %v, AttemptWindow: %v, MaxAttemptsPerWindow: %d}",
+		maskSecret(t.EncryptionKey), maskSecret(t.Keyring), t.Issuer, t.ChallengeTokenTTL, t.AttemptWindow, t.MaxAttemptsPerWindow)
 }
 
 // GoString implements fmt.GoStringer so %#v masks EncryptionKey.
 func (t TOTPConfig) GoString() string { return "config." + t.String() }
+
+func maskSecret(value string) string {
+	if value == "" {
+		return ""
+	}
+	return "[REDACTED]"
+}
 
 // DefaultTOTPConfig returns safe production defaults for TOTP configuration.
 func DefaultTOTPConfig() TOTPConfig {
@@ -246,6 +248,29 @@ func DefaultTOTPConfig() TOTPConfig {
 		MaxAttemptsPerWindow: 5,
 		AttemptWindow:        5 * time.Minute,
 	}
+}
+
+// legacyTOTPKeyID is the kid the hex EncryptionKey joins the TOTP ring under.
+// Stored envelopes and the secret_kid hint record it, so it is fixed.
+const legacyTOTPKeyID = "legacy"
+
+// KeyringSpec returns the exact ring spec the TOTP service builds: Keyring
+// followed by the hex EncryptionKey under kid "legacy". That entry only decrypts
+// when a Keyring precedes it; with an empty Keyring it is the ring head and
+// encrypts. An empty result means neither key surface is configured.
+func (t TOTPConfig) KeyringSpec() (string, error) {
+	if t.EncryptionKey == "" {
+		return t.Keyring, nil
+	}
+	key, err := hex.DecodeString(t.EncryptionKey)
+	if err != nil || len(key) != 32 {
+		return "", errors.ErrTOTPEncryptionKeyInvalid
+	}
+	entry := legacyTOTPKeyID + ":" + base64.StdEncoding.EncodeToString(key)
+	if t.Keyring == "" {
+		return entry, nil
+	}
+	return t.Keyring + "," + entry, nil
 }
 
 // DatabaseType specifies the supported persistence backend dialect.
@@ -959,6 +984,18 @@ func (c *Config) validate() error {
 		}
 		if _, err := hex.DecodeString(c.TOTP.EncryptionKey); err != nil {
 			return errors.ErrTOTPEncryptionKeyInvalid
+		}
+	}
+	// Validate the composed ring, not just the configured keyring: the service
+	// appends the hex key under kid "legacy", so a keyring already claiming that
+	// kid would pass here and then fail every TOTP operation at runtime.
+	spec, err := c.TOTP.KeyringSpec()
+	if err != nil {
+		return err
+	}
+	if spec != "" {
+		if _, err := crypto.ParseKeyring(spec); err != nil {
+			return errors.ErrTOTPKeyringInvalid
 		}
 	}
 

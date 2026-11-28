@@ -1,9 +1,11 @@
 package goauth
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"database/sql/driver"
+	"encoding/base64"
 	stderrors "errors"
 	"fmt"
 	"net/http"
@@ -616,6 +618,48 @@ func TestNew_RequiresTokenKEK(t *testing.T) {
 		}
 		t.Cleanup(func() { _ = a.Close() })
 	})
+}
+
+// TestNewWithStore_TOTPEnablementGate pins that either key surface enables TOTP:
+// a keyring-only deployment must not silently lose the TOTP routes, which would
+// turn configured 2FA into no 2FA.
+func TestNewWithStore_TOTPEnablementGate(t *testing.T) {
+	keyring := "k1:" + base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0x2a}, 32))
+	hexKey := "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+	tests := []struct {
+		name     string
+		hexKey   string
+		keyring  string
+		wantTOTP bool
+	}{
+		{name: "encryption key only", hexKey: hexKey, wantTOTP: true},
+		{name: "keyring only", keyring: keyring, wantTOTP: true},
+		{name: "both surfaces", hexKey: hexKey, keyring: keyring, wantTOTP: true},
+		{name: "neither surface"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := config.DefaultConfig()
+			cfg.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+			cfg.BaseURL = "https://auth.example.com"
+			cfg.TOTP.EncryptionKey = tt.hexKey
+			cfg.TOTP.Keyring = tt.keyring
+
+			a, err := NewWithStore(gormstore.New(openTestSQLite(t)), cfg)
+			if err != nil {
+				t.Fatalf("NewWithStore = %v", err)
+			}
+			t.Cleanup(func() { _ = a.Close() })
+
+			rec := httptest.NewRecorder()
+			a.Handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/auth/totp/status", nil))
+			if got := rec.Code != http.StatusNotFound; got != tt.wantTOTP {
+				t.Fatalf("TOTP route mounted = %v (status %d), want %v", got, rec.Code, tt.wantTOTP)
+			}
+		})
+	}
 }
 
 func TestNewWithDB_ZeroCleanupTick(t *testing.T) {

@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"database/sql/driver"
+	"encoding/base64"
 	stderrors "errors"
 	"net/http"
 	"net/http/httptest"
@@ -586,25 +587,43 @@ func TestHandler_WithStore_MountsSessionAndTOTPRoutes(t *testing.T) {
 	}
 	store := gormstore.New(sqliteDB)
 
-	cfg := config.DefaultConfig()
-	cfg.TOTP.EncryptionKey = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-
-	h := New(nil, cfg, nil, WithStore(store))
-
-	// Verify session route is mounted (should return 401 Unauthorized, not 404)
-	reqSession := httptest.NewRequest(http.MethodGet, "/auth/sessions", nil)
-	recSession := httptest.NewRecorder()
-	h.ServeHTTP(recSession, reqSession)
-	if recSession.Code == http.StatusNotFound {
-		t.Errorf("expected session route to be mounted, got 404")
+	keyring := "k1:" + base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0x2a}, 32))
+	tests := []struct {
+		name          string
+		encryptionKey string
+		keyring       string
+		wantTOTP      bool
+	}{
+		{name: "encryption key only", encryptionKey: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", wantTOTP: true},
+		{name: "keyring only", keyring: keyring, wantTOTP: true},
+		{name: "both surfaces", encryptionKey: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", keyring: keyring, wantTOTP: true},
+		{name: "neither surface"},
 	}
 
-	// Verify TOTP route is mounted (should return status other than 404)
-	reqTOTP := httptest.NewRequest(http.MethodPost, "/auth/totp/verify", strings.NewReader("{}"))
-	reqTOTP.Header.Set("Content-Type", "application/json")
-	recTOTP := httptest.NewRecorder()
-	h.ServeHTTP(recTOTP, reqTOTP)
-	if recTOTP.Code == http.StatusNotFound {
-		t.Errorf("expected TOTP route to be mounted, got 404")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := config.DefaultConfig()
+			cfg.TOTP.EncryptionKey = tt.encryptionKey
+			cfg.TOTP.Keyring = tt.keyring
+
+			h := New(nil, cfg, nil, WithStore(store))
+
+			// Verify session route is mounted (should return 401 Unauthorized, not 404)
+			reqSession := httptest.NewRequest(http.MethodGet, "/auth/sessions", nil)
+			recSession := httptest.NewRecorder()
+			h.ServeHTTP(recSession, reqSession)
+			if recSession.Code == http.StatusNotFound {
+				t.Errorf("expected session route to be mounted, got 404")
+			}
+
+			// TOTP is mounted exactly when a key surface is configured.
+			reqTOTP := httptest.NewRequest(http.MethodPost, "/auth/totp/verify", strings.NewReader("{}"))
+			reqTOTP.Header.Set("Content-Type", "application/json")
+			recTOTP := httptest.NewRecorder()
+			h.ServeHTTP(recTOTP, reqTOTP)
+			if got := recTOTP.Code != http.StatusNotFound; got != tt.wantTOTP {
+				t.Errorf("TOTP route mounted = %v (status %d), want %v", got, recTOTP.Code, tt.wantTOTP)
+			}
+		})
 	}
 }
