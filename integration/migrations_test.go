@@ -212,7 +212,7 @@ func TestMigrations_Claim000014IsDDLOnly(t *testing.T) {
 		t.Fatalf("insert app-keyed claim: %v", err)
 	}
 	var pgErr *pgconn.PgError
-	if _, err := migrateDB.Exec(`INSERT INTO claimed_emails (email, owner_user_id, verified) VALUES ($1, $2, TRUE)`, key, ownerID); !stderrors.As(err, &pgErr) || pgErr.Code != "23505" {
+	if _, err := migrateDB.Exec(`INSERT INTO claimed_emails (email, owner_user_id, verified) VALUES ($1, $2, TRUE)`, key, ownerID); !errors.As(err, &pgErr) || pgErr.Code != "23505" {
 		t.Fatalf("second claim row for the same key: want unique violation 23505, got: %v", err)
 	}
 
