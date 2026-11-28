@@ -2111,6 +2111,43 @@ func TestService_VerifyEmail_FailsWhenAddressClaimedByAnotherAccount(t *testing.
 	}
 }
 
+func TestService_ResetPassword_PromotesClaimToVerified(t *testing.T) {
+	database := setupTestDB(t)
+	cfg := testConfig()
+	store := gormstore.New(database)
+	svc, err := NewWithStore(cfg, store, email.Hooks{})
+	if err != nil {
+		t.Fatalf("NewWithStore: %v", err)
+	}
+	ctx := context.Background()
+
+	const addr = "reset-claim@example.com"
+	if _, _, serr := svc.Signup(ctx, db.SignupRequest{Email: addr, Password: "SignupPass#2026!"}); serr != nil {
+		t.Fatalf("signup: %v", serr)
+	}
+	if claim, gerr := store.ClaimedEmails().Get(ctx, addr); gerr != nil || claim.Verified {
+		t.Fatalf("claim before reset = %+v, %v; want an unverified reservation", claim, gerr)
+	}
+
+	raw, err := svc.RequestPasswordReset(ctx, db.PasswordResetRequest{Email: addr})
+	if err != nil {
+		t.Fatalf("RequestPasswordReset: %v", err)
+	}
+	if _, err := svc.ResetPassword(ctx, db.PasswordResetConfirmRequest{Token: raw, NewPassword: "ResetClaim#2026!"}); err != nil {
+		t.Fatalf("ResetPassword: %v", err)
+	}
+
+	// A consumed reset token proves the mailbox, so the claim must be verified:
+	// an unverified claim would leave the account open to a provider takeover.
+	claim, err := store.ClaimedEmails().Get(ctx, addr)
+	if err != nil {
+		t.Fatalf("load claim: %v", err)
+	}
+	if !claim.Verified {
+		t.Fatal("a reset-proved mailbox left its claim unverified")
+	}
+}
+
 func TestService_DispatchEmailAsync_SaturationOverflowAndPendingRelease(t *testing.T) {
 	database := setupTestDB(t)
 	cfg := testConfig()

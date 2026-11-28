@@ -516,12 +516,21 @@ func (s *authService) ResetPassword(ctx context.Context, req db.PasswordResetCon
 		if err != nil {
 			return err
 		}
+		// The consumed token proves the mailbox, so the claim is promoted exactly
+		// as mailbox verification does. An unverified claim would leave an address
+		// the owner just proved open to a provider takeover.
+		if cerr := txStore.ClaimedEmails().Claim(ctx, u.Email, tok.UserID, true); cerr != nil {
+			return cerr
+		}
 		resetUser = *u
 		return nil
 	})
 	if err != nil {
 		var appErr *errors.Error
 		if errors.As(err, &appErr) && (appErr.Code() == errors.CodeInvalidToken || appErr.Code() == errors.CodeTokenExpired) {
+			return nil, err
+		}
+		if errors.Is(err, errors.ErrEmailClaimed) {
 			return nil, err
 		}
 		return nil, errors.Wrap(err, errors.CodeDatabaseError, "failed to reset password")
