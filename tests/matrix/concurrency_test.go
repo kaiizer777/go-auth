@@ -17,8 +17,8 @@ import (
 	ptotp "github.com/pquerna/otp/totp"
 	"go.mongodb.org/mongo-driver/v2/bson"
 
-	mongostore "github.com/kaiizer777/go-auth/db/mongo"
 	"github.com/kaiizer777/go-auth/db"
+	mongostore "github.com/kaiizer777/go-auth/db/mongo"
 	"github.com/kaiizer777/go-auth/errors"
 	"github.com/kaiizer777/go-auth/totp"
 )

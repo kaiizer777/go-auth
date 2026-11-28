@@ -1250,4 +1250,3 @@ func TestMigration000013_UpAndDown(t *testing.T) {
 		t.Fatalf("restoring head failed: %v", err)
 	}
 }
-

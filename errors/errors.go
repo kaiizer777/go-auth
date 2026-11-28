@@ -395,16 +395,16 @@ var (
 	// distinct value from ErrEmailAlreadyExists on purpose: the signup path treats
 	// a lost claim as silent success, and the OAuth link path maps it to its own
 	// conflict code, so neither may collapse into the other's sentinel.
-	ErrEmailClaimed       = New(CodeEmailAlreadyExists, "email address is claimed by another account", nil)
-	ErrUserNotFound       = New(CodeUserNotFound, "user not found", nil)
-	ErrInvalidToken       = New(CodeInvalidToken, "token is invalid or malformed", nil)
-	ErrTokenExpired       = New(CodeTokenExpired, "token has expired", nil)
-	ErrTokenNotFound      = New(CodeTokenNotFound, "token not found", nil)
-	ErrPasswordTooShort   = New(CodePasswordTooShort, "password is too short", nil)
-	ErrPasswordTooLong    = New(CodePasswordTooLong, "password is too long", nil)
-	ErrPasswordTooCommon  = New(CodePasswordTooCommon, "password is too common", nil)
-	ErrInvalidEmail       = New(CodeInvalidEmail, "invalid email address", nil)
-	ErrValidationError    = New(CodeValidationError, "validation failed", nil)
+	ErrEmailClaimed      = New(CodeEmailAlreadyExists, "email address is claimed by another account", nil)
+	ErrUserNotFound      = New(CodeUserNotFound, "user not found", nil)
+	ErrInvalidToken      = New(CodeInvalidToken, "token is invalid or malformed", nil)
+	ErrTokenExpired      = New(CodeTokenExpired, "token has expired", nil)
+	ErrTokenNotFound     = New(CodeTokenNotFound, "token not found", nil)
+	ErrPasswordTooShort  = New(CodePasswordTooShort, "password is too short", nil)
+	ErrPasswordTooLong   = New(CodePasswordTooLong, "password is too long", nil)
+	ErrPasswordTooCommon = New(CodePasswordTooCommon, "password is too common", nil)
+	ErrInvalidEmail      = New(CodeInvalidEmail, "invalid email address", nil)
+	ErrValidationError   = New(CodeValidationError, "validation failed", nil)
 
 	// Predefined sentinel errors for Multi-Factor Authentication (MFA).
 	ErrMFARequired    = New(CodeMFARequired, "mfa verification required", nil)
