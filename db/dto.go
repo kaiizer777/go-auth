@@ -57,18 +57,20 @@ func ValidateEmail(email string) error {
 	return nil
 }
 
-// NormalizeEmail trims leading and trailing whitespace and converts the email
-// address to lowercase using Go's locale-independent folding. It is used for
-// display/normalized request values; account matching is performed by the
-// database with LOWER(email) = LOWER(?) so both sides share one folding rule
-// and do not depend on the database locale. Stored account emails keep their
-// original case for delivery (RFC 5321 local parts can be case-sensitive).
+// NormalizeEmail trims leading and trailing whitespace and lowercases the address
+// with Go's locale-independent folding. Stored account emails keep their original
+// case for delivery (RFC 5321 local parts can be case-sensitive).
+//
+// It is the claim key: claimed_emails stores this value and compares it byte for
+// byte, so a reservation never depends on a database collation. Account lookups
+// still fold in SQL (LOWER(email)), which agrees for ASCII and is not guaranteed
+// to for non-ASCII; the claim key, not the lookup key, is what both writers agree
+// on.
 func NormalizeEmail(email string) string {
 	return strings.ToLower(strings.TrimSpace(email))
 }
 
-// LookupKey returns the canonical case-insensitive lookup key for an email
-// address. It is the single policy shared by all account queries.
+// LookupKey returns the canonical case-insensitive key for an email address.
 func LookupKey(email string) string {
 	return NormalizeEmail(email)
 }
