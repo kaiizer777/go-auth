@@ -705,6 +705,19 @@ func TestMigration000013_AddsTotpSecretKid(t *testing.T) {
 	if !strings.Contains(mysqlDown, "ALTER TABLE totp_secrets DROP COLUMN secret_kid;") {
 		t.Fatalf("mysql migration 13 down must drop secret_kid: %q", mysqlDown)
 	}
+	// "exactly one column dropped" has to hold per dialect, and DROP COLUMN is a
+	// poor thing to count in raw prose: the MySQL recovery note names it too.
+	for name, down := range map[string]struct{ sql, statement string }{
+		"postgres": {sql: sqlWithoutComments(postgresDown), statement: "DROP COLUMN IF EXISTS secret_kid;"},
+		"mysql":    {sql: sqlWithoutComments(mysqlDown), statement: "DROP COLUMN secret_kid;"},
+	} {
+		if drops := strings.Count(down.sql, "DROP COLUMN"); drops != 1 {
+			t.Errorf("%s migration 13 down must contain exactly one DROP COLUMN, got %d: %q", name, drops, down.sql)
+		}
+		if !strings.Contains(down.sql, down.statement) {
+			t.Errorf("%s migration 13 down must drop exactly secret_kid: %q", name, down.sql)
+		}
+	}
 	// "exactly one column dropped" is only true while the down file holds exactly
 	// one ALTER TABLE; an extra statement could drop something else and still pass
 	// the per-column checks above.
@@ -747,6 +760,19 @@ func TestMigration000013_AddsTotpSecretKid(t *testing.T) {
 
 // hexRun matches 64 or more consecutive hex characters: a raw AES-256 key.
 var hexRun = regexp.MustCompile(`[0-9a-fA-F]{64,}`)
+
+// sqlWithoutComments drops full-line `--` comments so statement counts are not
+// swayed by recovery prose that names a keyword.
+func sqlWithoutComments(content string) string {
+	var statements []string
+	for _, line := range strings.Split(content, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "--") {
+			continue
+		}
+		statements = append(statements, line)
+	}
+	return strings.Join(statements, "\n")
+}
 
 func readMigration(t *testing.T, name string) string {
 	t.Helper()
