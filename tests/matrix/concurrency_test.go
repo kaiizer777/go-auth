@@ -17,9 +17,99 @@ import (
 	ptotp "github.com/pquerna/otp/totp"
 	"go.mongodb.org/mongo-driver/v2/bson"
 
+	"github.com/kaiizer777/go-auth/db"
 	mongostore "github.com/kaiizer777/go-auth/db/mongo"
+	"github.com/kaiizer777/go-auth/errors"
 	"github.com/kaiizer777/go-auth/totp"
 )
+
+// TestMatrix_ClaimedEmailRace pins the guard that closes #94 across adapters: the
+// two writers that can commit one address (a signup and an OAuth link) both take
+// the claim insert, so exactly one wins and only one row ever exists.
+//
+// Known limit: on SQLite the in-memory pool holds a single connection, so the two
+// transactions serialise and the interleaving is not exercised there. The race is
+// real on the PostgreSQL/MySQL/MongoDB adapters, which run when their DSNs are
+// configured; the SQLite adapter still checks the row-count and winner invariants.
+func TestMatrix_ClaimedEmailRace(t *testing.T) {
+	runMatrix(t, func(t *testing.T, adapter TestAdapter) {
+		ctx := context.Background()
+		store := adapter.Store
+		const rounds = 10
+		for round := 0; round < rounds; round++ {
+			suffix := uuid.New().String()[:8]
+			addr := fmt.Sprintf("claim_race_%d_%s@example.com", round, suffix)
+			signup := createTestUser(t, store, "claim_signup_"+suffix+"@example.com", "Password#2026!", false)
+			linker := createTestUser(t, store, "claim_linker_"+suffix+"@example.com", "Password#2026!", true)
+
+			var wg sync.WaitGroup
+			wg.Add(2)
+			start := make(chan struct{})
+			var signupErr, linkErr error
+			go func() {
+				defer wg.Done()
+				<-start
+				signupErr = store.Transaction(ctx, func(tx db.Store) error {
+					return tx.ClaimedEmails().Claim(ctx, addr, signup.ID, false)
+				})
+			}()
+			go func() {
+				defer wg.Done()
+				<-start
+				linkErr = store.Transaction(ctx, func(tx db.Store) error {
+					return tx.ClaimedEmails().Claim(ctx, addr, linker.ID, true)
+				})
+			}()
+			close(start)
+			wg.Wait()
+
+			claim, err := store.ClaimedEmails().Get(ctx, addr)
+			if err != nil {
+				t.Fatalf("round %d: load claim: %v", round, err)
+			}
+			if claim.OwnerUserID != signup.ID && claim.OwnerUserID != linker.ID {
+				t.Fatalf("round %d: claim owner = %v; want one of the two writers", round, claim.OwnerUserID)
+			}
+			// The constraint must keep exactly one row: Get returns whichever row it
+			// finds, so a duplicate would otherwise pass unnoticed.
+			if adapter.DB != nil {
+				var rows int64
+				if cerr := adapter.DB.Model(&db.ClaimedEmail{}).
+					Where("email = ?", db.NormalizeEmail(addr)).Count(&rows).Error; cerr != nil {
+					t.Fatalf("round %d: count claims: %v", round, cerr)
+				}
+				if rows != 1 {
+					t.Fatalf("round %d: claim rows for %q = %d; want 1", round, addr, rows)
+				}
+			}
+			for name, cerr := range map[string]error{"signup": signupErr, "link": linkErr} {
+				if cerr != nil && !errors.Is(cerr, errors.ErrEmailClaimed) {
+					t.Fatalf("round %d: %s error = %v; want nil or ErrEmailClaimed", round, name, cerr)
+				}
+			}
+			// Without transactional isolation (documented Mongo fallback) the two
+			// inserts still converge on one row, but only a transactional adapter can
+			// promise that exactly one of them returned nil.
+			if adapter.SupportsTransactions {
+				winners := 0
+				if signupErr == nil {
+					winners++
+				}
+				if linkErr == nil {
+					winners++
+				}
+				if winners != 1 {
+					t.Fatalf("round %d: winners = %d (signup=%v link=%v); want exactly one",
+						round, winners, signupErr, linkErr)
+				}
+				winner := claim.OwnerUserID
+				if winner == signup.ID && signupErr != nil || winner == linker.ID && linkErr != nil {
+					t.Fatalf("round %d: claim owner %v did not report success", round, winner)
+				}
+			}
+		}
+	})
+}
 
 func TestMatrix_ConcurrentReplayBarrier(t *testing.T) {
 	runMatrix(t, func(t *testing.T, adapter TestAdapter) {

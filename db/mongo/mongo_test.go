@@ -569,6 +569,16 @@ func TestNormalizeMongoError(t *testing.T) {
 			wantErr: errors.ErrOAuthAccountAlreadyLinked,
 		},
 		{
+			name:    "claim duplicate maps to claim sentinel",
+			err:     makeDupErr(`E11000 duplicate key error collection: test.claimed_emails index: _id_ dup key: { _id: "user@example.com" }`),
+			wantErr: errors.ErrEmailClaimed,
+		},
+		{
+			name:    "users duplicate whose value contains the claim collection name stays an email duplicate",
+			err:     makeDupErr(`E11000 duplicate key error collection: test.users index: uq_users_email dup key: { email: "claimed_emails@example.com" }`),
+			wantErr: errors.ErrEmailAlreadyExists,
+		},
+		{
 			name:    "unmapped duplicate key error with email substring returns original error",
 			err:     unmappedEmailErr,
 			wantErr: unmappedEmailErr,

@@ -3,12 +3,17 @@ package mongostore
 import (
 	"context"
 	stderrors "errors"
+	"fmt"
 	"log/slog"
+	"sort"
+	"strings"
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
+
+	"github.com/kaiizer777/go-auth/db"
 )
 
 // oauthVerifiedBackfillID is the schema_migrations marker of the data migration
@@ -152,6 +157,262 @@ func BackfillOAuthAccountVerified(ctx context.Context, database *mongo.Database)
 		"links_updated", updated,
 	)
 	return nil
+}
+
+// claimedEmailsBackfillID is the schema_migrations marker of the data migration
+// that mirrors SQL migration 000014 for MongoDB.
+const claimedEmailsBackfillID = "000014_create_claimed_emails"
+
+// claimedEmailsBackfillBatchSize bounds how many source documents the driver keeps
+// in memory per fetch: the cursors below stream this many at a time.
+const claimedEmailsBackfillBatchSize = 500
+
+// BackfillClaimedEmails populates the claimed_emails collection from users.email
+// and oauth_accounts.email. It is an explicit operator/embedder utility, not a
+// startup step: nothing calls it from Connect, because booting must never scan the
+// account tables. An embedder upgrading a database that already has users or links
+// must call it once. The key is db.NormalizeEmail, computed here so it is
+// byte-identical to every Go write path; empty and whitespace-only addresses are
+// skipped.
+//
+// Source rows are read through cursors with an explicit batch size, so the driver
+// holds one bounded page at a time rather than the whole collection. It writes its
+// own idempotent $setOnInsert (always unverified) and promotes in a second pass; it
+// does not call the runtime claimedEmailStore.Claim, whose verified argument carries
+// the caller's attestation.
+//
+// It aborts, naming the address and both accounts, when the existing rows already
+// disagree about who owns one: electing a winner strips the losing account's
+// attribution while leaving its rows pointing at an address it does not claim.
+// The insert is an idempotent $setOnInsert, so a run that aborted on the operator's
+// data converges when re-run after the offending links are removed.
+//
+// Link promotion uses oauth_accounts.verified, which is a provider attestation for
+// rows written since 000009. Migration 000009 set it TRUE only for owners whose
+// users.email_verified is TRUE, so a legacy link can never promote a claim its own
+// user row would not, and the value on an unverified owner can only come from a
+// provider-attested link written later.
+//
+// Runs are safe to repeat: the completion marker below is recorded for operators,
+// but it does not gate, so a re-run also picks up rows added after the last run.
+func BackfillClaimedEmails(ctx context.Context, database *mongo.Database) error {
+	if database == nil {
+		return nil
+	}
+	markers := database.Collection("schema_migrations")
+
+	claims := database.Collection("claimed_emails")
+	sources := []struct {
+		collection string
+		ownerField string
+	}{
+		{collection: "users", ownerField: "_id"},
+		{collection: "oauth_accounts", ownerField: "user_id"},
+	}
+	conflicts := make(map[string]map[string]struct{})
+	addConflict := func(key, owner string) {
+		owners, ok := conflicts[key]
+		if !ok {
+			owners = make(map[string]struct{})
+			conflicts[key] = owners
+		}
+		owners[owner] = struct{}{}
+	}
+	holders, skipped := 0, 0
+	created := make(map[string]string)
+	for _, src := range sources {
+		cursor, cerr := database.Collection(src.collection).Find(ctx,
+			bson.M{"email": bson.M{"$ne": ""}},
+			options.Find().SetProjection(bson.M{"email": 1, src.ownerField: 1}).SetBatchSize(claimedEmailsBackfillBatchSize),
+		)
+		if cerr != nil {
+			return cerr
+		}
+		for cursor.Next(ctx) {
+			var row struct {
+				Email   string `bson:"email"`
+				OwnerID string `bson:"user_id"`
+				ID      string `bson:"_id"`
+			}
+			if derr := cursor.Decode(&row); derr != nil {
+				_ = cursor.Close(ctx)
+				return derr
+			}
+			key, kerr := db.ClaimKey(row.Email)
+			if kerr != nil {
+				// Not an address: it can never be claimed, so report it and move on
+				// instead of aborting the import on junk data.
+				skipped++
+				continue
+			}
+			if key == "" {
+				continue
+			}
+			ownerID := row.OwnerID
+			if src.ownerField == "_id" {
+				ownerID = row.ID
+			}
+			// Check the holder before writing: a key already held by another account
+			// is recorded as a conflict and never overwritten.
+			var existing ClaimedEmailDoc
+			derr := claims.FindOne(ctx, bson.M{"_id": key}).Decode(&existing)
+			switch {
+			case derr == nil && existing.OwnerUserID != ownerID:
+				addConflict(key, existing.OwnerUserID)
+				addConflict(key, ownerID)
+				continue
+			case derr != nil && !stderrors.Is(derr, mongo.ErrNoDocuments):
+				_ = cursor.Close(ctx)
+				return derr
+			case derr != nil:
+				// Idempotent: a re-run after an aborted pass converges on the rows
+				// the first pass already wrote.
+				res, ierr := claims.UpdateOne(ctx,
+					bson.M{"_id": key},
+					bson.M{"$setOnInsert": bson.M{
+						"owner_user_id": ownerID,
+						"verified":      false,
+						"created_at":    time.Now().UTC(),
+						"updated_at":    time.Now().UTC(),
+					}},
+					options.UpdateOne().SetUpsert(true),
+				)
+				if ierr != nil && !mongo.IsDuplicateKeyError(ierr) {
+					_ = cursor.Close(ctx)
+					return ierr
+				}
+				// A concurrent run can win the upsert; the re-read resolves it instead
+				// of assuming our write landed.
+				if derr := claims.FindOne(ctx, bson.M{"_id": key}).Decode(&existing); derr != nil {
+					_ = cursor.Close(ctx)
+					return derr
+				}
+				if existing.OwnerUserID != ownerID {
+					addConflict(key, existing.OwnerUserID)
+					addConflict(key, ownerID)
+					continue
+				}
+				// Only a row this run actually inserted may be rolled back during
+				// conflict cleanup: a same-owner row created by another writer is a
+				// live reservation and must survive.
+				if res.UpsertedCount > 0 {
+					created[key] = ownerID
+				}
+			}
+			holders++
+		}
+		if cerr := cursor.Err(); cerr != nil {
+			_ = cursor.Close(ctx)
+			return cerr
+		}
+		_ = cursor.Close(ctx)
+	}
+
+	if len(conflicts) > 0 {
+		// Roll back the claims this run wrote for a conflicting address: leaving the
+		// first-seen owner behind would make the operator resolve the conflict and
+		// then hit it again as a pre-existing claim on the next run.
+		for key := range conflicts {
+			ownerID, ok := created[key]
+			if !ok {
+				continue
+			}
+			if _, derr := claims.DeleteOne(ctx, bson.M{"_id": key, "owner_user_id": ownerID}); derr != nil {
+				return derr
+			}
+		}
+		return mongoClaimConflictError(conflicts)
+	}
+
+	// Promote exactly the keys a trusted holder already proved: a verified user
+	// row, or a link the provider attested. Anything else keeps an unverified
+	// claim, which is the state a provider-attested address may take over.
+	promotions := []struct {
+		collection string
+		ownerField string
+		filter     bson.M
+	}{
+		{collection: "users", ownerField: "_id", filter: bson.M{"email_verified": true}},
+		{collection: "oauth_accounts", ownerField: "user_id", filter: bson.M{"verified": true}},
+	}
+	promoted := 0
+	for _, p := range promotions {
+		proofs, perr := database.Collection(p.collection).Find(ctx, p.filter,
+			options.Find().SetProjection(bson.M{"email": 1, p.ownerField: 1}).SetBatchSize(claimedEmailsBackfillBatchSize),
+		)
+		if perr != nil {
+			return perr
+		}
+		for proofs.Next(ctx) {
+			var row struct {
+				Email   string `bson:"email"`
+				OwnerID string `bson:"user_id"`
+				ID      string `bson:"_id"`
+			}
+			if derr := proofs.Decode(&row); derr != nil {
+				_ = proofs.Close(ctx)
+				return derr
+			}
+			key, kerr := db.ClaimKey(row.Email)
+			if kerr != nil || key == "" {
+				continue
+			}
+			ownerID := row.OwnerID
+			if p.ownerField == "_id" {
+				ownerID = row.ID
+			}
+			res, uerr := claims.UpdateOne(ctx,
+				bson.M{"_id": key, "owner_user_id": ownerID},
+				bson.M{"$set": bson.M{"verified": true, "updated_at": time.Now().UTC()}},
+			)
+			if uerr != nil {
+				_ = proofs.Close(ctx)
+				return uerr
+			}
+			promoted += int(res.ModifiedCount)
+		}
+		if perr := proofs.Err(); perr != nil {
+			_ = proofs.Close(ctx)
+			return perr
+		}
+		_ = proofs.Close(ctx)
+	}
+
+	if _, merr := markers.UpdateOne(ctx,
+		bson.M{"_id": claimedEmailsBackfillID},
+		bson.M{"$setOnInsert": bson.M{"applied_at": time.Now().UTC()}},
+		options.UpdateOne().SetUpsert(true),
+	); merr != nil {
+		return merr
+	}
+	slog.InfoContext(ctx, "claimed_emails_backfill_applied",
+		"migration", claimedEmailsBackfillID,
+		"claims_held", holders,
+		"claims_promoted", promoted,
+		"claims_skipped", skipped,
+	)
+	return nil
+}
+
+// mongoClaimConflictError lists every conflicting address with all owners seen
+// during the pass, matching the SQL import's aggregated conflict error.
+func mongoClaimConflictError(conflicts map[string]map[string]struct{}) error {
+	keys := make([]string, 0, len(conflicts))
+	for key := range conflicts {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, key := range keys {
+		owners := make([]string, 0, len(conflicts[key]))
+		for owner := range conflicts[key] {
+			owners = append(owners, owner)
+		}
+		sort.Strings(owners)
+		parts = append(parts, fmt.Sprintf("%s held by %s", key, strings.Join(owners, ", ")))
+	}
+	return fmt.Errorf("claimed_emails backfill aborted: %d address(es) held by more than one account: %s",
+		len(keys), strings.Join(parts, "; "))
 }
 
 // microsoftOIDBackfillID is the schema_migrations marker of the data migration

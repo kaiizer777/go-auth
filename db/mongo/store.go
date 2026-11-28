@@ -34,6 +34,7 @@ type MongoStore struct {
 	passwordReset      *passwordResetTokenStore
 	oauthAccounts      *oauthAccountStore
 	totp               *totpStore
+	claimedEmails      *claimedEmailStore
 }
 
 // New creates a new MongoStore instance wrapping a MongoDB client and database.
@@ -49,6 +50,7 @@ func New(client *mongo.Client, database *mongo.Database, allowNonTransactional b
 	store.passwordReset = &passwordResetTokenStore{store: store}
 	store.oauthAccounts = &oauthAccountStore{store: store}
 	store.totp = &totpStore{store: store}
+	store.claimedEmails = &claimedEmailStore{store: store}
 	return store
 }
 
@@ -65,6 +67,7 @@ func (s *MongoStore) withSession(sess *mongo.Session) *MongoStore {
 	store.passwordReset = &passwordResetTokenStore{store: store}
 	store.oauthAccounts = &oauthAccountStore{store: store}
 	store.totp = &totpStore{store: store}
+	store.claimedEmails = &claimedEmailStore{store: store}
 	return store
 }
 
@@ -81,6 +84,7 @@ func (s *MongoStore) VerificationTokens() db.VerificationTokenStore   { return s
 func (s *MongoStore) PasswordResetTokens() db.PasswordResetTokenStore { return s.passwordReset }
 func (s *MongoStore) OAuthAccounts() db.OAuthAccountStore             { return s.oauthAccounts }
 func (s *MongoStore) Totp() db.TotpStore                              { return s.totp }
+func (s *MongoStore) ClaimedEmails() db.ClaimedEmailStore             { return s.claimedEmails }
 
 func (s *MongoStore) Client() *mongo.Client     { return s.client }
 func (s *MongoStore) Database() *mongo.Database { return s.database }
@@ -390,6 +394,12 @@ func (s *userStore) Delete(ctx context.Context, id uuid.UUID) error {
 			if _, err := mTx.database.Collection(col).DeleteMany(cCtx, bson.M{"user_id": uidStr}); err != nil {
 				return err
 			}
+		}
+		// The claim collection names its owner column owner_user_id, so it is not
+		// covered by the user_id sweep above: these rows are what release an
+		// address for re-registration after the account is gone.
+		if _, err := mTx.database.Collection("claimed_emails").DeleteMany(cCtx, bson.M{"owner_user_id": uidStr}); err != nil {
+			return err
 		}
 		_, err := mTx.database.Collection("users").DeleteOne(cCtx, bson.M{"_id": uidStr})
 		return err
@@ -1261,5 +1271,151 @@ func (s *totpStore) DeleteTwoFactorToken(ctx context.Context, id uuid.UUID) (int
 
 func (s *totpStore) DeleteTwoFactorTokensByUserID(ctx context.Context, userID uuid.UUID) error {
 	_, err := s.twoFactorTokens().DeleteMany(s.store.resolveCtx(ctx), bson.M{"user_id": userID.String()})
+	return err
+}
+
+// ==========================================
+// ClaimedEmailStore implementation
+// ==========================================
+
+type claimedEmailStore struct {
+	store *MongoStore
+}
+
+func (s *claimedEmailStore) collection() *mongo.Collection {
+	return s.store.database.Collection("claimed_emails")
+}
+
+// claimFilter addresses one claim row. It is a typed struct rather than a map
+// literal so the query document has exactly one field the driver can serialise,
+// and it is only ever constructed from a key db.ClaimKey has validated as a
+// normalised ASCII address: the value is data, never a query operator.
+type claimFilter struct {
+	ID string `bson:"_id"`
+}
+
+// claimOwnerFilter scopes a write to the account that holds the claim.
+type claimOwnerFilter struct {
+	ID      string `bson:"_id"`
+	OwnerID string `bson:"owner_user_id"`
+}
+
+// Claim mirrors the SQL implementation: an upsert that cannot fail the call on a
+// duplicate, followed by a read of the holder. A duplicate-key error aborts a
+// MongoDB transaction, so the losing call resolves the winner with a read outside
+// it and does not promote: promotion belongs to the winner's own transaction.
+func (s *claimedEmailStore) Claim(ctx context.Context, email string, ownerID uuid.UUID, verified bool) error {
+	key, kerr := db.ClaimKey(email)
+	if kerr != nil {
+		return kerr
+	}
+	if key == "" {
+		return nil
+	}
+	now := time.Now().UTC()
+	sessionCtx := s.store.resolveCtx(ctx)
+	_, err := s.collection().UpdateOne(sessionCtx,
+		claimFilter{ID: key},
+		bson.M{"$setOnInsert": bson.M{
+			"owner_user_id": ownerID.String(),
+			"verified":      verified,
+			"created_at":    now,
+			"updated_at":    now,
+		}},
+		options.UpdateOne().SetUpsert(true),
+	)
+	if err != nil {
+		if !mongo.IsDuplicateKeyError(err) {
+			return NormalizeMongoError(err)
+		}
+		// The concurrent winner committed the row this call needs. Read it outside
+		// the aborted transaction and do not promote: a write made outside the
+		// caller's transaction would survive its rollback.
+		var winner ClaimedEmailDoc
+		if derr := s.collection().FindOne(ctx, claimFilter{ID: key}).Decode(&winner); derr != nil {
+			if errors.Is(derr, mongo.ErrNoDocuments) {
+				return errors.ErrEmailClaimed
+			}
+			return derr
+		}
+		if winner.toDomain().OwnerUserID != ownerID {
+			return errors.ErrEmailClaimed
+		}
+		// Without a session there is no enclosing transaction to abort, so the
+		// promotion can be applied here. With a session the transaction is already
+		// dead; the winner's own flow (or a later claim) promotes it.
+		if s.store.session == nil && verified && !winner.Verified {
+			res, uerr := s.collection().UpdateOne(ctx,
+				claimOwnerFilter{ID: key, OwnerID: ownerID.String()},
+				bson.M{"$set": bson.M{"verified": true, "updated_at": now}},
+			)
+			if uerr != nil {
+				return uerr
+			}
+			if res.MatchedCount == 0 {
+				return errors.ErrEmailClaimed
+			}
+			return nil
+		}
+		return nil
+	}
+	var doc ClaimedEmailDoc
+	if derr := s.collection().FindOne(sessionCtx, claimFilter{ID: key}).Decode(&doc); derr != nil {
+		if errors.Is(derr, mongo.ErrNoDocuments) {
+			return errors.ErrEmailClaimed
+		}
+		return derr
+	}
+	claim := doc.toDomain()
+	if claim.OwnerUserID != ownerID {
+		return errors.ErrEmailClaimed
+	}
+	if verified && !claim.Verified {
+		res, uerr := s.collection().UpdateOne(sessionCtx,
+			claimOwnerFilter{ID: key, OwnerID: ownerID.String()},
+			bson.M{"$set": bson.M{"verified": true, "updated_at": now}},
+		)
+		if uerr != nil {
+			return uerr
+		}
+		if res.MatchedCount == 0 {
+			// Released or reowned between the read and the promotion: the caller no
+			// longer holds the claim and must treat it as a lost race.
+			return errors.ErrEmailClaimed
+		}
+	}
+	return nil
+}
+
+func (s *claimedEmailStore) Get(ctx context.Context, email string) (*db.ClaimedEmail, error) {
+	key, kerr := db.ClaimKey(email)
+	if kerr != nil || key == "" {
+		return nil, gorm.ErrRecordNotFound
+	}
+	var doc ClaimedEmailDoc
+	if err := s.collection().FindOne(s.store.resolveCtx(ctx), claimFilter{ID: key}).Decode(&doc); err != nil {
+		if errors.Is(err, mongo.ErrNoDocuments) {
+			return nil, gorm.ErrRecordNotFound
+		}
+		return nil, err
+	}
+	return doc.toDomain(), nil
+}
+
+// Release deletes the holder's claim. It keys on NormalizeEmail rather than
+// ClaimKey, so a legacy row stored under an address the current rule would not
+// create is still matched and removed; a value that matches no row is a no-op.
+// The filter is still a typed struct, so the value is data only.
+func (s *claimedEmailStore) Release(ctx context.Context, email string, ownerID uuid.UUID) error {
+	key := db.NormalizeEmail(email)
+	if key == "" {
+		return nil
+	}
+	_, err := s.collection().DeleteOne(s.store.resolveCtx(ctx), claimOwnerFilter{ID: key, OwnerID: ownerID.String()})
+	return err
+}
+
+func (s *claimedEmailStore) ReleaseByUserID(ctx context.Context, ownerID uuid.UUID) error {
+	_, err := s.collection().DeleteMany(s.store.resolveCtx(ctx), bson.M{"owner_user_id": ownerID.String()})
 	return err
 }

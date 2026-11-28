@@ -46,6 +46,13 @@ func setupAntiHijackingDB(t *testing.T) (*gorm.DB, db.Store) {
 		credential_version INTEGER NOT NULL DEFAULT 0, email_verified INTEGER NOT NULL DEFAULT 0,
 		created_at DATETIME, updated_at DATETIME
 	);
+	CREATE TABLE IF NOT EXISTS claimed_emails (
+		email VARCHAR(255) PRIMARY KEY,
+		owner_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		verified INTEGER NOT NULL DEFAULT 0,
+		created_at DATETIME,
+		updated_at DATETIME
+	);
 	CREATE TABLE IF NOT EXISTS oauth_accounts (
 		id TEXT PRIMARY KEY, user_id TEXT NOT NULL, provider_id VARCHAR(32) NOT NULL,
 		provider_tenant_id VARCHAR(64) NOT NULL,
@@ -71,7 +78,7 @@ func setupAntiHijackingDB(t *testing.T) (*gorm.DB, db.Store) {
 	return database, gormstore.New(database)
 }
 
-func TestSecurity_PreHijackingAccountLinkConflict(t *testing.T) {
+func TestSecurity_PreHijackingUnverifiedClaimTakeover(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	database, store := setupAntiHijackingDB(t)
@@ -93,6 +100,17 @@ func TestSecurity_PreHijackingAccountLinkConflict(t *testing.T) {
 	}
 	if err := store.Users().Create(ctx, attackerUser); err != nil {
 		t.Fatalf("create pre-created user failed: %v", err)
+	}
+	// A real signup reserves the address; seed the same claim so the outcome is
+	// decided by the claim gate, not by an absent row.
+	if err := store.ClaimedEmails().Claim(ctx, victimEmail, attackerUser.ID, false); err != nil {
+		t.Fatalf("seed claim: %v", err)
+	}
+
+	// The squatter also holds a session; the takeover must revoke it.
+	_, squatterSession, err := sessSvc.CreateSession(ctx, attackerUser.ID, attackerUser.CredentialVersion, db.SessionTypeCookie, "127.0.0.1", "ua")
+	if err != nil {
+		t.Fatalf("create squatter session: %v", err)
 	}
 
 	// 2. Legitimate victim logs in via Microsoft OAuth with verified email
@@ -117,23 +135,92 @@ func TestSecurity_PreHijackingAccountLinkConflict(t *testing.T) {
 	}
 
 	cbRec := httptest.NewRecorder()
-	_, _, _, err = svc.HandleCallback(ctx, cbRec, cbReq, "microsoft", "code-1", state, db.SessionTypeCookie)
+	sess, _, _, err := svc.HandleCallback(ctx, cbRec, cbReq, "microsoft", "code-1", state, db.SessionTypeCookie)
 
-	// Invariant: Flow MUST be rejected with 409 Conflict (ErrOAuthAccountLinkConflict)
-	if err == nil {
-		t.Fatal("expected pre-hijacking attempt to fail with 409 Conflict, but succeeded")
+	// Invariant: provider proof over an unverified claim hands the account over.
+	// The identity that proves the mailbox wins, the squatter's session is revoked,
+	// and no second account appears.
+	if err != nil {
+		t.Fatalf("expected the proving identity to take over the unverified account, got %v", err)
+	}
+	if sess == nil || sess.UserID != attackerUser.ID {
+		t.Fatalf("session user = %v; want the handed-over account %v", sess, attackerUser.ID)
+	}
+	var claim db.ClaimedEmail
+	if err := database.Where("email = ?", db.NormalizeEmail(victimEmail)).First(&claim).Error; err != nil {
+		t.Fatalf("load claim: %v", err)
+	}
+	if claim.OwnerUserID != attackerUser.ID || !claim.Verified {
+		t.Fatalf("claim = %+v; want holder %v, verified", claim, attackerUser.ID)
+	}
+	if _, serr := sessSvc.GetSession(ctx, squatterSession); serr == nil {
+		t.Fatal("the squatter's session survived the takeover")
+	}
+	var users, links int64
+	database.Model(&db.User{}).Count(&users)
+	database.Model(&db.OAuthAccount{}).Count(&links)
+	if users != 1 || links != 1 {
+		t.Fatalf("users=%d links=%d; want one handed-over account with one link", users, links)
+	}
+}
+
+// TestSecurity_PreHijackingVerifiedClaimConflict pins the hard edge: a claim the
+// holder already proved is never taken over, even when the account row looks
+// unverified. The callback is rejected and nothing is touched.
+func TestSecurity_PreHijackingVerifiedClaimConflict(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	database, store := setupAntiHijackingDB(t)
+
+	cfg := config.DefaultConfig()
+	cfg.OAuth.StateSecret = "super-secret-anti-hijack-test-state-key-32b"
+	cfg.OAuth.TokenKEK = secTokenKEK
+	sessSvc := session.NewService(database, &cfg)
+
+	victimEmail := "proved-victim@target-corporation.com"
+	squatter := &db.User{
+		ID:            uuid.New(),
+		Email:         victimEmail,
+		PasswordHash:  "attacker-password-hash",
+		EmailVerified: false,
+		CreatedAt:     time.Now().UTC(),
+		UpdatedAt:     time.Now().UTC(),
+	}
+	if err := store.Users().Create(ctx, squatter); err != nil {
+		t.Fatalf("create squatter: %v", err)
+	}
+	if err := store.ClaimedEmails().Claim(ctx, victimEmail, squatter.ID, true); err != nil {
+		t.Fatalf("seed verified claim: %v", err)
+	}
+
+	mockMS := oauthmock.New("microsoft", "victim-ms-oid-verified", victimEmail, true)
+	defer mockMS.Close()
+	reg := oauth.NewRegistry()
+	_ = reg.Register(mockMS)
+	svc := oauth.NewServiceWithRegistry(store, sessSvc, reg, &cfg)
+
+	rec := httptest.NewRecorder()
+	state, err := oauth.SetStateCookie(rec, &cfg, "microsoft", "v-pkce-verified", "")
+	if err != nil {
+		t.Fatalf("SetStateCookie failed: %v", err)
+	}
+	mockMS.AuthURL(state, pkceChal("v-pkce-verified"))
+	cbReq := httptest.NewRequest("GET", "/auth/oauth/microsoft/callback?state="+state, nil)
+	for _, c := range rec.Result().Cookies() {
+		cbReq.AddCookie(c)
+	}
+	cbRec := httptest.NewRecorder()
+	sess, _, _, err := svc.HandleCallback(ctx, cbRec, cbReq, "microsoft", "code-1", state, db.SessionTypeCookie)
+	if sess != nil {
+		t.Fatalf("session minted for %v; a proved claim must not be taken over", sess.UserID)
 	}
 	if !errors.Is(err, errors.ErrOAuthAccountLinkConflict) {
 		t.Fatalf("expected ErrOAuthAccountLinkConflict, got %v", err)
 	}
-
-	// Invariant: Local account remains untouched and no oauth_accounts row is linked
-	var count int64
-	if err := database.Model(&db.OAuthAccount{}).Count(&count).Error; err != nil {
-		t.Fatalf("count links: %v", err)
-	}
-	if count != 0 {
-		t.Fatalf("expected 0 oauth links created, got %d", count)
+	var links int64
+	database.Model(&db.OAuthAccount{}).Count(&links)
+	if links != 0 {
+		t.Fatalf("expected 0 oauth links, got %d", links)
 	}
 }
 

@@ -17,6 +17,7 @@ import (
 	"github.com/golang-migrate/migrate/v4"
 	pgmigrate "github.com/golang-migrate/migrate/v4/database/postgres"
 	"github.com/golang-migrate/migrate/v4/source/iofs"
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgconn"
 	_ "github.com/jackc/pgx/v5/stdlib"
 
@@ -106,7 +107,7 @@ func TestMigrations_Lifecycle(t *testing.T) {
 	}
 
 	// Clean tables before downing all migrations to ensure no non-zero credential_version rows block 000006 down
-	_, _ = sqlDB.Exec("TRUNCATE TABLE sessions, verification_tokens, password_reset_tokens, oauth_accounts, totp_secrets, totp_used_codes, two_factor_tokens, users CASCADE")
+	_, _ = sqlDB.Exec("TRUNCATE TABLE sessions, verification_tokens, password_reset_tokens, oauth_accounts, totp_secrets, totp_used_codes, two_factor_tokens, claimed_emails, users CASCADE")
 
 	// 4. Down all migrations cleanly
 	if err := m.Down(); err != nil {
@@ -118,7 +119,7 @@ func TestMigrations_Lifecycle(t *testing.T) {
 	err = sqlDB.QueryRow(`
 		SELECT COUNT(*) FROM information_schema.tables 
 		WHERE table_schema = 'public' 
-		  AND table_name IN ('users', 'sessions', 'verification_tokens', 'password_reset_tokens', 'oauth_accounts', 'totp_secrets', 'totp_used_codes', 'two_factor_tokens')
+		  AND table_name IN ('users', 'sessions', 'verification_tokens', 'password_reset_tokens', 'oauth_accounts', 'totp_secrets', 'totp_used_codes', 'two_factor_tokens', 'claimed_emails')
 	`).Scan(&tableCount)
 	if err != nil {
 		t.Fatalf("querying tables failed: %v", err)
@@ -135,13 +136,91 @@ func TestMigrations_Lifecycle(t *testing.T) {
 	err = sqlDB.QueryRow(`
 		SELECT COUNT(*) FROM information_schema.tables 
 		WHERE table_schema = 'public' 
-		  AND table_name IN ('users', 'sessions', 'verification_tokens', 'password_reset_tokens', 'oauth_accounts', 'totp_secrets', 'totp_used_codes', 'two_factor_tokens')
+		  AND table_name IN ('users', 'sessions', 'verification_tokens', 'password_reset_tokens', 'oauth_accounts', 'totp_secrets', 'totp_used_codes', 'two_factor_tokens', 'claimed_emails')
 	`).Scan(&tableCount)
 	if err != nil {
 		t.Fatalf("querying tables failed: %v", err)
 	}
-	if tableCount != 8 {
-		t.Fatalf("expected 8 application tables after re-Up, found %d", tableCount)
+	if tableCount != 9 {
+		t.Fatalf("expected 9 application tables after re-Up, found %d", tableCount)
+	}
+}
+
+// TestMigrations_Claim000014IsDDLOnly pins the claim table on the real dialect:
+// the down path drops it (so a rollback cannot leave a stale claim blocking an
+// address), the up creates it empty even though addresses already exist (the
+// import is a Go job: SQL lower()/trim() cannot reproduce db.NormalizeEmail), and
+// the unique key holds one row per claim key.
+func TestMigrations_Claim000014IsDDLOnly(t *testing.T) {
+	dbURL := resolveDatabaseURL()
+	sqlDB, err := sql.Open("pgx", dbURL)
+	if err != nil {
+		if os.Getenv("CI") != "" {
+			t.Fatalf("CI: failed to open postgres connection: %v", err)
+		}
+		t.Skipf("Postgres not available, skipping: %v", err)
+	}
+	defer func() { _ = sqlDB.Close() }()
+	pingCtx, pingCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer pingCancel()
+	if err := sqlDB.PingContext(pingCtx); err != nil {
+		if os.Getenv("CI") != "" {
+			t.Fatalf("CI: PostgreSQL connection failed: %v", err)
+		}
+		t.Skipf("Postgres not available, skipping: %v", err)
+	}
+
+	m, migrateDB := newMigrator(t, dbURL)
+	defer func() {
+		_, _ = m.Close()
+		_ = migrateDB.Close()
+	}()
+	if err := m.Up(); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("m.Up() failed: %v", err)
+	}
+	_, _ = migrateDB.Exec("TRUNCATE TABLE sessions, verification_tokens, password_reset_tokens, oauth_accounts, totp_secrets, totp_used_codes, two_factor_tokens, claimed_emails, users CASCADE")
+	if err := m.Steps(-1); err != nil {
+		t.Fatalf("000014 down failed: %v", err)
+	}
+
+	// Legacy rows that a SQL backfill would have folded differently: mixed case
+	// and a leading tab that only Go's TrimSpace strips.
+	ownerID := uuid.New()
+	if _, err := migrateDB.Exec(`INSERT INTO users (id, email, password_hash, email_verified) VALUES ($1, $2, 'hash', FALSE)`,
+		ownerID, "  Claim.Owner@Example.Test\t"); err != nil {
+		t.Fatalf("seed owner: %v", err)
+	}
+	if _, err := migrateDB.Exec(`INSERT INTO oauth_accounts (id, user_id, provider_id, provider_tenant_id, provider_user_id, email, verified)
+		VALUES ($1, $2, 'google', '', 'sub-ddl-only', 'CLAIM.OWNER@example.test', FALSE)`, uuid.New(), ownerID); err != nil {
+		t.Fatalf("seed link: %v", err)
+	}
+
+	if err := m.Up(); err != nil {
+		t.Fatalf("re-applying 000014 failed: %v", err)
+	}
+	var claims int
+	if err := migrateDB.QueryRow(`SELECT COUNT(*) FROM claimed_emails`).Scan(&claims); err != nil {
+		t.Fatalf("count claims: %v", err)
+	}
+	if claims != 0 {
+		t.Fatalf("000014 wrote %d claims; the migration must not backfill", claims)
+	}
+
+	// The application's key is the only key: one row per key, byte for byte.
+	key := db.NormalizeEmail("  Claim.Owner@Example.Test\t")
+	if _, err := migrateDB.Exec(`INSERT INTO claimed_emails (email, owner_user_id, verified) VALUES ($1, $2, FALSE)`, key, ownerID); err != nil {
+		t.Fatalf("insert app-keyed claim: %v", err)
+	}
+	var pgErr *pgconn.PgError
+	if _, err := migrateDB.Exec(`INSERT INTO claimed_emails (email, owner_user_id, verified) VALUES ($1, $2, TRUE)`, key, ownerID); !errors.As(err, &pgErr) || pgErr.Code != "23505" {
+		t.Fatalf("second claim row for the same key: want unique violation 23505, got: %v", err)
+	}
+
+	if _, err := migrateDB.Exec(`DELETE FROM oauth_accounts WHERE user_id = $1`, ownerID); err != nil {
+		t.Fatalf("remove seeded link: %v", err)
+	}
+	if _, err := migrateDB.Exec(`DELETE FROM users WHERE id = $1`, ownerID); err != nil {
+		t.Fatalf("remove seeded user: %v", err)
 	}
 }
 
@@ -250,8 +329,8 @@ func TestMigrations_DownRefusedOnSeededDB(t *testing.T) {
 	if _, err := sqlDB2.Exec(`DELETE FROM users WHERE email = 'down-rollback@example.com'`); err != nil {
 		t.Fatalf("failed to remove seed row: %v", err)
 	}
-	if verr, ddirty, verr2 := m2.Version(); verr2 != nil || verr != 13 || ddirty {
-		t.Fatalf("expected version 13 clean after re-up, got version=%d dirty=%v err=%v", verr, ddirty, verr2)
+	if verr, ddirty, verr2 := m2.Version(); verr2 != nil || verr != 14 || ddirty {
+		t.Fatalf("expected version 14 clean after re-up, got version=%d dirty=%v err=%v", verr, ddirty, verr2)
 	}
 }
 

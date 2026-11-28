@@ -1105,7 +1105,7 @@ func validateIdentityFields(info *UserInfo, providerID string) error {
 	if strings.TrimSpace(info.Email) == "" {
 		return nil
 	}
-	if len(info.Email) > providerFieldMaxLen || db.ValidateEmail(info.Email) != nil {
+	if len(info.Email) > providerFieldMaxLen || db.ValidateClaimableEmail(info.Email) != nil {
 		return errOAuthProviderIdentityInvalid
 	}
 	return nil
@@ -1244,6 +1244,7 @@ func applyTokenRecord(row *db.OAuthAccount, rec db.OAuthTokenRecord) {
 func (s *service) attachLink(ctx context.Context, ownerID uuid.UUID, providerID string, info *UserInfo, tokens *OAuthToken) (db.User, bool, error) {
 	var owner db.User
 	linked := false
+	tookOver := false
 	err := s.store.Transaction(ctx, func(txStore db.Store) error {
 		locked, lerr := txStore.Users().GetByIDForUpdate(ctx, ownerID)
 		if lerr != nil {
@@ -1256,7 +1257,12 @@ func (s *service) attachLink(ctx context.Context, ownerID uuid.UUID, providerID 
 			return errors.ErrOAuthAccountNotLinked
 		}
 		if !isClaimedAccount(*locked) {
-			return errors.ErrOAuthAccountLinkConflict
+			// The provider may have proved the address the account squats. That
+			// proof hands the account over; anything else keeps the rejection.
+			if terr := s.takeoverUnverifiedAccount(ctx, txStore, locked, info); terr != nil {
+				return terr
+			}
+			tookOver = true
 		}
 		owner = *locked
 		email := info.Email
@@ -1278,6 +1284,20 @@ func (s *service) attachLink(ctx context.Context, ownerID uuid.UUID, providerID 
 				// not own, permanently claiming its provider identity.
 				return errLinkEmailOwnedByAnother
 			}
+			// The claim is the guard a read cannot be: the insert blocks on the
+			// unique key, so a signup or another link committing the same address
+			// either lands before this read or loses the insert.
+			if cerr := txStore.ClaimedEmails().Claim(ctx, email, owner.ID, verified); cerr != nil {
+				if errors.Is(cerr, errors.ErrEmailClaimed) {
+					return errLinkEmailOwnedByAnother
+				}
+				// An address the claim key cannot represent is a validation
+				// failure, not a database failure.
+				if errors.Is(cerr, errors.ErrInvalidEmail) {
+					return cerr
+				}
+				return errors.New(errors.CodeInternalError, "failed to claim link email", cerr)
+			}
 		}
 		if ierr := s.insertLink(ctx, txStore.OAuthAccounts(), owner.ID, providerID, info.ProviderTenantID, info.ProviderUserID, email, verified, tokens); ierr != nil {
 			return ierr
@@ -1290,12 +1310,80 @@ func (s *service) attachLink(ctx context.Context, ownerID uuid.UUID, providerID 
 			user, _, _, rerr := s.relinkExisting(ctx, providerID, info.ProviderTenantID, info.ProviderUserID)
 			return user, false, rerr
 		}
-		if errors.Is(err, errors.ErrOAuthAccountNotLinked) || errors.Is(err, errors.ErrOAuthAccountLinkConflict) || errors.Is(err, errLinkEmailOwnedByAnother) {
+		if errors.Is(err, errors.ErrOAuthAccountNotLinked) || errors.Is(err, errors.ErrOAuthAccountLinkConflict) || errors.Is(err, errLinkEmailOwnedByAnother) || errors.Is(err, errors.ErrInvalidEmail) {
 			return db.User{}, false, err
 		}
 		return db.User{}, false, errors.New(errors.CodeInternalError, "failed to link oauth account", err)
 	}
+	if tookOver {
+		// Audited after the commit: a rolled-back handover must not appear as one.
+		// Structured slog is this service's audit channel (see logLinkAudit).
+		slog.InfoContext(ctx, "oauth_account_takeover",
+			"provider", providerID,
+			"user_id", owner.ID.String(),
+			"email", db.NormalizeEmail(owner.Email),
+		)
+	}
 	return owner, linked, nil
+}
+
+// takeoverUnverifiedAccount hands an account over to the identity that just proved
+// the mailbox. It runs inside attachLink's transaction on the row-locked owner, and
+// only when the owner's claim is unverified: a claim another account already proved
+// is never moved, and a subject-only or unattested provider identity has nothing to
+// prove.
+//
+// The handed-over account keeps its rows: no account is deleted and no data moves.
+// Every credential the squatter held is invalidated in place, so proving the mailbox
+// always wins and never has to share the account.
+func (s *service) takeoverUnverifiedAccount(ctx context.Context, txStore db.Store, owner *db.User, info *UserInfo) error {
+	if info == nil || !info.EmailVerified || strings.TrimSpace(info.Email) == "" {
+		return errors.ErrOAuthAccountLinkConflict
+	}
+	claim, cerr := txStore.ClaimedEmails().Get(ctx, info.Email)
+	if cerr != nil {
+		if errors.Is(cerr, gorm.ErrRecordNotFound) || errors.Is(cerr, errors.ErrUserNotFound) {
+			return errors.ErrOAuthAccountLinkConflict
+		}
+		return errors.New(errors.CodeInternalError, "failed to read email claim", cerr)
+	}
+	if claim == nil || claim.OwnerUserID != owner.ID || claim.Verified {
+		return errors.ErrOAuthAccountLinkConflict
+	}
+
+	// Clearing the hash disabled password login while keeping timing parity:
+	// Login already treats an unusable hash as an OAuth-only account.
+	if err := txStore.Users().UpdatePassword(ctx, owner.ID, ""); err != nil {
+		return errors.New(errors.CodeInternalError, "failed to clear takeover password", err)
+	}
+	// The version bump invalidates a session that survives the delete below; the
+	// delete covers the rows the bump would otherwise leave to expire.
+	version, err := txStore.Users().IncrementCredentialVersion(ctx, owner.ID)
+	if err != nil {
+		return errors.New(errors.CodeInternalError, "failed to revoke takeover credential version", err)
+	}
+	if err := txStore.Sessions().DeleteByUserID(ctx, owner.ID); err != nil {
+		return errors.New(errors.CodeInternalError, "failed to revoke takeover sessions", err)
+	}
+	links, err := txStore.OAuthAccounts().GetByUserID(ctx, owner.ID)
+	if err != nil {
+		return errors.New(errors.CodeInternalError, "failed to load takeover grants", err)
+	}
+	for _, link := range links {
+		if link == nil {
+			continue
+		}
+		// Overwrites every token column: no refresh token outlives the handover.
+		if err := txStore.OAuthAccounts().SaveOAuthTokens(ctx, link.ID, db.OAuthTokenRecord{}); err != nil {
+			return errors.New(errors.CodeInternalError, "failed to revoke takeover grant", err)
+		}
+	}
+	if err := txStore.Users().SetEmailVerified(ctx, owner.ID, true); err != nil {
+		return errors.New(errors.CodeInternalError, "failed to mark takeover account verified", err)
+	}
+	owner.EmailVerified = true
+	owner.CredentialVersion = int(version)
+	return nil
 }
 
 // linkedUser resolves the owner and row of an existing provider link.
@@ -1382,6 +1470,14 @@ func (s *service) linkRacedUser(ctx context.Context, providerID string, info *Us
 	if err != nil {
 		if !errors.Is(err, gorm.ErrRecordNotFound) && !errors.Is(err, errors.ErrUserNotFound) {
 			return db.User{}, false, false, errors.New(errors.CodeInternalError, "failed to query user", err)
+		}
+		// The address can be reserved by another account's link, which has no
+		// users row to converge on. That is a conflict, not a failed query: a 500
+		// here would turn the documented rejection into an outage signal.
+		if claim, cerr := s.store.ClaimedEmails().Get(ctx, info.Email); cerr == nil && claim != nil {
+			return db.User{}, false, false, errLinkEmailOwnedByAnother
+		} else if cerr != nil && !errors.Is(cerr, gorm.ErrRecordNotFound) && !errors.Is(cerr, errors.ErrUserNotFound) {
+			return db.User{}, false, false, errors.New(errors.CodeInternalError, "failed to read email claim", cerr)
 		}
 		// No winner is visible, so there is nothing to converge on: an unverified
 		// claim stays a hard rejection.
@@ -1475,11 +1571,30 @@ func isClaimedAccount(u db.User) bool {
 
 // invalidateLink deletes a link that must never sign in again: a spent
 // unverified link, or a verified one whose tenant dropped out of the allowlist.
-// The delete is best-effort by design: the refusal does not depend on it because
-// link trust is re-derived from the owner and the tenant on every callback, so a
-// store failure is logged rather than turning a rejected login into a 500.
+// The delete and the release of its address claim share one transaction: a delete
+// that commits while the release fails would leave a stale claim that blocks the
+// address with no way to recover it short of database access. The call stays
+// best-effort by design: the refusal does not depend on it because link trust is
+// re-derived from the owner and the tenant on every callback, so a store failure
+// is logged rather than turning a rejected login into a 500.
+//
+// The owner row is locked before the link delete, matching attachLink's
+// owner-then-link order. Deleting first and locking afterwards would let a
+// concurrent attachLink (owner lock held, waiting on this link's unique index)
+// and this transaction (link lock held, waiting on the owner) deadlock.
 func (s *service) invalidateLink(ctx context.Context, link db.OAuthAccount) {
-	if err := s.store.OAuthAccounts().Delete(ctx, link.ID); err != nil {
+	err := s.store.Transaction(ctx, func(txStore db.Store) error {
+		if _, lerr := txStore.Users().GetByIDForUpdate(ctx, link.UserID); lerr != nil {
+			if !errors.Is(lerr, gorm.ErrRecordNotFound) && !errors.Is(lerr, errors.ErrUserNotFound) {
+				return lerr
+			}
+		}
+		if derr := txStore.OAuthAccounts().Delete(ctx, link.ID); derr != nil {
+			return derr
+		}
+		return db.ReleaseLinkClaim(ctx, txStore, link)
+	})
+	if err != nil {
 		slog.WarnContext(ctx, "oauth_link_invalidate_failed",
 			"provider", link.ProviderID,
 			"user_id", link.UserID.String(),
@@ -1503,17 +1618,23 @@ func (s *service) createUserAndLink(ctx context.Context, providerID string, info
 		PasswordHash:  "",
 		EmailVerified: info.EmailVerified,
 	}
-	userConflict, linkConflict := false, false
+	userConflict, linkConflict, claimConflict := false, false, false
 	op := "failed to create oauth user"
 	txErr := s.store.Transaction(ctx, func(txStore db.Store) error {
 		userConflict = false
 		linkConflict = false
+		claimConflict = false
 		op = "failed to create oauth user"
 		if err := txStore.Users().Create(ctx, &user); err != nil {
 			userConflict = errors.Is(err, errors.ErrEmailAlreadyExists) ||
 				errors.Is(err, errors.ErrUserAlreadyExists) ||
 				isUniqueViolation(err)
 			return err
+		}
+		op = "failed to claim oauth user email"
+		if cerr := txStore.ClaimedEmails().Claim(ctx, info.Email, user.ID, info.EmailVerified); cerr != nil {
+			claimConflict = errors.Is(cerr, errors.ErrEmailClaimed)
+			return cerr
 		}
 		op = "failed to link oauth account"
 		if err := s.insertLink(ctx, txStore.OAuthAccounts(), user.ID, providerID, info.ProviderTenantID, info.ProviderUserID, info.Email, info.EmailVerified, tokens); err != nil {
@@ -1526,8 +1647,19 @@ func (s *service) createUserAndLink(ctx context.Context, providerID string, info
 		if userConflict {
 			return s.linkRacedUser(ctx, providerID, info, tokens)
 		}
+		if claimConflict {
+			// The address is reserved by another account, so this registration is a
+			// conflict rather than a failed insert. Its link and user are gone with
+			// the rollback.
+			return db.User{}, false, false, errLinkEmailOwnedByAnother
+		}
 		if linkConflict {
 			return s.relinkExisting(ctx, providerID, info.ProviderTenantID, info.ProviderUserID)
+		}
+		// An address the claim key cannot represent is a validation failure, not a
+		// database failure.
+		if errors.Is(txErr, errors.ErrInvalidEmail) {
+			return db.User{}, false, false, txErr
 		}
 		return db.User{}, false, false, errors.New(errors.CodeInternalError, op, txErr)
 	}

@@ -114,6 +114,10 @@ func Connect(cfg config.Config) (*gorm.DB, error) {
 		return nil, errors.New(errors.CodeDatabaseUnavailable, "db ping failed", err)
 	}
 
+	// 4. Boot never scans the account tables. claimed_emails ships empty and the
+	// import of pre-000014 addresses is an explicit operator step
+	// (db.BackfillClaimedEmails); see docs/email-claims.md.
+
 	success = true
 	return db, nil
 }
@@ -310,6 +314,16 @@ func NormalizeMySQLError(err error) error {
 	}
 
 	switch {
+	case strings.Contains(msg, "for key 'claimed_emails.") ||
+		strings.Contains(msg, "uq_claimed_emails_email") ||
+		strings.Contains(msg, "claimed_emails_pkey") ||
+		strings.Contains(msg, "unique constraint failed: claimed_emails"):
+		// Match the claim key's constraint name, not the whole message: a users or
+		// oauth_accounts duplicate whose value happens to contain "claimed_emails"
+		// must still fall through to its own case, and a foreign-key failure on the
+		// claim table is not a lost claim race (signup would swallow it as silent
+		// success). The claim key must never normalise to ErrEmailAlreadyExists.
+		return errors.ErrEmailClaimed
 	case strings.Contains(msg, "idx_users_email") || strings.Contains(msg, "users"):
 		return errors.ErrEmailAlreadyExists
 	case strings.Contains(msg, "totp_used_codes") || strings.Contains(msg, "uq_totp_used_codes"):

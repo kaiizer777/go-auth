@@ -44,6 +44,7 @@ func setupTestDB(t *testing.T) (*gormdriver.DB, db.Store) {
 		&db.TotpSecret{},
 		&db.TotpUsedCode{},
 		&db.TwoFactorToken{},
+		&db.ClaimedEmail{},
 	)
 	if err != nil {
 		t.Fatalf("failed to auto-migrate models: %v", err)
@@ -1828,4 +1829,232 @@ func TestTotpStore_RewrapPair(t *testing.T) {
 
 func equalsBytes(a, b []byte) bool {
 	return bytes.Equal(a, b)
+}
+
+// seedClaimUsers creates one account per address and returns the stored users.
+func seedClaimUsers(t *testing.T, store db.Store, emails ...string) []db.User {
+	t.Helper()
+	users := make([]db.User, 0, len(emails))
+	for _, email := range emails {
+		u := db.User{ID: uuid.New(), Email: email, PasswordHash: "hash"}
+		if err := store.Users().Create(context.Background(), &u); err != nil {
+			t.Fatalf("seed user %s: %v", email, err)
+		}
+		users = append(users, u)
+	}
+	return users
+}
+
+func TestClaimedEmailStore_ClaimIsOwnedOnceAndNormalised(t *testing.T) {
+	_, store := setupTestDB(t)
+	ctx := context.Background()
+	users := seedClaimUsers(t, store, "owner@example.com", "other@example.com")
+	owner, other := users[0], users[1]
+
+	if err := store.ClaimedEmails().Claim(ctx, "  Owner@Example.COM ", owner.ID, false); err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	// Same holder, different casing and padding: the write is idempotent.
+	if err := store.ClaimedEmails().Claim(ctx, "owner@example.com", owner.ID, false); err != nil {
+		t.Fatalf("same-owner re-claim: %v", err)
+	}
+	claim, err := store.ClaimedEmails().Get(ctx, "OWNER@EXAMPLE.COM")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if claim.OwnerUserID != owner.ID {
+		t.Fatalf("owner = %v, want %v", claim.OwnerUserID, owner.ID)
+	}
+	if claim.Verified {
+		t.Fatal("an unverified write must not produce a verified claim")
+	}
+
+	// A verified write by the holder promotes the claim in place.
+	if err := store.ClaimedEmails().Claim(ctx, "owner@example.com", owner.ID, true); err != nil {
+		t.Fatalf("promote: %v", err)
+	}
+	if claim, err = store.ClaimedEmails().Get(ctx, "owner@example.com"); err != nil || !claim.Verified {
+		t.Fatalf("claim after promote = %+v, %v; want verified", claim, err)
+	}
+
+	// Another account is refused, and the holder is untouched.
+	if err := store.ClaimedEmails().Claim(ctx, "owner@example.com", other.ID, true); !errors.Is(err, apperrors.ErrEmailClaimed) {
+		t.Fatalf("foreign claim = %v, want ErrEmailClaimed", err)
+	}
+	if claim, err = store.ClaimedEmails().Get(ctx, "owner@example.com"); err != nil || claim.OwnerUserID != owner.ID {
+		t.Fatalf("claim after refused takeover = %+v, %v; want %v", claim, err, owner.ID)
+	}
+}
+
+func TestClaimedEmailStore_EmptyAddressClaimsNothing(t *testing.T) {
+	database, store := setupTestDB(t)
+	ctx := context.Background()
+	owner := seedClaimUsers(t, store, "empty-probe@example.com")[0]
+
+	for _, email := range []string{"", "   ", "\t\n"} {
+		if err := store.ClaimedEmails().Claim(ctx, email, owner.ID, true); err != nil {
+			t.Fatalf("claim %q: %v", email, err)
+		}
+		if err := store.ClaimedEmails().Release(ctx, email, owner.ID); err != nil {
+			t.Fatalf("release %q: %v", email, err)
+		}
+	}
+	if _, err := store.ClaimedEmails().Get(ctx, ""); !errors.Is(err, gormdriver.ErrRecordNotFound) {
+		t.Fatalf("empty address resolved to a claim, err = %v", err)
+	}
+	var rows int64
+	if err := database.Model(&db.ClaimedEmail{}).Count(&rows).Error; err != nil {
+		t.Fatalf("count claims: %v", err)
+	}
+	if rows != 0 {
+		t.Fatalf("claims = %d, want none for empty addresses", rows)
+	}
+}
+
+func TestClaimedEmailStore_ReleaseOnlyRemovesTheHoldersClaim(t *testing.T) {
+	_, store := setupTestDB(t)
+	ctx := context.Background()
+	users := seedClaimUsers(t, store, "holder@example.com", "rival@example.com")
+	holder, rival := users[0], users[1]
+
+	if err := store.ClaimedEmails().Claim(ctx, "holder@example.com", holder.ID, true); err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	// A non-holder cannot delete the row.
+	if err := store.ClaimedEmails().Release(ctx, "holder@example.com", rival.ID); err != nil {
+		t.Fatalf("foreign release: %v", err)
+	}
+	if _, err := store.ClaimedEmails().Get(ctx, "holder@example.com"); err != nil {
+		t.Fatalf("claim disappeared after a foreign release: %v", err)
+	}
+	// The holder can, and the address becomes claimable again.
+	if err := store.ClaimedEmails().Release(ctx, "holder@example.com", holder.ID); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	if err := store.ClaimedEmails().Claim(ctx, "holder@example.com", rival.ID, false); err != nil {
+		t.Fatalf("re-claim after release: %v", err)
+	}
+	// Releasing an absent claim is a no-op.
+	if err := store.ClaimedEmails().Release(ctx, "absent@example.com", holder.ID); err != nil {
+		t.Fatalf("absent release: %v", err)
+	}
+}
+
+func TestUserStore_DeleteReleasesEveryClaim(t *testing.T) {
+	_, store := setupTestDB(t)
+	ctx := context.Background()
+	users := seedClaimUsers(t, store, "gone@example.com", "kept@example.com")
+	gone, kept := users[0], users[1]
+	if err := store.ClaimedEmails().Claim(ctx, "gone@example.com", gone.ID, true); err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if err := store.ClaimedEmails().Claim(ctx, "kept@example.com", kept.ID, true); err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	// A link-only claim (its address is not users.email) is released too.
+	if err := store.ClaimedEmails().Claim(ctx, "provider-only@example.com", gone.ID, true); err != nil {
+		t.Fatalf("link claim: %v", err)
+	}
+
+	if err := store.Users().Delete(ctx, gone.ID); err != nil {
+		t.Fatalf("delete user: %v", err)
+	}
+	for _, email := range []string{"gone@example.com", "provider-only@example.com"} {
+		if _, err := store.ClaimedEmails().Get(ctx, email); !errors.Is(err, gormdriver.ErrRecordNotFound) {
+			t.Errorf("claim for %s survived its owner's deletion (err = %v)", email, err)
+		}
+	}
+	if _, err := store.ClaimedEmails().Get(ctx, "kept@example.com"); err != nil {
+		t.Errorf("claim for a surviving account was released: %v", err)
+	}
+}
+
+// lockingUserStore records whether the owner row was read with the row lock.
+type lockingUserStore struct {
+	db.UserStore
+	locked *bool
+}
+
+func (s *lockingUserStore) GetByIDForUpdate(ctx context.Context, id uuid.UUID) (*db.User, error) {
+	*s.locked = true
+	return s.UserStore.GetByIDForUpdate(ctx, id)
+}
+
+// lockingStore propagates the recorder through Transaction, so a release that runs
+// inside a transaction still reports which read it used.
+type lockingStore struct {
+	db.Store
+	locked *bool
+}
+
+func (s *lockingStore) Users() db.UserStore {
+	return &lockingUserStore{UserStore: s.Store.Users(), locked: s.locked}
+}
+
+func (s *lockingStore) Transaction(ctx context.Context, fn func(db.Store) error) error {
+	return s.Store.Transaction(ctx, func(tx db.Store) error {
+		return fn(&lockingStore{Store: tx, locked: s.locked})
+	})
+}
+
+// TestReleaseLinkClaimLocksTheOwnerRow pins the serialisation that stops a
+// concurrent attachLink from inserting a link between the scan and the release: the
+// claim release takes the owner row lock first.
+func TestReleaseLinkClaimLocksTheOwnerRow(t *testing.T) {
+	database, store := setupTestDB(t)
+	ctx := context.Background()
+	owner := seedClaimUsers(t, store, "lock-owner@example.com")[0]
+	link := db.OAuthAccount{ID: uuid.New(), UserID: owner.ID, ProviderID: "google",
+		ProviderUserID: "sub-lock-probe", Email: "lock-link@example.com"}
+	if err := database.Create(&link).Error; err != nil {
+		t.Fatalf("seed link: %v", err)
+	}
+	if err := store.ClaimedEmails().Claim(ctx, link.Email, owner.ID, true); err != nil {
+		t.Fatalf("seed claim: %v", err)
+	}
+
+	locked := false
+	wrapped := &lockingStore{Store: store, locked: &locked}
+	if err := wrapped.Transaction(ctx, func(tx db.Store) error {
+		if derr := tx.OAuthAccounts().Delete(ctx, link.ID); derr != nil {
+			return derr
+		}
+		return db.ReleaseLinkClaim(ctx, tx, link)
+	}); err != nil {
+		t.Fatalf("release in transaction: %v", err)
+	}
+	if !locked {
+		t.Fatal("ReleaseLinkClaim read the owner without the row lock; a concurrent link insert can be lost")
+	}
+	if _, err := store.ClaimedEmails().Get(ctx, link.Email); !errors.Is(err, gormdriver.ErrRecordNotFound) {
+		t.Fatalf("claim after its last holder was deleted: %v; want not found", err)
+	}
+}
+
+// TestClaimedEmailStore_RejectsInvalidAddress pins the claim key space: an
+// address the key grammar cannot represent is rejected before it reaches a query,
+// and the rejection is a validation error rather than a database failure.
+func TestClaimedEmailStore_RejectsInvalidAddress(t *testing.T) {
+	database, store := setupTestDB(t)
+	ctx := context.Background()
+	owner := seedClaimUsers(t, store, "invalid-probe@example.com")[0]
+
+	for _, addr := range []string{"user@@example.com", "no-at.example.com", "user@example"} {
+		if err := store.ClaimedEmails().Claim(ctx, addr, owner.ID, true); !errors.Is(err, apperrors.ErrInvalidEmail) {
+			t.Errorf("Claim(%q) err = %v; want ErrInvalidEmail", addr, err)
+		}
+		if _, err := store.ClaimedEmails().Get(ctx, addr); !errors.Is(err, gormdriver.ErrRecordNotFound) {
+			t.Errorf("Get(%q) err = %v; want not found", addr, err)
+		}
+		if err := store.ClaimedEmails().Release(ctx, addr, owner.ID); err != nil {
+			t.Errorf("Release(%q) = %v; want a no-op", addr, err)
+		}
+	}
+	var rows int64
+	if err := database.Model(&db.ClaimedEmail{}).Count(&rows).Error; err != nil {
+		t.Fatalf("count claims: %v", err)
+	}
+	if rows != 0 {
+		t.Fatalf("claim rows = %d; an invalid address must never be stored", rows)
+	}
 }

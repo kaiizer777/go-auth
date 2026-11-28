@@ -445,3 +445,28 @@ func (d *TwoFactorTokenDoc) toDomain() *db.TwoFactorToken {
 		Attempts:  d.Attempts,
 	}
 }
+
+// ClaimedEmailDoc represents one reserved address in the "claimed_emails"
+// collection. _id is the Go-normalised address, so the unique key on _id is the
+// claim and is compared byte for byte, exactly as the SQL primary key is.
+type ClaimedEmailDoc struct {
+	Email       string    `bson:"_id"`
+	OwnerUserID string    `bson:"owner_user_id"`
+	Verified    bool      `bson:"verified"`
+	CreatedAt   time.Time `bson:"created_at"`
+	UpdatedAt   time.Time `bson:"updated_at"`
+}
+
+func (d *ClaimedEmailDoc) toDomain() *db.ClaimedEmail {
+	if d == nil {
+		return nil
+	}
+	ownerID, _ := uuid.Parse(d.OwnerUserID)
+	return &db.ClaimedEmail{
+		Email:       db.ClaimKeyValue(d.Email),
+		OwnerUserID: ownerID,
+		Verified:    d.Verified,
+		CreatedAt:   d.CreatedAt.UTC(),
+		UpdatedAt:   d.UpdatedAt.UTC(),
+	}
+}

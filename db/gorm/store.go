@@ -97,7 +97,16 @@ func (s *userStore) SetEmailVerified(ctx context.Context, id uuid.UUID, verified
 }
 
 func (s *userStore) Delete(ctx context.Context, id uuid.UUID) error {
-	return s.db.WithContext(ctx).Where("id = ?", id).Delete(&db.User{}).Error
+	// One transaction so a failure cannot release the account's addresses while
+	// the account survives. The schema FK already cascades; the explicit delete
+	// keeps the invariant true for a store whose schema was built by AutoMigrate,
+	// which creates no foreign keys.
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Where("id = ?", id).Delete(&db.User{}).Error; err != nil {
+			return err
+		}
+		return tx.Where("owner_user_id = ?", id).Delete(&db.ClaimedEmail{}).Error
+	})
 }
 
 type sessionStore struct {
@@ -698,6 +707,41 @@ func (s *totpStore) DeleteTwoFactorTokensByUserID(ctx context.Context, userID uu
 	return s.db.WithContext(ctx).Where("user_id = ?", userID).Delete(&db.TwoFactorToken{}).Error
 }
 
+type claimedEmailStore struct {
+	db *gorm.DB
+}
+
+func (s *claimedEmailStore) Claim(ctx context.Context, email string, ownerID uuid.UUID, verified bool) error {
+	return db.ClaimWithin(ctx, s.db, email, ownerID, verified)
+}
+
+func (s *claimedEmailStore) Get(ctx context.Context, email string) (*db.ClaimedEmail, error) {
+	key, kerr := db.ClaimKey(email)
+	if kerr != nil || key == "" {
+		return nil, gorm.ErrRecordNotFound
+	}
+	var claim db.ClaimedEmail
+	if err := s.db.WithContext(ctx).Where("email = ?", key).First(&claim).Error; err != nil {
+		return nil, err
+	}
+	return &claim, nil
+}
+
+// Release deletes the holder's claim. It keys on NormalizeEmail rather than
+// ClaimKey, so a legacy row stored under an address the current rule would not
+// create is still matched and removed; a value that matches no row is a no-op.
+func (s *claimedEmailStore) Release(ctx context.Context, email string, ownerID uuid.UUID) error {
+	key := db.NormalizeEmail(email)
+	if key == "" {
+		return nil
+	}
+	return s.db.WithContext(ctx).Where("email = ? AND owner_user_id = ?", key, ownerID).Delete(&db.ClaimedEmail{}).Error
+}
+
+func (s *claimedEmailStore) ReleaseByUserID(ctx context.Context, ownerID uuid.UUID) error {
+	return s.db.WithContext(ctx).Where("owner_user_id = ?", ownerID).Delete(&db.ClaimedEmail{}).Error
+}
+
 type gormStore struct {
 	db                 *gorm.DB
 	users              *userStore
@@ -706,6 +750,7 @@ type gormStore struct {
 	passwordReset      *passwordResetTokenStore
 	oauthAccounts      *oauthAccountStore
 	totp               *totpStore
+	claimedEmails      *claimedEmailStore
 }
 
 // New constructs a GORM-backed implementation of db.Store.
@@ -721,6 +766,7 @@ func New(database *gorm.DB) db.Store {
 		passwordReset:      &passwordResetTokenStore{db: database},
 		oauthAccounts:      &oauthAccountStore{db: database},
 		totp:               &totpStore{db: database},
+		claimedEmails:      &claimedEmailStore{db: database},
 	}
 }
 
@@ -730,6 +776,7 @@ func (s *gormStore) VerificationTokens() db.VerificationTokenStore   { return s.
 func (s *gormStore) PasswordResetTokens() db.PasswordResetTokenStore { return s.passwordReset }
 func (s *gormStore) OAuthAccounts() db.OAuthAccountStore             { return s.oauthAccounts }
 func (s *gormStore) Totp() db.TotpStore                              { return s.totp }
+func (s *gormStore) ClaimedEmails() db.ClaimedEmailStore             { return s.claimedEmails }
 
 func (s *gormStore) Transaction(ctx context.Context, fn func(txStore db.Store) error) error {
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {

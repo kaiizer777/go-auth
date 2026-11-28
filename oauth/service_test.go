@@ -122,6 +122,13 @@ func serviceTestDB(t *testing.T) *gorm.DB {
 		created_at DATETIME,
 		updated_at DATETIME
 	);
+	CREATE TABLE IF NOT EXISTS claimed_emails (
+		email VARCHAR(255) PRIMARY KEY,
+		owner_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		verified INTEGER NOT NULL DEFAULT 0,
+		created_at DATETIME,
+		updated_at DATETIME
+	);
 	CREATE TABLE IF NOT EXISTS oauth_accounts (
 		id TEXT PRIMARY KEY,
 		user_id TEXT NOT NULL,
@@ -1378,6 +1385,570 @@ func (h *hideFirstLinkStore) GetByProvider(ctx context.Context, providerID, prov
 		return nil, gorm.ErrRecordNotFound
 	}
 	return h.OAuthAccountStore.GetByProvider(ctx, providerID, providerTenantID, providerUserID)
+}
+
+// hidesEmailUserStore reports one miss for a single address, standing in for the
+// read a signup invalidates when it commits between the link's probe and its
+// write. Every other lookup, and every later probe, is served normally.
+type hidesEmailUserStore struct {
+	db.UserStore
+	email  string
+	hidden *atomic.Bool
+}
+
+func (h *hidesEmailUserStore) GetByEmail(ctx context.Context, email string) (*db.User, error) {
+	if db.NormalizeEmail(email) == h.email && h.hidden.CompareAndSwap(true, false) {
+		return nil, gorm.ErrRecordNotFound
+	}
+	return h.UserStore.GetByEmail(ctx, email)
+}
+
+type hidesEmailStore struct {
+	db.Store
+	email  string
+	hidden *atomic.Bool
+}
+
+func (s *hidesEmailStore) Users() db.UserStore {
+	return &hidesEmailUserStore{UserStore: s.Store.Users(), email: s.email, hidden: s.hidden}
+}
+
+func (s *hidesEmailStore) Transaction(ctx context.Context, fn func(db.Store) error) error {
+	return s.Store.Transaction(ctx, func(tx db.Store) error {
+		return fn(&hidesEmailStore{Store: tx, email: s.email, hidden: s.hidden})
+	})
+}
+
+// TestHandleCallbackLinkLosesToSignupThatCommittedMidFlight is #94: a password
+// signup for the provider's address commits after the link's owner probe but
+// before its insert. The link must lose, because the claim insert is the guard a
+// read cannot be; without it both tables end up owning the address.
+func TestHandleCallbackLinkLosesToSignupThatCommittedMidFlight(t *testing.T) {
+	const addr = "midflight@example.test"
+	database, cfg, stub, rawSvc := setupServiceTest(t, &UserInfo{
+		ProviderID: "google", ProviderUserID: "sub-midflight",
+		Email: addr, EmailVerified: true,
+	})
+	ctx := context.Background()
+	base := rawSvc.(*service).store
+
+	// The signup that committed mid-flight: its row exists, its claim is unverified.
+	winner := db.User{ID: uuid.New(), Email: addr, PasswordHash: "hash"}
+	if err := base.Users().Create(ctx, &winner); err != nil {
+		t.Fatalf("seed signup: %v", err)
+	}
+	if err := base.ClaimedEmails().Claim(ctx, addr, winner.ID, false); err != nil {
+		t.Fatalf("seed claim: %v", err)
+	}
+
+	// A verified account linking an address that is not its own.
+	linker := db.User{ID: uuid.New(), Email: "linker@work.example", PasswordHash: "hash", EmailVerified: true}
+	if err := base.Users().Create(ctx, &linker); err != nil {
+		t.Fatalf("seed linker: %v", err)
+	}
+	sessSvc := session.NewService(database, cfg)
+	_, rawSession, err := sessSvc.CreateSession(ctx, linker.ID, linker.CredentialVersion, db.SessionTypeCookie, "127.0.0.1", "ua")
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	hidden := &atomic.Bool{}
+	hidden.Store(true)
+	svc := NewServiceWithStore(&hidesEmailStore{Store: base, email: db.NormalizeEmail(addr), hidden: hidden},
+		sessSvc, map[string]Provider{"google": stub}, cfg)
+
+	state, cookie := initiateLinked(t, svc, cfg, "google", rawSession)
+	rec, req := callbackRequestWithSession(state, cookie, cfg, rawSession)
+	sess, _, _, cerr := svc.HandleCallback(ctx, rec, req, "google", "code-1", state, db.SessionTypeCookie)
+	if sess != nil {
+		t.Fatalf("session minted for %v despite the committed signup", sess.UserID)
+	}
+	requireCode(t, cerr, errors.CodeOAuthAccountLinkConflict, http.StatusConflict)
+
+	// The signup stays the only holder: no link row carries its address.
+	var links int64
+	if err := database.Model(&db.OAuthAccount{}).Where("email = ?", addr).Count(&links).Error; err != nil {
+		t.Fatalf("count links: %v", err)
+	}
+	if links != 0 {
+		t.Fatalf("oauth_accounts holding %q = %d; want 0", addr, links)
+	}
+	claim, gerr := base.ClaimedEmails().Get(ctx, addr)
+	if gerr != nil {
+		t.Fatalf("load claim: %v", gerr)
+	}
+	if claim.OwnerUserID != winner.ID {
+		t.Fatalf("claim owner = %v; want the signup %v", claim.OwnerUserID, winner.ID)
+	}
+}
+
+// TestHandleCallbackLinkRefusesEmailClaimedByAnotherLink pins the 409 for an
+// address reserved by another account's link, which has no users row to converge
+// on and must not become a 500.
+func TestHandleCallbackLinkRefusesEmailClaimedByAnotherLink(t *testing.T) {
+	const addr = "held-by-link@example.test"
+	database, cfg, stub, rawSvc := setupServiceTest(t, &UserInfo{
+		ProviderID: "google", ProviderUserID: "sub-held-by-link",
+		Email: addr, EmailVerified: true,
+	})
+	ctx := context.Background()
+	base := rawSvc.(*service).store
+
+	holder := db.User{ID: uuid.New(), Email: "holder@work.example", PasswordHash: "hash", EmailVerified: true}
+	linker := db.User{ID: uuid.New(), Email: "linker@work.example", PasswordHash: "hash", EmailVerified: true}
+	for _, u := range []db.User{holder, linker} {
+		if err := base.Users().Create(ctx, &u); err != nil {
+			t.Fatalf("seed user: %v", err)
+		}
+	}
+	if err := base.ClaimedEmails().Claim(ctx, addr, holder.ID, true); err != nil {
+		t.Fatalf("seed claim: %v", err)
+	}
+	sessSvc := session.NewService(database, cfg)
+	_, rawSession, err := sessSvc.CreateSession(ctx, linker.ID, linker.CredentialVersion, db.SessionTypeCookie, "127.0.0.1", "ua")
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	svc := NewServiceWithStore(base, sessSvc, map[string]Provider{"google": stub}, cfg)
+
+	state, cookie := initiateLinked(t, svc, cfg, "google", rawSession)
+	rec, req := callbackRequestWithSession(state, cookie, cfg, rawSession)
+	sess, _, _, cerr := svc.HandleCallback(ctx, rec, req, "google", "code-1", state, db.SessionTypeCookie)
+	if sess != nil {
+		t.Fatalf("session minted for %v; the claim belongs to another account", sess.UserID)
+	}
+	requireCode(t, cerr, errors.CodeOAuthAccountLinkConflict, http.StatusConflict)
+	if n := countRows(t, database, &db.OAuthAccount{}); n != 0 {
+		t.Fatalf("oauth_accounts = %d; want 0", n)
+	}
+}
+
+// lockOrderStore records the order of the owner lock and the link delete inside
+// invalidateLink, which must match attachLink's owner-then-link lock order.
+type lockOrderStore struct {
+	db.Store
+	calls *[]string
+}
+
+type lockOrderUserStore struct {
+	db.UserStore
+	calls *[]string
+}
+
+func (s *lockOrderUserStore) GetByIDForUpdate(ctx context.Context, id uuid.UUID) (*db.User, error) {
+	*s.calls = append(*s.calls, "lock")
+	return s.UserStore.GetByIDForUpdate(ctx, id)
+}
+
+type lockOrderLinkStore struct {
+	db.OAuthAccountStore
+	calls *[]string
+}
+
+func (s *lockOrderLinkStore) Delete(ctx context.Context, id uuid.UUID) error {
+	*s.calls = append(*s.calls, "delete")
+	return s.OAuthAccountStore.Delete(ctx, id)
+}
+
+func (s *lockOrderStore) Users() db.UserStore {
+	return &lockOrderUserStore{UserStore: s.Store.Users(), calls: s.calls}
+}
+
+func (s *lockOrderStore) OAuthAccounts() db.OAuthAccountStore {
+	return &lockOrderLinkStore{OAuthAccountStore: s.Store.OAuthAccounts(), calls: s.calls}
+}
+
+func (s *lockOrderStore) Transaction(ctx context.Context, fn func(db.Store) error) error {
+	return s.Store.Transaction(ctx, func(tx db.Store) error {
+		return fn(&lockOrderStore{Store: tx, calls: s.calls})
+	})
+}
+
+// TestInvalidateLinkLocksTheOwnerBeforeDeleting pins the lock order that avoids a
+// deadlock with a concurrent attachLink: the owner row is locked before the link
+// row is deleted, never after.
+func TestInvalidateLinkLocksTheOwnerBeforeDeleting(t *testing.T) {
+	database, cfg, stub, rawSvc := setupServiceTest(t, &UserInfo{
+		ProviderID: "google", ProviderUserID: "sub-lock-order", Email: "", EmailVerified: true,
+	})
+	ctx := context.Background()
+	base := rawSvc.(*service).store
+
+	owner := db.User{ID: uuid.New(), Email: "lock-order-owner@example.com", PasswordHash: "hash", EmailVerified: true}
+	if err := base.Users().Create(ctx, &owner); err != nil {
+		t.Fatalf("seed owner: %v", err)
+	}
+	link := db.OAuthAccount{ID: uuid.New(), UserID: owner.ID, ProviderID: "google",
+		ProviderUserID: "sub-lock-order", Email: "lock-order-link@example.com", Verified: true}
+	if err := database.Create(&link).Error; err != nil {
+		t.Fatalf("seed link: %v", err)
+	}
+
+	calls := make([]string, 0, 4)
+	svc := NewServiceWithStore(&lockOrderStore{Store: base, calls: &calls},
+		session.NewService(database, cfg), map[string]Provider{"google": stub}, cfg)
+
+	svc.(*service).invalidateLink(ctx, link)
+	if len(calls) < 2 || calls[0] != "lock" || calls[1] != "delete" {
+		t.Fatalf("invalidateLink calls = %v; want the owner lock before the link delete", calls)
+	}
+}
+
+// TestRegistrationClaimsTheAddress pins the third account-creating path:
+// createUserAndLink must claim the address it registers, or every OAuth-only
+// account is missing the row the table exists to hold.
+func TestRegistrationClaimsTheAddress(t *testing.T) {
+	const addr = "register-claim@example.test"
+	database, cfg, _, rawSvc := setupServiceTest(t, &UserInfo{
+		ProviderID: "google", ProviderUserID: "sub-register-claim",
+		Email: addr, EmailVerified: true,
+	})
+	ctx := context.Background()
+
+	sess, err := loginViaGoogle(t, rawSvc, cfg)
+	if err != nil || sess == nil {
+		t.Fatalf("registration = %v, %v; want a session", sess, err)
+	}
+	claim, cerr := rawSvc.(*service).store.ClaimedEmails().Get(ctx, addr)
+	if cerr != nil {
+		t.Fatalf("load claim: %v", cerr)
+	}
+	if claim.OwnerUserID != sess.UserID || !claim.Verified {
+		t.Fatalf("claim = %+v; want holder %v, verified", claim, sess.UserID)
+	}
+	if n := countRows(t, database, &db.OAuthAccount{}); n != 1 {
+		t.Fatalf("oauth_accounts = %d; want the registration's single link", n)
+	}
+}
+
+// TestRegistrationRefusesAddressClaimedByAnotherLink drives the claimConflict arm:
+// the address has no users row, so the registration user insert succeeds and only
+// the claim insert can reject it. The rejection must be the 409, and the rolled-back
+// transaction must leave no user or link behind.
+func TestRegistrationRefusesAddressClaimedByAnotherLink(t *testing.T) {
+	const addr = "register-held@example.test"
+	database, cfg, _, rawSvc := setupServiceTest(t, &UserInfo{
+		ProviderID: "google", ProviderUserID: "sub-register-held",
+		Email: addr, EmailVerified: true,
+	})
+	ctx := context.Background()
+	base := rawSvc.(*service).store
+
+	holder := db.User{ID: uuid.New(), Email: "register-holder@work.example", PasswordHash: "hash", EmailVerified: true}
+	if err := base.Users().Create(ctx, &holder); err != nil {
+		t.Fatalf("seed holder: %v", err)
+	}
+	if err := base.ClaimedEmails().Claim(ctx, addr, holder.ID, true); err != nil {
+		t.Fatalf("seed claim: %v", err)
+	}
+
+	sess, err := loginViaGoogle(t, rawSvc, cfg)
+	if sess != nil {
+		t.Fatalf("session minted for %v; the address is claimed by another account", sess.UserID)
+	}
+	requireCode(t, err, errors.CodeOAuthAccountLinkConflict, http.StatusConflict)
+	if n := countRows(t, database, &db.User{}); n != 1 {
+		t.Fatalf("users = %d; want only the holder", n)
+	}
+	if n := countRows(t, database, &db.OAuthAccount{}); n != 0 {
+		t.Fatalf("oauth_accounts = %d; want the registration's link rolled back", n)
+	}
+	claim, cerr := base.ClaimedEmails().Get(ctx, addr)
+	if cerr != nil {
+		t.Fatalf("load claim: %v", cerr)
+	}
+	if claim.OwnerUserID != holder.ID {
+		t.Fatalf("claim owner = %v; want the seeded holder %v", claim.OwnerUserID, holder.ID)
+	}
+}
+
+// createRejectsUserStore makes the registration's user insert look like a lost
+// create race while the address has no users row: the window linkRacedUser runs in
+// when the winner is a link-only claim rather than an account.
+type createRejectsUserStore struct {
+	db.Store
+	email string
+}
+
+type createRejectsUser struct {
+	db.UserStore
+	email string
+}
+
+func (s *createRejectsUser) Create(ctx context.Context, user *db.User) error {
+	if db.NormalizeEmail(user.Email) == s.email {
+		return errors.ErrEmailAlreadyExists
+	}
+	return s.UserStore.Create(ctx, user)
+}
+
+func (s *createRejectsUserStore) Users() db.UserStore {
+	return &createRejectsUser{UserStore: s.Store.Users(), email: s.email}
+}
+
+func (s *createRejectsUserStore) Transaction(ctx context.Context, fn func(db.Store) error) error {
+	return s.Store.Transaction(ctx, func(tx db.Store) error {
+		return fn(&createRejectsUserStore{Store: tx, email: s.email})
+	})
+}
+
+// TestRegistrationRaceRejectsLinkOnlyClaim pins linkRacedUser: losing the user
+// insert to a race whose address is held by another account's link must return the
+// documented 409, not a 500.
+func TestRegistrationRaceRejectsLinkOnlyClaim(t *testing.T) {
+	const addr = "race-link-claim@example.test"
+	database, cfg, stub, rawSvc := setupServiceTest(t, &UserInfo{
+		ProviderID: "google", ProviderUserID: "sub-race-link",
+		Email: addr, EmailVerified: true,
+	})
+	ctx := context.Background()
+	base := rawSvc.(*service).store
+
+	holder := db.User{ID: uuid.New(), Email: "race-holder@work.example", PasswordHash: "hash", EmailVerified: true}
+	if err := base.Users().Create(ctx, &holder); err != nil {
+		t.Fatalf("seed holder: %v", err)
+	}
+	if err := base.ClaimedEmails().Claim(ctx, addr, holder.ID, true); err != nil {
+		t.Fatalf("seed claim: %v", err)
+	}
+	svc := NewServiceWithStore(
+		&createRejectsUserStore{Store: base, email: db.NormalizeEmail(addr)},
+		session.NewService(database, cfg), map[string]Provider{"google": stub}, cfg)
+
+	sess, err := loginViaGoogle(t, svc, cfg)
+	if sess != nil {
+		t.Fatalf("session minted for %v; the address is claimed by another account", sess.UserID)
+	}
+	requireCode(t, err, errors.CodeOAuthAccountLinkConflict, http.StatusConflict)
+	if n := countRows(t, database, &db.OAuthAccount{}); n != 0 {
+		t.Fatalf("oauth_accounts = %d; want 0", n)
+	}
+}
+
+// TestTakeoverRefusedWhenClaimAlreadyVerified pins the guard's hard edge: a claim
+// that is already proved is never handed over, even when the account row itself
+// still looks unverified. The address stays blocked and no credential is touched.
+func TestTakeoverRefusedWhenClaimAlreadyVerified(t *testing.T) {
+	const addr = "proved@example.test"
+	database, cfg, stub, rawSvc := setupServiceTest(t, &UserInfo{
+		ProviderID: "google", ProviderUserID: "sub-proved",
+		Email: addr, EmailVerified: true,
+	})
+	ctx := context.Background()
+	base := rawSvc.(*service).store
+
+	squatter := db.User{ID: uuid.New(), Email: addr, PasswordHash: "hash"}
+	if err := base.Users().Create(ctx, &squatter); err != nil {
+		t.Fatalf("seed squatter: %v", err)
+	}
+	if err := base.ClaimedEmails().Claim(ctx, addr, squatter.ID, true); err != nil {
+		t.Fatalf("seed verified claim: %v", err)
+	}
+	svc := NewServiceWithStore(base, session.NewService(database, cfg), map[string]Provider{"google": stub}, cfg)
+
+	sess, err := loginViaGoogle(t, svc, cfg)
+	if sess != nil {
+		t.Fatalf("session minted for %v; a verified claim must not be taken over", sess.UserID)
+	}
+	requireCode(t, err, errors.CodeOAuthAccountLinkConflict, http.StatusConflict)
+
+	var after db.User
+	if aerr := database.Where("id = ?", squatter.ID).First(&after).Error; aerr != nil {
+		t.Fatalf("reload squatter: %v", aerr)
+	}
+	if after.PasswordHash != squatter.PasswordHash {
+		t.Error("a refused takeover must not touch the password")
+	}
+	if n := countRows(t, database, &db.OAuthAccount{}); n != 0 {
+		t.Fatalf("oauth_accounts = %d; want 0", n)
+	}
+}
+
+// TestTakeoverRefusedForUnverifiedProviderEmail pins that the handover needs the
+// provider's attestation: without it the squatted account keeps its credentials.
+func TestTakeoverRefusedForUnverifiedProviderEmail(t *testing.T) {
+	const addr = "unattested@example.test"
+	database, cfg, stub, rawSvc := setupServiceTest(t, &UserInfo{
+		ProviderID: "google", ProviderUserID: "sub-unattested",
+		Email: addr, EmailVerified: false,
+	})
+	ctx := context.Background()
+	base := rawSvc.(*service).store
+
+	squatter := db.User{ID: uuid.New(), Email: addr, PasswordHash: "hash"}
+	if err := base.Users().Create(ctx, &squatter); err != nil {
+		t.Fatalf("seed squatter: %v", err)
+	}
+	if err := base.ClaimedEmails().Claim(ctx, addr, squatter.ID, false); err != nil {
+		t.Fatalf("seed claim: %v", err)
+	}
+	svc := NewServiceWithStore(base, session.NewService(database, cfg), map[string]Provider{"google": stub}, cfg)
+
+	sess, err := loginViaGoogle(t, svc, cfg)
+	if sess != nil {
+		t.Fatalf("session minted for %v; an unattested address proves nothing", sess.UserID)
+	}
+	requireCode(t, err, errors.CodeOAuthEmailUnverified, http.StatusBadRequest)
+
+	var after db.User
+	if aerr := database.Where("id = ?", squatter.ID).First(&after).Error; aerr != nil {
+		t.Fatalf("reload squatter: %v", aerr)
+	}
+	if after.PasswordHash != squatter.PasswordHash || after.EmailVerified {
+		t.Errorf("squatted account changed (password=%q verified=%v); want it untouched",
+			after.PasswordHash, after.EmailVerified)
+	}
+}
+
+// TestTakeoverRefusedWithoutProviderAttestation drives the guard directly: the
+// public callback rejects an unattested address before it can reach the handover,
+// so this pins the guard's own contract — no credential is touched and nothing is
+// promoted when the provider did not attest the mailbox.
+func TestTakeoverRefusedWithoutProviderAttestation(t *testing.T) {
+	const addr = "direct-unattested@example.test"
+	database, cfg, _, rawSvc := setupServiceTest(t, &UserInfo{
+		ProviderID: "google", ProviderUserID: "sub-direct", Email: addr, EmailVerified: false,
+	})
+	ctx := context.Background()
+	svc := rawSvc.(*service)
+	base := svc.store
+
+	squatter := db.User{ID: uuid.New(), Email: addr, PasswordHash: "hash"}
+	if err := base.Users().Create(ctx, &squatter); err != nil {
+		t.Fatalf("seed squatter: %v", err)
+	}
+	if err := base.ClaimedEmails().Claim(ctx, addr, squatter.ID, false); err != nil {
+		t.Fatalf("seed claim: %v", err)
+	}
+	if _, _, err := session.NewService(database, cfg).
+		CreateSession(ctx, squatter.ID, squatter.CredentialVersion, db.SessionTypeCookie, "127.0.0.1", "ua"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	owner, err := base.Users().GetByID(ctx, squatter.ID)
+	if err != nil {
+		t.Fatalf("load owner: %v", err)
+	}
+	terr := svc.takeoverUnverifiedAccount(ctx, base, owner,
+		&UserInfo{ProviderID: "google", Email: addr, EmailVerified: false})
+	if !errors.Is(terr, errors.ErrOAuthAccountLinkConflict) {
+		t.Fatalf("takeover = %v; want ErrOAuthAccountLinkConflict", terr)
+	}
+
+	after, err := base.Users().GetByID(ctx, squatter.ID)
+	if err != nil {
+		t.Fatalf("reload owner: %v", err)
+	}
+	if after.PasswordHash != squatter.PasswordHash || after.EmailVerified {
+		t.Errorf("account changed (password=%q verified=%v); want it untouched",
+			after.PasswordHash, after.EmailVerified)
+	}
+	if claim, cerr := base.ClaimedEmails().Get(ctx, addr); cerr != nil || claim.Verified {
+		t.Fatalf("claim = %+v, %v; want it left unverified", claim, cerr)
+	}
+	if sessions, serr := base.Sessions().ListByUserID(ctx, squatter.ID); serr != nil || len(sessions) != 1 {
+		t.Fatalf("sessions = %d, %v; want the existing session untouched", len(sessions), serr)
+	}
+}
+
+// TestTakeoverIsRetryable pins that repeating the proving callback is safe: the
+// identity resolves its own link, no second account or link appears, and the
+// account stays proved.
+func TestTakeoverIsRetryable(t *testing.T) {
+	const addr = "retry@example.test"
+	database, cfg, stub, rawSvc := setupServiceTest(t, &UserInfo{
+		ProviderID: "google", ProviderUserID: "sub-retry",
+		Email: addr, EmailVerified: true,
+	})
+	ctx := context.Background()
+	base := rawSvc.(*service).store
+
+	squatter := db.User{ID: uuid.New(), Email: addr, PasswordHash: "hash"}
+	if err := base.Users().Create(ctx, &squatter); err != nil {
+		t.Fatalf("seed squatter: %v", err)
+	}
+	if err := base.ClaimedEmails().Claim(ctx, addr, squatter.ID, false); err != nil {
+		t.Fatalf("seed claim: %v", err)
+	}
+	svc := NewServiceWithStore(base, session.NewService(database, cfg), map[string]Provider{"google": stub}, cfg)
+
+	for i := 0; i < 2; i++ {
+		sess, err := loginViaGoogle(t, svc, cfg)
+		if err != nil {
+			t.Fatalf("callback %d: %v", i, err)
+		}
+		if sess == nil || sess.UserID != squatter.ID {
+			t.Fatalf("callback %d session user = %v; want %v", i, sess, squatter.ID)
+		}
+	}
+	requireIdentityRows(t, database, 1, 1, 2)
+	claim, cerr := base.ClaimedEmails().Get(ctx, addr)
+	if cerr != nil {
+		t.Fatalf("load claim: %v", cerr)
+	}
+	if claim.OwnerUserID != squatter.ID || !claim.Verified {
+		t.Fatalf("claim = %+v; want it proved and held by %v", claim, squatter.ID)
+	}
+}
+
+// TestLinkDeletionReleasesClaimOnlyWhenItWasTheLastHolder pins the release rule:
+// a removed link frees its address only when the owner's account row and its other
+// links no longer hold it, so a released address becomes claimable again.
+func TestLinkDeletionReleasesClaimOnlyWhenItWasTheLastHolder(t *testing.T) {
+	const addr = "released@example.test"
+	database, _, _, rawSvc := setupServiceTest(t, &UserInfo{
+		ProviderID: "google", ProviderUserID: "sub-released", Email: "", EmailVerified: true,
+	})
+	ctx := context.Background()
+	svc := rawSvc.(*service)
+	base := svc.store
+
+	owner := db.User{ID: uuid.New(), Email: "owner@work.example", PasswordHash: "hash", EmailVerified: true}
+	if err := base.Users().Create(ctx, &owner); err != nil {
+		t.Fatalf("seed owner: %v", err)
+	}
+	first := db.OAuthAccount{ID: uuid.New(), UserID: owner.ID, ProviderID: "google",
+		ProviderTenantID: "", ProviderUserID: "sub-released", Email: addr, Verified: true}
+	second := db.OAuthAccount{ID: uuid.New(), UserID: owner.ID, ProviderID: "github",
+		ProviderTenantID: "", ProviderUserID: "gh-released", Email: addr, Verified: true}
+	for _, link := range []db.OAuthAccount{first, second} {
+		if err := database.Create(&link).Error; err != nil {
+			t.Fatalf("seed link: %v", err)
+		}
+	}
+	if err := base.ClaimedEmails().Claim(ctx, addr, owner.ID, true); err != nil {
+		t.Fatalf("seed claim: %v", err)
+	}
+
+	// A second link still holds the address.
+	svc.invalidateLink(ctx, first)
+	if _, err := base.ClaimedEmails().Get(ctx, addr); err != nil {
+		t.Fatalf("claim released while another link still holds the address: %v", err)
+	}
+	// The last holder is removed.
+	svc.invalidateLink(ctx, second)
+	if _, err := base.ClaimedEmails().Get(ctx, addr); !errors.Is(err, gorm.ErrRecordNotFound) {
+		t.Fatalf("claim survived its last holder, err = %v", err)
+	}
+	// The address is claimable again.
+	if err := base.ClaimedEmails().Claim(ctx, addr, owner.ID, false); err != nil {
+		t.Fatalf("re-claim after release: %v", err)
+	}
+
+	// The owner's own account row also holds an address, so deleting such a link
+	// keeps its claim.
+	ownLink := db.OAuthAccount{ID: uuid.New(), UserID: owner.ID, ProviderID: "github",
+		ProviderTenantID: "", ProviderUserID: "gh-own", Email: owner.Email, Verified: true}
+	if err := database.Create(&ownLink).Error; err != nil {
+		t.Fatalf("seed own-address link: %v", err)
+	}
+	if err := base.ClaimedEmails().Claim(ctx, owner.Email, owner.ID, true); err != nil {
+		t.Fatalf("claim own address: %v", err)
+	}
+	svc.invalidateLink(ctx, ownLink)
+	if _, err := base.ClaimedEmails().Get(ctx, owner.Email); err != nil {
+		t.Fatalf("claim for the account's own address was released: %v", err)
+	}
 }
 
 func TestHandleCallbackLinkConflictForeignOwner(t *testing.T) {

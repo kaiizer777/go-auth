@@ -168,6 +168,28 @@ type TotpStore interface {
 	DeleteTwoFactorTokensByUserID(ctx context.Context, userID uuid.UUID) error
 }
 
+// ClaimedEmailStore serialises ownership of a normalised address across the
+// account tables. A claim exists at most once per address and records the account
+// that holds it, so a released address can never be taken by a second writer while
+// the first is still committing.
+type ClaimedEmailStore interface {
+	// Claim records ownerID as the holder of email and reports
+	// ErrEmailClaimed when a different account holds it. It is idempotent for
+	// the current holder: repeating the write succeeds, and a verified write
+	// promotes an unverified claim the same holder already has. It never takes
+	// an address away from another account. An empty or whitespace-only address
+	// claims nothing and reports nil.
+	Claim(ctx context.Context, email string, ownerID uuid.UUID, verified bool) error
+	// Get returns the claim for email. A missing key is the backend not-found
+	// error, not a nil claim.
+	Get(ctx context.Context, email string) (*ClaimedEmail, error)
+	// Release removes the claim for email when ownerID holds it. An absent
+	// claim, or one held by another account, is a no-op.
+	Release(ctx context.Context, email string, ownerID uuid.UUID) error
+	// ReleaseByUserID removes every claim ownerID holds.
+	ReleaseByUserID(ctx context.Context, ownerID uuid.UUID) error
+}
+
 // Store is the composite storage abstraction interface.
 type Store interface {
 	Users() UserStore
@@ -176,6 +198,7 @@ type Store interface {
 	PasswordResetTokens() PasswordResetTokenStore
 	OAuthAccounts() OAuthAccountStore
 	Totp() TotpStore
+	ClaimedEmails() ClaimedEmailStore
 
 	Transaction(ctx context.Context, fn func(txStore Store) error) error
 	Ping(ctx context.Context) error

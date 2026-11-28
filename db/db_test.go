@@ -520,6 +520,10 @@ func TestMigrations_NoExplicitTransactionWrappers(t *testing.T) {
 		"migrations/000013_add_totp_secret_kid.down.sql",
 		"migrations/mysql/000013_add_totp_secret_kid.up.sql",
 		"migrations/mysql/000013_add_totp_secret_kid.down.sql",
+		"migrations/000014_create_claimed_emails.up.sql",
+		"migrations/000014_create_claimed_emails.down.sql",
+		"migrations/mysql/000014_create_claimed_emails.up.sql",
+		"migrations/mysql/000014_create_claimed_emails.down.sql",
 	}
 
 	for _, file := range files {
@@ -674,6 +678,63 @@ func TestMigration000012_AddsOAuthAccountTokens(t *testing.T) {
 	}
 	if strings.Contains(down, "DROP TABLE") {
 		t.Error("migration 12 down must drop only the token columns, never the links table")
+	}
+}
+
+// TestMigration000014_ClaimsEmailAddresses pins the claim table for #94: one row
+// per normalised address, keyed byte for byte, DDL only (SQL cannot reproduce
+// db.NormalizeEmail, so no backfill lives here), and a down path that only drops
+// the table.
+func TestMigration000014_ClaimsEmailAddresses(t *testing.T) {
+	postgresUp := readMigration(t, "migrations/000014_create_claimed_emails.up.sql")
+	postgresDown := readMigration(t, "migrations/000014_create_claimed_emails.down.sql")
+	mysqlUp := readMigration(t, "migrations/mysql/000014_create_claimed_emails.up.sql")
+	mysqlDown := readMigration(t, "migrations/mysql/000014_create_claimed_emails.down.sql")
+
+	for name, up := range map[string]string{"postgres": postgresUp, "mysql": mysqlUp} {
+		for _, want := range []string{
+			"CREATE TABLE IF NOT EXISTS claimed_emails",
+			"owner_user_id",
+			"REFERENCES users(id) ON DELETE CASCADE",
+			"verified",
+		} {
+			if !strings.Contains(up, want) {
+				t.Errorf("%s migration 14 up must contain %q", name, want)
+			}
+		}
+		// No backfill, and no database-derived key: lower()/trim() are not
+		// db.NormalizeEmail, so any row they write is unreachable by the app.
+		for _, forbidden := range []string{"INSERT INTO", "LOWER(", "TRIM(", "BTRIM("} {
+			if strings.Contains(sqlWithoutComments(up), forbidden) {
+				t.Errorf("%s migration 14 up must not contain %q: the import is a Go job", name, forbidden)
+			}
+		}
+	}
+	if !strings.Contains(postgresUp, "email          VARCHAR(255) PRIMARY KEY") {
+		t.Error("postgres migration 14 must store the claim key as a plain VARCHAR(255) primary key")
+	}
+	if !strings.Contains(postgresUp, "email          VARCHAR(255) PRIMARY KEY") {
+		t.Error("postgres migration 14 must enforce one claim per address")
+	}
+	if !strings.Contains(mysqlUp, "CHARACTER SET utf8mb4 COLLATE utf8mb4_bin") {
+		t.Error("mysql migration 14 must compare the claim key byte for byte")
+	}
+	if !strings.Contains(mysqlUp, "PRIMARY KEY (email)") {
+		t.Error("mysql migration 14 must key the claim table on the address")
+	}
+	if !strings.Contains(mysqlUp, "not transactional") {
+		t.Error("mysql migration 14 up must carry the non-transactional DDL recovery note")
+	}
+
+	for name, down := range map[string]string{"postgres": postgresDown, "mysql": mysqlDown} {
+		if drops := strings.Count(sqlWithoutComments(down), "DROP TABLE IF EXISTS claimed_emails;"); drops != 1 {
+			t.Errorf("%s migration 14 down must drop the claim table exactly once, got %d: %q", name, drops, down)
+		}
+		for _, forbidden := range []string{"ALTER TABLE", "INSERT ", "DELETE ", "UPDATE "} {
+			if strings.Contains(sqlWithoutComments(down), forbidden) {
+				t.Errorf("%s migration 14 down must not contain %q", name, forbidden)
+			}
+		}
 	}
 }
 

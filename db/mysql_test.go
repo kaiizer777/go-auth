@@ -57,8 +57,8 @@ func TestMySQLDefaultMigrationsEmbedded(t *testing.T) {
 		current = next
 	}
 
-	if count != 13 {
-		t.Fatalf("expected 13 mysql migration versions, found %d", count)
+	if count != 14 {
+		t.Fatalf("expected 14 mysql migration versions, found %d", count)
 	}
 }
 
@@ -330,6 +330,31 @@ func TestNormalizeMySQLError(t *testing.T) {
 			name:    "oauth account duplicate via string",
 			err:     stderrors.New("Error 1062 (23000): Duplicate entry 'p-uid' for key 'uq_oauth_accounts_provider_uid'"),
 			wantErr: errors.ErrOAuthAccountAlreadyLinked,
+		},
+		{
+			name:    "claimed email duplicate via MySQLError",
+			err:     &mysqlDriver.MySQLError{Number: 1062, Message: "Duplicate entry 'a@b.example' for key 'claimed_emails.PRIMARY'"},
+			wantErr: errors.ErrEmailClaimed,
+		},
+		{
+			name:    "claimed email duplicate via postgres string",
+			err:     stderrors.New("ERROR: duplicate key value violates unique constraint \"uq_claimed_emails_email\" (SQLSTATE 23505)"),
+			wantErr: errors.ErrEmailClaimed,
+		},
+		{
+			name:    "claimed email primary key via postgres string",
+			err:     stderrors.New("ERROR: duplicate key value violates unique constraint \"claimed_emails_pkey\" (SQLSTATE 23505)"),
+			wantErr: errors.ErrEmailClaimed,
+		},
+		{
+			name:    "users duplicate whose value contains the claim table name",
+			err:     stderrors.New("Error 1062 (23000): Duplicate entry 'claimed_emails@example.com' for key 'users.idx_users_email_lower'"),
+			wantErr: errors.ErrEmailAlreadyExists,
+		},
+		{
+			name:    "claimed email foreign key is not a claim conflict",
+			err:     stderrors.New("ERROR: insert or update on table \"claimed_emails\" violates foreign key constraint \"fk_claimed_emails_owner_user_id\" (SQLSTATE 23503)"),
+			wantErr: errors.ErrUserNotFound,
 		},
 		{
 			name:    "unmapped 1062 key returns original error",

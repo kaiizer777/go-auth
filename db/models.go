@@ -6,6 +6,7 @@ import (
 
 	"github.com/google/uuid"
 	"gorm.io/gorm"
+	"gorm.io/gorm/schema"
 )
 
 // User represents an authenticated account record in the database.
@@ -42,6 +43,55 @@ func (u User) LogValue() slog.Value {
 
 // TableName returns the table name for User.
 func (User) TableName() string { return "users" }
+
+// ClaimKeyValue is the stored form of a claim key: NormalizeEmail output, compared
+// byte for byte. It is a named type so the migrator's data-type hook applies to the
+// field itself: GORM calls GormDBDataType on the field's type, not on the model, so
+// a plain string field would silently ignore the hook.
+type ClaimKeyValue string
+
+// GormDBDataType makes the AutoMigrate-created key byte-comparable on MySQL: the
+// server default collation is case- and often accent-insensitive, so it would fold
+// addresses the Go key treats as distinct. The migration already defines the same
+// binary collation; this keeps an AutoMigrate-created schema from diverging.
+// PostgreSQL and SQLite compare a varchar equality byte for byte, so they keep the
+// plain type.
+func (ClaimKeyValue) GormDBDataType(database *gorm.DB, _ *schema.Field) string {
+	if database != nil && database.Dialector != nil && database.Name() == "mysql" {
+		return "varchar(255) COLLATE utf8mb4_bin"
+	}
+	return "varchar(255)"
+}
+
+// ClaimedEmail is the cross-table reservation of one normalised address. The
+// per-table keys cannot serialise a signup against an OAuth link, so the unique
+// key on Email is the lock both writers take with an insert inside their own
+// transaction. Email is NormalizeEmail output and is compared byte for byte:
+// the key never depends on a database collation.
+//
+// The byte comparison is a property of the deployed column, not of this tag: the
+// migrations define a binary-collation key (PostgreSQL PRIMARY KEY on a plain
+// varchar, MySQL utf8mb4_bin), and ClaimKeyValue makes an AutoMigrate-created
+// column match on MySQL.
+//
+// A claim does not imply users.email. A provider-attested address is claimed by
+// the account that linked it even when that is not the account's own address.
+//
+// Verified records that the holder proved the mailbox: either locally through
+// verification, or through a provider that attested the address. An unverified
+// claim is a reservation by a credential nobody proved yet, so a provider that
+// attests the address may take the account over; a verified claim cannot be
+// taken over and keeps reporting a conflict.
+type ClaimedEmail struct {
+	Email       ClaimKeyValue `gorm:"primaryKey;type:varchar(255)"`
+	OwnerUserID uuid.UUID     `gorm:"column:owner_user_id;type:varchar(36);not null;index:idx_claimed_emails_owner_user_id"`
+	Verified    bool          `gorm:"not null;default:false"`
+	CreatedAt   time.Time     `gorm:"not null"`
+	UpdatedAt   time.Time     `gorm:"not null"`
+}
+
+// TableName returns the table name for ClaimedEmail.
+func (ClaimedEmail) TableName() string { return "claimed_emails" }
 
 // SessionType represents the session transport type enum.
 type SessionType string

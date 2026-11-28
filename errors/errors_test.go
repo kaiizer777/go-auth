@@ -747,6 +747,7 @@ func TestSentinels_Phase3(t *testing.T) {
 		{ErrEmailNotVerified, CodeEmailNotVerified, "email address not verified", http.StatusForbidden},
 		{ErrUserAlreadyExists, CodeUserAlreadyExists, "user already exists", http.StatusConflict},
 		{ErrEmailAlreadyExists, CodeEmailAlreadyExists, "email already exists", http.StatusConflict},
+		{ErrEmailClaimed, CodeEmailAlreadyExists, "email address is claimed by another account", http.StatusConflict},
 		{ErrUserNotFound, CodeUserNotFound, "user not found", http.StatusNotFound},
 		{ErrInvalidToken, CodeInvalidToken, "token is invalid or malformed", http.StatusBadRequest},
 		{ErrTokenExpired, CodeTokenExpired, "token has expired", http.StatusBadRequest},
@@ -841,6 +842,17 @@ func TestOAuthTokenSentinels_Distinguishable(t *testing.T) {
 		if !Is(wrapped, sentinel) {
 			t.Errorf("%s does not match through one Wrap layer", sentinel.Code())
 		}
+	}
+}
+
+func TestEmailClaimSentinels_Distinguishable(t *testing.T) {
+	// Both carry CodeEmailAlreadyExists on the wire; in-process the signup and link
+	// paths must still be able to tell a lost claim from a duplicate signup.
+	if Is(ErrEmailClaimed, ErrEmailAlreadyExists) || Is(ErrEmailAlreadyExists, ErrEmailClaimed) {
+		t.Fatal("claim and duplicate sentinels must stay distinguishable in-process")
+	}
+	if ErrEmailClaimed.Message() == ErrEmailAlreadyExists.Message() {
+		t.Fatal("claim and duplicate sentinels must carry distinct messages")
 	}
 }
 
