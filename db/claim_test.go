@@ -4,6 +4,10 @@ import (
 	"strings"
 	"testing"
 
+	gormsqlite "github.com/glebarez/sqlite"
+	gormmysql "gorm.io/driver/mysql"
+	"gorm.io/gorm"
+
 	"github.com/kaiizer777/go-auth/errors"
 )
 
@@ -41,6 +45,13 @@ func TestClaimKey_NormalisesValidAddresses(t *testing.T) {
 // NormalizeEmail can make an address longer than its stored form.
 const foldExpander = "Ⱥ"
 
+// overlongFoldedAddress is 255 bytes raw and 256 after folding: foldExpander is
+// 2 bytes and its lowercase form is 3.
+func overlongFoldedAddress() string {
+	const domain = "@example.com"
+	return strings.Repeat("a", 255-len(domain)-len(foldExpander)) + foldExpander + domain
+}
+
 // TestValidateEmailAndClaimKeyAgree pins the predicate: an address the system
 // accepts is always claimable, and a key ClaimKey rejects was already rejected by
 // ValidateEmail. Folding expansion is the case that used to diverge.
@@ -55,7 +66,7 @@ func TestValidateEmailAndClaimKeyAgree(t *testing.T) {
 		{name: "ascii max length", addr: strings.Repeat("a", 255-len(domain)) + domain, accepted: true},
 		{name: "ascii over length", addr: strings.Repeat("a", 256-len(domain)) + domain, accepted: false},
 		{name: "folding expansion fits", addr: strings.Repeat("a", 254-len(domain)-len(foldExpander)) + foldExpander + domain, accepted: true},
-		{name: "folding expansion crosses the limit", addr: strings.Repeat("a", 255-len(domain)-len(foldExpander)) + foldExpander + domain, accepted: false},
+		{name: "folding expansion crosses the limit", addr: overlongFoldedAddress(), accepted: false},
 		{name: "combining characters", addr: "e\u0301milie@example.com", accepted: true},
 		{name: "quoted local part", addr: `"jane"@example.com`, accepted: true},
 		{name: "plus addressing", addr: "user+tag@example.com", accepted: true},
@@ -65,9 +76,9 @@ func TestValidateEmailAndClaimKeyAgree(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			verr := ValidateEmail(tc.addr)
+			verr := ValidateClaimableEmail(tc.addr)
 			if (verr == nil) != tc.accepted {
-				t.Fatalf("ValidateEmail(%q) = %v; want accepted=%v", tc.addr, verr, tc.accepted)
+				t.Fatalf("ValidateClaimableEmail(%q) = %v; want accepted=%v", tc.addr, verr, tc.accepted)
 			}
 			key, kerr := ClaimKey(tc.addr)
 			if verr == nil && kerr != nil {
@@ -100,5 +111,43 @@ func TestClaimKey_RejectsNonAddressValues(t *testing.T) {
 		if _, err := ClaimKey(bad); !errors.Is(err, errors.ErrInvalidEmail) {
 			t.Errorf("ClaimKey(%q) err = %v; want ErrInvalidEmail", bad, err)
 		}
+	}
+}
+
+// TestValidateClaimableEmailScopesTheFoldLimit pins where the folded-length rule
+// applies: only paths that create a claim reject the address. Login and password
+// reset requests keep accepting an existing account whose stored address no longer
+// fits a new claim key.
+func TestValidateClaimableEmailScopesTheFoldLimit(t *testing.T) {
+	long := overlongFoldedAddress()
+	if err := ValidateEmail(long); err != nil {
+		t.Fatalf("ValidateEmail(%q) = %v; a stored address must still be accepted", long, err)
+	}
+	var appErr *errors.Error
+	if err := ValidateClaimableEmail(long); !errors.As(err, &appErr) || appErr.Code() != errors.CodeInvalidEmail {
+		t.Fatalf("ValidateClaimableEmail(%q) = %v; want CodeInvalidEmail", long, err)
+	}
+	if err := (LoginRequest{Email: long, Password: "ValidPassword123#"}).Validate(); err != nil {
+		t.Errorf("LoginRequest.Validate(%q) = %v; an existing account must keep logging in", long, err)
+	}
+	if err := (PasswordResetRequest{Email: long}).Validate(); err != nil {
+		t.Errorf("PasswordResetRequest.Validate(%q) = %v; an existing account must keep requesting a reset", long, err)
+	}
+	if err := (SignupRequest{Email: long, Password: "ValidPassword123#"}).Validate(); !errors.As(err, &appErr) || appErr.Code() != errors.CodeInvalidEmail {
+		t.Errorf("SignupRequest.Validate(%q) = %v; a new claim must be rejected with CodeInvalidEmail", long, err)
+	}
+}
+
+// TestClaimedEmailMySQLKeyUsesBinaryCollation pins the AutoMigrate type: MySQL's
+// default collation folds case and accents, so the claim key needs an explicit
+// binary collation there. PostgreSQL and SQLite compare the varchar byte for byte.
+func TestClaimedEmailMySQLKeyUsesBinaryCollation(t *testing.T) {
+	mysqlDB := &gorm.DB{Config: &gorm.Config{Dialector: gormmysql.New(gormmysql.Config{DSN: "user:pass@tcp(127.0.0.1:3306)/x"})}}
+	if got := (ClaimedEmail{}).GormDBDataType(mysqlDB, nil); !strings.Contains(got, "COLLATE utf8mb4_bin") {
+		t.Errorf("mysql claim key type = %q; want an explicit utf8mb4_bin collation", got)
+	}
+	sqliteDB := &gorm.DB{Config: &gorm.Config{Dialector: gormsqlite.Open(":memory:")}}
+	if got := (ClaimedEmail{}).GormDBDataType(sqliteDB, nil); strings.Contains(got, "COLLATE") {
+		t.Errorf("sqlite claim key type = %q; want the plain varchar type", got)
 	}
 }

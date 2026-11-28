@@ -6,6 +6,7 @@ import (
 
 	"github.com/google/uuid"
 	"gorm.io/gorm"
+	"gorm.io/gorm/schema"
 )
 
 // User represents an authenticated account record in the database.
@@ -73,6 +74,19 @@ type ClaimedEmail struct {
 
 // TableName returns the table name for ClaimedEmail.
 func (ClaimedEmail) TableName() string { return "claimed_emails" }
+
+// GormDBDataType makes the AutoMigrate-created key byte-comparable on MySQL: the
+// server default collation is case- and often accent-insensitive, so it would fold
+// addresses the Go key treats as distinct. The migration already defines the same
+// binary collation; this keeps an AutoMigrate-created schema from diverging.
+// PostgreSQL and SQLite compare a varchar equality byte for byte, so they keep the
+// plain type.
+func (ClaimedEmail) GormDBDataType(database *gorm.DB, _ *schema.Field) string {
+	if database != nil && database.Dialector != nil && database.Dialector.Name() == "mysql" {
+		return "varchar(255) COLLATE utf8mb4_bin"
+	}
+	return "varchar(255)"
+}
 
 // SessionType represents the session transport type enum.
 type SessionType string

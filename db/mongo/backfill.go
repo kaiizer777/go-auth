@@ -163,6 +163,10 @@ func BackfillOAuthAccountVerified(ctx context.Context, database *mongo.Database)
 // that mirrors SQL migration 000014 for MongoDB.
 const claimedEmailsBackfillID = "000014_create_claimed_emails"
 
+// claimedEmailsBackfillBatchSize bounds how many source documents the driver keeps
+// in memory per fetch: the cursors below stream this many at a time.
+const claimedEmailsBackfillBatchSize = 500
+
 // BackfillClaimedEmails populates the claimed_emails collection from users.email
 // and oauth_accounts.email. It is an explicit operator/embedder utility, not a
 // startup step: nothing calls it from Connect, because booting must never scan the
@@ -171,11 +175,23 @@ const claimedEmailsBackfillID = "000014_create_claimed_emails"
 // byte-identical to every Go write path; empty and whitespace-only addresses are
 // skipped.
 //
+// Source rows are read through cursors with an explicit batch size, so the driver
+// holds one bounded page at a time rather than the whole collection. It writes its
+// own idempotent $setOnInsert (always unverified) and promotes in a second pass; it
+// does not call the runtime claimedEmailStore.Claim, whose verified argument carries
+// the caller's attestation.
+//
 // It aborts, naming the address and both accounts, when the existing rows already
 // disagree about who owns one: electing a winner strips the losing account's
 // attribution while leaving its rows pointing at an address it does not claim.
 // The insert is an idempotent $setOnInsert, so a run that aborted on the operator's
 // data converges when re-run after the offending links are removed.
+//
+// Link promotion uses oauth_accounts.verified, which is a provider attestation for
+// rows written since 000009. Migration 000009 set it TRUE only for owners whose
+// users.email_verified is TRUE, so a legacy link can never promote a claim its own
+// user row would not, and the value on an unverified owner can only come from a
+// provider-attested link written later.
 //
 // Runs are safe to repeat: the completion marker below is recorded for operators,
 // but it does not gate, so a re-run also picks up rows added after the last run.
@@ -207,7 +223,7 @@ func BackfillClaimedEmails(ctx context.Context, database *mongo.Database) error 
 	for _, src := range sources {
 		cursor, cerr := database.Collection(src.collection).Find(ctx,
 			bson.M{"email": bson.M{"$ne": ""}},
-			options.Find().SetProjection(bson.M{"email": 1, src.ownerField: 1}),
+			options.Find().SetProjection(bson.M{"email": 1, src.ownerField: 1}).SetBatchSize(claimedEmailsBackfillBatchSize),
 		)
 		if cerr != nil {
 			return cerr
@@ -322,7 +338,7 @@ func BackfillClaimedEmails(ctx context.Context, database *mongo.Database) error 
 	promoted := 0
 	for _, p := range promotions {
 		proofs, perr := database.Collection(p.collection).Find(ctx, p.filter,
-			options.Find().SetProjection(bson.M{"email": 1, p.ownerField: 1}),
+			options.Find().SetProjection(bson.M{"email": 1, p.ownerField: 1}).SetBatchSize(claimedEmailsBackfillBatchSize),
 		)
 		if perr != nil {
 			return perr

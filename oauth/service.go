@@ -1105,7 +1105,7 @@ func validateIdentityFields(info *UserInfo, providerID string) error {
 	if strings.TrimSpace(info.Email) == "" {
 		return nil
 	}
-	if len(info.Email) > providerFieldMaxLen || db.ValidateEmail(info.Email) != nil {
+	if len(info.Email) > providerFieldMaxLen || db.ValidateClaimableEmail(info.Email) != nil {
 		return errOAuthProviderIdentityInvalid
 	}
 	return nil

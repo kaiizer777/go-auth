@@ -1341,6 +1341,16 @@ func (s *claimedEmailStore) Claim(ctx context.Context, email string, ownerID uui
 		if winner.toDomain().OwnerUserID != ownerID {
 			return errors.ErrEmailClaimed
 		}
+		// Without a session there is no enclosing transaction to abort, so the
+		// promotion can be applied here. With a session the transaction is already
+		// dead; the winner's own flow (or a later claim) promotes it.
+		if s.store.session == nil && verified && !winner.Verified {
+			_, uerr := s.collection().UpdateOne(ctx,
+				claimOwnerFilter{ID: key, OwnerID: ownerID.String()},
+				bson.M{"$set": bson.M{"verified": true, "updated_at": now}},
+			)
+			return uerr
+		}
 		return nil
 	}
 	var doc ClaimedEmailDoc
@@ -1379,12 +1389,13 @@ func (s *claimedEmailStore) Get(ctx context.Context, email string) (*db.ClaimedE
 	return doc.toDomain(), nil
 }
 
-// Release deletes the holder's claim. A key ClaimKey rejects cannot exist in the
-// table: every write path and the explicit import skip such addresses, so an
-// invalid key is a no-op rather than a missed row.
+// Release deletes the holder's claim. It keys on NormalizeEmail rather than
+// ClaimKey so it can remove a row that a legacy or manual write stored under an
+// address the current rule would not create; an invalid address simply matches
+// nothing. The filter is still a typed struct, so the value is data only.
 func (s *claimedEmailStore) Release(ctx context.Context, email string, ownerID uuid.UUID) error {
-	key, kerr := db.ClaimKey(email)
-	if kerr != nil || key == "" {
+	key := db.NormalizeEmail(email)
+	if key == "" {
 		return nil
 	}
 	_, err := s.collection().DeleteOne(s.store.resolveCtx(ctx), claimOwnerFilter{ID: key, OwnerID: ownerID.String()})

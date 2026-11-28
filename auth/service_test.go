@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -20,6 +21,7 @@ import (
 	gormstore "github.com/kaiizer777/go-auth/db/gorm"
 	"github.com/kaiizer777/go-auth/email"
 	"github.com/kaiizer777/go-auth/errors"
+	"github.com/kaiizer777/go-auth/session"
 )
 
 func testConfig() config.Config {
@@ -2326,6 +2328,53 @@ func TestService_ResetPassword_UnclaimableStoredAddressIsClientError(t *testing.
 	var appErr *errors.Error
 	if !errors.As(rerr, &appErr) || appErr.Code() != errors.CodeInvalidEmail {
 		t.Fatalf("ResetPassword code = %v; want %v (a 4xx, not a database 500)", rerr, errors.CodeInvalidEmail)
+	}
+}
+
+// authOverlongFoldedAddress is 255 bytes raw and 256 after case folding.
+func authOverlongFoldedAddress() string {
+	const domain = "@example.com"
+	return strings.Repeat("a", 255-len(domain)-len("Ⱥ")) + "Ⱥ" + domain
+}
+
+// TestService_LegacyFoldedAddressStillAuthenticates pins the scope of the
+// folded-length rule: it guards claim creation, never authentication. An account
+// stored with an address that no longer fits a new claim key must still log in,
+// refresh its session, and request a password reset.
+func TestService_LegacyFoldedAddressStillAuthenticates(t *testing.T) {
+	database := setupTestDB(t)
+	cfg := testConfig()
+	svc, err := New(cfg, database, email.Hooks{})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ctx := context.Background()
+
+	const password = "LegacyPass#2026!"
+	user, _, serr := svc.Signup(ctx, db.SignupRequest{Email: "legacy-login@example.com", Password: password})
+	if serr != nil || user == nil {
+		t.Fatalf("signup = %v, %v", user, serr)
+	}
+	long := authOverlongFoldedAddress()
+	if err := database.Model(&db.User{}).Where("id = ?", user.ID).
+		Updates(map[string]any{"email": long, "email_verified": true}).Error; err != nil {
+		t.Fatalf("store legacy address: %v", err)
+	}
+
+	if _, lerr := svc.Login(ctx, db.LoginRequest{Email: long, Password: password}); lerr != nil {
+		t.Fatalf("legacy account cannot log in: %v", lerr)
+	}
+	if _, rerr := svc.RequestPasswordReset(ctx, db.PasswordResetRequest{Email: long}); rerr != nil {
+		t.Fatalf("legacy account cannot request a password reset: %v", rerr)
+	}
+
+	sessSvc := session.NewService(database, &cfg)
+	_, raw, cerr := sessSvc.CreateSession(ctx, user.ID, user.CredentialVersion, db.SessionTypeCookie, "127.0.0.1", "ua")
+	if cerr != nil {
+		t.Fatalf("create session: %v", cerr)
+	}
+	if _, _, rerr := sessSvc.RotateSession(ctx, raw, "127.0.0.1", "ua"); rerr != nil {
+		t.Fatalf("legacy account cannot refresh its session: %v", rerr)
 	}
 }
 
