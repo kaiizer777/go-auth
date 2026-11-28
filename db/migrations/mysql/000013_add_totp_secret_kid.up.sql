@@ -1,0 +1,16 @@
+-- 000013 records which key id last rewrote each stored TOTP secret envelope.
+-- The column is bookkeeping only: it holds no key material and no ciphertext,
+-- the read path never consults it, and it is deliberately absent from the
+-- db.TotpSecret model so a down-migrated database keeps serving every read and
+-- write. '' means unknown — every row enrolled before this column existed, and
+-- every row an enrolment wrote without touching the hint.
+--
+-- The rewrap sweep sets the hint in the same statement that rewrites the
+-- ciphertext, CAS-guarded on the previous bytes, so the hint can never disagree
+-- with the envelope's own kid for longer than one statement.
+--
+-- MySQL DDL is not transactional and ADD COLUMN has no IF NOT EXISTS here, so a
+-- failure partway records version 13 dirty. Recovery: do NOT re-run this ALTER.
+-- Check information_schema for totp_secrets.secret_kid, add it by hand if it is
+-- missing, then force version 13 (migrate force 13).
+ALTER TABLE totp_secrets ADD COLUMN secret_kid VARCHAR(32) NOT NULL DEFAULT '';

@@ -2,6 +2,8 @@ package mongostore
 
 import (
 	"context"
+	"errors"
+	"fmt"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
@@ -21,6 +23,10 @@ func IndexSpecifications() map[string][]mongo.IndexModel {
 						Locale:   "en",
 						Strength: 2,
 					}),
+			},
+			{
+				Keys:    bson.D{{Key: "email_verified", Value: 1}},
+				Options: options.Index().SetName("idx_users_email_verified"),
 			},
 		},
 		"sessions": {
@@ -57,13 +63,20 @@ func IndexSpecifications() map[string][]mongo.IndexModel {
 				Options: options.Index().SetName("ttl_password_reset_tokens_expiry").SetExpireAfterSeconds(0),
 			},
 		},
+		"claimed_emails": {
+			{
+				Keys:    bson.D{{Key: "owner_user_id", Value: 1}},
+				Options: options.Index().SetName("idx_claimed_emails_owner_user_id"),
+			},
+		},
 		"oauth_accounts": {
 			{
 				Keys: bson.D{
 					{Key: "provider_id", Value: 1},
+					{Key: "provider_tenant_id", Value: 1},
 					{Key: "provider_user_id", Value: 1},
 				},
-				Options: options.Index().SetName("uq_oauth_accounts_provider_uid").SetUnique(true),
+				Options: options.Index().SetName("uq_oauth_accounts_provider_tenant_uid").SetUnique(true),
 			},
 			{
 				Keys:    bson.D{{Key: "user_id", Value: 1}},
@@ -113,6 +126,43 @@ func IndexSpecifications() map[string][]mongo.IndexModel {
 	}
 }
 
+// legacyOAuthUniqueIndex is the pre-000011 tenant-blind identity key. CreateMany
+// never drops an index, so it is removed explicitly after the tenant-qualified
+// index is built: leaving it in place keeps rejecting a pairwise subject that a
+// second tenant legitimately owns.
+const legacyOAuthUniqueIndex = "uq_oauth_accounts_provider_uid"
+
+// verifyOAuthAccountTenantScope refuses startup on an oauth_accounts document
+// whose tenant is missing or not a string. Mongo has no NOT NULL: such a
+// document is indexed as null and is invisible to a tenant-qualified lookup,
+// unlike SQL where the write fails.
+func verifyOAuthAccountTenantScope(ctx context.Context, database *mongo.Database) error {
+	var doc struct {
+		ID string `bson:"_id"`
+	}
+	err := database.Collection("oauth_accounts").
+		FindOne(ctx, tenantScopeViolationFilter(), options.FindOne().SetProjection(bson.M{"_id": 1})).
+		Decode(&doc)
+	if errors.Is(err, mongo.ErrNoDocuments) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	return fmt.Errorf("oauth_accounts document %q has no string provider_tenant_id", doc.ID)
+}
+
+// tenantScopeViolationFilter selects documents whose tenant cannot key a
+// tenant-qualified lookup. $type:"string" also matches an array that contains a
+// string, so arrays are excluded explicitly: Mongo indexes ["tenant-a"] as a
+// multi-key value no equality lookup with the tenant string reaches.
+func tenantScopeViolationFilter() bson.M {
+	return bson.M{"$or": bson.A{
+		bson.M{"provider_tenant_id": bson.M{"$not": bson.M{"$type": "string"}}},
+		bson.M{"provider_tenant_id": bson.M{"$type": "array"}},
+	}}
+}
+
 // EnsureIndexes provisions all required collection indexes idempotently.
 func EnsureIndexes(ctx context.Context, database *mongo.Database) error {
 	if database == nil {
@@ -125,5 +175,29 @@ func EnsureIndexes(ctx context.Context, database *mongo.Database) error {
 			return err
 		}
 	}
-	return nil
+	return dropLegacyOAuthIndex(ctx, database.Collection("oauth_accounts"))
+}
+
+// dropLegacyOAuthIndex removes the tenant-blind oauth_accounts index. A missing
+// index is the steady state after the first run, not a failure.
+func dropLegacyOAuthIndex(ctx context.Context, col *mongo.Collection) error {
+	err := col.Indexes().DropOne(ctx, legacyOAuthUniqueIndex)
+	if err == nil || isMissingIndex(err) {
+		return nil
+	}
+	return err
+}
+
+// isMissingIndex reports the server codes for a collection or index that does
+// not exist, so an already-clean database stays a no-op.
+func isMissingIndex(err error) bool {
+	var cmdErr mongo.CommandError
+	if errors.As(err, &cmdErr) {
+		const (
+			namespaceNotFound = 26
+			indexNotFound     = 27
+		)
+		return cmdErr.Code == namespaceNotFound || cmdErr.Code == indexNotFound
+	}
+	return false
 }

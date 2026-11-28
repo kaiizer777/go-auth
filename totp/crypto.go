@@ -2,95 +2,93 @@ package totp
 
 import (
 	"bytes"
-	"crypto/aes"
-	"crypto/cipher"
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"image/png"
-	"io"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/pquerna/otp"
 	ptotp "github.com/pquerna/otp/totp"
 
+	"github.com/kaiizer777/go-auth/config"
+	"github.com/kaiizer777/go-auth/crypto"
 	"github.com/kaiizer777/go-auth/errors"
 )
 
-// Crypto provides AES-256-GCM symmetric encryption for TOTP secrets,
-// along with RFC 6238 TOTP generation and verification helpers.
+// secretKeyField is the stable AAD field binding a sealed secret to the
+// totp_secrets.encrypted_secret column.
+const secretKeyField = "encrypted_secret"
+
+// Crypto seals TOTP secrets through the shared crypto envelope, and provides
+// RFC 6238 TOTP generation and verification helpers.
 type Crypto struct {
-	key []byte
+	sealer *crypto.SecretSealer
 }
 
-// NewCrypto creates a new Crypto instance from a 64-character hex-encoded string (32 bytes).
-func NewCrypto(hexKey string) (*Crypto, error) {
-	if len(hexKey) != 64 {
+// NewCrypto builds the secret sealer from cfg. The ring is cfg.Keyring followed
+// by the hex EncryptionKey under kid "legacy": the first entry encrypts, every
+// entry decrypts.
+func NewCrypto(cfg config.TOTPConfig) (*Crypto, error) {
+	ring, err := parseTOTPKeyring(cfg)
+	if err != nil {
+		return nil, err
+	}
+	return &Crypto{sealer: crypto.NewSecretSealer(ring)}, nil
+}
+
+func parseTOTPKeyring(cfg config.TOTPConfig) (*crypto.Keyring, error) {
+	spec, err := cfg.KeyringSpec()
+	if err != nil {
+		return nil, err
+	}
+	if spec == "" {
 		return nil, errors.ErrTOTPEncryptionKeyInvalid
 	}
-	key, err := hex.DecodeString(hexKey)
-	if err != nil || len(key) != 32 {
+
+	ring, err := crypto.ParseKeyring(spec)
+	if err != nil {
+		return nil, errors.ErrTOTPKeyringInvalid
+	}
+	return ring, nil
+}
+
+// ActiveKeyID returns the kid new secrets are sealed under.
+func (c *Crypto) ActiveKeyID() string {
+	if c == nil {
+		return ""
+	}
+	return c.sealer.ActiveKeyID()
+}
+
+// Encrypt seals plaintext for its owner. It only ever writes the envelope
+// format, bound to ownerID and the encrypted_secret field.
+func (c *Crypto) Encrypt(ownerID uuid.UUID, plaintext []byte) ([]byte, error) {
+	if c == nil {
 		return nil, errors.ErrTOTPEncryptionKeyInvalid
 	}
-	return &Crypto{key: key}, nil
+	return c.sealer.Seal(ownerID.String(), secretKeyField, plaintext)
 }
 
-// NewCryptoFromBytes creates a new Crypto instance from a 32-byte AES key.
-func NewCryptoFromBytes(key []byte) (*Crypto, error) {
-	if len(key) != 32 {
+// Decrypt opens a stored secret for its owner, accepting both the envelope
+// format and the legacy nonce||ciphertext||tag layout. A legacy row carries no
+// AAD, so it still opens for any owner until the rewrap drains it.
+func (c *Crypto) Decrypt(ownerID uuid.UUID, blob []byte) ([]byte, error) {
+	if c == nil {
 		return nil, errors.ErrTOTPEncryptionKeyInvalid
 	}
-	k := make([]byte, 32)
-	copy(k, key)
-	return &Crypto{key: k}, nil
+	return c.sealer.Open(ownerID.String(), secretKeyField, blob)
 }
 
-// Encrypt encrypts plaintext using AES-256-GCM with a fresh 12-byte CSPRNG nonce.
-// Returns a byte slice formatted as: nonce (12B) || ciphertext || tag (16B).
-func (c *Crypto) Encrypt(plaintext []byte) ([]byte, error) {
-	block, err := aes.NewCipher(c.key)
-	if err != nil {
-		return nil, fmt.Errorf("totp: failed to create cipher block: %w", err)
+// EnvelopeKeyID reports the kid a stored blob is already sealed under. It is
+// false for a legacy row, and it never proves the blob decrypts.
+func (c *Crypto) EnvelopeKeyID(blob []byte) (string, bool) {
+	if c == nil {
+		return "", false
 	}
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return nil, fmt.Errorf("totp: failed to create gcm: %w", err)
-	}
-
-	nonce := make([]byte, gcm.NonceSize())
-	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
-		return nil, fmt.Errorf("totp: failed to generate nonce: %w", err)
-	}
-
-	return gcm.Seal(nonce, nonce, plaintext, nil), nil
-}
-
-// Decrypt decrypts an AES-256-GCM encrypted blob formatted as: nonce (12B) || ciphertext || tag (16B).
-func (c *Crypto) Decrypt(blob []byte) ([]byte, error) {
-	block, err := aes.NewCipher(c.key)
-	if err != nil {
-		return nil, fmt.Errorf("totp: failed to create cipher block: %w", err)
-	}
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return nil, fmt.Errorf("totp: failed to create gcm: %w", err)
-	}
-
-	nonceSize := gcm.NonceSize()
-	if len(blob) < nonceSize {
-		return nil, errors.New(errors.CodeInternalError, "totp: ciphertext too short", nil)
-	}
-
-	nonce := blob[:nonceSize]
-	ciphertext := blob[nonceSize:]
-
-	plaintext, err := gcm.Open(nil, nonce, ciphertext, nil)
-	if err != nil {
-		return nil, fmt.Errorf("totp: decryption failed: %w", err)
-	}
-	return plaintext, nil
+	return c.sealer.EnvelopeKeyID(blob)
 }
 
 // GenerateKey generates an RFC 6238 compliant base32 TOTP key.

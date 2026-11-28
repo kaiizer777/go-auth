@@ -97,7 +97,16 @@ func (s *userStore) SetEmailVerified(ctx context.Context, id uuid.UUID, verified
 }
 
 func (s *userStore) Delete(ctx context.Context, id uuid.UUID) error {
-	return s.db.WithContext(ctx).Where("id = ?", id).Delete(&db.User{}).Error
+	// One transaction so a failure cannot release the account's addresses while
+	// the account survives. The schema FK already cascades; the explicit delete
+	// keeps the invariant true for a store whose schema was built by AutoMigrate,
+	// which creates no foreign keys.
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Where("id = ?", id).Delete(&db.User{}).Error; err != nil {
+			return err
+		}
+		return tx.Where("owner_user_id = ?", id).Delete(&db.ClaimedEmail{}).Error
+	})
 }
 
 type sessionStore struct {
@@ -235,9 +244,9 @@ func (s *oauthAccountStore) Create(ctx context.Context, account *db.OAuthAccount
 	return nil
 }
 
-func (s *oauthAccountStore) GetByProvider(ctx context.Context, providerID, providerUserID string) (*db.OAuthAccount, error) {
+func (s *oauthAccountStore) GetByProvider(ctx context.Context, providerID, providerTenantID, providerUserID string) (*db.OAuthAccount, error) {
 	var acc db.OAuthAccount
-	if err := s.db.WithContext(ctx).Where("provider_id = ? AND provider_user_id = ?", providerID, providerUserID).First(&acc).Error; err != nil {
+	if err := s.db.WithContext(ctx).Where("provider_id = ? AND provider_tenant_id = ? AND provider_user_id = ?", providerID, providerTenantID, providerUserID).First(&acc).Error; err != nil {
 		return nil, err
 	}
 	return &acc, nil
@@ -245,10 +254,23 @@ func (s *oauthAccountStore) GetByProvider(ctx context.Context, providerID, provi
 
 func (s *oauthAccountStore) GetByUserID(ctx context.Context, userID uuid.UUID) ([]*db.OAuthAccount, error) {
 	var accounts []*db.OAuthAccount
-	if err := s.db.WithContext(ctx).Where("user_id = ?", userID).Find(&accounts).Error; err != nil {
+	// Most recently updated first: a user can hold two links for one provider
+	// and the newest is the one a single-row lookup must resolve.
+	if err := s.db.WithContext(ctx).Where("user_id = ?", userID).Order("updated_at DESC").Find(&accounts).Error; err != nil {
 		return nil, err
 	}
 	return accounts, nil
+}
+
+func (s *oauthAccountStore) UpdateProviderUserID(ctx context.Context, id uuid.UUID, providerUserID string) error {
+	res := s.db.WithContext(ctx).Model(&db.OAuthAccount{}).Where("id = ?", id).Update("provider_user_id", providerUserID)
+	if err := res.Error; err != nil {
+		return db.NormalizeMySQLError(err)
+	}
+	if res.RowsAffected == 0 {
+		return gorm.ErrRecordNotFound
+	}
+	return nil
 }
 
 func (s *oauthAccountStore) Delete(ctx context.Context, id uuid.UUID) error {
@@ -257,6 +279,170 @@ func (s *oauthAccountStore) Delete(ctx context.Context, id uuid.UUID) error {
 
 func (s *oauthAccountStore) DeleteByUserID(ctx context.Context, userID uuid.UUID) error {
 	return s.db.WithContext(ctx).Where("user_id = ?", userID).Delete(&db.OAuthAccount{}).Error
+}
+
+// oauthTokenUpdates builds the column payload both write paths share. updated_at
+// is always restamped, so the row changes unless a retry lands inside the same
+// timestamp precision with an identical record.
+func oauthTokenUpdates(rec db.OAuthTokenRecord) map[string]any {
+	return map[string]any{
+		"access_token_ciphertext":   rec.AccessTokenCiphertext,
+		"refresh_token_ciphertext":  rec.RefreshTokenCiphertext,
+		"refresh_token_fingerprint": rec.RefreshTokenFingerprint,
+		"token_scope":               rec.TokenScope,
+		"token_expires_at":          rec.TokenExpiresAt,
+		"updated_at":                time.Now().UTC(),
+	}
+}
+
+func (s *oauthAccountStore) SaveOAuthTokens(ctx context.Context, id uuid.UUID, rec db.OAuthTokenRecord) error {
+	res := s.db.WithContext(ctx).Model(&db.OAuthAccount{}).Where("id = ?", id).Updates(oauthTokenUpdates(rec))
+	if err := res.Error; err != nil {
+		return db.NormalizeMySQLError(err)
+	}
+	if res.RowsAffected > 0 {
+		return nil
+	}
+	// MySQL reports 0 affected rows for an UPDATE that changes nothing (identical
+	// tokens saved inside the same microsecond), so zero rows alone cannot prove
+	// the account is missing. CAS needs no equivalent: there a no-op reports a
+	// miss and the caller re-reads the winner's token, which is the same outcome.
+	var exists int64
+	if err := s.db.WithContext(ctx).Model(&db.OAuthAccount{}).Where("id = ?", id).Count(&exists).Error; err != nil {
+		return db.NormalizeMySQLError(err)
+	}
+	if exists == 0 {
+		return gorm.ErrRecordNotFound
+	}
+	return nil
+}
+
+func (s *oauthAccountStore) SaveOAuthTokensCAS(ctx context.Context, id uuid.UUID, expectedFingerprint string, rec db.OAuthTokenRecord) (bool, error) {
+	if expectedFingerprint == "" {
+		return false, nil
+	}
+	res := s.db.WithContext(ctx).Model(&db.OAuthAccount{}).
+		Where("id = ? AND refresh_token_fingerprint = ?", id, expectedFingerprint).
+		Updates(oauthTokenUpdates(rec))
+	if err := res.Error; err != nil {
+		return false, db.NormalizeMySQLError(err)
+	}
+	return res.RowsAffected > 0, nil
+}
+
+func (s *oauthAccountStore) SaveOAuthTokensIfUnset(ctx context.Context, id uuid.UUID, rec db.OAuthTokenRecord) (bool, error) {
+	res := s.db.WithContext(ctx).Model(&db.OAuthAccount{}).
+		Where("id = ? AND refresh_token_fingerprint = ?", id, "").
+		Updates(oauthTokenUpdates(rec))
+	if err := res.Error; err != nil {
+		return false, db.NormalizeMySQLError(err)
+	}
+	return res.RowsAffected > 0, nil
+}
+
+// oauthAccessUpdates is the column payload for an access-only write: the refresh
+// columns are deliberately absent so a tokenless grant cannot erase them.
+func oauthAccessUpdates(rec db.OAuthTokenRecord) map[string]any {
+	return map[string]any{
+		"access_token_ciphertext": rec.AccessTokenCiphertext,
+		"token_scope":             rec.TokenScope,
+		"token_expires_at":        rec.TokenExpiresAt,
+		"updated_at":              time.Now().UTC(),
+	}
+}
+
+func (s *oauthAccountStore) SaveOAuthAccess(ctx context.Context, id uuid.UUID, rec db.OAuthTokenRecord) error {
+	res := s.db.WithContext(ctx).Model(&db.OAuthAccount{}).Where("id = ?", id).Updates(oauthAccessUpdates(rec))
+	if err := res.Error; err != nil {
+		return db.NormalizeMySQLError(err)
+	}
+	if res.RowsAffected > 0 {
+		return nil
+	}
+	// Same MySQL no-op caveat as SaveOAuthTokens: zero affected rows alone does
+	// not prove the account is missing.
+	var exists int64
+	if err := s.db.WithContext(ctx).Model(&db.OAuthAccount{}).Where("id = ?", id).Count(&exists).Error; err != nil {
+		return db.NormalizeMySQLError(err)
+	}
+	if exists == 0 {
+		return gorm.ErrRecordNotFound
+	}
+	return nil
+}
+
+// SaveOAuthAccessCAS writes the access columns only while the stored access
+// ciphertext still matches the value the caller read. A miss reports false: a
+// newer access envelope is stored, and MySQL would also report one for a write
+// that changed nothing, which is the same outcome.
+func (s *oauthAccountStore) SaveOAuthAccessCAS(ctx context.Context, id uuid.UUID, expectedCiphertext string, rec db.OAuthTokenRecord) (bool, error) {
+	res := s.db.WithContext(ctx).Model(&db.OAuthAccount{}).
+		Where("id = ? AND access_token_ciphertext = ?", id, expectedCiphertext).
+		Updates(oauthAccessUpdates(rec))
+	if err := res.Error; err != nil {
+		return false, db.NormalizeMySQLError(err)
+	}
+	return res.RowsAffected > 0, nil
+}
+
+// ClearOAuthRefresh empties the refresh columns only, guarded on the fingerprint
+// the caller read: the access envelope has its own writers and is never touched.
+func (s *oauthAccountStore) ClearOAuthRefresh(ctx context.Context, id uuid.UUID, expectedFingerprint string) (bool, error) {
+	if expectedFingerprint == "" {
+		return false, nil
+	}
+	res := s.db.WithContext(ctx).Model(&db.OAuthAccount{}).
+		Where("id = ? AND refresh_token_fingerprint = ?", id, expectedFingerprint).
+		Updates(map[string]any{
+			"refresh_token_ciphertext":  "",
+			"refresh_token_fingerprint": "",
+			"updated_at":                time.Now().UTC(),
+		})
+	if err := res.Error; err != nil {
+		return false, db.NormalizeMySQLError(err)
+	}
+	return res.RowsAffected > 0, nil
+}
+
+// SaveOAuthRefreshIfUnset stores a rotated refresh pair over a row holding none,
+// then fills the access columns only while the row still holds no access
+// envelope, so a concurrent access-only winner keeps its own. Each guard lives
+// in its own WHERE clause, which every backend evaluates against the original
+// row: no assignment may read a column the same statement writes, because MySQL
+// applies single-table SET assignments left to right against already-updated
+// values.
+//
+// The two statements run sequentially, so the access write is skipped when the
+// refresh guard misses — a stored refresh grant owns the row and the caller lost
+// — and a failed access write reports (true, error): the refresh pair landed and
+// the row keeps a usable grant.
+func (s *oauthAccountStore) SaveOAuthRefreshIfUnset(ctx context.Context, id uuid.UUID, rec db.OAuthTokenRecord) (bool, error) {
+	if rec.RefreshTokenFingerprint == "" {
+		return false, nil
+	}
+	res := s.db.WithContext(ctx).Model(&db.OAuthAccount{}).
+		Where("id = ? AND refresh_token_fingerprint = ?", id, "").
+		Updates(map[string]any{
+			"refresh_token_ciphertext":  rec.RefreshTokenCiphertext,
+			"refresh_token_fingerprint": rec.RefreshTokenFingerprint,
+			"updated_at":                time.Now().UTC(),
+		})
+	if err := res.Error; err != nil {
+		return false, db.NormalizeMySQLError(err)
+	}
+	if res.RowsAffected == 0 {
+		return false, nil
+	}
+	if rec.AccessTokenCiphertext == "" {
+		return true, nil
+	}
+	access := s.db.WithContext(ctx).Model(&db.OAuthAccount{}).
+		Where("id = ? AND access_token_ciphertext = ?", id, "").
+		Updates(oauthAccessUpdates(rec))
+	if err := access.Error; err != nil {
+		return true, db.NormalizeMySQLError(err)
+	}
+	return true, nil
 }
 
 type totpStore struct {
@@ -285,6 +471,56 @@ func (s *totpStore) GetSecretByUserIDForUpdate(ctx context.Context, userID uuid.
 		return nil, err
 	}
 	return &sec, nil
+}
+
+// totpRewrapRow is the explicit projection the sweep reads. secret_kid is not on
+// db.TotpSecret on purpose: a modelled field would join every SELECT and every
+// INSERT, and a down-migrated database would then break all TOTP traffic.
+type totpRewrapRow struct {
+	ID              uuid.UUID `gorm:"column:id"`
+	UserID          uuid.UUID `gorm:"column:user_id"`
+	EncryptedSecret []byte    `gorm:"column:encrypted_secret"`
+	SecretKid       string    `gorm:"column:secret_kid"`
+}
+
+func (s *totpStore) ListSecretsForRewrap(ctx context.Context, afterID uuid.UUID, limit int) ([]db.TotpSecretRewrap, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+
+	var rows []totpRewrapRow
+	err := s.db.WithContext(ctx).
+		Table("totp_secrets").
+		Select("id, user_id, encrypted_secret, secret_kid").
+		Where("id > ?", afterID.String()).
+		Order("id ASC").
+		Limit(limit).
+		Scan(&rows).Error
+	if err != nil {
+		return nil, db.NormalizeMySQLError(err)
+	}
+
+	secrets := make([]db.TotpSecretRewrap, 0, len(rows))
+	for _, row := range rows {
+		secrets = append(secrets, db.TotpSecretRewrap{
+			ID:              row.ID,
+			UserID:          row.UserID,
+			EncryptedSecret: row.EncryptedSecret,
+			SecretKid:       row.SecretKid,
+		})
+	}
+	return secrets, nil
+}
+
+func (s *totpStore) UpdateSecretForRewrap(ctx context.Context, id uuid.UUID, expectedCiphertext, newCiphertext []byte, newKid string) (bool, error) {
+	res := s.db.WithContext(ctx).Exec(
+		"UPDATE totp_secrets SET encrypted_secret = ?, secret_kid = ?, updated_at = ? WHERE id = ? AND encrypted_secret = ?",
+		newCiphertext, newKid, time.Now().UTC(), id.String(), expectedCiphertext,
+	)
+	if res.Error != nil {
+		return false, db.NormalizeMySQLError(res.Error)
+	}
+	return res.RowsAffected > 0, nil
 }
 
 func (s *totpStore) EnableSecret(ctx context.Context, secretID uuid.UUID, backupCodesJSON []byte) error {
@@ -471,6 +707,41 @@ func (s *totpStore) DeleteTwoFactorTokensByUserID(ctx context.Context, userID uu
 	return s.db.WithContext(ctx).Where("user_id = ?", userID).Delete(&db.TwoFactorToken{}).Error
 }
 
+type claimedEmailStore struct {
+	db *gorm.DB
+}
+
+func (s *claimedEmailStore) Claim(ctx context.Context, email string, ownerID uuid.UUID, verified bool) error {
+	return db.ClaimWithin(ctx, s.db, email, ownerID, verified)
+}
+
+func (s *claimedEmailStore) Get(ctx context.Context, email string) (*db.ClaimedEmail, error) {
+	key, kerr := db.ClaimKey(email)
+	if kerr != nil || key == "" {
+		return nil, gorm.ErrRecordNotFound
+	}
+	var claim db.ClaimedEmail
+	if err := s.db.WithContext(ctx).Where("email = ?", key).First(&claim).Error; err != nil {
+		return nil, err
+	}
+	return &claim, nil
+}
+
+// Release deletes the holder's claim. It keys on NormalizeEmail rather than
+// ClaimKey, so a legacy row stored under an address the current rule would not
+// create is still matched and removed; a value that matches no row is a no-op.
+func (s *claimedEmailStore) Release(ctx context.Context, email string, ownerID uuid.UUID) error {
+	key := db.NormalizeEmail(email)
+	if key == "" {
+		return nil
+	}
+	return s.db.WithContext(ctx).Where("email = ? AND owner_user_id = ?", key, ownerID).Delete(&db.ClaimedEmail{}).Error
+}
+
+func (s *claimedEmailStore) ReleaseByUserID(ctx context.Context, ownerID uuid.UUID) error {
+	return s.db.WithContext(ctx).Where("owner_user_id = ?", ownerID).Delete(&db.ClaimedEmail{}).Error
+}
+
 type gormStore struct {
 	db                 *gorm.DB
 	users              *userStore
@@ -479,6 +750,7 @@ type gormStore struct {
 	passwordReset      *passwordResetTokenStore
 	oauthAccounts      *oauthAccountStore
 	totp               *totpStore
+	claimedEmails      *claimedEmailStore
 }
 
 // New constructs a GORM-backed implementation of db.Store.
@@ -494,6 +766,7 @@ func New(database *gorm.DB) db.Store {
 		passwordReset:      &passwordResetTokenStore{db: database},
 		oauthAccounts:      &oauthAccountStore{db: database},
 		totp:               &totpStore{db: database},
+		claimedEmails:      &claimedEmailStore{db: database},
 	}
 }
 
@@ -503,6 +776,7 @@ func (s *gormStore) VerificationTokens() db.VerificationTokenStore   { return s.
 func (s *gormStore) PasswordResetTokens() db.PasswordResetTokenStore { return s.passwordReset }
 func (s *gormStore) OAuthAccounts() db.OAuthAccountStore             { return s.oauthAccounts }
 func (s *gormStore) Totp() db.TotpStore                              { return s.totp }
+func (s *gormStore) ClaimedEmails() db.ClaimedEmailStore             { return s.claimedEmails }
 
 func (s *gormStore) Transaction(ctx context.Context, fn func(txStore db.Store) error) error {
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {

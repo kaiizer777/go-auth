@@ -2,6 +2,7 @@ package db
 
 import (
 	"encoding/json"
+	"log/slog"
 	"reflect"
 	"strings"
 	"testing"
@@ -501,5 +502,43 @@ func TestSession_LogValue_RedactsIDHash(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("expected id_hash in Session.LogValue()")
+	}
+}
+
+func TestOAuthAccount_LogValue_RedactsTokensAndKeepsNilExpiry(t *testing.T) {
+	account := OAuthAccount{
+		ID:                      uuid.New(),
+		UserID:                  uuid.New(),
+		AccessTokenCiphertext:   "sealed-access-envelope",
+		RefreshTokenCiphertext:  "sealed-refresh-envelope",
+		RefreshTokenFingerprint: "0123456789abcdef",
+		TokenScope:              "users.read offline.access",
+	}
+
+	attrs := make(map[string]slog.Value)
+	for _, a := range account.LogValue().Group() {
+		attrs[a.Key] = a.Value
+	}
+	for _, key := range []string{"access_token_ciphertext", "refresh_token_ciphertext", "refresh_token_fingerprint"} {
+		if got := attrs[key].String(); got != "[REDACTED]" {
+			t.Errorf("%s = %q; want [REDACTED]", key, got)
+		}
+	}
+	if got := attrs["token_scope"].String(); got != account.TokenScope {
+		t.Errorf("token_scope = %q; want %q", got, account.TokenScope)
+	}
+	if got := attrs["token_expires_at"]; got.Kind() != slog.KindAny || got.Any() != nil {
+		t.Errorf("nil token_expires_at must log as null, got %v (kind %v)", got, got.Kind())
+	}
+
+	expiresAt := time.Date(2026, 11, 27, 12, 0, 0, 0, time.UTC)
+	account.TokenExpiresAt = &expiresAt
+	for _, a := range account.LogValue().Group() {
+		if a.Key != "token_expires_at" {
+			continue
+		}
+		if got := a.Value.Time(); !got.Equal(expiresAt) {
+			t.Errorf("token_expires_at = %v; want %v", got, expiresAt)
+		}
 	}
 }

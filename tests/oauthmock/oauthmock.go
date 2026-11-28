@@ -1,8 +1,7 @@
-// Package oauthmock fronts httptest token/userinfo servers (plus a JWKS
-// server for apple) while implementing oauth.Provider. The token server
-// binds the verifier to the challenge observed at authorize time and
-// enforces single-use codes, so PKCE-tamper and replay paths fail exactly
-// like a real provider with invalid_grant.
+// Package oauthmock provides two test doubles for OAuth flows: Mock implements
+// oauth.Provider for provider-agnostic service and handler tests, while the IdP
+// servers (NewMicrosoftIdP and friends) emulate a provider's real HTTP surface
+// so adapter tests can drive the actual adapter through oauth.WithEndpoints.
 package oauthmock
 
 import (
@@ -31,13 +30,13 @@ type Mock struct {
 	userSrv  *httptest.Server
 	jwksSrv  *httptest.Server
 
-	mu              sync.Mutex
-	gotVerifier     string
-	verifierCalls   int
-	seenCodes       map[string]bool
-	challenges      map[string]struct{}
-	requireVerifier string
-	profile         *oauth.UserInfo
+	mu            sync.Mutex
+	gotVerifier   string
+	verifierCalls int
+	seenCodes     map[string]bool
+	challenges    map[string]struct{}
+	profile       *oauth.UserInfo
+	rawClaims     map[string]any
 
 	// SingleUseCodes rejects an auth code on second use (replay tests).
 	SingleUseCodes bool
@@ -48,6 +47,20 @@ type Mock struct {
 	RefreshToken string
 	IDToken      string
 	ClientSecret string
+}
+
+// MicrosoftTenantID is the tenant the Microsoft mock reports. The production
+// adapter always names a verified tenant, so a Microsoft mock without one could
+// not form a storable identity.
+const MicrosoftTenantID = "33333333-3333-3333-3333-333333333333"
+
+// mockTenant returns the tenant a mocked provider's identity is scoped to.
+// Only Microsoft is tenant-scoped; every other provider has no tenant namespace.
+func mockTenant(providerID string) string {
+	if providerID == "microsoft" {
+		return MicrosoftTenantID
+	}
+	return ""
 }
 
 // New returns a Mock serving fixed tokens and the given profile.
@@ -62,7 +75,7 @@ func New(id, sub, email string, verified bool) *Mock {
 		IDToken:      "mock-id-" + id + "-7f3a9c1e",
 		ClientSecret: "mock-client-secret-7f3a9c1e",
 		profile: &oauth.UserInfo{
-			ProviderID: id, ProviderUserID: sub,
+			ProviderID: id, ProviderTenantID: mockTenant(id), ProviderUserID: sub,
 			Email: email, EmailVerified: verified, Name: "OAuth User",
 		},
 	}
@@ -83,10 +96,6 @@ func New(id, sub, email string, verified bool) *Mock {
 		// which a real provider also rejects.
 		sum := sha256.Sum256([]byte(verifier))
 		if _, ok := m.challenges[base64.RawURLEncoding.EncodeToString(sum[:])]; !ok {
-			http.Error(w, `{"error":"invalid_grant"}`, http.StatusBadRequest)
-			return
-		}
-		if m.requireVerifier != "" && verifier != m.requireVerifier {
 			http.Error(w, `{"error":"invalid_grant"}`, http.StatusBadRequest)
 			return
 		}
@@ -139,6 +148,11 @@ func (m *Mock) AuthURL(state, codeChallenge string) string {
 	m.challenges[codeChallenge] = struct{}{}
 	m.mu.Unlock()
 	return "https://provider." + m.id + ".example/auth?state=" + state + "&code_challenge=" + codeChallenge
+}
+
+// AuthCodeURL returns a fake provider authorization URL, recording the challenge.
+func (m *Mock) AuthCodeURL(state, codeChallenge string, _ ...oauth.AuthCodeOption) string {
+	return m.AuthURL(state, codeChallenge)
 }
 
 // ExchangeCode posts the code/verifier to the mock token server.
@@ -223,10 +237,17 @@ func (m *Mock) FetchUserInfo(ctx context.Context, tokens *oauth.TokenResponse) (
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	var claims map[string]any
+	if m.rawClaims != nil {
+		claims = make(map[string]any, len(m.rawClaims))
+		for k, v := range m.rawClaims {
+			claims[k] = v
+		}
+	}
 	return &oauth.UserInfo{
-		ProviderID: m.id, ProviderUserID: raw.Sub,
+		ProviderID: m.id, ProviderTenantID: m.profile.ProviderTenantID, ProviderUserID: raw.Sub,
 		Email: raw.Email, EmailVerified: verified || m.profile.EmailVerified,
-		Name: raw.Name,
+		Name: raw.Name, RawClaims: claims,
 	}, nil
 }
 
@@ -237,11 +258,13 @@ func (m *Mock) ObservedVerifier() (string, int) {
 	return m.gotVerifier, m.verifierCalls
 }
 
-// SetRequireVerifier pins the verifier the token server accepts.
-func (m *Mock) SetRequireVerifier(v string) {
+// SetRawClaims pins extra claims (e.g. untrusted_tenant) onto the profile
+// FetchUserInfo returns. Opt-in: mocks without pinned claims keep the
+// previous nil-RawClaims behavior for all other consumers.
+func (m *Mock) SetRawClaims(claims map[string]any) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.requireVerifier = v
+	m.rawClaims = claims
 }
 
 // drainBody discards and closes a mock provider response body.

@@ -8,6 +8,8 @@ import (
 	"context"
 	"log/slog"
 	"net/http"
+	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -72,10 +74,42 @@ var (
 	}
 )
 
+// tokenKEKEnvVar is the only place the token keyring environment variable is read.
+const tokenKEKEnvVar = "GOAUTH_TOKEN_KEK"
+
+// resolveTokenKEK applies the environment keyring when the config leaves it
+// unset; an explicit config value always wins. Config.Validate stays free of
+// environment reads on purpose.
+func resolveTokenKEK(cfg *config.Config) {
+	if cfg.OAuth.TokenKEK != "" {
+		return
+	}
+	cfg.OAuth.TokenKEK = strings.TrimSpace(os.Getenv(tokenKEKEnvVar))
+}
+
+// requireProviderTokenKEK fails closed when a provider is configured without a
+// keyring. cfg must have passed Validate so Providers carries the resolved
+// enable flags; there is no default, generated, or plaintext fallback.
+func requireProviderTokenKEK(cfg *config.Config) error {
+	if cfg.OAuth.TokenKEK != "" {
+		return nil
+	}
+	for _, provider := range cfg.OAuth.Providers {
+		if provider.Enabled {
+			return errors.Wrap(errors.ErrOAuthTokenKEKMissing, errors.CodeInvalidConfig, "goauth: invalid configuration")
+		}
+	}
+	return nil
+}
+
 // NewWithStore initializes Auth using an existing db.Store.
 func NewWithStore(store db.Store, cfg config.Config) (*Auth, error) {
+	resolveTokenKEK(&cfg)
 	if err := cfg.Validate(); err != nil {
 		return nil, errors.Wrap(err, errors.CodeInvalidConfig, "goauth: invalid configuration")
+	}
+	if err := requireProviderTokenKEK(&cfg); err != nil {
+		return nil, err
 	}
 
 	emailHooks := cfg.EmailHooks
@@ -128,28 +162,28 @@ func NewWithStore(store db.Store, cfg config.Config) (*Auth, error) {
 
 	sessHandler := handler.NewSessionHandlerWithStore(sessionSvc, store, &cfg)
 
-	providers := make(map[string]oauth.Provider)
-	for id, pcfg := range cfg.OAuth.Providers {
-		if !pcfg.Enabled {
-			continue
-		}
-		p, err := oauth.NewProvider(id, pcfg)
-		if err != nil {
+	providers, err := newOAuthProviders(cfg.OAuth)
+	if err != nil {
+		close(limiterDone)
+		return nil, err
+	}
+	registry := oauth.NewRegistry()
+	for _, p := range providers {
+		if err := registry.Register(p); err != nil {
 			close(limiterDone)
 			return nil, err
 		}
-		providers[id] = p
 	}
 	var oauthSvc oauth.Service
 	var oauthOpt handler.Option
 	if len(providers) > 0 {
-		oauthSvc = oauth.NewServiceWithStore(store, sessionSvc, providers, &cfg)
-		oauthOpt = handler.WithOAuthService(oauthSvc, providers)
+		oauthSvc = oauth.NewServiceWithRegistry(store, sessionSvc, registry, &cfg)
+		oauthOpt = handler.WithOAuthRegistry(oauthSvc, registry)
 	}
 
 	var totpSvc totp.Service
 	var totpLimiter *ratelimit.Limiter
-	if cfg.TOTP.EncryptionKey != "" {
+	if cfg.TOTP.EncryptionKey != "" || cfg.TOTP.Keyring != "" {
 		window := cfg.TOTP.AttemptWindow
 		if window <= 0 {
 			window = 5 * time.Minute
@@ -210,6 +244,24 @@ func NewWithStore(store db.Store, cfg config.Config) (*Auth, error) {
 	return a, nil
 }
 
+// newOAuthProviders instantiates every enabled entry of the resolved provider
+// config. cfg must have passed Config.Validate, which merges the typed sections
+// into cfg.Providers and applies defaults.
+func newOAuthProviders(cfg config.OAuthConfig) (map[string]oauth.Provider, error) {
+	providers := make(map[string]oauth.Provider, len(cfg.Providers))
+	for id, pcfg := range cfg.Providers {
+		if !pcfg.Enabled {
+			continue
+		}
+		p, err := oauth.NewProvider(id, pcfg)
+		if err != nil {
+			return nil, err
+		}
+		providers[id] = p
+	}
+	return providers, nil
+}
+
 // NewWithDB initializes Auth using an existing GORM database connection.
 func NewWithDB(database *gorm.DB, cfg config.Config) (*Auth, error) {
 	adapter := gormstore.New(database)
@@ -224,8 +276,12 @@ func NewWithDB(database *gorm.DB, cfg config.Config) (*Auth, error) {
 // New validates runtime configuration, establishes database connectivity,
 // runs pending migrations, and initializes the HTTP handler chain.
 func New(cfg config.Config) (*Auth, error) {
+	resolveTokenKEK(&cfg)
 	if err := cfg.Validate(); err != nil {
 		return nil, errors.Wrap(err, errors.CodeInvalidConfig, "goauth: invalid configuration")
+	}
+	if err := requireProviderTokenKEK(&cfg); err != nil {
+		return nil, err
 	}
 
 	switch cfg.DatabaseType {

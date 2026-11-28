@@ -34,6 +34,7 @@ type MongoStore struct {
 	passwordReset      *passwordResetTokenStore
 	oauthAccounts      *oauthAccountStore
 	totp               *totpStore
+	claimedEmails      *claimedEmailStore
 }
 
 // New creates a new MongoStore instance wrapping a MongoDB client and database.
@@ -49,6 +50,7 @@ func New(client *mongo.Client, database *mongo.Database, allowNonTransactional b
 	store.passwordReset = &passwordResetTokenStore{store: store}
 	store.oauthAccounts = &oauthAccountStore{store: store}
 	store.totp = &totpStore{store: store}
+	store.claimedEmails = &claimedEmailStore{store: store}
 	return store
 }
 
@@ -65,6 +67,7 @@ func (s *MongoStore) withSession(sess *mongo.Session) *MongoStore {
 	store.passwordReset = &passwordResetTokenStore{store: store}
 	store.oauthAccounts = &oauthAccountStore{store: store}
 	store.totp = &totpStore{store: store}
+	store.claimedEmails = &claimedEmailStore{store: store}
 	return store
 }
 
@@ -81,6 +84,7 @@ func (s *MongoStore) VerificationTokens() db.VerificationTokenStore   { return s
 func (s *MongoStore) PasswordResetTokens() db.PasswordResetTokenStore { return s.passwordReset }
 func (s *MongoStore) OAuthAccounts() db.OAuthAccountStore             { return s.oauthAccounts }
 func (s *MongoStore) Totp() db.TotpStore                              { return s.totp }
+func (s *MongoStore) ClaimedEmails() db.ClaimedEmailStore             { return s.claimedEmails }
 
 func (s *MongoStore) Client() *mongo.Client     { return s.client }
 func (s *MongoStore) Database() *mongo.Database { return s.database }
@@ -164,7 +168,9 @@ func isStandaloneTransactionError(err error) bool {
 }
 
 // Connect establishes a connection to MongoDB, validates connectivity via ping,
-// and idempotently provisions native indexes.
+// refuses oauth_accounts documents without a string tenant (once per schema
+// version), and idempotently provisions native indexes and the
+// oauth_accounts.verified data backfill.
 func Connect(cfg config.Config) (*MongoStore, error) {
 	opts := options.Client().ApplyURI(cfg.DatabaseURL)
 
@@ -211,11 +217,27 @@ func Connect(cfg config.Config) (*MongoStore, error) {
 	dbName := cfg.MongoDB.Database
 	database := client.Database(dbName)
 
-	idxCtx, idxCancel := context.WithTimeout(context.Background(), connectTimeout)
-	defer idxCancel()
-	if err := EnsureIndexes(idxCtx, database); err != nil {
-		_ = client.Disconnect(context.Background())
-		return nil, errors.Wrap(err, errors.CodeDatabaseError, "failed to provision mongodb indexes")
+	initOp := func(fn func(context.Context, *mongo.Database) error, opName string) error {
+		ctx, cancel := context.WithTimeout(context.Background(), connectTimeout)
+		defer cancel()
+		if err := fn(ctx, database); err != nil {
+			_ = client.Disconnect(context.Background())
+			return errors.Wrap(err, errors.CodeDatabaseError, opName)
+		}
+		return nil
+	}
+
+	if err := initOp(VerifyOAuthAccountTenantScope, "failed to verify oauth account tenant scope"); err != nil {
+		return nil, err
+	}
+	if err := initOp(EnsureIndexes, "failed to provision mongodb indexes"); err != nil {
+		return nil, err
+	}
+	if err := initOp(BackfillOAuthAccountVerified, "failed to backfill oauth account verification"); err != nil {
+		return nil, err
+	}
+	if err := initOp(BackfillMicrosoftOIDLinks, "failed to backfill microsoft oid links"); err != nil {
+		return nil, err
 	}
 
 	return New(client, database, cfg.MongoDB.AllowNonTransactionalMongo), nil
@@ -372,6 +394,12 @@ func (s *userStore) Delete(ctx context.Context, id uuid.UUID) error {
 			if _, err := mTx.database.Collection(col).DeleteMany(cCtx, bson.M{"user_id": uidStr}); err != nil {
 				return err
 			}
+		}
+		// The claim collection names its owner column owner_user_id, so it is not
+		// covered by the user_id sweep above: these rows are what release an
+		// address for re-registration after the account is gone.
+		if _, err := mTx.database.Collection("claimed_emails").DeleteMany(cCtx, bson.M{"owner_user_id": uidStr}); err != nil {
+			return err
 		}
 		_, err := mTx.database.Collection("users").DeleteOne(cCtx, bson.M{"_id": uidStr})
 		return err
@@ -664,13 +692,14 @@ func (s *oauthAccountStore) Create(ctx context.Context, account *db.OAuthAccount
 	return nil
 }
 
-func (s *oauthAccountStore) GetByProvider(ctx context.Context, providerID, providerUserID string) (*db.OAuthAccount, error) {
+func (s *oauthAccountStore) GetByProvider(ctx context.Context, providerID, providerTenantID, providerUserID string) (*db.OAuthAccount, error) {
 	filter := bson.M{
-		"provider_id":      providerID,
-		"provider_user_id": providerUserID,
+		"provider_id":        providerID,
+		"provider_tenant_id": providerTenantID,
+		"provider_user_id":   providerUserID,
 	}
 	var doc OAuthAccountDoc
-	// codeql[go/sql-injection] Safe: providerID and providerUserID are strictly-typed Go strings serialized as BSON string literals.
+	// codeql[go/sql-injection] Safe: providerID, providerTenantID and providerUserID are strictly-typed Go strings serialized as BSON string literals.
 	err := s.collection().FindOne(s.store.resolveCtx(ctx), filter).Decode(&doc)
 	if err != nil {
 		if errors.Is(err, mongo.ErrNoDocuments) {
@@ -682,7 +711,10 @@ func (s *oauthAccountStore) GetByProvider(ctx context.Context, providerID, provi
 }
 
 func (s *oauthAccountStore) GetByUserID(ctx context.Context, userID uuid.UUID) ([]*db.OAuthAccount, error) {
-	cursor, err := s.collection().Find(s.store.resolveCtx(ctx), bson.M{"user_id": userID.String()})
+	// Most recently updated first: a user can hold two links for one provider
+	// and the newest is the one a single-row lookup must resolve.
+	opts := options.Find().SetSort(bson.D{{Key: "updated_at", Value: -1}})
+	cursor, err := s.collection().Find(s.store.resolveCtx(ctx), bson.M{"user_id": userID.String()}, opts)
 	if err != nil {
 		return []*db.OAuthAccount{}, err
 	}
@@ -699,6 +731,20 @@ func (s *oauthAccountStore) GetByUserID(ctx context.Context, userID uuid.UUID) (
 	return accounts, nil
 }
 
+func (s *oauthAccountStore) UpdateProviderUserID(ctx context.Context, id uuid.UUID, providerUserID string) error {
+	res, err := s.collection().UpdateOne(s.store.resolveCtx(ctx),
+		bson.M{"_id": id.String()},
+		bson.M{"$set": bson.M{"provider_user_id": providerUserID, "updated_at": time.Now().UTC()}},
+	)
+	if err != nil {
+		return NormalizeMongoError(err)
+	}
+	if res.MatchedCount == 0 {
+		return gorm.ErrRecordNotFound
+	}
+	return nil
+}
+
 func (s *oauthAccountStore) Delete(ctx context.Context, id uuid.UUID) error {
 	_, err := s.collection().DeleteOne(s.store.resolveCtx(ctx), bson.M{"_id": id.String()})
 	return err
@@ -707,6 +753,175 @@ func (s *oauthAccountStore) Delete(ctx context.Context, id uuid.UUID) error {
 func (s *oauthAccountStore) DeleteByUserID(ctx context.Context, userID uuid.UUID) error {
 	_, err := s.collection().DeleteMany(s.store.resolveCtx(ctx), bson.M{"user_id": userID.String()})
 	return err
+}
+
+// oauthAccessSetDoc is the $set payload for an access-only write: the refresh
+// fields are absent so a tokenless grant cannot erase them. A nil expiry is
+// written as null so the field decodes back to a nil pointer, never a year-1
+// time.
+func oauthAccessSetDoc(rec db.OAuthTokenRecord) bson.M {
+	set := bson.M{
+		"access_token_ciphertext": rec.AccessTokenCiphertext,
+		"token_scope":             rec.TokenScope,
+		"updated_at":              time.Now().UTC(),
+	}
+	if rec.TokenExpiresAt != nil {
+		set["token_expires_at"] = rec.TokenExpiresAt.UTC()
+	} else {
+		set["token_expires_at"] = nil
+	}
+	return set
+}
+
+// oauthTokenSetDoc is the $set payload both all-column write paths share.
+func oauthTokenSetDoc(rec db.OAuthTokenRecord) bson.M {
+	set := oauthAccessSetDoc(rec)
+	set["refresh_token_ciphertext"] = rec.RefreshTokenCiphertext
+	set["refresh_token_fingerprint"] = rec.RefreshTokenFingerprint
+	return set
+}
+
+func (s *oauthAccountStore) SaveOAuthTokens(ctx context.Context, id uuid.UUID, rec db.OAuthTokenRecord) error {
+	res, err := s.collection().UpdateOne(s.store.resolveCtx(ctx),
+		bson.M{"_id": id.String()},
+		bson.M{"$set": oauthTokenSetDoc(rec)},
+	)
+	if err != nil {
+		return NormalizeMongoError(err)
+	}
+	if res.MatchedCount == 0 {
+		return gorm.ErrRecordNotFound
+	}
+	return nil
+}
+
+func (s *oauthAccountStore) SaveOAuthTokensCAS(ctx context.Context, id uuid.UUID, expectedFingerprint string, rec db.OAuthTokenRecord) (bool, error) {
+	// An empty expectation is never proof of the stored token: a link that
+	// carries no fingerprint must not be overwritten by a refresh that has
+	// nothing to match. Checked before the filter is built.
+	if expectedFingerprint == "" {
+		return false, nil
+	}
+	res, err := s.collection().UpdateOne(s.store.resolveCtx(ctx),
+		bson.M{"_id": id.String(), "refresh_token_fingerprint": expectedFingerprint},
+		bson.M{"$set": oauthTokenSetDoc(rec)},
+	)
+	if err != nil {
+		return false, NormalizeMongoError(err)
+	}
+	return res.MatchedCount > 0, nil
+}
+
+func (s *oauthAccountStore) SaveOAuthTokensIfUnset(ctx context.Context, id uuid.UUID, rec db.OAuthTokenRecord) (bool, error) {
+	res, err := s.collection().UpdateOne(s.store.resolveCtx(ctx),
+		bson.M{"_id": id.String(), "$or": oauthAbsentOr("refresh_token_fingerprint")},
+		bson.M{"$set": oauthTokenSetDoc(rec)},
+	)
+	if err != nil {
+		return false, NormalizeMongoError(err)
+	}
+	return res.MatchedCount > 0, nil
+}
+
+func (s *oauthAccountStore) SaveOAuthAccess(ctx context.Context, id uuid.UUID, rec db.OAuthTokenRecord) error {
+	res, err := s.collection().UpdateOne(s.store.resolveCtx(ctx),
+		bson.M{"_id": id.String()},
+		bson.M{"$set": oauthAccessSetDoc(rec)},
+	)
+	if err != nil {
+		return NormalizeMongoError(err)
+	}
+	if res.MatchedCount == 0 {
+		return gorm.ErrRecordNotFound
+	}
+	return nil
+}
+
+// oauthAbsentOr matches a token column that holds no value, counting a document
+// written before that column existed as absent: it decodes to the empty string,
+// but an equality on "" alone would never match it.
+func oauthAbsentOr(field string) []bson.M {
+	return []bson.M{
+		{field: ""},
+		{field: bson.M{"$exists": false}},
+	}
+}
+
+func (s *oauthAccountStore) SaveOAuthAccessCAS(ctx context.Context, id uuid.UUID, expectedCiphertext string, rec db.OAuthTokenRecord) (bool, error) {
+	filter := bson.M{"_id": id.String()}
+	if expectedCiphertext == "" {
+		filter["$or"] = oauthAbsentOr("access_token_ciphertext")
+	} else {
+		filter["access_token_ciphertext"] = expectedCiphertext
+	}
+	res, err := s.collection().UpdateOne(s.store.resolveCtx(ctx), filter, bson.M{"$set": oauthAccessSetDoc(rec)})
+	if err != nil {
+		return false, NormalizeMongoError(err)
+	}
+	return res.MatchedCount > 0, nil
+}
+
+func (s *oauthAccountStore) ClearOAuthRefresh(ctx context.Context, id uuid.UUID, expectedFingerprint string) (bool, error) {
+	if expectedFingerprint == "" {
+		return false, nil
+	}
+	res, err := s.collection().UpdateOne(s.store.resolveCtx(ctx),
+		bson.M{"_id": id.String(), "refresh_token_fingerprint": expectedFingerprint},
+		bson.M{"$set": oauthRefreshClearSet()},
+	)
+	if err != nil {
+		return false, NormalizeMongoError(err)
+	}
+	return res.MatchedCount > 0, nil
+}
+
+// oauthRefreshClearSet is the payload for a refresh-only clear: the access
+// fields are absent so a discarded refresh grant leaves its envelope in place.
+func oauthRefreshClearSet() bson.M {
+	return bson.M{
+		"refresh_token_ciphertext":  "",
+		"refresh_token_fingerprint": "",
+		"updated_at":                time.Now().UTC(),
+	}
+}
+
+// oauthRefreshPairSet is the payload for a rotated pair that owns only the
+// refresh columns, leaving the access envelope to its own writers.
+func oauthRefreshPairSet(rec db.OAuthTokenRecord) bson.M {
+	return bson.M{
+		"refresh_token_ciphertext":  rec.RefreshTokenCiphertext,
+		"refresh_token_fingerprint": rec.RefreshTokenFingerprint,
+		"updated_at":                time.Now().UTC(),
+	}
+}
+
+// SaveOAuthRefreshIfUnset installs the rotated refresh pair over a row holding
+// none, then writes the access columns only while the row still holds no access
+// envelope. An update document cannot carry a per-field condition, so the access
+// write is its own statement guarded on the column it writes; the refresh pair
+// landed first, so a failed second statement leaves a usable grant behind.
+func (s *oauthAccountStore) SaveOAuthRefreshIfUnset(ctx context.Context, id uuid.UUID, rec db.OAuthTokenRecord) (bool, error) {
+	if rec.RefreshTokenFingerprint == "" {
+		return false, nil
+	}
+	filter := bson.M{"_id": id.String(), "$or": oauthAbsentOr("refresh_token_fingerprint")}
+	res, err := s.collection().UpdateOne(s.store.resolveCtx(ctx), filter, bson.M{"$set": oauthRefreshPairSet(rec)})
+	if err != nil {
+		return false, NormalizeMongoError(err)
+	}
+	if res.MatchedCount == 0 {
+		return false, nil
+	}
+	if rec.AccessTokenCiphertext == "" {
+		return true, nil
+	}
+	accessFilter := bson.M{"_id": id.String(), "$or": oauthAbsentOr("access_token_ciphertext")}
+	if _, err := s.collection().UpdateOne(s.store.resolveCtx(ctx), accessFilter,
+		bson.M{"$set": oauthAccessSetDoc(rec)},
+	); err != nil {
+		return true, NormalizeMongoError(err)
+	}
+	return true, nil
 }
 
 // ==========================================
@@ -760,6 +975,81 @@ func (s *totpStore) GetSecretByUserIDForUpdate(ctx context.Context, userID uuid.
 		return nil, err
 	}
 	return doc.toDomain(), nil
+}
+
+// totpRewrapDoc is the stored shape the sweep reads; secret_kid is bookkeeping
+// only and absent on documents written before the sweep first touched them.
+type totpRewrapDoc struct {
+	ID              string `bson:"_id"`
+	UserID          string `bson:"user_id"`
+	EncryptedSecret []byte `bson:"encrypted_secret"`
+	SecretKid       string `bson:"secret_kid"`
+}
+
+func (s *totpStore) ListSecretsForRewrap(ctx context.Context, afterID uuid.UUID, limit int) ([]db.TotpSecretRewrap, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+
+	filter := bson.M{}
+	if afterID != uuid.Nil {
+		filter["_id"] = bson.M{"$gt": afterID.String()}
+	}
+	opts := options.Find().
+		SetSort(bson.D{{Key: "_id", Value: 1}}).
+		SetLimit(int64(limit))
+
+	resolveCtx := s.store.resolveCtx(ctx)
+	cursor, err := s.secrets().Find(resolveCtx, filter, opts)
+	if err != nil {
+		return nil, NormalizeMongoError(err)
+	}
+	defer func() {
+		_ = cursor.Close(resolveCtx)
+	}()
+
+	var docs []totpRewrapDoc
+	if err := cursor.All(resolveCtx, &docs); err != nil {
+		return nil, NormalizeMongoError(err)
+	}
+
+	secrets := make([]db.TotpSecretRewrap, 0, len(docs))
+	for _, doc := range docs {
+		id, err := uuid.Parse(doc.ID)
+		if err != nil {
+			return nil, errors.New(errors.CodeDatabaseError, "totp secret has a malformed id", err)
+		}
+		userID, err := uuid.Parse(doc.UserID)
+		if err != nil {
+			return nil, errors.New(errors.CodeDatabaseError, "totp secret has a malformed user id", err)
+		}
+		secrets = append(secrets, db.TotpSecretRewrap{
+			ID:              id,
+			UserID:          userID,
+			EncryptedSecret: doc.EncryptedSecret,
+			SecretKid:       doc.SecretKid,
+		})
+	}
+	return secrets, nil
+}
+
+func (s *totpStore) UpdateSecretForRewrap(ctx context.Context, id uuid.UUID, expectedCiphertext, newCiphertext []byte, newKid string) (bool, error) {
+	filter := bson.M{
+		"_id":              id.String(),
+		"encrypted_secret": expectedCiphertext,
+	}
+	update := bson.M{
+		"$set": bson.M{
+			"encrypted_secret": newCiphertext,
+			"secret_kid":       newKid,
+			"updated_at":       time.Now().UTC(),
+		},
+	}
+	res, err := s.secrets().UpdateOne(s.store.resolveCtx(ctx), filter, update)
+	if err != nil {
+		return false, NormalizeMongoError(err)
+	}
+	return res.MatchedCount > 0, nil
 }
 
 func (s *totpStore) EnableSecret(ctx context.Context, secretID uuid.UUID, backupCodesJSON []byte) error {
@@ -981,5 +1271,151 @@ func (s *totpStore) DeleteTwoFactorToken(ctx context.Context, id uuid.UUID) (int
 
 func (s *totpStore) DeleteTwoFactorTokensByUserID(ctx context.Context, userID uuid.UUID) error {
 	_, err := s.twoFactorTokens().DeleteMany(s.store.resolveCtx(ctx), bson.M{"user_id": userID.String()})
+	return err
+}
+
+// ==========================================
+// ClaimedEmailStore implementation
+// ==========================================
+
+type claimedEmailStore struct {
+	store *MongoStore
+}
+
+func (s *claimedEmailStore) collection() *mongo.Collection {
+	return s.store.database.Collection("claimed_emails")
+}
+
+// claimFilter addresses one claim row. It is a typed struct rather than a map
+// literal so the query document has exactly one field the driver can serialise,
+// and it is only ever constructed from a key db.ClaimKey has validated as a
+// normalised ASCII address: the value is data, never a query operator.
+type claimFilter struct {
+	ID string `bson:"_id"`
+}
+
+// claimOwnerFilter scopes a write to the account that holds the claim.
+type claimOwnerFilter struct {
+	ID      string `bson:"_id"`
+	OwnerID string `bson:"owner_user_id"`
+}
+
+// Claim mirrors the SQL implementation: an upsert that cannot fail the call on a
+// duplicate, followed by a read of the holder. A duplicate-key error aborts a
+// MongoDB transaction, so the losing call resolves the winner with a read outside
+// it and does not promote: promotion belongs to the winner's own transaction.
+func (s *claimedEmailStore) Claim(ctx context.Context, email string, ownerID uuid.UUID, verified bool) error {
+	key, kerr := db.ClaimKey(email)
+	if kerr != nil {
+		return kerr
+	}
+	if key == "" {
+		return nil
+	}
+	now := time.Now().UTC()
+	sessionCtx := s.store.resolveCtx(ctx)
+	_, err := s.collection().UpdateOne(sessionCtx,
+		claimFilter{ID: key},
+		bson.M{"$setOnInsert": bson.M{
+			"owner_user_id": ownerID.String(),
+			"verified":      verified,
+			"created_at":    now,
+			"updated_at":    now,
+		}},
+		options.UpdateOne().SetUpsert(true),
+	)
+	if err != nil {
+		if !mongo.IsDuplicateKeyError(err) {
+			return NormalizeMongoError(err)
+		}
+		// The concurrent winner committed the row this call needs. Read it outside
+		// the aborted transaction and do not promote: a write made outside the
+		// caller's transaction would survive its rollback.
+		var winner ClaimedEmailDoc
+		if derr := s.collection().FindOne(ctx, claimFilter{ID: key}).Decode(&winner); derr != nil {
+			if errors.Is(derr, mongo.ErrNoDocuments) {
+				return errors.ErrEmailClaimed
+			}
+			return derr
+		}
+		if winner.toDomain().OwnerUserID != ownerID {
+			return errors.ErrEmailClaimed
+		}
+		// Without a session there is no enclosing transaction to abort, so the
+		// promotion can be applied here. With a session the transaction is already
+		// dead; the winner's own flow (or a later claim) promotes it.
+		if s.store.session == nil && verified && !winner.Verified {
+			res, uerr := s.collection().UpdateOne(ctx,
+				claimOwnerFilter{ID: key, OwnerID: ownerID.String()},
+				bson.M{"$set": bson.M{"verified": true, "updated_at": now}},
+			)
+			if uerr != nil {
+				return uerr
+			}
+			if res.MatchedCount == 0 {
+				return errors.ErrEmailClaimed
+			}
+			return nil
+		}
+		return nil
+	}
+	var doc ClaimedEmailDoc
+	if derr := s.collection().FindOne(sessionCtx, claimFilter{ID: key}).Decode(&doc); derr != nil {
+		if errors.Is(derr, mongo.ErrNoDocuments) {
+			return errors.ErrEmailClaimed
+		}
+		return derr
+	}
+	claim := doc.toDomain()
+	if claim.OwnerUserID != ownerID {
+		return errors.ErrEmailClaimed
+	}
+	if verified && !claim.Verified {
+		res, uerr := s.collection().UpdateOne(sessionCtx,
+			claimOwnerFilter{ID: key, OwnerID: ownerID.String()},
+			bson.M{"$set": bson.M{"verified": true, "updated_at": now}},
+		)
+		if uerr != nil {
+			return uerr
+		}
+		if res.MatchedCount == 0 {
+			// Released or reowned between the read and the promotion: the caller no
+			// longer holds the claim and must treat it as a lost race.
+			return errors.ErrEmailClaimed
+		}
+	}
+	return nil
+}
+
+func (s *claimedEmailStore) Get(ctx context.Context, email string) (*db.ClaimedEmail, error) {
+	key, kerr := db.ClaimKey(email)
+	if kerr != nil || key == "" {
+		return nil, gorm.ErrRecordNotFound
+	}
+	var doc ClaimedEmailDoc
+	if err := s.collection().FindOne(s.store.resolveCtx(ctx), claimFilter{ID: key}).Decode(&doc); err != nil {
+		if errors.Is(err, mongo.ErrNoDocuments) {
+			return nil, gorm.ErrRecordNotFound
+		}
+		return nil, err
+	}
+	return doc.toDomain(), nil
+}
+
+// Release deletes the holder's claim. It keys on NormalizeEmail rather than
+// ClaimKey, so a legacy row stored under an address the current rule would not
+// create is still matched and removed; a value that matches no row is a no-op.
+// The filter is still a typed struct, so the value is data only.
+func (s *claimedEmailStore) Release(ctx context.Context, email string, ownerID uuid.UUID) error {
+	key := db.NormalizeEmail(email)
+	if key == "" {
+		return nil
+	}
+	_, err := s.collection().DeleteOne(s.store.resolveCtx(ctx), claimOwnerFilter{ID: key, OwnerID: ownerID.String()})
+	return err
+}
+
+func (s *claimedEmailStore) ReleaseByUserID(ctx context.Context, ownerID uuid.UUID) error {
+	_, err := s.collection().DeleteMany(s.store.resolveCtx(ctx), bson.M{"owner_user_id": ownerID.String()})
 	return err
 }

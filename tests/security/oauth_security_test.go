@@ -10,7 +10,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"sort"
+	"regexp"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -31,6 +32,9 @@ import (
 	"github.com/kaiizer777/go-auth/tests/oauthmock"
 )
 
+// secTokenKEK is a fixed valid keyring: kid "test-kid" plus the 32 bytes 0x00-0x1f.
+const secTokenKEK = "test-kid:AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
+
 // setupOAuthSecurityApp builds the full HTTP stack over an isolated sqlite DB.
 func setupOAuthSecurityApp(t *testing.T, mocks map[string]*oauthmock.Mock, modifyCfg ...func(*config.Config)) (http.Handler, *gorm.DB, config.Config) {
 	t.Helper()
@@ -45,11 +49,25 @@ func setupOAuthSecurityApp(t *testing.T, mocks map[string]*oauthmock.Mock, modif
 		credential_version INTEGER NOT NULL DEFAULT 0, email_verified INTEGER NOT NULL DEFAULT 0,
 		created_at DATETIME, updated_at DATETIME
 	);
+	CREATE TABLE IF NOT EXISTS claimed_emails (
+		email VARCHAR(255) PRIMARY KEY,
+		owner_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		verified INTEGER NOT NULL DEFAULT 0,
+		created_at DATETIME,
+		updated_at DATETIME
+	);
 	CREATE TABLE IF NOT EXISTS oauth_accounts (
 		id TEXT PRIMARY KEY, user_id TEXT NOT NULL, provider_id VARCHAR(32) NOT NULL,
+		provider_tenant_id VARCHAR(64) NOT NULL,
 		provider_user_id VARCHAR(255) NOT NULL, email VARCHAR(255) NOT NULL,
+		verified INTEGER NOT NULL DEFAULT 0,
+		access_token_ciphertext TEXT NOT NULL DEFAULT '',
+		refresh_token_ciphertext TEXT NOT NULL DEFAULT '',
+		refresh_token_fingerprint CHAR(64) NOT NULL DEFAULT '',
+		token_expires_at DATETIME,
+		token_scope TEXT NOT NULL DEFAULT '',
 		created_at DATETIME, updated_at DATETIME,
-		CONSTRAINT uq_oauth_accounts_provider_uid UNIQUE (provider_id, provider_user_id)
+		CONSTRAINT uq_oauth_accounts_provider_tenant_uid UNIQUE (provider_id, provider_tenant_id, provider_user_id)
 	);
 	CREATE TABLE IF NOT EXISTS verification_tokens (
 		token_hash BLOB PRIMARY KEY, user_id TEXT NOT NULL, expires_at DATETIME NOT NULL, created_at DATETIME
@@ -72,6 +90,7 @@ func setupOAuthSecurityApp(t *testing.T, mocks map[string]*oauthmock.Mock, modif
 	cfg.DisableAsyncEmailDispatch = true
 	cfg.SessionCookieSecure = true
 	cfg.OAuth.StateSecret = "test-oauth-state-secret-32bytes!!"
+	cfg.OAuth.TokenKEK = secTokenKEK
 	for _, fn := range modifyCfg {
 		fn(&cfg)
 	}
@@ -225,7 +244,27 @@ func TestOAuthSecurity_LocalUnverifiedLinkConflict(t *testing.T) {
 	}
 }
 
-func TestOAuthSecurity_OAuthOnlyLoginDummyTiming(t *testing.T) {
+// argon2MemoryFloor is the smallest allocation one Argon2id derivation at the
+// given memory cost can produce: Argon2 allocates one KiB block per unit, so the
+// exact footprint is memoryKiB*1024 and the floor keeps only 10% headroom for the
+// allocations the surrounding login path adds. TotalAlloc is monotonic, so a
+// loaded runner can only push the measurement up, never below the floor, while a
+// dummy hash run at half the configured memory lands near 0.5x and stays visible.
+func argon2MemoryFloor(memoryKiB uint32) uint64 {
+	return uint64(memoryKiB) * 1024 * 9 / 10
+}
+
+// allocDelta reports bytes allocated by fn, so a memory-hard derivation that
+// did not run is visible without measuring elapsed time.
+func allocDelta(fn func()) uint64 {
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	fn()
+	runtime.ReadMemStats(&after)
+	return after.TotalAlloc - before.TotalAlloc
+}
+
+func TestOAuthSecurity_OAuthOnlyLoginDummyHashCost(t *testing.T) {
 	m := oauthmock.New("google", "sub-timing", "timing@example.com", true)
 	h, database, cfg := setupOAuthSecurityApp(t, map[string]*oauthmock.Mock{"google": m})
 
@@ -247,7 +286,7 @@ func TestOAuthSecurity_OAuthOnlyLoginDummyTiming(t *testing.T) {
 
 	signupViaService(t, database, cfg, "normal@example.com", "NormalPass123!")
 
-	login := func(email, password string) (int, string, time.Duration) {
+	login := func(email, password string) (int, string, uint64) {
 		csrfRec := httptest.NewRecorder()
 		h.ServeHTTP(csrfRec, httptest.NewRequest(http.MethodGet, "/auth/csrf", nil))
 		var tok struct {
@@ -267,27 +306,19 @@ func TestOAuthSecurity_OAuthOnlyLoginDummyTiming(t *testing.T) {
 		r.Header.Set("Content-Type", "application/json")
 		r.AddCookie(jar)
 		r.Header.Set(cfg.CSRFHeaderName, tok.CSRFToken)
-		start := time.Now()
-		out := httptest.NewRecorder()
-		h.ServeHTTP(out, r)
-		return out.Code, out.Body.String(), time.Since(start)
+		var code int
+		var respBody string
+		alloc := allocDelta(func() {
+			out := httptest.NewRecorder()
+			h.ServeHTTP(out, r)
+			code, respBody = out.Code, out.Body.String()
+		})
+		return code, respBody, alloc
 	}
 
-	const rounds = 5
-	timeLogin := func(email string) (time.Duration, int, string) {
-		var ds []time.Duration
-		var code int
-		var body string
-		for range rounds {
-			c, b, d := login(email, "WrongPass000!")
-			ds, code, body = append(ds, d), c, b
-		}
-		sort.Slice(ds, func(i, j int) bool { return ds[i] < ds[j] })
-		return ds[len(ds)/2], code, body
-	}
-	oauthMed, oauthCode, oauthBody := timeLogin("timing@example.com")
-	normalMed, normalCode, normalBody := timeLogin("normal@example.com")
-	ghostMed, ghostCode, ghostBody := timeLogin("ghost@example.com")
+	oauthCode, oauthBody, oauthAlloc := login("timing@example.com", "WrongPass000!")
+	normalCode, normalBody, normalAlloc := login("normal@example.com", "WrongPass000!")
+	ghostCode, ghostBody, ghostAlloc := login("ghost@example.com", "WrongPass000!")
 
 	for name, code := range map[string]int{"oauth-only": oauthCode, "normal": normalCode, "ghost": ghostCode} {
 		if code != http.StatusUnauthorized {
@@ -297,13 +328,10 @@ func TestOAuthSecurity_OAuthOnlyLoginDummyTiming(t *testing.T) {
 	if oauthBody != ghostBody || normalBody != ghostBody {
 		t.Fatal("login bodies must be identical across oauth-only, normal, and missing users")
 	}
-	if oauthMed < 5*time.Millisecond {
-		t.Fatalf("oauth-only median %v too fast; dummy Argon2id work missing", oauthMed)
-	}
-	for name, med := range map[string]time.Duration{"normal": normalMed, "ghost": ghostMed} {
-		ratio := float64(oauthMed) / float64(med)
-		if ratio < 0.2 || ratio > 5 {
-			t.Fatalf("oauth-only median %v vs %s %v (ratio %.2f); want within [0.2,5]", oauthMed, name, med, ratio)
+	floor := argon2MemoryFloor(cfg.Argon2.Memory)
+	for name, alloc := range map[string]uint64{"oauth-only": oauthAlloc, "normal": normalAlloc, "ghost": ghostAlloc} {
+		if alloc < floor {
+			t.Fatalf("%s login allocated %d bytes; want >= %d (Argon2id m=%d KiB did not run)", name, alloc, floor, cfg.Argon2.Memory)
 		}
 	}
 }
@@ -445,11 +473,25 @@ func secServiceDB(t *testing.T) (*gorm.DB, config.Config) {
 		credential_version INTEGER NOT NULL DEFAULT 0, email_verified INTEGER NOT NULL DEFAULT 0,
 		created_at DATETIME, updated_at DATETIME
 	);
+	CREATE TABLE IF NOT EXISTS claimed_emails (
+		email VARCHAR(255) PRIMARY KEY,
+		owner_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		verified INTEGER NOT NULL DEFAULT 0,
+		created_at DATETIME,
+		updated_at DATETIME
+	);
 	CREATE TABLE IF NOT EXISTS oauth_accounts (
 		id TEXT PRIMARY KEY, user_id TEXT NOT NULL, provider_id VARCHAR(32) NOT NULL,
+		provider_tenant_id VARCHAR(64) NOT NULL,
 		provider_user_id VARCHAR(255) NOT NULL, email VARCHAR(255) NOT NULL,
+		verified INTEGER NOT NULL DEFAULT 0,
+		access_token_ciphertext TEXT NOT NULL DEFAULT '',
+		refresh_token_ciphertext TEXT NOT NULL DEFAULT '',
+		refresh_token_fingerprint CHAR(64) NOT NULL DEFAULT '',
+		token_expires_at DATETIME,
+		token_scope TEXT NOT NULL DEFAULT '',
 		created_at DATETIME, updated_at DATETIME,
-		CONSTRAINT uq_oauth_accounts_provider_uid UNIQUE (provider_id, provider_user_id)
+		CONSTRAINT uq_oauth_accounts_provider_tenant_uid UNIQUE (provider_id, provider_tenant_id, provider_user_id)
 	);
 	CREATE TABLE IF NOT EXISTS sessions (
 		id TEXT PRIMARY KEY, user_id TEXT NOT NULL, id_hash CHAR(64) UNIQUE NOT NULL,
@@ -463,6 +505,7 @@ func secServiceDB(t *testing.T) (*gorm.DB, config.Config) {
 	cfg := config.DefaultConfig()
 	cfg.SessionCookieSecure = false
 	cfg.OAuth.StateSecret = "test-oauth-state-secret-32bytes!!"
+	cfg.OAuth.TokenKEK = secTokenKEK
 	return database, cfg
 }
 
@@ -595,15 +638,50 @@ func TestOAuthSecurity_ZeroSecretLeakInLogs(t *testing.T) {
 	}
 
 	logs := sink.String()
+	_, encodedKey, ok := strings.Cut(secTokenKEK, ":")
+	if !ok {
+		t.Fatal("test keyring spec is missing its separator")
+	}
+	keyBytes, err := base64.StdEncoding.DecodeString(encodedKey)
+	if err != nil {
+		t.Fatalf("decode test key: %v", err)
+	}
+	// Negative controls: slog escapes control bytes and base64-encodes []byte,
+	// so a raw substring search can never see either form. Both arms must find a
+	// secret that the handler really did render, or the leak assertions are dead.
+	var escapedProbe, base64Probe bytes.Buffer
+	probe := slog.New(slog.NewJSONHandler(&escapedProbe, nil))
+	probe.Info("escaped probe", "key", string(keyBytes))
+	probe = slog.New(slog.NewJSONHandler(&base64Probe, nil))
+	probe.Info("base64 probe", "key", keyBytes)
+	if !secLogLeaks(escapedProbe.String(), string(keyBytes)) {
+		t.Fatal("leak detector misses a JSON-escaped key")
+	}
+	if !secLogLeaks(base64Probe.String(), string(keyBytes)) {
+		t.Fatal("leak detector misses a base64-encoded key")
+	}
+	var stored db.OAuthAccount
+	if err := database.Where("provider_id = ?", "apple").First(&stored).Error; err != nil {
+		t.Fatalf("load linked apple account: %v", err)
+	}
+	if stored.AccessTokenCiphertext == "" || stored.RefreshTokenCiphertext == "" {
+		t.Fatal("linked account must store both sealed token columns")
+	}
+	if secLogLeaks(logs, encodedKey) {
+		t.Errorf("log leaked the token key in base64")
+	}
 	for name, secret := range map[string]string{
-		"access token":  m.AccessToken,
-		"refresh token": m.RefreshToken,
-		"id token":      m.IDToken,
-		"client secret": m.ClientSecret,
-		"code verifier": verifier,
-		"raw session":   sid.Value,
+		"access token":       m.AccessToken,
+		"refresh token":      m.RefreshToken,
+		"id token":           m.IDToken,
+		"client secret":      m.ClientSecret,
+		"code verifier":      verifier,
+		"raw session":        sid.Value,
+		"token key":          string(keyBytes),
+		"access ciphertext":  stored.AccessTokenCiphertext,
+		"refresh ciphertext": stored.RefreshTokenCiphertext,
 	} {
-		if secret != "" && strings.Contains(logs, secret) {
+		if secret != "" && secLogLeaks(logs, secret) {
 			t.Errorf("log leaked %s", name)
 		}
 	}
@@ -629,6 +707,55 @@ func TestOAuthSecurity_ZeroSecretLeakInLogs(t *testing.T) {
 		t.Fatalf("sessions = %d, err = %v; want 1", n, err)
 	}
 }
+
+// secLogLeaks reports whether secret appears in captured slog output: verbatim,
+// inside a decoded JSON value (the handler escapes control bytes, so a raw
+// substring search cannot see them), or inside any base64 chunk the log carries.
+func secLogLeaks(logs, secret string) bool {
+	if strings.Contains(logs, secret) {
+		return true
+	}
+	for _, line := range strings.Split(logs, "\n") {
+		var record any
+		if err := json.Unmarshal([]byte(line), &record); err == nil && secJSONValueContains(record, secret) {
+			return true
+		}
+	}
+	for _, chunk := range secBase64Chunk.FindAllString(logs, -1) {
+		for _, enc := range []*base64.Encoding{base64.StdEncoding, base64.RawStdEncoding, base64.RawURLEncoding} {
+			if raw, err := enc.DecodeString(chunk); err == nil && bytes.Contains(raw, []byte(secret)) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// secJSONValueContains walks a decoded JSON value, including nested groups and
+// slices, for the secret in any string it holds.
+func secJSONValueContains(value any, secret string) bool {
+	switch v := value.(type) {
+	case string:
+		return strings.Contains(v, secret)
+	case map[string]any:
+		for key, inner := range v {
+			if strings.Contains(key, secret) || secJSONValueContains(inner, secret) {
+				return true
+			}
+		}
+	case []any:
+		for _, inner := range v {
+			if secJSONValueContains(inner, secret) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// secBase64Chunk matches the base64 runs a JSON log line can carry, including
+// the URL-safe alphabet and padding.
+var secBase64Chunk = regexp.MustCompile(`[A-Za-z0-9+/=_-]{16,}`)
 
 // secLogSink is a mutex-guarded writer so captured slog output stays race-clean.
 type secLogSink struct {
@@ -678,8 +805,15 @@ func TestOAuthSecurity_CallbackFailureReasons(t *testing.T) {
 		wantReason string
 	}{
 		{
-			name:       "email_unverified",
-			mock:       oauthmock.New("google", "sub-reason-unverified", "reason-unverified@example.com", false),
+			name: "email_unverified_merge_gate",
+			mock: oauthmock.New("google", "sub-reason-unverified", "reason-unverified@example.com", false),
+			seed: func(t *testing.T, database *gorm.DB) {
+				t.Helper()
+				local := db.User{ID: uuid.New(), Email: "reason-unverified@example.com", PasswordHash: "hash", EmailVerified: true}
+				if err := database.Create(&local).Error; err != nil {
+					t.Fatalf("seed local: %v", err)
+				}
+			},
 			query:      func(state string) string { return "?code=c&state=" + state },
 			wantStatus: http.StatusBadRequest, wantReason: "email_unverified",
 		},

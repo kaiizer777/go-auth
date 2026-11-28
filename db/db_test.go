@@ -6,6 +6,7 @@ import (
 	stderrors "errors"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -456,6 +457,37 @@ func TestMigration000007_DownRefusesOnLinkedAccounts(t *testing.T) {
 	}
 }
 
+func TestMigration000009_BackfillTrustsVerifiedOwners(t *testing.T) {
+	data, err := defaultMigrationsFS.ReadFile("migrations/000009_add_oauth_account_verified.up.sql")
+	if err != nil {
+		t.Fatalf("failed to read migration 9 up: %v", err)
+	}
+	content := string(data)
+
+	alterIdx := strings.Index(content, "ALTER TABLE oauth_accounts ADD COLUMN IF NOT EXISTS verified BOOLEAN NOT NULL DEFAULT FALSE")
+	if alterIdx == -1 {
+		t.Fatal("migration 9 up must add oauth_accounts.verified as NOT NULL DEFAULT FALSE")
+	}
+	backfillIdx := strings.Index(content, "UPDATE oauth_accounts SET verified = TRUE")
+	if backfillIdx == -1 {
+		t.Fatal("migration 9 up must backfill verified from the owning account")
+	}
+	if alterIdx > backfillIdx {
+		t.Errorf("migration 9 column add (idx %d) must precede the backfill (idx %d)", alterIdx, backfillIdx)
+	}
+
+	backfill := content[backfillIdx:]
+	if semi := strings.Index(backfill, ";"); semi != -1 {
+		backfill = backfill[:semi]
+	}
+	if !strings.Contains(backfill, "users.email_verified") {
+		t.Errorf("migration 9 backfill must gate trust on users.email_verified: %q", backfill)
+	}
+	if !strings.Contains(backfill, "users.id = oauth_accounts.user_id") {
+		t.Errorf("migration 9 backfill must correlate the link to its owning user: %q", backfill)
+	}
+}
+
 func TestMigrations_NoExplicitTransactionWrappers(t *testing.T) {
 	files := []string{
 		"migrations/000001_create_users.up.sql",
@@ -474,6 +506,24 @@ func TestMigrations_NoExplicitTransactionWrappers(t *testing.T) {
 		"migrations/000007_create_oauth_accounts.down.sql",
 		"migrations/000008_create_totp.up.sql",
 		"migrations/000008_create_totp.down.sql",
+		"migrations/000009_add_oauth_account_verified.up.sql",
+		"migrations/000009_add_oauth_account_verified.down.sql",
+		"migrations/000010_resolve_microsoft_oid_links.up.sql",
+		"migrations/000010_resolve_microsoft_oid_links.down.sql",
+		"migrations/000011_add_oauth_account_tenant.up.sql",
+		"migrations/000011_add_oauth_account_tenant.down.sql",
+		"migrations/000012_add_oauth_account_tokens.up.sql",
+		"migrations/000012_add_oauth_account_tokens.down.sql",
+		"migrations/mysql/000012_add_oauth_account_tokens.up.sql",
+		"migrations/mysql/000012_add_oauth_account_tokens.down.sql",
+		"migrations/000013_add_totp_secret_kid.up.sql",
+		"migrations/000013_add_totp_secret_kid.down.sql",
+		"migrations/mysql/000013_add_totp_secret_kid.up.sql",
+		"migrations/mysql/000013_add_totp_secret_kid.down.sql",
+		"migrations/000014_create_claimed_emails.up.sql",
+		"migrations/000014_create_claimed_emails.down.sql",
+		"migrations/mysql/000014_create_claimed_emails.up.sql",
+		"migrations/mysql/000014_create_claimed_emails.down.sql",
 	}
 
 	for _, file := range files {
@@ -502,4 +552,303 @@ func TestRunMigrations_ConfiguresStatementTimeout(t *testing.T) {
 	if !strings.Contains(src, "StatementTimeout: defaultMigrationTimeout") {
 		t.Fatal("runMigrations must configure StatementTimeout: defaultMigrationTimeout in pgmigrate.Config")
 	}
+}
+
+func TestMigration000010_DeduplicatesMicrosoftOIDLinks(t *testing.T) {
+	data, err := defaultMigrationsFS.ReadFile("migrations/000010_resolve_microsoft_oid_links.up.sql")
+	if err != nil {
+		t.Fatalf("failed to read migration 10 up: %v", err)
+	}
+	content := string(data)
+	if !strings.Contains(content, "DELETE FROM oauth_accounts") {
+		t.Fatal("migration 10 up must delete duplicate oauth_accounts")
+	}
+	if !strings.Contains(content, "provider_id = 'microsoft'") {
+		t.Fatal("migration 10 up must be scoped to microsoft provider")
+	}
+
+	downData, err := defaultMigrationsFS.ReadFile("migrations/000010_resolve_microsoft_oid_links.down.sql")
+	if err != nil {
+		t.Fatalf("failed to read migration 10 down: %v", err)
+	}
+	if len(downData) == 0 {
+		t.Fatal("migration 10 down file must exist")
+	}
+}
+
+// TestMigration000011_TenantQualifiesIdentityKey pins the schema half of the fix
+// for #72: the tenant joins the unique key, is required, and the tenant-blind
+// constraint is gone.
+func TestMigration000011_TenantQualifiesIdentityKey(t *testing.T) {
+	data, err := defaultMigrationsFS.ReadFile("migrations/000011_add_oauth_account_tenant.up.sql")
+	if err != nil {
+		t.Fatalf("failed to read migration 11 up: %v", err)
+	}
+	content := string(data)
+
+	column := "ADD COLUMN IF NOT EXISTS provider_tenant_id VARCHAR(64) NOT NULL"
+	columnIdx := strings.Index(content, column)
+	if columnIdx == -1 {
+		t.Fatalf("migration 11 up must add a required provider_tenant_id column: %q", content)
+	}
+	if columnStmt := upToSemicolon(content[columnIdx:]); strings.Contains(columnStmt, "DEFAULT") {
+		t.Fatalf("migration 11 up must not default the tenant: %q", columnStmt)
+	}
+
+	newKey := "CREATE UNIQUE INDEX IF NOT EXISTS uq_oauth_accounts_provider_tenant_uid"
+	newKeyIdx := strings.Index(content, newKey)
+	if newKeyIdx == -1 {
+		t.Fatal("migration 11 up must create the tenant-qualified unique index")
+	}
+	if !strings.Contains(content[newKeyIdx:], "provider_id, provider_tenant_id, provider_user_id") {
+		t.Fatal("migration 11 up must key uniqueness on provider, tenant and provider user id")
+	}
+
+	dropOldIdx := strings.Index(content, "DROP CONSTRAINT IF EXISTS uq_oauth_accounts_provider_uid")
+	if dropOldIdx == -1 {
+		t.Fatal("migration 11 up must drop the tenant-blind unique constraint")
+	}
+	// The down migration restores the old key as a unique constraint, so the
+	// re-applied up must drop that form too (and the plain index form an older
+	// down left behind) or it keeps enforcing the old key.
+	dropOldIndex := strings.Index(content, "DROP INDEX IF EXISTS uq_oauth_accounts_provider_uid")
+	if dropOldIndex == -1 || dropOldIndex < dropOldIdx {
+		t.Fatal("migration 11 up must drop the tenant-blind unique index after the constraint")
+	}
+	if columnIdx > newKeyIdx || newKeyIdx > dropOldIdx {
+		t.Errorf("migration 11 ordering must be column, new index, drop old constraint: column=%d new=%d drop=%d", columnIdx, newKeyIdx, dropOldIdx)
+	}
+
+	downData, err := defaultMigrationsFS.ReadFile("migrations/000011_add_oauth_account_tenant.down.sql")
+	if err != nil {
+		t.Fatalf("failed to read migration 11 down: %v", err)
+	}
+	if !strings.Contains(string(downData), "DROP COLUMN IF EXISTS provider_tenant_id") {
+		t.Fatal("migration 11 down must drop the tenant column it added")
+	}
+}
+
+// TestMigration000012_AddsOAuthAccountTokens pins the token schema for #54: the
+// four non-expiry columns are NOT NULL with an empty-string default so a legacy
+// row reads as "no token stored", the expiry stays nullable, and the down
+// migration drops exactly the columns the up added.
+func TestMigration000012_AddsOAuthAccountTokens(t *testing.T) {
+	data, err := defaultMigrationsFS.ReadFile("migrations/000012_add_oauth_account_tokens.up.sql")
+	if err != nil {
+		t.Fatalf("failed to read migration 12 up: %v", err)
+	}
+	content := string(data)
+
+	columns := []struct{ name, definition string }{
+		{"access_token_ciphertext", "TEXT NOT NULL DEFAULT ''"},
+		{"refresh_token_ciphertext", "TEXT NOT NULL DEFAULT ''"},
+		{"refresh_token_fingerprint", "VARCHAR(64) NOT NULL DEFAULT ''"},
+		{"token_expires_at", "TIMESTAMPTZ"},
+		{"token_scope", "TEXT NOT NULL DEFAULT ''"},
+	}
+
+	lastIdx := -1
+	for _, column := range columns {
+		statement := "ADD COLUMN IF NOT EXISTS " + column.name + " " + column.definition
+		idx := strings.Index(content, statement)
+		if idx == -1 {
+			t.Fatalf("migration 12 up must contain %q", statement)
+		}
+		if idx < lastIdx {
+			t.Errorf("migration 12 up adds %s out of model order", column.name)
+		}
+		lastIdx = idx
+		if stmt := upToSemicolon(content[idx:]); strings.Contains(stmt, "DEFAULT") && !strings.Contains(stmt, "DEFAULT ''") {
+			t.Errorf("migration 12 up must not give %s a non-empty default: %q", column.name, stmt)
+		}
+	}
+
+	downData, err := defaultMigrationsFS.ReadFile("migrations/000012_add_oauth_account_tokens.down.sql")
+	if err != nil {
+		t.Fatalf("failed to read migration 12 down: %v", err)
+	}
+	down := string(downData)
+	if drops := strings.Count(down, "DROP COLUMN IF EXISTS"); drops != len(columns) {
+		t.Fatalf("migration 12 down must drop exactly %d columns, got %d: %q", len(columns), drops, down)
+	}
+	for _, column := range columns {
+		if !strings.Contains(down, "DROP COLUMN IF EXISTS "+column.name+";") {
+			t.Errorf("migration 12 down must drop %s", column.name)
+		}
+	}
+	if strings.Contains(down, "DROP TABLE") {
+		t.Error("migration 12 down must drop only the token columns, never the links table")
+	}
+}
+
+// TestMigration000014_ClaimsEmailAddresses pins the claim table for #94: one row
+// per normalised address, keyed byte for byte, DDL only (SQL cannot reproduce
+// db.NormalizeEmail, so no backfill lives here), and a down path that only drops
+// the table.
+func TestMigration000014_ClaimsEmailAddresses(t *testing.T) {
+	postgresUp := readMigration(t, "migrations/000014_create_claimed_emails.up.sql")
+	postgresDown := readMigration(t, "migrations/000014_create_claimed_emails.down.sql")
+	mysqlUp := readMigration(t, "migrations/mysql/000014_create_claimed_emails.up.sql")
+	mysqlDown := readMigration(t, "migrations/mysql/000014_create_claimed_emails.down.sql")
+
+	for name, up := range map[string]string{"postgres": postgresUp, "mysql": mysqlUp} {
+		for _, want := range []string{
+			"CREATE TABLE IF NOT EXISTS claimed_emails",
+			"owner_user_id",
+			"REFERENCES users(id) ON DELETE CASCADE",
+			"verified",
+		} {
+			if !strings.Contains(up, want) {
+				t.Errorf("%s migration 14 up must contain %q", name, want)
+			}
+		}
+		// No backfill, and no database-derived key: lower()/trim() are not
+		// db.NormalizeEmail, so any row they write is unreachable by the app.
+		for _, forbidden := range []string{"INSERT INTO", "LOWER(", "TRIM(", "BTRIM("} {
+			if strings.Contains(sqlWithoutComments(up), forbidden) {
+				t.Errorf("%s migration 14 up must not contain %q: the import is a Go job", name, forbidden)
+			}
+		}
+	}
+	if !strings.Contains(postgresUp, "email          VARCHAR(255) PRIMARY KEY") {
+		t.Error("postgres migration 14 must store the claim key as a plain VARCHAR(255) primary key")
+	}
+	if !strings.Contains(postgresUp, "email          VARCHAR(255) PRIMARY KEY") {
+		t.Error("postgres migration 14 must enforce one claim per address")
+	}
+	if !strings.Contains(mysqlUp, "CHARACTER SET utf8mb4 COLLATE utf8mb4_bin") {
+		t.Error("mysql migration 14 must compare the claim key byte for byte")
+	}
+	if !strings.Contains(mysqlUp, "PRIMARY KEY (email)") {
+		t.Error("mysql migration 14 must key the claim table on the address")
+	}
+	if !strings.Contains(mysqlUp, "not transactional") {
+		t.Error("mysql migration 14 up must carry the non-transactional DDL recovery note")
+	}
+
+	for name, down := range map[string]string{"postgres": postgresDown, "mysql": mysqlDown} {
+		if drops := strings.Count(sqlWithoutComments(down), "DROP TABLE IF EXISTS claimed_emails;"); drops != 1 {
+			t.Errorf("%s migration 14 down must drop the claim table exactly once, got %d: %q", name, drops, down)
+		}
+		for _, forbidden := range []string{"ALTER TABLE", "INSERT ", "DELETE ", "UPDATE "} {
+			if strings.Contains(sqlWithoutComments(down), forbidden) {
+				t.Errorf("%s migration 14 down must not contain %q", name, forbidden)
+			}
+		}
+	}
+}
+
+// TestMigration000013_AddsTotpSecretKid pins the bookkeeping column for #83: one
+// NOT NULL empty-default VARCHAR(32) in each dialect, exactly one column dropped
+// by the down files, and no UPDATE, key material or ciphertext in any of them.
+func TestMigration000013_AddsTotpSecretKid(t *testing.T) {
+	postgresUp := readMigration(t, "migrations/000013_add_totp_secret_kid.up.sql")
+	postgresDown := readMigration(t, "migrations/000013_add_totp_secret_kid.down.sql")
+	mysqlUp := readMigration(t, "migrations/mysql/000013_add_totp_secret_kid.up.sql")
+	mysqlDown := readMigration(t, "migrations/mysql/000013_add_totp_secret_kid.down.sql")
+
+	column := "secret_kid VARCHAR(32) NOT NULL DEFAULT ''"
+	postgresAdd := "ALTER TABLE totp_secrets ADD COLUMN IF NOT EXISTS " + column + ";"
+	if !strings.Contains(postgresUp, postgresAdd) {
+		t.Fatalf("migration 13 up must add the bookkeeping column: %q", postgresUp)
+	}
+	mysqlAdd := "ALTER TABLE totp_secrets ADD COLUMN " + column + ";"
+	if !strings.Contains(mysqlUp, mysqlAdd) {
+		t.Fatalf("mysql migration 13 up must add the bookkeeping column: %q", mysqlUp)
+	}
+	if !strings.Contains(mysqlUp, "not transactional") {
+		t.Error("mysql migration 13 up must carry the non-transactional DDL recovery note")
+	}
+
+	if drops := strings.Count(postgresDown, "DROP COLUMN IF EXISTS secret_kid;"); drops != 1 {
+		t.Fatalf("migration 13 down must drop exactly one column, got %d: %q", drops, postgresDown)
+	}
+	if !strings.Contains(mysqlDown, "ALTER TABLE totp_secrets DROP COLUMN secret_kid;") {
+		t.Fatalf("mysql migration 13 down must drop secret_kid: %q", mysqlDown)
+	}
+	// "exactly one column dropped" has to hold per dialect, and DROP COLUMN is a
+	// poor thing to count in raw prose: the MySQL recovery note names it too.
+	for name, down := range map[string]struct{ sql, statement string }{
+		"postgres": {sql: sqlWithoutComments(postgresDown), statement: "DROP COLUMN IF EXISTS secret_kid;"},
+		"mysql":    {sql: sqlWithoutComments(mysqlDown), statement: "DROP COLUMN secret_kid;"},
+	} {
+		if drops := strings.Count(down.sql, "DROP COLUMN"); drops != 1 {
+			t.Errorf("%s migration 13 down must contain exactly one DROP COLUMN, got %d: %q", name, drops, down.sql)
+		}
+		if !strings.Contains(down.sql, down.statement) {
+			t.Errorf("%s migration 13 down must drop exactly secret_kid: %q", name, down.sql)
+		}
+	}
+	// "exactly one column dropped" is only true while the down file holds exactly
+	// one ALTER TABLE; an extra statement could drop something else and still pass
+	// the per-column checks above.
+	for name, down := range map[string]string{"postgres": postgresDown, "mysql": mysqlDown} {
+		if statements := strings.Count(down, "ALTER TABLE "); statements != 1 {
+			t.Errorf("%s migration 13 down must contain one ALTER TABLE, got %d: %q", name, statements, down)
+		}
+	}
+	// golang-migrate stamps the down target, not the version it is leaving, so a
+	// failed down is recovered by forcing 12 - never by re-running the ALTER.
+	if !strings.Contains(mysqlDown, "down target, 12, as dirty") {
+		t.Errorf("mysql migration 13 down must name the dirty down target: %q", mysqlDown)
+	}
+	if !strings.Contains(mysqlDown, "migrate force 12") {
+		t.Errorf("mysql migration 13 down must recover with `migrate force 12`: %q", mysqlDown)
+	}
+	if strings.Contains(mysqlDown, "force 13") {
+		t.Errorf("mysql migration 13 down must not force the up version: %q", mysqlDown)
+	}
+
+	for name, content := range map[string]string{
+		"postgres up":   postgresUp,
+		"postgres down": postgresDown,
+		"mysql up":      mysqlUp,
+		"mysql down":    mysqlDown,
+	} {
+		for _, keyword := range []string{"UPDATE ", "INSERT ", "DELETE "} {
+			if strings.Contains(content, keyword) {
+				t.Errorf("%s migration 13 must not contain %q", name, keyword)
+			}
+		}
+		if strings.Contains(content, "DROP TABLE") {
+			t.Errorf("%s migration 13 must never drop the secrets table", name)
+		}
+		if hexRun.MatchString(content) {
+			t.Errorf("%s migration 13 embeds something that looks like key material", name)
+		}
+	}
+}
+
+// hexRun matches 64 or more consecutive hex characters: a raw AES-256 key.
+var hexRun = regexp.MustCompile(`[0-9a-fA-F]{64,}`)
+
+// sqlWithoutComments drops full-line `--` comments so statement counts are not
+// swayed by recovery prose that names a keyword.
+func sqlWithoutComments(content string) string {
+	var statements []string
+	for _, line := range strings.Split(content, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "--") {
+			continue
+		}
+		statements = append(statements, line)
+	}
+	return strings.Join(statements, "\n")
+}
+
+func readMigration(t *testing.T, name string) string {
+	t.Helper()
+
+	data, err := defaultMigrationsFS.ReadFile(name)
+	if err != nil {
+		t.Fatalf("failed to read migration %s: %v", name, err)
+	}
+	return string(data)
+}
+
+// upToSemicolon returns the statement starting at raw, without its terminator.
+func upToSemicolon(raw string) string {
+	if semi := strings.Index(raw, ";"); semi != -1 {
+		return raw[:semi]
+	}
+	return raw
 }

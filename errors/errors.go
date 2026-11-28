@@ -54,6 +54,16 @@ const (
 	CodeOAuthEmailUnverified      Code = "OAUTH_EMAIL_UNVERIFIED"
 	CodeOAuthAccountLinkConflict  Code = "OAUTH_ACCOUNT_LINK_CONFLICT"
 	CodeOAuthProviderNotFound     Code = "OAUTH_PROVIDER_NOT_FOUND"
+	CodeOAuthEmailRequired        Code = "OAUTH_EMAIL_REQUIRED"
+	CodeOAuthRateLimitExceeded    Code = "OAUTH_RATE_LIMIT_EXCEEDED"
+	CodeOAuthTokenExchangeFailed  Code = "OAUTH_TOKEN_EXCHANGE_FAILED"
+	CodeOAuthIDTokenInvalid       Code = "OAUTH_ID_TOKEN_INVALID"
+	CodeOAuthTenantInvalid        Code = "OAUTH_TENANT_INVALID"
+
+	// OAuth token refresh error codes
+	CodeOAuthTokenDecryptionFailed Code = "OAUTH_TOKEN_DECRYPTION_FAILED"
+	CodeOAuthReauthRequired        Code = "OAUTH_REAUTH_REQUIRED"
+	CodeOAuthRefreshUnsupported    Code = "OAUTH_REFRESH_UNSUPPORTED"
 
 	// Phase 4 Session errors
 	CodeSessionNotFound Code = "SESSION_NOT_FOUND" // 401
@@ -133,21 +143,23 @@ func (c Code) HTTPStatus() int {
 	case CodePasswordTooShort, CodePasswordTooLong, CodePasswordTooCommon,
 		CodeInvalidEmail, CodeValidationError, CodeInvalidToken, CodeTokenExpired,
 		CodeOAuthCallbackFailed, CodeOAuthCodeInvalid, CodeOAuthEmailUnverified,
+		CodeOAuthEmailRequired, CodeOAuthTenantInvalid,
 		CodeTOTPNotEnrolled, CodeTOTPCodeInvalid, CodeTOTPCodeReplayed, CodeTOTPBackupCodeInvalid,
 		CodeDatabaseUnsupported:
 		return http.StatusBadRequest
-	case CodeTransactionUnsupported:
+	case CodeTransactionUnsupported, CodeOAuthRefreshUnsupported:
 		return http.StatusNotImplemented
-	case CodeDatabaseAdapterFailed:
+	case CodeDatabaseAdapterFailed, CodeOAuthTokenDecryptionFailed:
 		return http.StatusInternalServerError
 	case CodeInvalidCredentials, CodeUnauthenticated,
 		CodeSessionNotFound, CodeSessionExpired, CodeSessionInvalid,
 		CodeMFARequired, CodeMFAInvalidCode,
-		CodeTwoFactorTokenInvalid, CodeTwoFactorTokenExpired:
+		CodeTwoFactorTokenInvalid, CodeTwoFactorTokenExpired,
+		CodeOAuthIDTokenInvalid, CodeOAuthReauthRequired:
 		return http.StatusUnauthorized
 	case CodeEmailNotVerified, CodeCSRFTokenMissing, CodeCSRFTokenInvalid, CodeOAuthStateInvalid:
 		return http.StatusForbidden
-	case CodeRateLimitExceeded, CodeTwoFactorMaxAttemptsExceeded, CodeTOTPRateLimitExceeded:
+	case CodeRateLimitExceeded, CodeTwoFactorMaxAttemptsExceeded, CodeTOTPRateLimitExceeded, CodeOAuthRateLimitExceeded:
 		return http.StatusTooManyRequests
 	case CodeNotFound, CodeUserNotFound, CodeTokenNotFound, CodeOAuthAccountNotLinked, CodeOAuthProviderNotFound:
 		return http.StatusNotFound
@@ -155,7 +167,7 @@ func (c Code) HTTPStatus() int {
 		return http.StatusConflict
 	case CodeMethodNotAllowed:
 		return http.StatusMethodNotAllowed
-	case CodeOAuthProviderError:
+	case CodeOAuthProviderError, CodeOAuthTokenExchangeFailed:
 		return http.StatusBadGateway
 	case CodeDatabaseUnavailable:
 		return http.StatusServiceUnavailable
@@ -359,8 +371,12 @@ var (
 	ErrOAuthStateCookiePathInvalid     = New(CodeInvalidConfig, "oauth state cookie path is invalid", nil)
 	ErrOAuthStateSecretTooShort        = New(CodeInvalidConfig, "oauth state secret length too short", nil)
 	ErrOAuthStateSecretRequired        = New(CodeInvalidConfig, "oauth state secret is required when providers are configured", nil)
+	ErrOAuthTokenKEKMissing            = New(CodeInvalidConfig, "oauth token encryption key is required when providers are configured", nil)
+	ErrOAuthTokenKEKInvalid            = New(CodeInvalidConfig, "oauth token encryption key must be comma-separated kid:base64 entries with 32-byte keys", nil)
 	ErrOAuthStateCookieNameCollision   = New(CodeInvalidConfig, "oauth state cookie name must not match session or CSRF cookie name", nil)
+	ErrOAuthGraphVersionInvalid        = New(CodeInvalidConfig, "facebook graph version must be v<major>.<minor> with no leading zeros and a major of at least 19", nil)
 	ErrTOTPEncryptionKeyInvalid        = New(CodeInvalidConfig, "totp encryption key must be 64 hex chars (32 bytes)", nil)
+	ErrTOTPKeyringInvalid              = New(CodeInvalidConfig, "totp keyring must be comma-separated kid:base64 entries with 32-byte keys", nil)
 	ErrTOTPChallengeTokenTTLInvalid    = New(CodeInvalidConfig, "totp challenge token TTL must be between 1m and 30m", nil)
 	ErrTOTPMaxAttemptsInvalid          = New(CodeInvalidConfig, "totp max attempts must be at least 1", nil)
 	ErrTOTPAttemptWindowInvalid        = New(CodeInvalidConfig, "totp attempt window must be at least 1m", nil)
@@ -375,15 +391,20 @@ var (
 	ErrEmailNotVerified   = New(CodeEmailNotVerified, "email address not verified", nil)
 	ErrUserAlreadyExists  = New(CodeUserAlreadyExists, "user already exists", nil)
 	ErrEmailAlreadyExists = New(CodeEmailAlreadyExists, "email already exists", nil)
-	ErrUserNotFound       = New(CodeUserNotFound, "user not found", nil)
-	ErrInvalidToken       = New(CodeInvalidToken, "token is invalid or malformed", nil)
-	ErrTokenExpired       = New(CodeTokenExpired, "token has expired", nil)
-	ErrTokenNotFound      = New(CodeTokenNotFound, "token not found", nil)
-	ErrPasswordTooShort   = New(CodePasswordTooShort, "password is too short", nil)
-	ErrPasswordTooLong    = New(CodePasswordTooLong, "password is too long", nil)
-	ErrPasswordTooCommon  = New(CodePasswordTooCommon, "password is too common", nil)
-	ErrInvalidEmail       = New(CodeInvalidEmail, "invalid email address", nil)
-	ErrValidationError    = New(CodeValidationError, "validation failed", nil)
+	// ErrEmailClaimed reports an address reserved by a different account. It is a
+	// distinct value from ErrEmailAlreadyExists on purpose: the signup path treats
+	// a lost claim as silent success, and the OAuth link path maps it to its own
+	// conflict code, so neither may collapse into the other's sentinel.
+	ErrEmailClaimed      = New(CodeEmailAlreadyExists, "email address is claimed by another account", nil)
+	ErrUserNotFound      = New(CodeUserNotFound, "user not found", nil)
+	ErrInvalidToken      = New(CodeInvalidToken, "token is invalid or malformed", nil)
+	ErrTokenExpired      = New(CodeTokenExpired, "token has expired", nil)
+	ErrTokenNotFound     = New(CodeTokenNotFound, "token not found", nil)
+	ErrPasswordTooShort  = New(CodePasswordTooShort, "password is too short", nil)
+	ErrPasswordTooLong   = New(CodePasswordTooLong, "password is too long", nil)
+	ErrPasswordTooCommon = New(CodePasswordTooCommon, "password is too common", nil)
+	ErrInvalidEmail      = New(CodeInvalidEmail, "invalid email address", nil)
+	ErrValidationError   = New(CodeValidationError, "validation failed", nil)
 
 	// Predefined sentinel errors for Multi-Factor Authentication (MFA).
 	ErrMFARequired    = New(CodeMFARequired, "mfa verification required", nil)
@@ -399,6 +420,19 @@ var (
 	ErrOAuthEmailUnverified      = New(CodeOAuthEmailUnverified, "oauth provider email is not verified", nil)
 	ErrOAuthAccountLinkConflict  = New(CodeOAuthAccountLinkConflict, "cannot link oauth identity to unverified local account", nil)
 	ErrOAuthProviderNotFound     = New(CodeOAuthProviderNotFound, "oauth provider not found", nil)
+	ErrOAuthEmailRequired        = New(CodeOAuthEmailRequired, "oauth email required for unauthenticated registration", nil)
+	ErrOAuthRateLimitExceeded    = New(CodeOAuthRateLimitExceeded, "oauth provider rate limit exceeded", nil)
+	ErrOAuthTokenExchangeFailed  = New(CodeOAuthTokenExchangeFailed, "oauth token exchange failed", nil)
+	ErrOAuthIDTokenInvalid       = New(CodeOAuthIDTokenInvalid, "oauth id token verification failed", nil)
+	ErrOAuthTenantInvalid        = New(CodeOAuthTenantInvalid, "oauth tenant is invalid or untrusted", nil)
+	ErrOAuthTokenKeyNotFound     = New(CodeOAuthTokenDecryptionFailed, "oauth token encryption key not found", nil)
+	ErrOAuthTokenCorrupt         = New(CodeOAuthTokenDecryptionFailed, "oauth token failed authentication", nil)
+	ErrOAuthReauthRequired       = New(CodeOAuthReauthRequired, "oauth grant is no longer usable; re-authentication required", nil)
+	ErrOAuthRefreshUnsupported   = New(CodeOAuthRefreshUnsupported, "oauth provider does not support token refresh", nil)
+	// ErrOAuthGrantRejected is the adapter-level classification of the
+	// provider's own rejection; it shares the re-auth wire code but never
+	// substitutes for a generic refresh failure.
+	ErrOAuthGrantRejected = New(CodeOAuthReauthRequired, "oauth provider rejected the grant", nil)
 
 	// Predefined sentinel errors for Phase 4 Session, CSRF, and Rate Limiting.
 	ErrSessionNotFound   = New(CodeSessionNotFound, "Session is invalid or has expired", nil)

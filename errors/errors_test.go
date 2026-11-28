@@ -747,6 +747,7 @@ func TestSentinels_Phase3(t *testing.T) {
 		{ErrEmailNotVerified, CodeEmailNotVerified, "email address not verified", http.StatusForbidden},
 		{ErrUserAlreadyExists, CodeUserAlreadyExists, "user already exists", http.StatusConflict},
 		{ErrEmailAlreadyExists, CodeEmailAlreadyExists, "email already exists", http.StatusConflict},
+		{ErrEmailClaimed, CodeEmailAlreadyExists, "email address is claimed by another account", http.StatusConflict},
 		{ErrUserNotFound, CodeUserNotFound, "user not found", http.StatusNotFound},
 		{ErrInvalidToken, CodeInvalidToken, "token is invalid or malformed", http.StatusBadRequest},
 		{ErrTokenExpired, CodeTokenExpired, "token has expired", http.StatusBadRequest},
@@ -794,6 +795,11 @@ func TestSentinels_MFAAndOAuth(t *testing.T) {
 		{ErrOAuthEmailUnverified, CodeOAuthEmailUnverified, "oauth provider email is not verified", http.StatusBadRequest},
 		{ErrOAuthAccountLinkConflict, CodeOAuthAccountLinkConflict, "cannot link oauth identity to unverified local account", http.StatusConflict},
 		{ErrOAuthProviderNotFound, CodeOAuthProviderNotFound, "oauth provider not found", http.StatusNotFound},
+		{ErrOAuthTokenKeyNotFound, CodeOAuthTokenDecryptionFailed, "oauth token encryption key not found", http.StatusInternalServerError},
+		{ErrOAuthTokenCorrupt, CodeOAuthTokenDecryptionFailed, "oauth token failed authentication", http.StatusInternalServerError},
+		{ErrOAuthReauthRequired, CodeOAuthReauthRequired, "oauth grant is no longer usable; re-authentication required", http.StatusUnauthorized},
+		{ErrOAuthRefreshUnsupported, CodeOAuthRefreshUnsupported, "oauth provider does not support token refresh", http.StatusNotImplemented},
+		{ErrOAuthGrantRejected, CodeOAuthReauthRequired, "oauth provider rejected the grant", http.StatusUnauthorized},
 	}
 
 	for _, tt := range tests {
@@ -808,6 +814,45 @@ func TestSentinels_MFAAndOAuth(t *testing.T) {
 				t.Errorf("HTTPStatus() = %d; want %d", got, tt.wantStatus)
 			}
 		})
+	}
+}
+
+func TestOAuthTokenSentinels_Distinguishable(t *testing.T) {
+	if Is(ErrOAuthTokenKeyNotFound, ErrOAuthTokenCorrupt) || Is(ErrOAuthTokenCorrupt, ErrOAuthTokenKeyNotFound) {
+		t.Fatal("key-not-found and corrupt must stay distinguishable in-process")
+	}
+	if ErrOAuthTokenKeyNotFound.Message() == ErrOAuthTokenCorrupt.Message() {
+		t.Fatal("key-not-found and corrupt must carry distinct messages")
+	}
+	if ErrOAuthGrantRejected.Code() != CodeOAuthReauthRequired {
+		t.Errorf("grant rejected code = %q; want %q", ErrOAuthGrantRejected.Code(), CodeOAuthReauthRequired)
+	}
+
+	for _, sentinel := range []*Error{
+		ErrOAuthTokenKeyNotFound,
+		ErrOAuthTokenCorrupt,
+		ErrOAuthReauthRequired,
+		ErrOAuthRefreshUnsupported,
+		ErrOAuthGrantRejected,
+	} {
+		if !Is(sentinel, sentinel) {
+			t.Errorf("%s does not match itself via Is", sentinel.Code())
+		}
+		wrapped := Wrap(sentinel, CodeInternalError, "wrapped")
+		if !Is(wrapped, sentinel) {
+			t.Errorf("%s does not match through one Wrap layer", sentinel.Code())
+		}
+	}
+}
+
+func TestEmailClaimSentinels_Distinguishable(t *testing.T) {
+	// Both carry CodeEmailAlreadyExists on the wire; in-process the signup and link
+	// paths must still be able to tell a lost claim from a duplicate signup.
+	if Is(ErrEmailClaimed, ErrEmailAlreadyExists) || Is(ErrEmailAlreadyExists, ErrEmailClaimed) {
+		t.Fatal("claim and duplicate sentinels must stay distinguishable in-process")
+	}
+	if ErrEmailClaimed.Message() == ErrEmailAlreadyExists.Message() {
+		t.Fatal("claim and duplicate sentinels must carry distinct messages")
 	}
 }
 

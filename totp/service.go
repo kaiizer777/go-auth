@@ -100,8 +100,14 @@ func NewServiceWithStore(store db.Store, cfg config.TOTPConfig, limiter Limiter,
 
 	var crypt *Crypto
 	var cryptErr error
-	if cfg.EncryptionKey != "" {
-		crypt, cryptErr = NewCrypto(cfg.EncryptionKey)
+	if cfg.EncryptionKey != "" || cfg.Keyring != "" {
+		crypt, cryptErr = NewCrypto(cfg)
+		if cryptErr != nil {
+			// TOTP stays wired up because a key surface is configured; refusing
+			// loudly here beats silently serving 2FA-less logins.
+			logger.Warn("totp crypto configuration is unusable",
+				slog.String("event", "totp_crypto_config_invalid"), slog.Any("error", cryptErr))
+		}
 	} else {
 		cryptErr = apperrors.ErrTOTPEncryptionKeyInvalid
 	}
@@ -193,7 +199,7 @@ func (s *totpService) Enroll(ctx context.Context, userID string) (*EnrollmentRes
 		return nil, err
 	}
 
-	encSecret, err := crypt.Encrypt([]byte(key.Secret()))
+	encSecret, err := crypt.Encrypt(uid, []byte(key.Secret()))
 	if err != nil {
 		return nil, err
 	}
@@ -250,7 +256,7 @@ func (s *totpService) ConfirmEnrollment(ctx context.Context, userID, code string
 		return nil, err
 	}
 
-	rawSecretBytes, err := crypt.Decrypt(pending.EncryptedSecret)
+	rawSecretBytes, err := crypt.Decrypt(uid, pending.EncryptedSecret)
 	if err != nil {
 		return nil, err
 	}
@@ -454,7 +460,7 @@ func (s *totpService) VerifyCode(ctx context.Context, userID, code, clientIP str
 		return err
 	}
 
-	rawSecretBytes, err := crypt.Decrypt(secretRecord.EncryptedSecret)
+	rawSecretBytes, err := crypt.Decrypt(uid, secretRecord.EncryptedSecret)
 	if err != nil {
 		return err
 	}
@@ -675,7 +681,7 @@ func (s *totpService) DisableTOTP(ctx context.Context, userID, password, code st
 	if !authed && trimmedCode != "" {
 		crypt, err := s.getCrypto()
 		if err == nil {
-			rawSecretBytes, err := crypt.Decrypt(secretRecord.EncryptedSecret)
+			rawSecretBytes, err := crypt.Decrypt(uid, secretRecord.EncryptedSecret)
 			if err == nil {
 				valid, err := ValidateCode(trimmedCode, string(rawSecretBytes))
 				if err == nil && valid {

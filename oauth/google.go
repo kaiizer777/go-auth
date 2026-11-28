@@ -34,6 +34,11 @@ func (p *GoogleProvider) ID() string { return "google" }
 
 // AuthURL builds the Google authorization URL with PKCE S256 parameters.
 func (p *GoogleProvider) AuthURL(state, codeChallenge string) string {
+	return p.AuthCodeURL(state, codeChallenge)
+}
+
+// AuthCodeURL builds the Google authorization URL with options.
+func (p *GoogleProvider) AuthCodeURL(state, codeChallenge string, opts ...AuthCodeOption) string {
 	q := url.Values{}
 	q.Set("response_type", "code")
 	q.Set("client_id", p.cfg.ClientID)
@@ -44,6 +49,7 @@ func (p *GoogleProvider) AuthURL(state, codeChallenge string) string {
 	q.Set("code_challenge_method", "S256")
 	q.Set("access_type", "offline")
 	q.Set("prompt", "select_account")
+	applyAuthCodeOptions(q, opts)
 	return p.authURL + "?" + q.Encode()
 }
 

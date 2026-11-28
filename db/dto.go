@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/mail"
 	"strings"
+	"unicode"
 
 	"github.com/google/uuid"
 
@@ -14,14 +15,19 @@ import (
 // ValidateEmail validates an email address according to Phase 3 requirements.
 // It enforces non-empty, max 255 length, no spaces, RFC 5322 compliance via net/mail,
 // and domain structure (at least one dot, no empty labels, no trailing/leading dots).
+//
+// This is the authenticity rule: login and password-reset requests only need to
+// recognise an existing address, so they must keep accepting a stored address even
+// if it would no longer fit a new claim key. Use ValidateClaimableEmail where a
+// claim is about to be created.
 func ValidateEmail(email string) error {
-	if email == "" {
+	if email == "" || strings.TrimSpace(email) == "" {
 		return errors.New(errors.CodeInvalidEmail, "email is required", nil)
 	}
 	if len(email) > 255 {
 		return errors.New(errors.CodeInvalidEmail, "email exceeds maximum length of 255 characters", nil)
 	}
-	if strings.Contains(email, " ") {
+	if strings.IndexFunc(email, unicode.IsSpace) >= 0 {
 		return errors.New(errors.CodeInvalidEmail, "email cannot contain spaces", nil)
 	}
 
@@ -56,18 +62,36 @@ func ValidateEmail(email string) error {
 	return nil
 }
 
-// NormalizeEmail trims leading and trailing whitespace and converts the email
-// address to lowercase using Go's locale-independent folding. It is used for
-// display/normalized request values; account matching is performed by the
-// database with LOWER(email) = LOWER(?) so both sides share one folding rule
-// and do not depend on the database locale. Stored account emails keep their
-// original case for delivery (RFC 5321 local parts can be case-sensitive).
+// ValidateClaimableEmail is ValidateEmail plus the claim key's folded-length
+// limit. Go's unicode case folding can expand a character (U+023A is 2 bytes and
+// folds to U+2C65, 3 bytes), so an address that fits raw can exceed the key limit
+// once normalised. An address accepted here can always be claimed; an existing
+// account whose stored address no longer fits keeps logging in because login paths
+// use ValidateEmail.
+func ValidateClaimableEmail(email string) error {
+	if err := ValidateEmail(email); err != nil {
+		return err
+	}
+	if key := NormalizeEmail(email); len(key) > claimKeyMaxLength {
+		return errors.New(errors.CodeInvalidEmail, "email exceeds maximum length of 255 characters after case folding", nil)
+	}
+	return nil
+}
+
+// NormalizeEmail trims leading and trailing whitespace and lowercases the address
+// with Go's locale-independent folding. Stored account emails keep their original
+// case for delivery (RFC 5321 local parts can be case-sensitive).
+//
+// It is the claim key: claimed_emails stores this value and compares it byte for
+// byte, so a reservation never depends on a database collation. Account lookups
+// still fold in SQL (LOWER(email)), which agrees for ASCII and is not guaranteed
+// to for non-ASCII; the claim key, not the lookup key, is what both writers agree
+// on.
 func NormalizeEmail(email string) string {
 	return strings.ToLower(strings.TrimSpace(email))
 }
 
-// LookupKey returns the canonical case-insensitive lookup key for an email
-// address. It is the single policy shared by all account queries.
+// LookupKey returns the canonical case-insensitive key for an email address.
 func LookupKey(email string) string {
 	return NormalizeEmail(email)
 }
@@ -92,7 +116,7 @@ type SignupRequest struct {
 
 // Validate validates the signup request fields.
 func (r SignupRequest) Validate() error {
-	if err := ValidateEmail(r.Email); err != nil {
+	if err := ValidateClaimableEmail(r.Email); err != nil {
 		return err
 	}
 	if r.Password == "" {

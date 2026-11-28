@@ -31,12 +31,16 @@ import (
 	"github.com/kaiizer777/go-auth/tests/oauthmock"
 )
 
+// testTokenKEK is the fixed valid keyring the OAuth service seals grants with.
+const testTokenKEK = "test-kid:AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
+
 // pgSetupOAuth builds the full HTTP stack over real PG (migrated schema)
 // with mock providers wired by slug.
 func pgSetupOAuth(t *testing.T, mocks map[string]*oauthmock.Mock) (http.Handler, *gorm.DB, config.Config) {
 	t.Helper()
 	database, cfg := setupDB(t)
 	cfg.OAuth.StateSecret = "test-oauth-state-secret-32bytes!!"
+	cfg.OAuth.TokenKEK = testTokenKEK
 	cfg.SessionCookieSecure = false
 	cfg.DisableAsyncEmailDispatch = true
 	authSvc, err := auth.New(cfg, database, cfg.EmailHooks)

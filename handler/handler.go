@@ -31,6 +31,7 @@ type Handler struct {
 	sessionSvc      session.Service
 	oauthSvc        oauth.Service
 	oauthProviders  map[string]oauth.Provider
+	oauthRegistry   oauth.Registry
 	sessHandler     *SessionHandler
 	loginLimiter    *ratelimit.Limiter
 	signupLimiter   *ratelimit.Limiter
@@ -67,11 +68,22 @@ func WithSessionHandler(sh *SessionHandler) Option {
 	}
 }
 
-// WithOAuthService attaches the OAuth linking service and its providers.
+// WithOAuthService attaches the OAuth linking service. providers widens the
+// handler's provider gate: a slug reachable only through that map is no longer
+// rejected as unknown before the service sees it.
 func WithOAuthService(svc oauth.Service, providers map[string]oauth.Provider) Option {
 	return func(h *Handler) {
 		h.oauthSvc = svc
 		h.oauthProviders = providers
+	}
+}
+
+// WithOAuthRegistry attaches the OAuth linking service and the registry that
+// resolves dynamic providers, so the handler's gate accepts them.
+func WithOAuthRegistry(svc oauth.Service, registry oauth.Registry) Option {
+	return func(h *Handler) {
+		h.oauthSvc = svc
+		h.oauthRegistry = registry
 	}
 }
 
@@ -159,7 +171,7 @@ func New(db *gorm.DB, cfg config.Config, authSvc auth.Service, opts ...Option) h
 		h.totpLimiter = ratelimit.NewLimiter(window, h.cfg.TOTP.MaxAttemptsPerWindow)
 	}
 
-	if h.totpSvc == nil && cfg.TOTP.EncryptionKey != "" {
+	if h.totpSvc == nil && (cfg.TOTP.EncryptionKey != "" || cfg.TOTP.Keyring != "") {
 		if h.store != nil {
 			h.totpSvc = totp.NewServiceWithStore(h.store, cfg.TOTP, h.totpLimiter, slog.Default())
 		} else if db != nil {
@@ -318,7 +330,9 @@ func (h *Handler) registerRoutes() {
 		h.mux.Handle("POST /sessions/rotate", sessionWrap(h.sessHandler.RotateSession))
 	}
 
-	if h.oauthSvc != nil {
+	// An attached provider map or registry without a service still mounts the
+	// routes so the nil-service 500 reports the wiring bug instead of a 404.
+	if h.oauthSvc != nil || h.oauthProviders != nil || h.oauthRegistry != nil {
 		// Mounted RAW outside csrf.Middleware/PreAuthMiddleware: Apple
 		// form_post callbacks carry no CSRF cookie+header, and RFC 6749
 		// state validation in HandleCallback is the CSRF defense.

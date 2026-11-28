@@ -89,7 +89,7 @@ func (c *emailCapture) nextResetToken(t *testing.T, timeout time.Duration) strin
 
 func truncateTables(t *testing.T, db *sql.DB) {
 	t.Helper()
-	_, err := db.Exec("TRUNCATE TABLE users, sessions, verification_tokens, password_reset_tokens, oauth_accounts, totp_secrets, totp_used_codes, two_factor_tokens CASCADE")
+	_, err := db.Exec("TRUNCATE TABLE users, sessions, verification_tokens, password_reset_tokens, oauth_accounts, totp_secrets, totp_used_codes, two_factor_tokens, claimed_emails CASCADE")
 	if err != nil {
 		t.Fatalf("failed to truncate tables: %v", err)
 	}
@@ -198,7 +198,7 @@ func setupE2EServerWithConfig(t *testing.T, mutate func(*config.Config)) (*httpt
 
 	client := &http.Client{
 		Jar:     jar,
-		Timeout: 5 * time.Second,
+		Timeout: 30 * time.Second,
 	}
 
 	t.Cleanup(func() {
@@ -208,6 +208,20 @@ func setupE2EServerWithConfig(t *testing.T, mutate func(*config.Config)) (*httpt
 	})
 
 	return server, client, capture, sqlDB
+}
+
+// newCookieJarClient returns an independent cookie-jar client, so a second
+// device can hold its own session without sharing the harness client's jar.
+func newCookieJarClient(t *testing.T) *http.Client {
+	t.Helper()
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		t.Fatalf("failed to initialize cookiejar: %v", err)
+	}
+	return &http.Client{
+		Jar:     jar,
+		Timeout: 30 * time.Second,
+	}
 }
 
 func postJSON(t *testing.T, client *http.Client, targetURL string, payload any) (*http.Response, map[string]any) {

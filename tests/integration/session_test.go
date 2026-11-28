@@ -55,6 +55,30 @@ func setupIntegrationApp(t *testing.T, modifyCfg ...func(*config.Config)) (*goau
 		expires_at DATETIME NOT NULL,
 		created_at DATETIME
 	);
+	CREATE TABLE IF NOT EXISTS claimed_emails (
+		email VARCHAR(255) PRIMARY KEY,
+		owner_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		verified INTEGER NOT NULL DEFAULT 0,
+		created_at DATETIME,
+		updated_at DATETIME
+	);
+	CREATE TABLE IF NOT EXISTS oauth_accounts (
+		id TEXT PRIMARY KEY,
+		user_id TEXT NOT NULL,
+		provider_id VARCHAR(32) NOT NULL,
+		provider_tenant_id VARCHAR(64) NOT NULL,
+		provider_user_id VARCHAR(255) NOT NULL,
+		email VARCHAR(255) NOT NULL,
+		verified INTEGER NOT NULL DEFAULT 0,
+		access_token_ciphertext TEXT NOT NULL DEFAULT '',
+		refresh_token_ciphertext TEXT NOT NULL DEFAULT '',
+		refresh_token_fingerprint CHAR(64) NOT NULL DEFAULT '',
+		token_expires_at DATETIME,
+		token_scope TEXT NOT NULL DEFAULT '',
+		created_at DATETIME,
+		updated_at DATETIME,
+		CONSTRAINT uq_oauth_accounts_provider_tenant_uid UNIQUE (provider_id, provider_tenant_id, provider_user_id)
+	);
 	CREATE TABLE IF NOT EXISTS sessions (
 		id TEXT PRIMARY KEY,
 		user_id TEXT NOT NULL,
@@ -537,16 +561,16 @@ func TestIdleTimeoutEnforced_Integration(t *testing.T) {
 }
 
 // Test 7: TestAbsoluteTimeoutEnforced_Integration (ASVS V3.3.3)
-// Elapsed time past SessionAbsoluteMaxAge triggers 401 SESSION_EXPIRED even if kept active
+// A stored absolute deadline in the past triggers 401 SESSION_EXPIRED even when the session sits well inside its idle budget
 func TestAbsoluteTimeoutEnforced_Integration(t *testing.T) {
-	app, _, cfg := setupIntegrationApp(t, func(c *config.Config) {
-		c.SessionIdleTimeout = 150 * time.Millisecond
-		c.SessionAbsoluteMaxAge = 250 * time.Millisecond
+	app, database, cfg := setupIntegrationApp(t, func(c *config.Config) {
+		c.SessionIdleTimeout = time.Hour
+		c.SessionAbsoluteMaxAge = 2 * time.Hour
 	})
 
 	email := "abs_timeout@example.com"
 	pass := "Pass123456789!"
-	signupUser(t, app, email, pass)
+	userID := signupUser(t, app, email, pass)
 
 	loginBody, _ := json.Marshal(db.LoginRequest{Email: email, Password: pass})
 	pair, pairToken := fetchCSRFPair(t, app.Handler)
@@ -556,37 +580,50 @@ func TestAbsoluteTimeoutEnforced_Integration(t *testing.T) {
 	rec := httptest.NewRecorder()
 	app.Handler.ServeHTTP(rec, loginReq)
 	c := readCookieFromResponse(rec.Result(), cfg.SessionCookieName)
-
-	// Keep session active before idle timeout expires (first keep-alive at 60ms)
-	time.Sleep(60 * time.Millisecond)
-	keepAliveReq := httptest.NewRequest(http.MethodGet, "/auth/session", nil)
-	keepAliveReq.AddCookie(c)
-	keepAliveRec := httptest.NewRecorder()
-	app.Handler.ServeHTTP(keepAliveRec, keepAliveReq)
-	if keepAliveRec.Code != http.StatusOK {
-		t.Fatalf("expected 200 OK on first keep-alive request, got %d", keepAliveRec.Code)
+	if c == nil {
+		t.Fatalf("expected session cookie %q in login response", cfg.SessionCookieName)
 	}
 
-	// Second keep-alive at 120ms to ensure idle timeout (150ms) never elapses before absolute timeout (250ms)
-	time.Sleep(60 * time.Millisecond)
-	keepAliveReq2 := httptest.NewRequest(http.MethodGet, "/auth/session", nil)
-	keepAliveReq2.AddCookie(c)
-	keepAliveRec2 := httptest.NewRecorder()
-	app.Handler.ServeHTTP(keepAliveRec2, keepAliveReq2)
-	if keepAliveRec2.Code != http.StatusOK {
-		t.Fatalf("expected 200 OK on second keep-alive request, got %d", keepAliveRec2.Code)
+	// Mint contract: deadline is stamped as created_at + SessionAbsoluteMaxAge, and the row starts active.
+	var row db.Session
+	if err := database.Where("user_id = ?", userID).First(&row).Error; err != nil {
+		t.Fatalf("failed to load minted session row: %v", err)
+	}
+	if delta := row.AbsoluteExpiresAt.Sub(row.CreatedAt); delta < cfg.SessionAbsoluteMaxAge-time.Second || delta > cfg.SessionAbsoluteMaxAge+time.Second {
+		t.Fatalf("expected absolute deadline %v after creation, got %v", cfg.SessionAbsoluteMaxAge, delta)
+	}
+	if delta := row.LastActiveAt.Sub(row.CreatedAt); delta < -time.Second || delta > time.Second {
+		t.Fatalf("expected last_active_at at creation time, got offset %v", delta)
 	}
 
-	// Wait until absolute timeout elapses (total elapsed: ~260ms > 250ms, but only 140ms since last keep-alive < 150ms idle)
-	time.Sleep(140 * time.Millisecond)
-
+	// Positive control: the session is live while its deadline is in the future.
 	getReq := httptest.NewRequest(http.MethodGet, "/auth/session", nil)
 	getReq.AddCookie(c)
 	getRec := httptest.NewRecorder()
 	app.Handler.ServeHTTP(getRec, getReq)
+	if getRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK on live session, got %d", getRec.Code)
+	}
 
+	// Expire only the absolute deadline; last_active_at stays current so the idle budget cannot explain a rejection.
+	now := time.Now().UTC()
+	res := database.Model(&db.Session{}).Where("user_id = ?", userID).Updates(map[string]any{
+		"absolute_expires_at": now.Add(-time.Minute),
+		"last_active_at":      now,
+	})
+	if res.Error != nil {
+		t.Fatalf("failed to expire absolute deadline: %v", res.Error)
+	}
+	if res.RowsAffected != 1 {
+		t.Fatalf("expected 1 session row updated, got %d", res.RowsAffected)
+	}
+
+	getReq = httptest.NewRequest(http.MethodGet, "/auth/session", nil)
+	getReq.AddCookie(c)
+	getRec = httptest.NewRecorder()
+	app.Handler.ServeHTTP(getRec, getReq)
 	if getRec.Code != http.StatusUnauthorized {
-		t.Fatalf("expected 401 Unauthorized after absolute timeout, got %d", getRec.Code)
+		t.Fatalf("expected 401 Unauthorized from absolute expiry with %v of idle budget still available, got %d", cfg.SessionIdleTimeout, getRec.Code)
 	}
 }
 

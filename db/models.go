@@ -6,6 +6,7 @@ import (
 
 	"github.com/google/uuid"
 	"gorm.io/gorm"
+	"gorm.io/gorm/schema"
 )
 
 // User represents an authenticated account record in the database.
@@ -42,6 +43,55 @@ func (u User) LogValue() slog.Value {
 
 // TableName returns the table name for User.
 func (User) TableName() string { return "users" }
+
+// ClaimKeyValue is the stored form of a claim key: NormalizeEmail output, compared
+// byte for byte. It is a named type so the migrator's data-type hook applies to the
+// field itself: GORM calls GormDBDataType on the field's type, not on the model, so
+// a plain string field would silently ignore the hook.
+type ClaimKeyValue string
+
+// GormDBDataType makes the AutoMigrate-created key byte-comparable on MySQL: the
+// server default collation is case- and often accent-insensitive, so it would fold
+// addresses the Go key treats as distinct. The migration already defines the same
+// binary collation; this keeps an AutoMigrate-created schema from diverging.
+// PostgreSQL and SQLite compare a varchar equality byte for byte, so they keep the
+// plain type.
+func (ClaimKeyValue) GormDBDataType(database *gorm.DB, _ *schema.Field) string {
+	if database != nil && database.Dialector != nil && database.Name() == "mysql" {
+		return "varchar(255) COLLATE utf8mb4_bin"
+	}
+	return "varchar(255)"
+}
+
+// ClaimedEmail is the cross-table reservation of one normalised address. The
+// per-table keys cannot serialise a signup against an OAuth link, so the unique
+// key on Email is the lock both writers take with an insert inside their own
+// transaction. Email is NormalizeEmail output and is compared byte for byte:
+// the key never depends on a database collation.
+//
+// The byte comparison is a property of the deployed column, not of this tag: the
+// migrations define a binary-collation key (PostgreSQL PRIMARY KEY on a plain
+// varchar, MySQL utf8mb4_bin), and ClaimKeyValue makes an AutoMigrate-created
+// column match on MySQL.
+//
+// A claim does not imply users.email. A provider-attested address is claimed by
+// the account that linked it even when that is not the account's own address.
+//
+// Verified records that the holder proved the mailbox: either locally through
+// verification, or through a provider that attested the address. An unverified
+// claim is a reservation by a credential nobody proved yet, so a provider that
+// attests the address may take the account over; a verified claim cannot be
+// taken over and keeps reporting a conflict.
+type ClaimedEmail struct {
+	Email       ClaimKeyValue `gorm:"primaryKey;type:varchar(255)"`
+	OwnerUserID uuid.UUID     `gorm:"column:owner_user_id;type:varchar(36);not null;index:idx_claimed_emails_owner_user_id"`
+	Verified    bool          `gorm:"not null;default:false"`
+	CreatedAt   time.Time     `gorm:"not null"`
+	UpdatedAt   time.Time     `gorm:"not null"`
+}
+
+// TableName returns the table name for ClaimedEmail.
+func (ClaimedEmail) TableName() string { return "claimed_emails" }
 
 // SessionType represents the session transport type enum.
 type SessionType string
@@ -135,17 +185,37 @@ func (p PasswordResetToken) LogValue() slog.Value {
 }
 
 // OAuthAccount represents an external federated identity linked to a user.
-// Uniqueness of (provider_id, provider_user_id) is enforced by the
-// uq_oauth_accounts_provider_uid composite constraint (migration 000007),
-// not by the single-column indexes below.
+// Uniqueness of (provider_id, provider_tenant_id, provider_user_id) is enforced
+// by the uq_oauth_accounts_provider_tenant_uid composite unique index (migration
+// 000011), not by the single-column indexes below. ProviderTenantID scopes an
+// identity to the tenant that issued it: a pairwise subject is only unique
+// within its tenant. Providers without a tenant namespace store "".
+//
+// Verified records that the provider attested Email for this identity. An
+// unverified link may only sign in the account it was created on, and only
+// while that account still holds no proven credential; it can never merge,
+// recover, or resolve by email. Legacy rows decode as false (fail-closed).
+//
+// The token columns hold opaque AES-256-GCM envelopes, never plaintext: this
+// package is plaintext-blind and does no crypto. AccessTokenCiphertext and
+// RefreshTokenCiphertext are the sealed envelopes, RefreshTokenFingerprint is
+// the hex SHA-256 fingerprint of the stored refresh token, and TokenExpiresAt is
+// nil while no token is stored.
 type OAuthAccount struct {
-	ID             uuid.UUID `gorm:"primaryKey;type:varchar(36)"`
-	UserID         uuid.UUID `gorm:"type:varchar(36);not null;index"`
-	ProviderID     string    `gorm:"type:varchar(32);not null"`
-	ProviderUserID string    `gorm:"type:varchar(255);not null"`
-	Email          string    `gorm:"type:varchar(255);not null;index"`
-	CreatedAt      time.Time
-	UpdatedAt      time.Time
+	ID                      uuid.UUID `gorm:"primaryKey;type:varchar(36)"`
+	UserID                  uuid.UUID `gorm:"type:varchar(36);not null;index"`
+	ProviderID              string    `gorm:"type:varchar(32);not null"`
+	ProviderTenantID        string    `gorm:"type:varchar(64);not null"`
+	ProviderUserID          string    `gorm:"type:varchar(255);not null"`
+	Email                   string    `gorm:"type:varchar(255);not null;index"`
+	Verified                bool      `gorm:"not null;default:false"`
+	AccessTokenCiphertext   string    `gorm:"type:text;not null;default:''" json:"-"`
+	RefreshTokenCiphertext  string    `gorm:"type:text;not null;default:''" json:"-"`
+	RefreshTokenFingerprint string    `gorm:"type:varchar(64);not null;default:''" json:"-"`
+	TokenExpiresAt          *time.Time
+	TokenScope              string `gorm:"type:text;not null;default:''"`
+	CreatedAt               time.Time
+	UpdatedAt               time.Time
 }
 
 // BeforeCreate hook generates a new UUID if none is set.
@@ -159,14 +229,28 @@ func (o *OAuthAccount) BeforeCreate(tx *gorm.DB) error {
 // TableName returns the table name for OAuthAccount.
 func (OAuthAccount) TableName() string { return "oauth_accounts" }
 
-// LogValue implements slog.LogValuer to prevent federated identifier leakage in logs.
+// LogValue implements slog.LogValuer to prevent federated identifier and token
+// leakage in logs.
 func (o OAuthAccount) LogValue() slog.Value {
+	// A nil expiry is the honest "no token stored" state; a zero time.Time
+	// would render as year 1 and read like a real expiry.
+	expiresAt := slog.Any("token_expires_at", nil)
+	if o.TokenExpiresAt != nil {
+		expiresAt = slog.Time("token_expires_at", o.TokenExpiresAt.UTC())
+	}
 	return slog.GroupValue(
 		slog.String("id", o.ID.String()),
 		slog.String("user_id", o.UserID.String()),
 		slog.String("provider_id", o.ProviderID),
+		slog.String("provider_tenant_id", o.ProviderTenantID),
 		slog.String("provider_user_id", "[REDACTED]"),
 		slog.String("email", o.Email),
+		slog.Bool("verified", o.Verified),
+		slog.String("access_token_ciphertext", "[REDACTED]"),
+		slog.String("refresh_token_ciphertext", "[REDACTED]"),
+		slog.String("refresh_token_fingerprint", "[REDACTED]"),
+		expiresAt,
+		slog.String("token_scope", o.TokenScope),
 		slog.Time("created_at", o.CreatedAt),
 		slog.Time("updated_at", o.UpdatedAt),
 	)

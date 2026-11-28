@@ -5,12 +5,93 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/kaiizer777/go-auth/errors"
 )
+
+// TestConfigValidate_FailingValidationLeavesConfigUntouched pins the no-write
+// contract: defaults and provider normalization are applied to a working copy,
+// so a config rejected by a later check is not silently rewritten first.
+func TestConfigValidate_FailingValidationLeavesConfigUntouched(t *testing.T) {
+	cfg := validOAuthBase()
+	cfg.SessionIdleTimeout = 0
+	cfg.OAuth.Providers = map[string]ProviderConfig{
+		"microsoft": {
+			ClientID:     "ms-client-id",
+			ClientSecret: "ms-client-secret",
+			RedirectURL:  "https://example.com/auth/oauth/microsoft/callback",
+			Enabled:      true,
+			Tenant:       "  Contoso.OnMicrosoft.com  ",
+		},
+	}
+	// Fails at the TOTP key check, which runs after the session defaults and
+	// the provider-map normalization.
+	cfg.TOTP.EncryptionKey = "not-a-64-byte-hex-key"
+	want := cfg.clone()
+
+	if err := cfg.Validate(); !errors.Is(err, errors.ErrTOTPEncryptionKeyInvalid) {
+		t.Fatalf("Validate = %v; want %v", err, errors.ErrTOTPEncryptionKeyInvalid)
+	}
+	if cfg.SessionIdleTimeout != 0 {
+		t.Fatalf("SessionIdleTimeout = %v; want 0 (default written before the failing check)", cfg.SessionIdleTimeout)
+	}
+	if got := cfg.OAuth.Providers["microsoft"].Tenant; got != "  Contoso.OnMicrosoft.com  " {
+		t.Fatalf("microsoft tenant = %q; want the unnormalized input", got)
+	}
+	if !reflect.DeepEqual(cfg, *want) {
+		t.Fatalf("rejected Validate mutated the config:\n got %#v\nwant %#v", cfg, *want)
+	}
+}
+
+// TestValidateGraphVersion_ParityWithConfigValidate pins that Config.Validate
+// applies the same grammar the exported validator exposes. The empty version is
+// covered separately: applyProviderDefaults rewrites it to v19.0 before the
+// validation loop, so it is not a grammar disagreement.
+func TestValidateGraphVersion_ParityWithConfigValidate(t *testing.T) {
+	versions := []string{
+		"v19.0", "v22.0", "v100.10", "19.0", "v0x13", "v19.0 beta", "../x",
+		"v18.9", "v19", "v19.0.1", " v19.0", "v19.0 ", "V19.0", "v019.0",
+	}
+	for _, version := range versions {
+		t.Run(version, func(t *testing.T) {
+			cfg := validOAuthBase()
+			cfg.OAuth.Facebook = &FacebookConfig{
+				AppID:        "fb-app-id",
+				AppSecret:    "fb-app-secret",
+				RedirectURI:  "https://example.com/callback",
+				GraphVersion: version,
+			}
+
+			validateErr := ValidateGraphVersion(version)
+			configErr := cfg.Validate()
+			got := errors.Is(configErr, errors.ErrOAuthGraphVersionInvalid)
+			want := errors.Is(validateErr, errors.ErrOAuthGraphVersionInvalid)
+			if got != want {
+				t.Fatalf("Config.Validate error = %v; ValidateGraphVersion error = %v", configErr, validateErr)
+			}
+			if validateErr == nil && configErr != nil {
+				t.Fatalf("Config.Validate = %v; want nil", configErr)
+			}
+		})
+	}
+
+	cfg := validOAuthBase()
+	cfg.OAuth.Facebook = &FacebookConfig{
+		AppID:       "fb-app-id",
+		AppSecret:   "fb-app-secret",
+		RedirectURI: "https://example.com/callback",
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Config.Validate with an empty graph version = %v; want nil", err)
+	}
+	if got := cfg.OAuth.Providers["facebook"].GraphVersion; got != "v19.0" {
+		t.Fatalf("resolved graph version = %q; want v19.0", got)
+	}
+}
 
 func TestDefaultConfig(t *testing.T) {
 	cfg := DefaultConfig()
@@ -1474,6 +1555,74 @@ func TestConfig_SecretRedaction_LogValue_String(t *testing.T) {
 		}
 	})
 }
+func TestConfigSecretsMaskedUnderFormatVerbs(t *testing.T) {
+	const (
+		dbPassword    = "db-super-secret"
+		stateSecret   = "state-super-secret"
+		tokenKEK      = "kek-super-secret"
+		clientSecret  = "provider-super-secret"
+		privateKey    = "private-key-super-secret"
+		totpKey       = "totp-super-secret"
+		totpKeyring   = "totp-keyring-super-secret"
+		msSecret      = "microsoft-super-secret"
+		fbSecret      = "facebook-super-secret"
+		discordSecret = "discord-super-secret"
+		xSecret       = "x-super-secret"
+	)
+
+	provider := ProviderConfig{ClientID: "id", ClientSecret: clientSecret, PrivateKey: privateKey}
+	oauthCfg := OAuthConfig{
+		Providers: map[string]ProviderConfig{"google": provider},
+		Microsoft: &MicrosoftConfig{
+			ClientID:     "ms-id",
+			ClientSecret: msSecret,
+		},
+		Facebook: &FacebookConfig{
+			AppID:     "fb-id",
+			AppSecret: fbSecret,
+		},
+		Discord: &DiscordConfig{
+			ClientID:     "discord-id",
+			ClientSecret: discordSecret,
+		},
+		X: &XConfig{
+			ClientID:     "x-id",
+			ClientSecret: xSecret,
+		},
+		StateSecret: stateSecret,
+		TokenKEK:    tokenKEK,
+	}
+	cfg := Config{
+		DatabaseURL: "postgres://admin:" + dbPassword + "@localhost:5432/auth",
+		OAuth:       oauthCfg,
+		TOTP:        TOTPConfig{EncryptionKey: totpKey, Keyring: totpKeyring},
+	}
+
+	cases := []struct {
+		name    string
+		value   any
+		secrets []string
+	}{
+		{"Config", cfg, []string{dbPassword, stateSecret, tokenKEK, clientSecret, privateKey, totpKey, totpKeyring}},
+		{"OAuthConfig", oauthCfg, []string{stateSecret, tokenKEK, clientSecret, privateKey, msSecret, fbSecret, discordSecret, xSecret}},
+		{"ProviderConfig", provider, []string{clientSecret, privateKey}},
+		{"TOTPConfig", cfg.TOTP, []string{totpKey, totpKeyring}},
+		{"MicrosoftConfig", *oauthCfg.Microsoft, []string{msSecret}},
+		{"FacebookConfig", *oauthCfg.Facebook, []string{fbSecret}},
+		{"DiscordConfig", *oauthCfg.Discord, []string{discordSecret}},
+		{"XConfig", *oauthCfg.X, []string{xSecret}},
+	}
+	for _, tc := range cases {
+		for _, verb := range []string{"%v", "%+v", "%#v", "%s"} {
+			out := fmt.Sprintf(verb, tc.value)
+			for _, secret := range tc.secrets {
+				if strings.Contains(out, secret) {
+					t.Errorf("%s under %s leaked %q: %s", tc.name, verb, secret, out)
+				}
+			}
+		}
+	}
+}
 func TestConfigValidate_SecurityHeaders(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
@@ -1895,5 +2044,208 @@ func TestConfigValidate_MongoDBDefaultsAppliedWhenUnset(t *testing.T) {
 	}
 	if cfg.Mongo.ConnectTimeout != 10*time.Second {
 		t.Errorf("got Mongo.ConnectTimeout %v, want 10s", cfg.Mongo.ConnectTimeout)
+	}
+}
+
+func TestConfigValidate_DisabledProviderWithIncompleteCredentialsBoots(t *testing.T) {
+	off := false
+	tests := []struct {
+		name   string
+		mutate func(*Config)
+	}{
+		{
+			name: "disabled provider in map with empty credentials",
+			mutate: func(c *Config) {
+				c.OAuth.Providers = map[string]ProviderConfig{
+					"discord": {
+						Enabled: false,
+					},
+				}
+			},
+		},
+		{
+			name: "disabled provider in map with partial credentials",
+			mutate: func(c *Config) {
+				c.OAuth.Providers = map[string]ProviderConfig{
+					"google": {
+						ClientID: "google-id",
+						Enabled:  false,
+					},
+				}
+			},
+		},
+		{
+			name: "disabled provider in map with incomplete typed struct",
+			mutate: func(c *Config) {
+				c.OAuth.Providers = map[string]ProviderConfig{
+					"microsoft": {
+						Enabled: false,
+					},
+				}
+				c.OAuth.Microsoft = &MicrosoftConfig{
+					ClientID: "ms-client-id",
+				}
+			},
+		},
+		{
+			name: "disabled typed provider with missing credentials",
+			mutate: func(c *Config) {
+				c.OAuth.Microsoft = &MicrosoftConfig{
+					Enabled:  &off,
+					ClientID: "ms-client-id",
+				}
+			},
+		},
+		{
+			name: "typed disabled overrides enabled map entry with missing credentials",
+			mutate: func(c *Config) {
+				c.OAuth.Providers = map[string]ProviderConfig{
+					"discord": {
+						Enabled:  true,
+						ClientID: "discord-id",
+					},
+				}
+				c.OAuth.Discord = &DiscordConfig{
+					Enabled: &off,
+				}
+			},
+		},
+		{
+			name: "map disabled overrides typed enabled with missing credentials",
+			mutate: func(c *Config) {
+				c.OAuth.Providers = map[string]ProviderConfig{
+					"facebook": {
+						Enabled: false,
+					},
+				}
+				c.OAuth.Facebook = &FacebookConfig{
+					AppID: "fb-app-id",
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := validOAuthBase()
+			tt.mutate(&cfg)
+			if err := cfg.Validate(); err != nil {
+				t.Fatalf("Validate() = %v; want nil for disabled provider", err)
+			}
+		})
+	}
+}
+
+func TestConfigValidate_SplitCredentialsBoot(t *testing.T) {
+	tests := []struct {
+		name     string
+		provider string
+		mutate   func(*Config)
+		wantID   string
+		wantSec  string
+		wantURI  string
+	}{
+		{
+			name:     "microsoft client ID in map and secret in typed",
+			provider: "microsoft",
+			mutate: func(c *Config) {
+				c.OAuth.Providers = map[string]ProviderConfig{
+					"microsoft": {
+						ClientID:    "ms-map-id",
+						RedirectURL: "https://example.com/callback",
+						Enabled:     true,
+					},
+				}
+				c.OAuth.Microsoft = &MicrosoftConfig{
+					ClientSecret: "ms-typed-secret",
+				}
+			},
+			wantID:  "ms-map-id",
+			wantSec: "ms-typed-secret",
+			wantURI: "https://example.com/callback",
+		},
+		{
+			name:     "discord client secret in map and id/redirect in typed",
+			provider: "discord",
+			mutate: func(c *Config) {
+				c.OAuth.Providers = map[string]ProviderConfig{
+					"discord": {
+						ClientSecret: "discord-map-secret",
+						Enabled:      true,
+					},
+				}
+				c.OAuth.Discord = &DiscordConfig{
+					ClientID:    "discord-typed-id",
+					RedirectURI: "https://example.com/discord/callback",
+				}
+			},
+			wantID:  "discord-typed-id",
+			wantSec: "discord-map-secret",
+			wantURI: "https://example.com/discord/callback",
+		},
+		{
+			name:     "facebook app id in typed and secret/redirect in map",
+			provider: "facebook",
+			mutate: func(c *Config) {
+				c.OAuth.Providers = map[string]ProviderConfig{
+					"facebook": {
+						ClientSecret: "fb-map-secret",
+						RedirectURL:  "https://example.com/fb/callback",
+						Enabled:      true,
+					},
+				}
+				c.OAuth.Facebook = &FacebookConfig{
+					AppID: "fb-typed-id",
+				}
+			},
+			wantID:  "fb-typed-id",
+			wantSec: "fb-map-secret",
+			wantURI: "https://example.com/fb/callback",
+		},
+		{
+			name:     "x client id and redirect in map and secret in typed",
+			provider: "x",
+			mutate: func(c *Config) {
+				c.OAuth.Providers = map[string]ProviderConfig{
+					"x": {
+						ClientID:    "x-map-id",
+						RedirectURL: "https://example.com/x/callback",
+						Enabled:     true,
+					},
+				}
+				c.OAuth.X = &XConfig{
+					ClientSecret: "x-typed-secret",
+				}
+			},
+			wantID:  "x-map-id",
+			wantSec: "x-typed-secret",
+			wantURI: "https://example.com/x/callback",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := validOAuthBase()
+			tt.mutate(&cfg)
+			if err := cfg.Validate(); err != nil {
+				t.Fatalf("Validate() = %v; want nil for valid split-credential config", err)
+			}
+			p, ok := cfg.OAuth.Providers[tt.provider]
+			if !ok {
+				t.Fatalf("provider %q not found in merged Providers map", tt.provider)
+			}
+			if !p.Enabled {
+				t.Fatalf("provider %q Enabled = false; want true", tt.provider)
+			}
+			if p.ClientID != tt.wantID {
+				t.Errorf("ClientID = %q; want %q", p.ClientID, tt.wantID)
+			}
+			if p.ClientSecret != tt.wantSec {
+				t.Errorf("ClientSecret = %q; want %q", p.ClientSecret, tt.wantSec)
+			}
+			if p.RedirectURL != tt.wantURI {
+				t.Errorf("RedirectURL = %q; want %q", p.RedirectURL, tt.wantURI)
+			}
+		})
 	}
 }

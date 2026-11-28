@@ -203,14 +203,33 @@ func (d *PasswordResetTokenDoc) toDomain() *db.PasswordResetToken {
 }
 
 // OAuthAccountDoc represents a federated identity document in the "oauth_accounts" collection.
+// A document written before the verified flag existed decodes as false: missing
+// fields land on the Go zero value, which is the fail-closed default. Startup
+// re-derives the flag from the owning user (BackfillOAuthAccountVerified), so a
+// legacy link on a locally verified account keeps signing in.
+//
+// provider_tenant_id scopes the identity to the tenant that issued it; it is
+// part of the unique index, so a pairwise subject can exist once per tenant.
+//
+// The token fields mirror db.OAuthAccount: opaque ciphertext envelopes this
+// package never opens, plus the rotation fingerprint and scope. token_expires_at
+// is a pointer so a document without a stored token keeps a nil expiry instead
+// of a year-1 timestamp.
 type OAuthAccountDoc struct {
-	ID             string    `bson:"_id"`
-	UserID         string    `bson:"user_id"`
-	ProviderID     string    `bson:"provider_id"`
-	ProviderUserID string    `bson:"provider_user_id"`
-	Email          string    `bson:"email"`
-	CreatedAt      time.Time `bson:"created_at"`
-	UpdatedAt      time.Time `bson:"updated_at"`
+	ID                      string     `bson:"_id"`
+	UserID                  string     `bson:"user_id"`
+	ProviderID              string     `bson:"provider_id"`
+	ProviderTenantID        string     `bson:"provider_tenant_id"`
+	ProviderUserID          string     `bson:"provider_user_id"`
+	Email                   string     `bson:"email"`
+	Verified                bool       `bson:"verified"`
+	AccessTokenCiphertext   string     `bson:"access_token_ciphertext"`
+	RefreshTokenCiphertext  string     `bson:"refresh_token_ciphertext"`
+	RefreshTokenFingerprint string     `bson:"refresh_token_fingerprint"`
+	TokenExpiresAt          *time.Time `bson:"token_expires_at"`
+	TokenScope              string     `bson:"token_scope"`
+	CreatedAt               time.Time  `bson:"created_at"`
+	UpdatedAt               time.Time  `bson:"updated_at"`
 }
 
 func oauthAccountDocFromDomain(o *db.OAuthAccount) *OAuthAccountDoc {
@@ -232,14 +251,26 @@ func oauthAccountDocFromDomain(o *db.OAuthAccount) *OAuthAccountDoc {
 		updatedAt = createdAt
 		o.UpdatedAt = updatedAt
 	}
+	var tokenExpiresAt *time.Time
+	if o.TokenExpiresAt != nil {
+		expiresAt := o.TokenExpiresAt.UTC()
+		tokenExpiresAt = &expiresAt
+	}
 	return &OAuthAccountDoc{
-		ID:             id.String(),
-		UserID:         o.UserID.String(),
-		ProviderID:     o.ProviderID,
-		ProviderUserID: o.ProviderUserID,
-		Email:          o.Email,
-		CreatedAt:      createdAt,
-		UpdatedAt:      updatedAt,
+		ID:                      id.String(),
+		UserID:                  o.UserID.String(),
+		ProviderID:              o.ProviderID,
+		ProviderTenantID:        o.ProviderTenantID,
+		ProviderUserID:          o.ProviderUserID,
+		Email:                   o.Email,
+		Verified:                o.Verified,
+		AccessTokenCiphertext:   o.AccessTokenCiphertext,
+		RefreshTokenCiphertext:  o.RefreshTokenCiphertext,
+		RefreshTokenFingerprint: o.RefreshTokenFingerprint,
+		TokenExpiresAt:          tokenExpiresAt,
+		TokenScope:              o.TokenScope,
+		CreatedAt:               createdAt,
+		UpdatedAt:               updatedAt,
 	}
 }
 
@@ -250,13 +281,20 @@ func (d *OAuthAccountDoc) toDomain() *db.OAuthAccount {
 	id, _ := uuid.Parse(d.ID)
 	userID, _ := uuid.Parse(d.UserID)
 	return &db.OAuthAccount{
-		ID:             id,
-		UserID:         userID,
-		ProviderID:     d.ProviderID,
-		ProviderUserID: d.ProviderUserID,
-		Email:          d.Email,
-		CreatedAt:      d.CreatedAt.UTC(),
-		UpdatedAt:      d.UpdatedAt.UTC(),
+		ID:                      id,
+		UserID:                  userID,
+		ProviderID:              d.ProviderID,
+		ProviderTenantID:        d.ProviderTenantID,
+		ProviderUserID:          d.ProviderUserID,
+		Email:                   d.Email,
+		Verified:                d.Verified,
+		AccessTokenCiphertext:   d.AccessTokenCiphertext,
+		RefreshTokenCiphertext:  d.RefreshTokenCiphertext,
+		RefreshTokenFingerprint: d.RefreshTokenFingerprint,
+		TokenExpiresAt:          d.TokenExpiresAt,
+		TokenScope:              d.TokenScope,
+		CreatedAt:               d.CreatedAt.UTC(),
+		UpdatedAt:               d.UpdatedAt.UTC(),
 	}
 }
 
@@ -405,5 +443,30 @@ func (d *TwoFactorTokenDoc) toDomain() *db.TwoFactorToken {
 		TokenHash: d.TokenHash,
 		ExpiresAt: d.ExpiresAt.UTC(),
 		Attempts:  d.Attempts,
+	}
+}
+
+// ClaimedEmailDoc represents one reserved address in the "claimed_emails"
+// collection. _id is the Go-normalised address, so the unique key on _id is the
+// claim and is compared byte for byte, exactly as the SQL primary key is.
+type ClaimedEmailDoc struct {
+	Email       string    `bson:"_id"`
+	OwnerUserID string    `bson:"owner_user_id"`
+	Verified    bool      `bson:"verified"`
+	CreatedAt   time.Time `bson:"created_at"`
+	UpdatedAt   time.Time `bson:"updated_at"`
+}
+
+func (d *ClaimedEmailDoc) toDomain() *db.ClaimedEmail {
+	if d == nil {
+		return nil
+	}
+	ownerID, _ := uuid.Parse(d.OwnerUserID)
+	return &db.ClaimedEmail{
+		Email:       db.ClaimKeyValue(d.Email),
+		OwnerUserID: ownerID,
+		Verified:    d.Verified,
+		CreatedAt:   d.CreatedAt.UTC(),
+		UpdatedAt:   d.UpdatedAt.UTC(),
 	}
 }

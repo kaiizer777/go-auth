@@ -1,12 +1,15 @@
 package goauth
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"database/sql/driver"
+	"encoding/base64"
 	stderrors "errors"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -470,6 +473,195 @@ func TestNew_SuccessAndWiring(t *testing.T) {
 	}
 }
 
+func TestNew_OAuthRegistryWiring(t *testing.T) {
+	sqliteDB, err := gorm.Open(sqlite.Open("file::memory:?cache=shared"), &gorm.Config{
+		DisableAutomaticPing: true,
+	})
+	if err != nil {
+		t.Fatalf("failed to open sqlite db: %v", err)
+	}
+	t.Cleanup(func() {
+		if sqlDB, errDB := sqliteDB.DB(); errDB == nil {
+			_ = sqlDB.Close()
+		}
+	})
+	store := gormstore.New(sqliteDB)
+
+	cfg := config.DefaultConfig()
+	cfg.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+	cfg.BaseURL = "https://auth.example.com"
+	cfg.OAuth.StateSecret = "test-state-secret-at-least-32-bytes!"
+	cfg.OAuth.TokenKEK = testTokenKEK
+	cfg.OAuth.Providers = map[string]config.ProviderConfig{
+		"microsoft": {
+			ClientID:     "ms-client-id",
+			ClientSecret: "ms-client-secret",
+			RedirectURL:  "https://auth.example.com/auth/oauth/microsoft/callback",
+			Enabled:      true,
+		},
+	}
+	cfg.OAuth.Microsoft = &config.MicrosoftConfig{
+		ClientID:     "ms-client-id",
+		ClientSecret: "ms-client-secret",
+		Tenant:       "organizations",
+		RedirectURI:  "https://auth.example.com/auth/oauth/microsoft/callback",
+	}
+
+	a, err := NewWithStore(store, cfg)
+	if err != nil {
+		t.Fatalf("NewWithStore unexpected err = %v", err)
+	}
+	t.Cleanup(func() { _ = a.Close() })
+	if a.OAuthService() == nil {
+		t.Fatal("expected non-nil OAuth service for enabled provider")
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/auth/oauth/microsoft", nil)
+	authURL, err := a.OAuthService().InitiateFlow(rec, req, "microsoft")
+	if err != nil {
+		t.Fatalf("InitiateFlow(microsoft) unexpected err = %v", err)
+	}
+	if !strings.Contains(authURL, "/organizations/") {
+		t.Errorf("authURL = %q; want organizations authority from typed config", authURL)
+	}
+
+	if _, err := a.OAuthService().InitiateFlow(rec, req, "slack"); err == nil {
+		t.Error("InitiateFlow(slack) expected error, got nil")
+	}
+}
+
+func oauthProviderConfig() config.Config {
+	cfg := config.DefaultConfig()
+	cfg.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+	cfg.BaseURL = "https://auth.example.com"
+	cfg.OAuth.StateSecret = "test-state-secret-at-least-32-bytes!"
+	cfg.OAuth.Providers = map[string]config.ProviderConfig{
+		"google": {
+			ClientID:     "gid",
+			ClientSecret: "gsecret",
+			RedirectURL:  "https://auth.example.com/auth/oauth/google/callback",
+			Enabled:      true,
+		},
+	}
+	return cfg
+}
+
+func TestNew_RequiresTokenKEK(t *testing.T) {
+	t.Run("New and NewWithStore fail alike when keyring is absent", func(t *testing.T) {
+		t.Setenv(tokenKEKEnvVar, "")
+		_, newErr := New(oauthProviderConfig())
+		_, storeErr := NewWithStore(nil, oauthProviderConfig())
+		if !stderrors.Is(newErr, errors.ErrOAuthTokenKEKMissing) {
+			t.Fatalf("New err = %v; want ErrOAuthTokenKEKMissing", newErr)
+		}
+		if !stderrors.Is(storeErr, errors.ErrOAuthTokenKEKMissing) {
+			t.Fatalf("NewWithStore err = %v; want ErrOAuthTokenKEKMissing", storeErr)
+		}
+		if newErr.Error() != storeErr.Error() {
+			t.Errorf("New err = %q; NewWithStore err = %q", newErr, storeErr)
+		}
+		var appErr *errors.Error
+		if !errors.As(newErr, &appErr) || appErr.Code() != errors.CodeInvalidConfig {
+			t.Errorf("err = %v; want a CodeInvalidConfig error", newErr)
+		}
+	})
+
+	t.Run("whitespace environment keyring counts as absent", func(t *testing.T) {
+		t.Setenv(tokenKEKEnvVar, "   ")
+		_, err := NewWithStore(nil, oauthProviderConfig())
+		if !stderrors.Is(err, errors.ErrOAuthTokenKEKMissing) {
+			t.Fatalf("err = %v; want ErrOAuthTokenKEKMissing", err)
+		}
+	})
+
+	t.Run("malformed explicit keyring is rejected", func(t *testing.T) {
+		t.Setenv(tokenKEKEnvVar, "")
+		cfg := oauthProviderConfig()
+		cfg.OAuth.TokenKEK = "typo-not-a-keyring"
+		_, err := NewWithStore(nil, cfg)
+		if !stderrors.Is(err, errors.ErrOAuthTokenKEKInvalid) {
+			t.Fatalf("err = %v; want ErrOAuthTokenKEKInvalid", err)
+		}
+		if strings.Contains(err.Error(), "typo-not-a-keyring") {
+			t.Fatalf("err leaked keyring spec: %v", err)
+		}
+	})
+
+	t.Run("environment keyring satisfies the gate", func(t *testing.T) {
+		t.Setenv(tokenKEKEnvVar, testTokenKEK)
+		a, err := NewWithStore(gormstore.New(openTestSQLite(t)), oauthProviderConfig())
+		if err != nil {
+			t.Fatalf("NewWithStore = %v", err)
+		}
+		t.Cleanup(func() { _ = a.Close() })
+	})
+
+	t.Run("explicit keyring wins over environment", func(t *testing.T) {
+		t.Setenv(tokenKEKEnvVar, "not-a-keyring")
+		cfg := oauthProviderConfig()
+		cfg.OAuth.TokenKEK = testTokenKEK
+		a, err := NewWithStore(gormstore.New(openTestSQLite(t)), cfg)
+		if err != nil {
+			t.Fatalf("NewWithStore = %v", err)
+		}
+		t.Cleanup(func() { _ = a.Close() })
+	})
+
+	t.Run("no providers leaves the keyring optional", func(t *testing.T) {
+		t.Setenv(tokenKEKEnvVar, "")
+		cfg := oauthProviderConfig()
+		cfg.OAuth.Providers = nil
+		a, err := NewWithStore(gormstore.New(openTestSQLite(t)), cfg)
+		if err != nil {
+			t.Fatalf("NewWithStore = %v", err)
+		}
+		t.Cleanup(func() { _ = a.Close() })
+	})
+}
+
+// TestNewWithStore_TOTPEnablementGate pins that either key surface enables TOTP:
+// a keyring-only deployment must not silently lose the TOTP routes, which would
+// turn configured 2FA into no 2FA.
+func TestNewWithStore_TOTPEnablementGate(t *testing.T) {
+	keyring := "k1:" + base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0x2a}, 32))
+	hexKey := "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+	tests := []struct {
+		name     string
+		hexKey   string
+		keyring  string
+		wantTOTP bool
+	}{
+		{name: "encryption key only", hexKey: hexKey, wantTOTP: true},
+		{name: "keyring only", keyring: keyring, wantTOTP: true},
+		{name: "both surfaces", hexKey: hexKey, keyring: keyring, wantTOTP: true},
+		{name: "neither surface"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := config.DefaultConfig()
+			cfg.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
+			cfg.BaseURL = "https://auth.example.com"
+			cfg.TOTP.EncryptionKey = tt.hexKey
+			cfg.TOTP.Keyring = tt.keyring
+
+			a, err := NewWithStore(gormstore.New(openTestSQLite(t)), cfg)
+			if err != nil {
+				t.Fatalf("NewWithStore = %v", err)
+			}
+			t.Cleanup(func() { _ = a.Close() })
+
+			rec := httptest.NewRecorder()
+			a.Handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/auth/totp/status", nil))
+			if got := rec.Code != http.StatusNotFound; got != tt.wantTOTP {
+				t.Fatalf("TOTP route mounted = %v (status %d), want %v", got, rec.Code, tt.wantTOTP)
+			}
+		})
+	}
+}
+
 func TestNewWithDB_ZeroCleanupTick(t *testing.T) {
 	sqliteDB, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{
 		DisableAutomaticPing: true,
@@ -733,12 +925,26 @@ func TestNew_MySQL(t *testing.T) {
 		expires_at DATETIME NOT NULL,
 		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 	);
+	CREATE TABLE IF NOT EXISTS claimed_emails (
+		email VARCHAR(255) PRIMARY KEY,
+		owner_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		verified INTEGER NOT NULL DEFAULT 0,
+		created_at DATETIME,
+		updated_at DATETIME
+	);
 	CREATE TABLE IF NOT EXISTS oauth_accounts (
 		id TEXT PRIMARY KEY,
 		user_id TEXT NOT NULL,
 		provider_id TEXT NOT NULL,
+		provider_tenant_id TEXT NOT NULL,
 		provider_user_id TEXT NOT NULL,
 		email TEXT NOT NULL,
+		verified INTEGER NOT NULL DEFAULT 0,
+		access_token_ciphertext TEXT NOT NULL DEFAULT '',
+		refresh_token_ciphertext TEXT NOT NULL DEFAULT '',
+		refresh_token_fingerprint CHAR(64) NOT NULL DEFAULT '',
+		token_expires_at DATETIME,
+		token_scope TEXT NOT NULL DEFAULT '',
 		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
 		updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 	);
@@ -849,12 +1055,26 @@ func TestNew_MongoDB_Success(t *testing.T) {
 		expires_at DATETIME NOT NULL,
 		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 	);
+	CREATE TABLE IF NOT EXISTS claimed_emails (
+		email VARCHAR(255) PRIMARY KEY,
+		owner_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		verified INTEGER NOT NULL DEFAULT 0,
+		created_at DATETIME,
+		updated_at DATETIME
+	);
 	CREATE TABLE IF NOT EXISTS oauth_accounts (
 		id TEXT PRIMARY KEY,
 		user_id TEXT NOT NULL,
 		provider_id TEXT NOT NULL,
+		provider_tenant_id TEXT NOT NULL,
 		provider_user_id TEXT NOT NULL,
 		email TEXT NOT NULL,
+		verified INTEGER NOT NULL DEFAULT 0,
+		access_token_ciphertext TEXT NOT NULL DEFAULT '',
+		refresh_token_ciphertext TEXT NOT NULL DEFAULT '',
+		refresh_token_fingerprint CHAR(64) NOT NULL DEFAULT '',
+		token_expires_at DATETIME,
+		token_scope TEXT NOT NULL DEFAULT '',
 		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
 		updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 	);
@@ -932,9 +1152,10 @@ func TestNew_MongoDB_NewWithStoreError_ClosesStore(t *testing.T) {
 	orig := mongoConnectFn
 	defer func() { mongoConnectFn = orig }()
 
-	providersMap := make(map[string]config.ProviderConfig)
+	// Provider config is a map shared with New's copy of cfg, so adding an
+	// unknown provider here surfaces in the post-connect validation.
 	mongoConnectFn = func(cfg config.Config) (db.Store, error) {
-		providersMap["invalid_provider"] = config.ProviderConfig{Enabled: true}
+		cfg.OAuth.Providers["invalid_provider"] = config.ProviderConfig{Enabled: true}
 		return tracker, nil
 	}
 
@@ -943,13 +1164,16 @@ func TestNew_MongoDB_NewWithStoreError_ClosesStore(t *testing.T) {
 		DatabaseURL:  "mongodb://localhost:27017/test_db",
 		BaseURL:      "http://localhost:8080",
 		OAuth: config.OAuthConfig{
-			Providers: providersMap,
+			StateSecret: "test-state-secret-at-least-32-bytes!",
 		},
 	}
 
 	auth, err := New(cfg)
 	if err == nil {
 		t.Fatal("expected error from New, got nil")
+	}
+	if !errors.Is(err, errors.ErrOAuthProviderUnknown) {
+		t.Fatalf("expected ErrOAuthProviderUnknown, got: %v", err)
 	}
 	if auth != nil {
 		t.Fatal("expected nil auth on initialization failure")

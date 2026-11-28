@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"log/slog"
@@ -11,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/kaiizer777/go-auth/crypto"
 	"github.com/kaiizer777/go-auth/email"
 	"github.com/kaiizer777/go-auth/errors"
 )
@@ -42,6 +44,26 @@ type ProviderConfig struct {
 	TeamID     string // 10-character Apple Developer Team ID
 	KeyID      string // 10-character Apple Developer Key ID
 	PrivateKey string // PEM-encoded PKCS#8 ECDSA private key (.p8 content)
+
+	// Authority settings shared across adapters; currently consumed only by
+	// Microsoft Entra ID. Empty Tenant and non-positive JWKSCacheTTL fall back
+	// to provider defaults ("common" / 24h). Empty TrustedTenants means no
+	// allowlist: every tenant the configured authority admits stays trusted. A
+	// non-empty allowlist marks unlisted tenants untrusted and evicts their
+	// existing links on the next callback.
+	Tenant         string        `json:"tenant,omitempty"`
+	TrustedTenants []string      `json:"trusted_tenants,omitempty"`
+	JWKSCacheTTL   time.Duration `json:"jwks_cache_ttl,omitempty"`
+
+	// GraphVersion pins the Facebook Graph API version (e.g. "v19.0"); ignored
+	// by every other adapter.
+	GraphVersion string `json:"graph_version,omitempty"`
+
+	// AssertEmailVerified declares that the operator trusts a non-empty email
+	// from the Facebook Graph API as provider-verified, which enables the
+	// existing-account merge. Default false keeps the address unattested;
+	// ignored by every other adapter.
+	AssertEmailVerified bool `json:"assert_email_verified,omitempty"`
 }
 
 // LogValue implements slog.LogValuer to ensure ClientSecret and PrivateKey are masked in logs.
@@ -63,6 +85,11 @@ func (p ProviderConfig) LogValue() slog.Value {
 		slog.String("team_id", p.TeamID),
 		slog.String("key_id", p.KeyID),
 		slog.String("private_key", keyMasked),
+		slog.String("tenant", p.Tenant),
+		slog.Any("trusted_tenants", p.TrustedTenants),
+		slog.Duration("jwks_cache_ttl", p.JWKSCacheTTL),
+		slog.String("graph_version", p.GraphVersion),
+		slog.Bool("assert_email_verified", p.AssertEmailVerified),
 	)
 }
 
@@ -75,21 +102,93 @@ func (p ProviderConfig) String() string {
 	return fmt.Sprintf("ProviderConfig{ClientID: %s, ClientSecret: %s, RedirectURL: %s}", p.ClientID, secret, p.RedirectURL)
 }
 
+// GoString implements fmt.GoStringer so %#v masks ClientSecret and PrivateKey.
+func (p ProviderConfig) GoString() string { return "config." + p.String() }
+
 // OAuthConfig groups configurations for all external identity providers.
 type OAuthConfig struct {
-	// Providers maps provider ID ("google", "github", "apple") to provider configuration.
+	// Providers maps provider ID ("google", "github", "apple", "microsoft") to provider configuration.
+	// Validate merges the typed sections below into this map and applies provider
+	// defaults there, so after validation this map is the authoritative source.
 	Providers       map[string]ProviderConfig
-	StateCookieName string        // Default: "oauth_state"
-	StateCookiePath string        // Default: "/" (ensures cookies are sent on /auth/oauth/* and /api/auth/oauth/*)
-	StateTTL        time.Duration // Default: 10 * time.Minute
-	StateSecret     string        // Required when any OAuth provider is enabled; empty fails closed at startup. Min 32 bytes.
-	CallbackBaseURL string        // e.g. "https://api.example.com"
+	Microsoft       *MicrosoftConfig `json:"microsoft,omitempty"`
+	Facebook        *FacebookConfig  `json:"facebook,omitempty"`
+	Discord         *DiscordConfig   `json:"discord,omitempty"`
+	X               *XConfig         `json:"x,omitempty"`
+	StateCookieName string           // Default: "oauth_state"
+	StateCookiePath string           // Default: "/" (ensures cookies are sent on /auth/oauth/* and /api/auth/oauth/*)
+	StateTTL        time.Duration    // Default: 10 * time.Minute
+	StateSecret     string           // Required when any OAuth provider is enabled; empty fails closed at startup. Min 32 bytes.
+	// TokenKEK is the comma-separated `kid:base64key` keyring that encrypts
+	// stored OAuth tokens. The first entry encrypts, every entry decrypts, each
+	// key must decode to 32 bytes. Required when any provider is enabled; empty
+	// fails closed at startup. Never logged.
+	TokenKEK        string
+	CallbackBaseURL string // e.g. "https://api.example.com"
 	// StateCookieSameSite is the base SameSite policy for the OAuth state
 	// cookie on GET-redirect flows. Default: Lax. form_post providers (Apple)
 	// always escalate to None+Secure regardless, since browsers withhold Lax
 	// on cross-site POST navigations.
 	StateCookieSameSite http.SameSite
 }
+
+// LogValue implements slog.LogValuer to ensure StateSecret, TokenKEK and nested provider secrets are redacted.
+func (o OAuthConfig) LogValue() slog.Value {
+	secretMasked := "[REDACTED]"
+	if o.StateSecret == "" {
+		secretMasked = ""
+	}
+	kekMasked := "[REDACTED]"
+	if o.TokenKEK == "" {
+		kekMasked = ""
+	}
+	providerAttrs := make([]slog.Attr, 0, len(o.Providers))
+	for name, provider := range o.Providers {
+		providerAttrs = append(providerAttrs, slog.Any(name, provider.LogValue()))
+	}
+	attrs := []slog.Attr{
+		slog.String("state_secret", secretMasked),
+		slog.String("token_kek", kekMasked),
+		slog.String("state_cookie_name", o.StateCookieName),
+		slog.String("state_cookie_path", o.StateCookiePath),
+		slog.Duration("state_ttl", o.StateTTL),
+		slog.String("callback_base_url", o.CallbackBaseURL),
+	}
+	if len(providerAttrs) > 0 {
+		attrs = append(attrs, slog.Attr{Key: "providers", Value: slog.GroupValue(providerAttrs...)})
+	}
+	if o.Microsoft != nil {
+		attrs = append(attrs, slog.Any("microsoft", o.Microsoft.LogValue()))
+	}
+	if o.Facebook != nil {
+		attrs = append(attrs, slog.Any("facebook", o.Facebook.LogValue()))
+	}
+	if o.Discord != nil {
+		attrs = append(attrs, slog.Any("discord", o.Discord.LogValue()))
+	}
+	if o.X != nil {
+		attrs = append(attrs, slog.Any("x", o.X.LogValue()))
+	}
+	return slog.GroupValue(attrs...)
+}
+
+// String implements fmt.Stringer to ensure StateSecret and TokenKEK are masked when printed.
+func (o OAuthConfig) String() string {
+	secret := "[REDACTED]"
+	if o.StateSecret == "" {
+		secret = ""
+	}
+	kek := "[REDACTED]"
+	if o.TokenKEK == "" {
+		kek = ""
+	}
+	return fmt.Sprintf("OAuthConfig{Providers: %v, Microsoft: %v, Facebook: %v, Discord: %v, X: %v, StateSecret: %s, TokenKEK: %s, CallbackBaseURL: %s}",
+		o.Providers, o.Microsoft, o.Facebook, o.Discord, o.X, secret, kek, o.CallbackBaseURL)
+}
+
+// GoString implements fmt.GoStringer so %#v masks StateSecret, TokenKEK and the
+// nested provider credentials.
+func (o OAuthConfig) GoString() string { return "config." + o.String() }
 
 // SecurityHeadersConfig groups HTTP security header policies.
 // Struct fields are ordered largest-to-smallest to eliminate memory alignment padding.
@@ -106,6 +205,7 @@ type SecurityHeadersConfig struct {
 // TOTPConfig groups configuration settings for RFC 6238 TOTP two-factor authentication.
 type TOTPConfig struct {
 	EncryptionKey        string        // 64-hex AES-256 key (32 bytes)
+	Keyring              string        // Optional `kid:base64key[,…]` ring; the hex key joins it under kid "legacy"
 	Issuer               string        // App name / issuer for OTP URI; default "go-auth"
 	ChallengeTokenTTL    time.Duration // Default: 10m; valid range: 1m–30m
 	AttemptWindow        time.Duration // Default: 5m; min: 1m
@@ -114,12 +214,9 @@ type TOTPConfig struct {
 
 // LogValue implements slog.LogValuer to prevent secret encryption key leakage in logs.
 func (t TOTPConfig) LogValue() slog.Value {
-	keyMasked := "[REDACTED]"
-	if t.EncryptionKey == "" {
-		keyMasked = ""
-	}
 	return slog.GroupValue(
-		slog.String("encryption_key", keyMasked),
+		slog.String("encryption_key", maskSecret(t.EncryptionKey)),
+		slog.String("keyring", maskSecret(t.Keyring)),
 		slog.String("issuer", t.Issuer),
 		slog.Duration("challenge_token_ttl", t.ChallengeTokenTTL),
 		slog.Duration("attempt_window", t.AttemptWindow),
@@ -129,12 +226,18 @@ func (t TOTPConfig) LogValue() slog.Value {
 
 // String implements fmt.Stringer to ensure EncryptionKey is masked when formatted.
 func (t TOTPConfig) String() string {
-	keyMasked := "[REDACTED]"
-	if t.EncryptionKey == "" {
-		keyMasked = ""
+	return fmt.Sprintf("TOTPConfig{EncryptionKey: %s, Keyring: %s, Issuer: %s, ChallengeTokenTTL: %v, AttemptWindow: %v, MaxAttemptsPerWindow: %d}",
+		maskSecret(t.EncryptionKey), maskSecret(t.Keyring), t.Issuer, t.ChallengeTokenTTL, t.AttemptWindow, t.MaxAttemptsPerWindow)
+}
+
+// GoString implements fmt.GoStringer so %#v masks EncryptionKey.
+func (t TOTPConfig) GoString() string { return "config." + t.String() }
+
+func maskSecret(value string) string {
+	if value == "" {
+		return ""
 	}
-	return fmt.Sprintf("TOTPConfig{EncryptionKey: %s, Issuer: %s, ChallengeTokenTTL: %v, AttemptWindow: %v, MaxAttemptsPerWindow: %d}",
-		keyMasked, t.Issuer, t.ChallengeTokenTTL, t.AttemptWindow, t.MaxAttemptsPerWindow)
+	return "[REDACTED]"
 }
 
 // DefaultTOTPConfig returns safe production defaults for TOTP configuration.
@@ -145,6 +248,29 @@ func DefaultTOTPConfig() TOTPConfig {
 		MaxAttemptsPerWindow: 5,
 		AttemptWindow:        5 * time.Minute,
 	}
+}
+
+// legacyTOTPKeyID is the kid the hex EncryptionKey joins the TOTP ring under.
+// Stored envelopes and the secret_kid hint record it, so it is fixed.
+const legacyTOTPKeyID = "legacy"
+
+// KeyringSpec returns the exact ring spec the TOTP service builds: Keyring
+// followed by the hex EncryptionKey under kid "legacy". That entry only decrypts
+// when a Keyring precedes it; with an empty Keyring it is the ring head and
+// encrypts. An empty result means neither key surface is configured.
+func (t TOTPConfig) KeyringSpec() (string, error) {
+	if t.EncryptionKey == "" {
+		return t.Keyring, nil
+	}
+	key, err := hex.DecodeString(t.EncryptionKey)
+	if err != nil || len(key) != 32 {
+		return "", errors.ErrTOTPEncryptionKeyInvalid
+	}
+	entry := legacyTOTPKeyID + ":" + base64.StdEncoding.EncodeToString(key)
+	if t.Keyring == "" {
+		return entry, nil
+	}
+	return t.Keyring + "," + entry, nil
 }
 
 // DatabaseType specifies the supported persistence backend dialect.
@@ -358,7 +484,50 @@ func DefaultConfig() Config {
 }
 
 // Validate ensures required fields are set and connection parameters are sane.
+// It commits the normalization only after every check passes: a rejected config
+// keeps its original values instead of the half-applied defaults that were
+// written before the failing check.
 func (c *Config) Validate() error {
+	working := c.clone()
+	if err := working.validate(); err != nil {
+		return err
+	}
+	*c = *working
+	return nil
+}
+
+// clone isolates the sections validate writes into, so a failed validation
+// cannot reach the caller through the typed provider pointers or the
+// AllowedOrigins backing array.
+func (c *Config) clone() *Config {
+	cp := *c
+	// validate normalizes origins in place; a shared backing array would mutate
+	// the caller's slice even when the config is rejected.
+	if c.AllowedOrigins != nil {
+		cp.AllowedOrigins = append([]string(nil), c.AllowedOrigins...)
+	}
+	if c.OAuth.Microsoft != nil {
+		v := *c.OAuth.Microsoft
+		cp.OAuth.Microsoft = &v
+	}
+	if c.OAuth.Facebook != nil {
+		v := *c.OAuth.Facebook
+		cp.OAuth.Facebook = &v
+	}
+	if c.OAuth.Discord != nil {
+		v := *c.OAuth.Discord
+		cp.OAuth.Discord = &v
+	}
+	if c.OAuth.X != nil {
+		v := *c.OAuth.X
+		cp.OAuth.X = &v
+	}
+	return &cp
+}
+
+// validate is the mutating body of Validate: it defaults and normalizes c in
+// place and reports the first failing check.
+func (c *Config) validate() error {
 	if c.DatabaseType == "" {
 		c.DatabaseType = DatabaseTypePostgres
 	}
@@ -676,13 +845,20 @@ func (c *Config) Validate() error {
 	// verify across replicas and restarts, which a per-process fallback key
 	// cannot do. With no providers enabled OAuth is inert and empty stays valid.
 	if c.OAuth.StateSecret == "" {
-		for _, provider := range c.OAuth.Providers {
-			if provider.Enabled {
-				return errors.ErrOAuthStateSecretRequired
-			}
+		if c.OAuth.anyProviderEnabled() {
+			return errors.ErrOAuthStateSecretRequired
 		}
 	} else if len(c.OAuth.StateSecret) < 32 {
 		return errors.ErrOAuthStateSecretTooShort
+	}
+	// A non-empty keyring must parse here so a typo fails at startup rather than
+	// on the first token write. Empty stays valid: this function performs no
+	// environment reads, and the constructors enforce the provider-enabled
+	// requirement after resolving GOAUTH_TOKEN_KEK.
+	if c.OAuth.TokenKEK != "" {
+		if _, err := crypto.ParseKeyring(c.OAuth.TokenKEK); err != nil {
+			return errors.ErrOAuthTokenKEKInvalid
+		}
 	}
 	if !isToken(c.OAuth.StateCookieName) {
 		return errors.ErrOAuthStateCookieNameInvalid
@@ -697,23 +873,79 @@ func (c *Config) Validate() error {
 	if !isCookiePath(c.OAuth.StateCookiePath) {
 		return errors.ErrOAuthStateCookiePathInvalid
 	}
+	// Normalized entries land in a fresh map: writing back into the map under
+	// range leaves a partially normalized map behind on a later entry's error.
+	normalizedProviders := make(map[string]ProviderConfig, len(c.OAuth.Providers))
 	for id, provider := range c.OAuth.Providers {
 		switch id {
-		case "google", "github", "apple":
+		case "google", "github", "apple", "microsoft", "discord", "facebook", "x":
 		default:
 			return errors.ErrOAuthProviderUnknown
 		}
+		if id == "microsoft" {
+			tenant, err := normalizeMicrosoftTenant(provider.Tenant)
+			if err != nil {
+				return err
+			}
+			provider.Tenant = tenant
+		}
+		normalizedProviders[id] = provider
+	}
+	c.OAuth.Providers = normalizedProviders
+
+	if c.OAuth.Microsoft != nil {
+		// Merge rule: typed defaults materialise only without a map entry for
+		// this provider. A pre-merge "common"/scope/TTL default reads as an
+		// explicit typed value and would otherwise shadow explicit map config.
+		_, msMapEntry := c.OAuth.Providers["microsoft"]
+		tenant := c.OAuth.Microsoft.Tenant
+		if strings.TrimSpace(tenant) == "" && !msMapEntry {
+			tenant = "common"
+		}
+		normalized, err := normalizeMicrosoftTenant(tenant)
+		if err != nil {
+			return err
+		}
+		c.OAuth.Microsoft.Tenant = normalized
+		trusted := make([]string, 0, len(c.OAuth.Microsoft.TrustedTenants))
+		for _, t := range c.OAuth.Microsoft.TrustedTenants {
+			if t = strings.ToLower(strings.TrimSpace(t)); t != "" {
+				trusted = append(trusted, t)
+			}
+		}
+		c.OAuth.Microsoft.TrustedTenants = trusted
+		if len(c.OAuth.Microsoft.Scopes) == 0 && !msMapEntry {
+			c.OAuth.Microsoft.Scopes = []string{"openid", "profile", "email", "offline_access"}
+		}
+		if c.OAuth.Microsoft.JWKSCacheTTL == 0 && !msMapEntry {
+			c.OAuth.Microsoft.JWKSCacheTTL = 24 * time.Hour
+		}
+	}
+
+	if c.OAuth.X != nil {
+		// Same merge rule as Microsoft above: no pre-merge default when a map
+		// entry carries explicit scopes. X scopes the profile endpoint with both
+		// users.read and tweet.read, so the default requests both.
+		_, xMapEntry := c.OAuth.Providers["x"]
+		if len(c.OAuth.X.Scopes) == 0 && !xMapEntry {
+			c.OAuth.X.Scopes = []string{"tweet.read", "users.read", "offline.access"}
+		}
+	}
+
+	// Resolve folds typed sections into Providers and defaults merged entries.
+	c.OAuth.resolveProviders()
+
+	// Validate credentials on the resolved providers. Every check routes through
+	// the resolved enabled state (resolveEnabled).
+	for id, provider := range c.OAuth.Providers {
 		if !provider.Enabled {
 			continue
 		}
 		if provider.ClientID == "" {
 			return errors.ErrOAuthClientIDRequired
 		}
-		if provider.RedirectURL == "" {
-			return errors.ErrOAuthRedirectURLRequired
-		}
 		switch id {
-		case "google", "github":
+		case "google", "github", "microsoft", "discord", "facebook", "x":
 			if provider.ClientSecret == "" {
 				return errors.ErrOAuthClientSecretRequired
 			}
@@ -721,6 +953,14 @@ func (c *Config) Validate() error {
 			if provider.ClientSecret == "" &&
 				(provider.TeamID == "" || provider.KeyID == "" || provider.PrivateKey == "") {
 				return errors.ErrOAuthClientSecretRequired
+			}
+		}
+		if provider.RedirectURL == "" {
+			return errors.ErrOAuthRedirectURLRequired
+		}
+		if id == "facebook" {
+			if err := ValidateGraphVersion(provider.GraphVersion); err != nil {
+				return err
 			}
 		}
 	}
@@ -744,6 +984,18 @@ func (c *Config) Validate() error {
 		}
 		if _, err := hex.DecodeString(c.TOTP.EncryptionKey); err != nil {
 			return errors.ErrTOTPEncryptionKeyInvalid
+		}
+	}
+	// Validate the composed ring, not just the configured keyring: the service
+	// appends the hex key under kid "legacy", so a keyring already claiming that
+	// kid would pass here and then fail every TOTP operation at runtime.
+	spec, err := c.TOTP.KeyringSpec()
+	if err != nil {
+		return err
+	}
+	if spec != "" {
+		if _, err := crypto.ParseKeyring(spec); err != nil {
+			return errors.ErrTOTPKeyringInvalid
 		}
 	}
 
@@ -822,6 +1074,27 @@ func isToken(s string) bool {
 	return true
 }
 
+// ValidateGraphVersion reports whether version is an acceptable Facebook Graph
+// API version: a lowercase "v" prefix followed by "<major>.<minor>", no leading
+// zeros, and a major of at least 19. The empty string is rejected; callers that
+// accept an unset version must default it to "v19.0" before validating. It is
+// the single grammar shared by Config.Validate and the oauth Facebook adapter,
+// so the two cannot drift; do not reimplement it.
+func ValidateGraphVersion(version string) error {
+	if !graphVersionRegex.MatchString(version) {
+		return errors.ErrOAuthGraphVersionInvalid
+	}
+	// Compare integers, not floats: float64 rounds a long fractional minor such as
+	// 18.9999999999999999 up to 19.0. The minor never lifts the floor (it is always
+	// >= 0) and is left unparsed, so an oversized minor cannot overflow into an accept.
+	major, _, _ := strings.Cut(strings.TrimPrefix(version, "v"), ".")
+	n, err := strconv.Atoi(major)
+	if err != nil || n < 19 {
+		return errors.ErrOAuthGraphVersionInvalid
+	}
+	return nil
+}
+
 func isCookiePath(s string) bool {
 	if s == "" || s[0] != '/' {
 		return false
@@ -854,11 +1127,34 @@ func isCookieDomain(s string) bool {
 
 var (
 	dsnParamRegex        = regexp.MustCompile(`(?i)\b(host|dbname)\b\s*=\s*(?:'(?:\\.|[^'\\])*'|"(?:\\.|[^"\\])*"|\S+)`)
+	graphVersionRegex    = regexp.MustCompile(`^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$`)
 	urlSchemePrefixRegex = regexp.MustCompile(`^(?:[a-zA-Z][a-zA-Z0-9+.-]*:)?//`)
 	dsnSecretRegex       = regexp.MustCompile(`(?i)\b(password|pass|token|secret|api_key|apikey|sslpassword)\b(\s*=\s*)(?:'(?:\\.|[^'\\])*'|"(?:\\.|[^"\\])*"|\S+)`)
 	userinfoRegex        = regexp.MustCompile(`://([^:]+):([^@]+)@`)
 	mysqlUserinfoRegex   = regexp.MustCompile(`(^|[^\w/])([a-zA-Z0-9_\-\.]+):(.+)@((?:tcp|unix)\([^\)]+\)|[a-zA-Z0-9_\-\.]*\/|$)`)
+	tenantGUIDRegex      = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+	tenantDomainRegex    = regexp.MustCompile(`^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}$`)
 )
+
+// isMicrosoftTenantRef reports whether tenant is a GUID or domain name.
+// Callers must lowercase tenant first; named authorities are handled separately.
+func isMicrosoftTenantRef(tenant string) bool {
+	return tenantGUIDRegex.MatchString(tenant) || tenantDomainRegex.MatchString(tenant)
+}
+
+// normalizeMicrosoftTenant lowercases and trims tenant, then rejects anything
+// that is not a named authority, GUID, or domain.
+func normalizeMicrosoftTenant(tenant string) (string, error) {
+	tenant = strings.ToLower(strings.TrimSpace(tenant))
+	switch tenant {
+	case "", "common", "organizations", "consumers":
+		return tenant, nil
+	}
+	if !isMicrosoftTenantRef(tenant) {
+		return "", errors.WrapOverride(errors.ErrOAuthTenantInvalid, errors.CodeInvalidConfig, "oauth microsoft tenant is invalid: "+tenant)
+	}
+	return tenant, nil
+}
 
 func isSecretParam(k string) bool {
 	switch strings.ToLower(k) {
@@ -950,3 +1246,7 @@ func (c Config) String() string {
 	return fmt.Sprintf("Config{DatabaseURL: %s, BaseURL: %s, MigrationsPath: %s, MaxOpenConns: %d, MaxIdleConns: %d}",
 		RedactURL(c.DatabaseURL), c.BaseURL, c.MigrationsPath, c.MaxOpenConns, c.MaxIdleConns)
 }
+
+// GoString implements fmt.GoStringer so %#v masks DatabaseURL and every nested
+// secret-bearing section.
+func (c Config) GoString() string { return "config." + c.String() }

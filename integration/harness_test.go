@@ -5,6 +5,7 @@ package integration
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"net/url"
 	"os"
 	"strings"
@@ -28,6 +29,69 @@ func resolveDatabaseURL() string {
 		return u
 	}
 	return defaultTestDBURL
+}
+
+// testSchemaTables are the tables this suite owns. The reset drops exactly these
+// plus the migration bookkeeping, never the whole public schema: an unrelated table
+// in the target database survives, and a -run selection that never connects only
+// loses data this suite created anyway.
+var testSchemaTables = []string{
+	"claimed_emails",
+	"two_factor_tokens",
+	"totp_used_codes",
+	"totp_secrets",
+	"oauth_accounts",
+	"password_reset_tokens",
+	"verification_tokens",
+	"sessions",
+	"users",
+	"schema_migrations",
+}
+
+// TestMain resets the suite's tables and migration state once per run. This suite
+// is destructive by design (it truncates every table and drives migrations down and
+// up), and a run that dies mid-migration leaves schema_migrations dirty, which
+// fails every later run before it reaches a test. Dropping the suite's own tables
+// removes that state instead of forcing a guessed version over a possibly real
+// defect.
+func TestMain(m *testing.M) {
+	reachable, err := resetTestSchema(resolveDatabaseURL())
+	if err != nil {
+		if reachable {
+			// The database is up but the reset failed: running on the dirty state is
+			// exactly what the reset exists to prevent, so fail the package.
+			fmt.Fprintf(os.Stderr, "integration: schema reset failed: %v\n", err)
+			os.Exit(1)
+		}
+		// An unreachable database must not fail the package: each test skips itself
+		// when PostgreSQL is absent.
+		fmt.Fprintf(os.Stderr, "integration: schema reset skipped: %v\n", err)
+	}
+	os.Exit(m.Run())
+}
+
+// resetTestSchema drops the tables this suite owns so migrations start from version
+// zero, whatever a previous interrupted run left behind. reachable reports whether
+// the database answered at all, so a reset failure on a live database can be told
+// apart from an absent one. It targets the dedicated test database resolved by
+// resolveDatabaseURL; never point TEST_DATABASE_URL at a database whose contents
+// matter.
+func resetTestSchema(dbURL string) (reachable bool, err error) {
+	sqlDB, err := sql.Open("pgx", dbURL)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = sqlDB.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := sqlDB.PingContext(ctx); err != nil {
+		return false, err
+	}
+	if _, err := sqlDB.ExecContext(ctx, "DROP TABLE IF EXISTS "+strings.Join(testSchemaTables, ", ")+" CASCADE"); err != nil {
+		return true, err
+	}
+	return true, nil
 }
 
 // testConfig returns a standard configuration tuned for integration testing:
@@ -93,7 +157,7 @@ func setupDB(t *testing.T) (*gorm.DB, config.Config) {
 // truncateTables clears all test tables with CASCADE between tests.
 func truncateTables(t *testing.T, database *gorm.DB) {
 	t.Helper()
-	err := database.Exec("TRUNCATE TABLE users, sessions, verification_tokens, password_reset_tokens, oauth_accounts, totp_secrets, totp_used_codes, two_factor_tokens CASCADE").Error
+	err := database.Exec("TRUNCATE TABLE users, sessions, verification_tokens, password_reset_tokens, oauth_accounts, totp_secrets, totp_used_codes, two_factor_tokens, claimed_emails CASCADE").Error
 	if err != nil {
 		t.Fatalf("failed to truncate test tables: %v", err)
 	}

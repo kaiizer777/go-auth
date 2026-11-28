@@ -32,6 +32,11 @@ func TestValidateEmail(t *testing.T) {
 		{name: "leading dot in domain", email: "user@.example.com", wantError: true, wantCode: errors.CodeInvalidEmail},
 		{name: "consecutive dots in domain", email: "user@example..com", wantError: true, wantCode: errors.CodeInvalidEmail},
 		{name: "missing local part", email: "@example.com", wantError: true, wantCode: errors.CodeInvalidEmail},
+		{name: "whitespace only spaces", email: "   ", wantError: true, wantCode: errors.CodeInvalidEmail},
+		{name: "whitespace only tabs", email: "\t\t", wantError: true, wantCode: errors.CodeInvalidEmail},
+		{name: "whitespace only mixed", email: " \t \r\n ", wantError: true, wantCode: errors.CodeInvalidEmail},
+		{name: "tab in email", email: "user\t@example.com", wantError: true, wantCode: errors.CodeInvalidEmail},
+		{name: "newline in email", email: "user\n@example.com", wantError: true, wantCode: errors.CodeInvalidEmail},
 		{name: "exceeds max length of 255", email: strings.Repeat("a", 250) + "@example.com", wantError: true, wantCode: errors.CodeInvalidEmail},
 	}
 

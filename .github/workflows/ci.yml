@@ -146,6 +146,47 @@ jobs:
           DATABASE_URL: postgres://postgres:postgrespassword@localhost:5432/goauth_test?sslmode=disable
         run: go test -v -race -tags=e2e -count=1 -timeout=10m ./e2e/...
 
+  mongodb:
+    name: MongoDB Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      mongo:
+        image: mongo:7
+        ports:
+          - 27017:27017
+        options: >-
+          --health-cmd "mongosh --quiet --eval 'db.adminCommand({ping: 1}).ok'"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version: '1.26.11'
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Vet MongoDB Tests
+        run: go vet -tags=mongodb ./db/mongo/...
+
+      - name: Run MongoDB Tests
+        shell: bash
+        env:
+          TEST_MONGO_URI: mongodb://localhost:27017
+        run: |
+          set -eo pipefail
+          go test -v -race -tags=mongodb -shuffle=on -count=1 -timeout=10m ./db/mongo/... | tee mongo-test.log
+          # Untagged tests pass with the tag dropped, so require live-test evidence.
+          if ! grep -q '^--- PASS: TestBackfillOAuthAccountVerified (' mongo-test.log; then
+            echo "live MongoDB tests did not run: expected TestBackfillOAuthAccountVerified to pass"
+            exit 1
+          fi
+
   quality:
     name: Format, Module & Lint
     runs-on: ubuntu-latest

@@ -3,6 +3,7 @@ package matrix_test
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
@@ -13,6 +14,73 @@ import (
 	"github.com/kaiizer777/go-auth/db"
 	"github.com/kaiizer777/go-auth/errors"
 )
+
+func TestMatrix_ClaimedEmailLifecycle(t *testing.T) {
+	runMatrix(t, func(t *testing.T, adapter TestAdapter) {
+		ctx := context.Background()
+		store := adapter.Store
+		suffix := uuid.New().String()[:8]
+		addr := "claimed_" + suffix + "@example.com"
+		owner := createTestUser(t, store, "claim_owner_"+suffix+"@example.com", "Password#2026!", true)
+		rival := createTestUser(t, store, "claim_rival_"+suffix+"@example.com", "Password#2026!", true)
+
+		// The key is the Go-normalised address on every adapter.
+		if err := store.ClaimedEmails().Claim(ctx, "  "+strings.ToUpper(addr)+" ", owner.ID, false); err != nil {
+			t.Fatalf("claim: %v", err)
+		}
+		claim, err := store.ClaimedEmails().Get(ctx, addr)
+		if err != nil {
+			t.Fatalf("get: %v", err)
+		}
+		if claim.OwnerUserID != owner.ID || claim.Verified {
+			t.Fatalf("claim = %+v; want holder %v, unverified", claim, owner.ID)
+		}
+		if err := store.ClaimedEmails().Claim(ctx, addr, owner.ID, false); err != nil {
+			t.Fatalf("same-owner re-claim: %v", err)
+		}
+		if err := store.ClaimedEmails().Claim(ctx, addr, owner.ID, true); err != nil {
+			t.Fatalf("promote: %v", err)
+		}
+		if claim, err = store.ClaimedEmails().Get(ctx, addr); err != nil || !claim.Verified {
+			t.Fatalf("claim after promote = %+v, %v; want verified", claim, err)
+		}
+		if err := store.ClaimedEmails().Claim(ctx, addr, rival.ID, true); !errors.Is(err, errors.ErrEmailClaimed) {
+			t.Fatalf("foreign claim = %v; want ErrEmailClaimed", err)
+		}
+		if err := store.ClaimedEmails().Claim(ctx, "   ", owner.ID, true); err != nil {
+			t.Fatalf("empty claim: %v", err)
+		}
+
+		// A non-holder's release is a no-op; the holder's frees the address.
+		if err := store.ClaimedEmails().Release(ctx, addr, rival.ID); err != nil {
+			t.Fatalf("foreign release: %v", err)
+		}
+		if _, err := store.ClaimedEmails().Get(ctx, addr); err != nil {
+			t.Fatalf("claim disappeared after a foreign release: %v", err)
+		}
+		if err := store.ClaimedEmails().Release(ctx, addr, owner.ID); err != nil {
+			t.Fatalf("release: %v", err)
+		}
+		if _, err := store.ClaimedEmails().Get(ctx, addr); !errors.Is(err, gorm.ErrRecordNotFound) {
+			t.Fatalf("claim after release, err = %v; want not found", err)
+		}
+
+		// Deleting the holder releases its claims, and the address becomes
+		// claimable by another account.
+		if err := store.ClaimedEmails().Claim(ctx, addr, rival.ID, true); err != nil {
+			t.Fatalf("re-claim: %v", err)
+		}
+		if err := store.Users().Delete(ctx, rival.ID); err != nil {
+			t.Fatalf("delete holder: %v", err)
+		}
+		if _, err := store.ClaimedEmails().Get(ctx, addr); !errors.Is(err, gorm.ErrRecordNotFound) {
+			t.Fatalf("claim survived its holder's deletion, err = %v", err)
+		}
+		if err := store.ClaimedEmails().Claim(ctx, addr, owner.ID, false); err != nil {
+			t.Fatalf("claim after deletion: %v", err)
+		}
+	})
+}
 
 func TestMatrix_UserLifecycle(t *testing.T) {
 	runMatrix(t, func(t *testing.T, adapter TestAdapter) {
@@ -102,7 +170,7 @@ func TestMatrix_UserLifecycle(t *testing.T) {
 		}
 
 		// 4. Session Creation & Validation
-		sess, rawSessionToken, err := app.Session.CreateSession(ctx, user.ID, 0, db.SessionTypeBearer, "127.0.0.1", "MatrixUserAgent/1.0")
+		sess, rawSessionToken, err := app.Session.CreateSession(ctx, verifiedUser.ID, verifiedUser.CredentialVersion, db.SessionTypeBearer, "127.0.0.1", "MatrixUserAgent/1.0")
 		if err != nil {
 			t.Fatalf("CreateSession failed: %v", err)
 		}

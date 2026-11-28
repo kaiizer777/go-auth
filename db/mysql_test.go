@@ -57,8 +57,8 @@ func TestMySQLDefaultMigrationsEmbedded(t *testing.T) {
 		current = next
 	}
 
-	if count != 8 {
-		t.Fatalf("expected 8 mysql migration versions, found %d", count)
+	if count != 14 {
+		t.Fatalf("expected 14 mysql migration versions, found %d", count)
 	}
 }
 
@@ -191,6 +191,51 @@ func TestMySQLMigration000008_DownRefusesOnTotpSecrets(t *testing.T) {
 	}
 }
 
+func TestMySQLMigration000009_AddsVerifiedFlag(t *testing.T) {
+	data, err := defaultMigrationsFS.ReadFile("migrations/mysql/000009_add_oauth_account_verified.up.sql")
+	if err != nil {
+		t.Fatalf("failed to read mysql migration 9 up: %v", err)
+	}
+	content := string(data)
+
+	alterIdx := strings.Index(content, "ALTER TABLE oauth_accounts ADD COLUMN")
+	if alterIdx == -1 || !strings.Contains(content, "verified TINYINT(1) NOT NULL DEFAULT 0") {
+		t.Fatal("mysql migration 9 up must add oauth_accounts.verified as TINYINT(1) NOT NULL DEFAULT 0")
+	}
+	backfillIdx := strings.Index(content, "UPDATE oauth_accounts SET verified = 1")
+	if backfillIdx == -1 {
+		t.Fatal("mysql migration 9 up must backfill verified from the owning account")
+	}
+	if alterIdx > backfillIdx {
+		t.Errorf("mysql migration 9 column add (idx %d) must precede the backfill (idx %d)", alterIdx, backfillIdx)
+	}
+	backfill := content[backfillIdx:]
+	if semi := strings.Index(backfill, ";"); semi != -1 {
+		backfill = backfill[:semi]
+	}
+	if !strings.Contains(backfill, "users.email_verified = 1") {
+		t.Errorf("mysql migration 9 backfill must gate trust on users.email_verified: %q", backfill)
+	}
+	if !strings.Contains(backfill, "users.id = oauth_accounts.user_id") {
+		t.Errorf("mysql migration 9 backfill must correlate the link to its owning user: %q", backfill)
+	}
+
+	downData, err := defaultMigrationsFS.ReadFile("migrations/mysql/000009_add_oauth_account_verified.down.sql")
+	if err != nil {
+		t.Fatalf("failed to read mysql migration 9 down: %v", err)
+	}
+	downContent := string(downData)
+	if !strings.Contains(downContent, "ALTER TABLE oauth_accounts DROP COLUMN") || !strings.Contains(downContent, "verified") {
+		t.Error("mysql migration 9 down must drop the verified column")
+	}
+	if strings.Contains(strings.ToUpper(downContent), "DROP TABLE") {
+		t.Error("mysql migration 9 down must drop only the column, never the links table")
+	}
+	if strings.Contains(downContent, "loses no identity data") {
+		t.Error("mysql migration 9 down must not claim the rollback is lossless")
+	}
+}
+
 func TestMySQLMigration000002_SessionTimestampIndexes(t *testing.T) {
 	data, err := defaultMigrationsFS.ReadFile("migrations/mysql/000002_create_sessions.up.sql")
 	if err != nil {
@@ -285,6 +330,31 @@ func TestNormalizeMySQLError(t *testing.T) {
 			name:    "oauth account duplicate via string",
 			err:     stderrors.New("Error 1062 (23000): Duplicate entry 'p-uid' for key 'uq_oauth_accounts_provider_uid'"),
 			wantErr: errors.ErrOAuthAccountAlreadyLinked,
+		},
+		{
+			name:    "claimed email duplicate via MySQLError",
+			err:     &mysqlDriver.MySQLError{Number: 1062, Message: "Duplicate entry 'a@b.example' for key 'claimed_emails.PRIMARY'"},
+			wantErr: errors.ErrEmailClaimed,
+		},
+		{
+			name:    "claimed email duplicate via postgres string",
+			err:     stderrors.New("ERROR: duplicate key value violates unique constraint \"uq_claimed_emails_email\" (SQLSTATE 23505)"),
+			wantErr: errors.ErrEmailClaimed,
+		},
+		{
+			name:    "claimed email primary key via postgres string",
+			err:     stderrors.New("ERROR: duplicate key value violates unique constraint \"claimed_emails_pkey\" (SQLSTATE 23505)"),
+			wantErr: errors.ErrEmailClaimed,
+		},
+		{
+			name:    "users duplicate whose value contains the claim table name",
+			err:     stderrors.New("Error 1062 (23000): Duplicate entry 'claimed_emails@example.com' for key 'users.idx_users_email_lower'"),
+			wantErr: errors.ErrEmailAlreadyExists,
+		},
+		{
+			name:    "claimed email foreign key is not a claim conflict",
+			err:     stderrors.New("ERROR: insert or update on table \"claimed_emails\" violates foreign key constraint \"fk_claimed_emails_owner_user_id\" (SQLSTATE 23503)"),
+			wantErr: errors.ErrUserNotFound,
 		},
 		{
 			name:    "unmapped 1062 key returns original error",
@@ -460,5 +530,141 @@ func TestPrepareMySQLMigrationDSN_MultiStatements(t *testing.T) {
 	var appErr *errors.Error
 	if !errors.As(err, &appErr) || appErr.Code() != errors.CodeDatabaseError {
 		t.Fatalf("expected CodeDatabaseError, got: %v", err)
+	}
+}
+
+func TestMySQLMigration000010_DeduplicatesMicrosoftOIDLinks(t *testing.T) {
+	data, err := defaultMigrationsFS.ReadFile("migrations/mysql/000010_resolve_microsoft_oid_links.up.sql")
+	if err != nil {
+		t.Fatalf("failed to read mysql migration 10 up: %v", err)
+	}
+	content := string(data)
+	if !strings.Contains(content, "DELETE a FROM oauth_accounts a") {
+		t.Fatal("mysql migration 10 up must delete duplicate oauth_accounts")
+	}
+	if !strings.Contains(content, "a.provider_id = 'microsoft'") {
+		t.Fatal("mysql migration 10 up must be scoped to microsoft provider")
+	}
+
+	downData, err := defaultMigrationsFS.ReadFile("migrations/mysql/000010_resolve_microsoft_oid_links.down.sql")
+	if err != nil {
+		t.Fatalf("failed to read mysql migration 10 down: %v", err)
+	}
+	if len(downData) == 0 {
+		t.Fatal("mysql migration 10 down file must exist")
+	}
+}
+
+// TestMySQLMigration000011_TenantQualifiesIdentityKey mirrors the Postgres
+// assertions on MySQL's non-transactional DDL.
+func TestMySQLMigration000011_TenantQualifiesIdentityKey(t *testing.T) {
+	data, err := defaultMigrationsFS.ReadFile("migrations/mysql/000011_add_oauth_account_tenant.up.sql")
+	if err != nil {
+		t.Fatalf("failed to read mysql migration 11 up: %v", err)
+	}
+	content := string(data)
+
+	columnIdx := strings.Index(content, "ADD COLUMN provider_tenant_id VARCHAR(64)")
+	if columnIdx == -1 {
+		t.Fatalf("mysql migration 11 up must add provider_tenant_id: %q", content)
+	}
+	columnStmt := upToSemicolon(content[columnIdx:])
+	if !strings.Contains(columnStmt, "NOT NULL") {
+		t.Fatal("mysql migration 11 up must require the tenant")
+	}
+	if strings.Contains(columnStmt, "DEFAULT") {
+		t.Fatalf("mysql migration 11 up must not default the tenant: %q", columnStmt)
+	}
+
+	guardIdx := strings.Index(content, "INSERT INTO oauth_accounts")
+	if guardIdx == -1 {
+		t.Fatal("mysql migration 11 up must refuse a non-empty oauth_accounts table")
+	}
+	if guardIdx > columnIdx {
+		t.Errorf("mysql migration 11 empty-table guard must run before the column add: guard=%d column=%d", guardIdx, columnIdx)
+	}
+	if !strings.Contains(content[guardIdx:columnIdx], "FROM oauth_accounts LIMIT 1") {
+		t.Fatal("mysql migration 11 guard must copy at most one existing row back into the table")
+	}
+	for _, privileged := range []string{"PROCEDURE", "TEMPORARY TABLE"} {
+		if strings.Contains(content, privileged) {
+			t.Fatalf("mysql migration 11 guard must not need %s privileges", privileged)
+		}
+	}
+
+	newKeyIdx := strings.Index(content, "CREATE UNIQUE INDEX uq_oauth_accounts_provider_tenant_uid")
+	if newKeyIdx == -1 {
+		t.Fatal("mysql migration 11 up must create the tenant-qualified unique index")
+	}
+	if !strings.Contains(content[newKeyIdx:], "(provider_id, provider_tenant_id, provider_user_id)") {
+		t.Fatal("mysql migration 11 up must key uniqueness on provider, tenant and provider user id")
+	}
+
+	dropOldIdx := strings.Index(content, "DROP INDEX uq_oauth_accounts_provider_uid")
+	if dropOldIdx == -1 {
+		t.Fatal("mysql migration 11 up must drop the tenant-blind unique constraint")
+	}
+	if columnIdx > newKeyIdx || newKeyIdx > dropOldIdx {
+		t.Errorf("mysql migration 11 ordering must be column, new index, drop old constraint: column=%d new=%d drop=%d", columnIdx, newKeyIdx, dropOldIdx)
+	}
+
+	downData, err := defaultMigrationsFS.ReadFile("migrations/mysql/000011_add_oauth_account_tenant.down.sql")
+	if err != nil {
+		t.Fatalf("failed to read mysql migration 11 down: %v", err)
+	}
+	if !strings.Contains(string(downData), "DROP COLUMN provider_tenant_id") {
+		t.Fatal("mysql migration 11 down must drop the tenant column it added")
+	}
+}
+
+// TestMySQLMigration000012_AddsOAuthAccountTokens mirrors the postgres pin: five
+// token columns, NOT NULL without a non-empty default, nullable expiry, and a
+// down migration that drops exactly those five.
+func TestMySQLMigration000012_AddsOAuthAccountTokens(t *testing.T) {
+	data, err := defaultMigrationsFS.ReadFile("migrations/mysql/000012_add_oauth_account_tokens.up.sql")
+	if err != nil {
+		t.Fatalf("failed to read mysql migration 12 up: %v", err)
+	}
+	content := string(data)
+
+	columns := []struct{ name, definition string }{
+		{"access_token_ciphertext", "TEXT NOT NULL"},
+		{"refresh_token_ciphertext", "TEXT NOT NULL"},
+		{"refresh_token_fingerprint", "VARCHAR(64) NOT NULL DEFAULT ''"},
+		{"token_expires_at", "DATETIME(6) NULL"},
+		{"token_scope", "TEXT NOT NULL"},
+	}
+
+	lastIdx := -1
+	for _, column := range columns {
+		statement := "ADD COLUMN " + column.name + " " + column.definition + ";"
+		idx := strings.Index(content, statement)
+		if idx == -1 {
+			t.Fatalf("mysql migration 12 up must contain %q", statement)
+		}
+		if idx < lastIdx {
+			t.Errorf("mysql migration 12 up adds %s out of model order", column.name)
+		}
+		lastIdx = idx
+		if strings.Contains(statement, "DEFAULT") && !strings.Contains(statement, "DEFAULT ''") {
+			t.Errorf("mysql migration 12 up must not give %s a non-empty default: %q", column.name, statement)
+		}
+	}
+
+	downData, err := defaultMigrationsFS.ReadFile("migrations/mysql/000012_add_oauth_account_tokens.down.sql")
+	if err != nil {
+		t.Fatalf("failed to read mysql migration 12 down: %v", err)
+	}
+	down := string(downData)
+	if drops := strings.Count(down, "DROP COLUMN "); drops != len(columns) {
+		t.Fatalf("mysql migration 12 down must drop exactly %d columns, got %d: %q", len(columns), drops, down)
+	}
+	for _, column := range columns {
+		if !strings.Contains(down, "DROP COLUMN "+column.name+";") {
+			t.Errorf("mysql migration 12 down must drop %s", column.name)
+		}
+	}
+	if strings.Contains(strings.ToUpper(down), "DROP TABLE") {
+		t.Error("mysql migration 12 down must drop only the token columns, never the links table")
 	}
 }

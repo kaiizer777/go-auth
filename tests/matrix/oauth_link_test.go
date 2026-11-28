@@ -40,7 +40,7 @@ func TestMatrix_OAuthLink(t *testing.T) {
 		}
 
 		// 2. Lookup by Provider
-		fetched, err := store.OAuthAccounts().GetByProvider(ctx, providerID, providerUserID)
+		fetched, err := store.OAuthAccounts().GetByProvider(ctx, providerID, "", providerUserID)
 		if err != nil {
 			t.Fatalf("GetByProvider failed: %v", err)
 		}
@@ -98,12 +98,12 @@ func TestMatrix_OAuthLink(t *testing.T) {
 			t.Fatalf("failed to insert lower-case provider subject: %v", errLower)
 		}
 
-		fetchedUpper, err := store.OAuthAccounts().GetByProvider(ctx, "google", upperSubject)
+		fetchedUpper, err := store.OAuthAccounts().GetByProvider(ctx, "google", "", upperSubject)
 		if err != nil || fetchedUpper.UserID != userCaseUpper.ID {
 			t.Fatalf("upper subject mismatch: err=%v, user=%v, want=%v", err, fetchedUpper.UserID, userCaseUpper.ID)
 		}
 
-		fetchedLower, err := store.OAuthAccounts().GetByProvider(ctx, "google", lowerSubject)
+		fetchedLower, err := store.OAuthAccounts().GetByProvider(ctx, "google", "", lowerSubject)
 		if err != nil || fetchedLower.UserID != userCaseLower.ID {
 			t.Fatalf("lower subject mismatch: err=%v, user=%v, want=%v", err, fetchedLower.UserID, userCaseLower.ID)
 		}
@@ -129,7 +129,7 @@ func TestMatrix_OAuthLink(t *testing.T) {
 		}
 
 		// Assert linked account cascaded away
-		_, err = store.OAuthAccounts().GetByProvider(ctx, providerID, providerUserID)
+		_, err = store.OAuthAccounts().GetByProvider(ctx, providerID, "", providerUserID)
 		if err == nil {
 			t.Fatal("expected linked OAuth account to be deleted by cascade, but found it")
 		} else if !errors.Is(err, gorm.ErrRecordNotFound) && !errors.Is(err, mongo.ErrNoDocuments) {

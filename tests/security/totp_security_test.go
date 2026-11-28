@@ -3,6 +3,7 @@ package security_test
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -958,39 +959,83 @@ func TestDualKeyRateLimit_User(t *testing.T) {
 	}
 }
 
-// 16. TestAESCiphertextTampering: bit-flip in nonce, ciphertext, or tag fails GCM tag check.
-func TestAESCiphertextTampering(t *testing.T) {
+// 16. TestEnvelopeSecretTampering: bit flips in the ciphertext, nonce, kid or
+// header fail authentication, truncated blobs fail, and a secret sealed for one
+// user never opens for another.
+func TestEnvelopeSecretTampering(t *testing.T) {
 	t.Parallel()
-	c, err := totp.NewCrypto(secEncryptionKey)
+
+	c, err := totp.NewCrypto(config.TOTPConfig{EncryptionKey: secEncryptionKey})
 	if err != nil {
 		t.Fatalf("new crypto: %v", err)
 	}
 
+	owner := uuid.New()
 	secret := []byte("JBSWY3DPEHPK3PXP")
-	encrypted, err := c.Encrypt(secret)
+	sealed, err := c.Encrypt(owner, secret)
 	if err != nil {
 		t.Fatalf("encrypt secret: %v", err)
 	}
-
-	// 1. Bit flip in nonce (first 12 bytes)
-	tamperedNonce := make([]byte, len(encrypted))
-	copy(tamperedNonce, encrypted)
-	tamperedNonce[2] ^= 0x01
-	if _, err := c.Decrypt(tamperedNonce); err == nil {
-		t.Fatal("expected decryption error with tampered nonce")
+	if plaintext, err := c.Decrypt(owner, sealed); err != nil || !bytes.Equal(plaintext, secret) {
+		t.Fatalf("roundtrip = (%q, %v)", plaintext, err)
 	}
 
-	// 2. Bit flip in ciphertext / tag
-	tamperedPayload := make([]byte, len(encrypted))
-	copy(tamperedPayload, encrypted)
-	tamperedPayload[len(tamperedPayload)-1] ^= 0x01
-	if _, err := c.Decrypt(tamperedPayload); err == nil {
-		t.Fatal("expected decryption error with tampered ciphertext/tag")
+	var envelope map[string]any
+	if err := json.Unmarshal(sealed, &envelope); err != nil {
+		t.Fatalf("stored secret is not an envelope: %v", err)
 	}
 
-	// 3. Truncated ciphertext (< 12 bytes)
-	if _, err := c.Decrypt([]byte("short")); err == nil {
-		t.Fatal("expected decryption error on truncated blob")
+	flip := func(t *testing.T, value string) string {
+		t.Helper()
+		raw, err := base64.RawURLEncoding.DecodeString(value)
+		if err != nil {
+			t.Fatalf("decode %q: %v", value, err)
+		}
+		raw[0] ^= 0x01
+		return base64.RawURLEncoding.EncodeToString(raw)
+	}
+
+	mutations := []struct {
+		name   string
+		mutate func(map[string]any)
+	}{
+		{name: "ciphertext flipped", mutate: func(doc map[string]any) { doc["ct"] = flip(t, envelope["ct"].(string)) }},
+		{name: "nonce flipped", mutate: func(doc map[string]any) { doc["n"] = flip(t, envelope["n"].(string)) }},
+		{name: "kid swapped", mutate: func(doc map[string]any) { doc["kid"] = "rotated" }},
+		{name: "version bumped", mutate: func(doc map[string]any) { doc["v"] = 2 }},
+	}
+
+	for _, mutation := range mutations {
+		t.Run(mutation.name, func(t *testing.T) {
+			t.Parallel()
+
+			doc := make(map[string]any, len(envelope))
+			for key, value := range envelope {
+				doc[key] = value
+			}
+			mutation.mutate(doc)
+			tampered, err := json.Marshal(doc)
+			if err != nil {
+				t.Fatalf("re-encode envelope: %v", err)
+			}
+			if plaintext, err := c.Decrypt(owner, tampered); err == nil {
+				t.Fatalf("tampered %s decrypted to %q; expected authentication failure", mutation.name, plaintext)
+			}
+		})
+	}
+
+	t.Run("cross-user transplant", func(t *testing.T) {
+		t.Parallel()
+
+		if plaintext, err := c.Decrypt(uuid.New(), sealed); err == nil {
+			t.Fatalf("another user's row opened to %q; envelope is not owner-bound", plaintext)
+		}
+	})
+
+	for _, blob := range [][]byte{nil, {}, []byte("short")} {
+		if _, err := c.Decrypt(owner, blob); err == nil {
+			t.Fatalf("decrypting blob of len %d succeeded, expected error", len(blob))
+		}
 	}
 }
 

@@ -125,6 +125,30 @@ func setupTestDB(t *testing.T) *gorm.DB {
 		expires_at DATETIME NOT NULL,
 		created_at DATETIME
 	);
+	CREATE TABLE IF NOT EXISTS claimed_emails (
+		email VARCHAR(255) PRIMARY KEY,
+		owner_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		verified INTEGER NOT NULL DEFAULT 0,
+		created_at DATETIME,
+		updated_at DATETIME
+	);
+	CREATE TABLE IF NOT EXISTS oauth_accounts (
+		id TEXT PRIMARY KEY,
+		user_id TEXT NOT NULL,
+		provider_id VARCHAR(32) NOT NULL,
+		provider_tenant_id VARCHAR(64) NOT NULL,
+		provider_user_id VARCHAR(255) NOT NULL,
+		email VARCHAR(255) NOT NULL,
+		verified INTEGER NOT NULL DEFAULT 0,
+		access_token_ciphertext TEXT NOT NULL DEFAULT '',
+		refresh_token_ciphertext TEXT NOT NULL DEFAULT '',
+		refresh_token_fingerprint CHAR(64) NOT NULL DEFAULT '',
+		token_expires_at DATETIME,
+		token_scope TEXT NOT NULL DEFAULT '',
+		created_at DATETIME,
+		updated_at DATETIME,
+		CONSTRAINT uq_oauth_accounts_provider_tenant_uid UNIQUE (provider_id, provider_tenant_id, provider_user_id)
+	);
 	CREATE TABLE IF NOT EXISTS sessions (
 		id TEXT PRIMARY KEY,
 		user_id TEXT NOT NULL,
@@ -902,6 +926,37 @@ func Test500InternalErrorMasking(t *testing.T) {
 }
 
 // Additional Routing & Alias Tests
+// TestSignupRejectsUnclaimableAddress is the end-to-end guard for the folded
+// length rule: an address whose normalised form exceeds the claim key limit is a
+// request error, and no user or claim row is created.
+func TestSignupRejectsUnclaimableAddress(t *testing.T) {
+	database, _, h, _ := setupTestEnv(t)
+
+	const domain = "@example.com"
+	long := strings.Repeat("a", 255-len(domain)-len("Ⱥ")) + "Ⱥ" + domain
+	rec := executeRequest(t, h, http.MethodPost, "/auth/signup", db.SignupRequest{
+		Email:    long,
+		Password: "ValidPassword123#",
+	})
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("signup status = %d; want 400", rec.Code)
+	}
+	errResp := decodeResponseBody[errors.Response](t, rec)
+	if errResp.Code != errors.CodeInvalidEmail {
+		t.Fatalf("signup code = %s; want %s", errResp.Code, errors.CodeInvalidEmail)
+	}
+	var users, claims int64
+	if err := database.Model(&db.User{}).Count(&users).Error; err != nil {
+		t.Fatalf("count users: %v", err)
+	}
+	if err := database.Model(&db.ClaimedEmail{}).Count(&claims).Error; err != nil {
+		t.Fatalf("count claims: %v", err)
+	}
+	if users != 0 || claims != 0 {
+		t.Fatalf("users=%d claims=%d; an unclaimable signup must create neither", users, claims)
+	}
+}
+
 func TestRoutingAndAliases(t *testing.T) {
 	_, svc, h, _ := setupTestEnv(t)
 

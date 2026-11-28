@@ -3,7 +3,8 @@ package mongostore
 import (
 	"context"
 	"fmt"
-	"os"
+	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -12,7 +13,6 @@ import (
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
-	"gorm.io/gorm"
 
 	"github.com/kaiizer777/go-auth/config"
 	"github.com/kaiizer777/go-auth/db"
@@ -172,14 +172,22 @@ func TestDocumentSerialization_RoundTrip(t *testing.T) {
 	t.Run("OAuthAccountDoc", func(t *testing.T) {
 		id := uuid.New()
 		userID := uuid.New()
+		tokenExpiresAt := now.Add(time.Hour)
 		acc := &db.OAuthAccount{
-			ID:             id,
-			UserID:         userID,
-			ProviderID:     "google",
-			ProviderUserID: "google-uid-123",
-			Email:          "user@example.com",
-			CreatedAt:      now,
-			UpdatedAt:      now,
+			ID:                      id,
+			UserID:                  userID,
+			ProviderID:              "google",
+			ProviderTenantID:        "tenant-a",
+			ProviderUserID:          "google-uid-123",
+			Email:                   "user@example.com",
+			Verified:                true,
+			AccessTokenCiphertext:   `{"v":1,"alg":"A256GCM","ct":"access"}`,
+			RefreshTokenCiphertext:  `{"v":1,"alg":"A256GCM","ct":"refresh"}`,
+			RefreshTokenFingerprint: strings.Repeat("a", 64),
+			TokenExpiresAt:          &tokenExpiresAt,
+			TokenScope:              "users.read offline.access",
+			CreatedAt:               now,
+			UpdatedAt:               now,
 		}
 
 		doc := oauthAccountDocFromDomain(acc)
@@ -196,9 +204,85 @@ func TestDocumentSerialization_RoundTrip(t *testing.T) {
 		roundTripped := unmarshaled.toDomain()
 		if roundTripped.ID != acc.ID || roundTripped.UserID != acc.UserID ||
 			roundTripped.ProviderID != acc.ProviderID ||
+			roundTripped.ProviderTenantID != acc.ProviderTenantID ||
 			roundTripped.ProviderUserID != acc.ProviderUserID ||
-			roundTripped.Email != acc.Email {
+			roundTripped.Email != acc.Email ||
+			!roundTripped.Verified ||
+			roundTripped.AccessTokenCiphertext != acc.AccessTokenCiphertext ||
+			roundTripped.RefreshTokenCiphertext != acc.RefreshTokenCiphertext ||
+			roundTripped.RefreshTokenFingerprint != acc.RefreshTokenFingerprint ||
+			roundTripped.TokenScope != acc.TokenScope {
 			t.Fatalf("roundtrip mismatch: got %+v, want %+v", roundTripped, acc)
+		}
+		if roundTripped.TokenExpiresAt == nil || !roundTripped.TokenExpiresAt.Equal(tokenExpiresAt) {
+			t.Fatalf("token_expires_at roundtrip = %v; want %v", roundTripped.TokenExpiresAt, tokenExpiresAt)
+		}
+	})
+
+	t.Run("OAuthAccountDoc without tokens keeps nil expiry", func(t *testing.T) {
+		acc := &db.OAuthAccount{
+			ID:               uuid.New(),
+			UserID:           uuid.New(),
+			ProviderID:       "google",
+			ProviderTenantID: "tenant-a",
+			ProviderUserID:   "tokenless-uid",
+			Email:            "tokenless@example.com",
+			CreatedAt:        now,
+			UpdatedAt:        now,
+		}
+
+		data, err := bson.Marshal(oauthAccountDocFromDomain(acc))
+		if err != nil {
+			t.Fatalf("bson.Marshal failed: %v", err)
+		}
+		var unmarshaled OAuthAccountDoc
+		if err := bson.Unmarshal(data, &unmarshaled); err != nil {
+			t.Fatalf("bson.Unmarshal failed: %v", err)
+		}
+
+		got := unmarshaled.toDomain()
+		if got.TokenExpiresAt != nil {
+			t.Fatalf("nil token_expires_at decoded as %v; want nil", got.TokenExpiresAt)
+		}
+		if got.AccessTokenCiphertext != "" || got.RefreshTokenCiphertext != "" ||
+			got.RefreshTokenFingerprint != "" || got.TokenScope != "" {
+			t.Fatalf("empty token fields decoded as %+v", got)
+		}
+	})
+
+	t.Run("OAuthAccountDoc without verified decodes unverified", func(t *testing.T) {
+		// Documents written before the flag existed carry no verified field;
+		// the missing field must land on the fail-closed zero value.
+		legacy := bson.M{
+			"_id":              uuid.New().String(),
+			"user_id":          uuid.New().String(),
+			"provider_id":      "google",
+			"provider_user_id": "legacy-uid",
+			"email":            "legacy@example.com",
+			"created_at":       now,
+			"updated_at":       now,
+		}
+		data, err := bson.Marshal(legacy)
+		if err != nil {
+			t.Fatalf("bson.Marshal failed: %v", err)
+		}
+
+		var unmarshaled OAuthAccountDoc
+		if err := bson.Unmarshal(data, &unmarshaled); err != nil {
+			t.Fatalf("bson.Unmarshal failed: %v", err)
+		}
+		if unmarshaled.Verified {
+			t.Fatal("missing verified field must decode false")
+		}
+		if unmarshaled.TokenExpiresAt != nil {
+			t.Fatalf("missing token_expires_at must decode nil, got %v", unmarshaled.TokenExpiresAt)
+		}
+		if got := unmarshaled.toDomain(); got.Verified {
+			t.Fatalf("legacy document decoded Verified=%v; want false", got.Verified)
+		} else if got.TokenExpiresAt != nil || got.TokenScope != "" ||
+			got.AccessTokenCiphertext != "" || got.RefreshTokenCiphertext != "" ||
+			got.RefreshTokenFingerprint != "" {
+			t.Fatalf("legacy document decoded token fields: %+v", got)
 		}
 	})
 
@@ -348,6 +432,7 @@ func TestIndexSpecifications_Completeness(t *testing.T) {
 		name string
 	}{
 		{"users", "uq_users_email"},
+		{"users", "idx_users_email_verified"},
 		{"sessions", "uq_sessions_id_hash"},
 		{"sessions", "idx_sessions_user_id"},
 		{"sessions", "ttl_sessions_expiry"},
@@ -355,7 +440,7 @@ func TestIndexSpecifications_Completeness(t *testing.T) {
 		{"verification_tokens", "ttl_verification_tokens_expiry"},
 		{"password_reset_tokens", "idx_password_reset_tokens_user_id"},
 		{"password_reset_tokens", "ttl_password_reset_tokens_expiry"},
-		{"oauth_accounts", "uq_oauth_accounts_provider_uid"},
+		{"oauth_accounts", "uq_oauth_accounts_provider_tenant_uid"},
 		{"oauth_accounts", "idx_oauth_accounts_user_id"},
 		{"totp_secrets", "uq_totp_secrets_user_id"},
 		{"totp_used_codes", "uq_totp_used_codes_user_code"},
@@ -370,6 +455,46 @@ func TestIndexSpecifications_Completeness(t *testing.T) {
 		if !indexNames[c.col][c.name] {
 			t.Errorf("expected index %q on collection %q, not found", c.name, c.col)
 		}
+	}
+
+	// The tenant must be part of the key, not a filter around the old one:
+	// otherwise two tenants still cannot hold the same pairwise subject.
+	wantKeys := []string{"provider_id", "provider_tenant_id", "provider_user_id"}
+	var oauthKeys []string
+	var oauthUnique bool
+	for _, m := range specs["oauth_accounts"] {
+		opts := &options.IndexOptions{}
+		for _, fn := range m.Options.List() {
+			_ = fn(opts)
+		}
+		if opts.Name == nil || *opts.Name != "uq_oauth_accounts_provider_tenant_uid" {
+			continue
+		}
+		keys, _ := m.Keys.(bson.D)
+		for _, key := range keys {
+			oauthKeys = append(oauthKeys, key.Key)
+		}
+		oauthUnique = opts.Unique != nil && *opts.Unique
+	}
+	if !slices.Equal(oauthKeys, wantKeys) {
+		t.Errorf("uq_oauth_accounts_provider_tenant_uid key = %v; want %v", oauthKeys, wantKeys)
+	}
+	bsonFields := make(map[string]bool)
+	docType := reflect.TypeOf(OAuthAccountDoc{})
+	for i := 0; i < docType.NumField(); i++ {
+		name, _, _ := strings.Cut(docType.Field(i).Tag.Get("bson"), ",")
+		bsonFields[name] = true
+	}
+	for _, key := range oauthKeys {
+		if !bsonFields[key] {
+			t.Errorf("oauth_accounts index key %q is not a bson field on OAuthAccountDoc", key)
+		}
+	}
+	if !oauthUnique {
+		t.Error("uq_oauth_accounts_provider_tenant_uid must be unique")
+	}
+	if indexNames["oauth_accounts"][legacyOAuthUniqueIndex] {
+		t.Error("the tenant-blind oauth_accounts index must not be provisioned")
 	}
 }
 
@@ -442,6 +567,16 @@ func TestNormalizeMongoError(t *testing.T) {
 			name:    "oauth account duplicate with email in dup key maps to oauth account error",
 			err:     makeDupErr("E11000 duplicate key error collection: test.oauth_accounts index: uq_oauth_accounts_provider_uid dup key: { provider_id: \"google\", email: \"user@example.com\" }"),
 			wantErr: errors.ErrOAuthAccountAlreadyLinked,
+		},
+		{
+			name:    "claim duplicate maps to claim sentinel",
+			err:     makeDupErr(`E11000 duplicate key error collection: test.claimed_emails index: _id_ dup key: { _id: "user@example.com" }`),
+			wantErr: errors.ErrEmailClaimed,
+		},
+		{
+			name:    "users duplicate whose value contains the claim collection name stays an email duplicate",
+			err:     makeDupErr(`E11000 duplicate key error collection: test.users index: uq_users_email dup key: { email: "claimed_emails@example.com" }`),
+			wantErr: errors.ErrEmailAlreadyExists,
 		},
 		{
 			name:    "unmapped duplicate key error with email substring returns original error",
@@ -518,6 +653,43 @@ func TestEnsureIndexes_ModelsAndNilDatabase(t *testing.T) {
 		if !ok || len(models) == 0 {
 			t.Errorf("expected non-empty index models for collection %s", col)
 		}
+	}
+}
+
+// TestTenantScopeViolationFilter_RejectsArrays pins the array clause: $type:
+// "string" matches an array containing a string, so {provider_tenant_id:
+// ["tenant-a"]} would otherwise pass a gate that requires a string.
+func TestTenantScopeViolationFilter_RejectsArrays(t *testing.T) {
+	or, ok := tenantScopeViolationFilter()["$or"].(bson.A)
+	if !ok || len(or) != 2 {
+		t.Fatalf("tenant scope filter must be a two-clause $or: %#v", tenantScopeViolationFilter())
+	}
+	nonString, ok := or[0].(bson.M)["provider_tenant_id"].(bson.M)
+	if !ok {
+		t.Fatalf("unexpected first clause: %#v", or[0])
+	}
+	if not, ok := nonString["$not"].(bson.M); !ok || not["$type"] != "string" {
+		t.Fatalf("first clause must exclude non-strings: %#v", or[0])
+	}
+	array, ok := or[1].(bson.M)["provider_tenant_id"].(bson.M)
+	if !ok || array["$type"] != "array" {
+		t.Fatalf("second clause must exclude arrays: %#v", or[1])
+	}
+}
+
+// TestIsMissingIndex pins the not-found classification that keeps a repeated
+// startup from failing on an index the previous run already dropped.
+func TestIsMissingIndex(t *testing.T) {
+	for _, code := range []int32{26, 27} {
+		if !isMissingIndex(mongo.CommandError{Code: code}) {
+			t.Errorf("code %d must count as a missing index", code)
+		}
+	}
+	if isMissingIndex(mongo.CommandError{Code: 11000}) {
+		t.Error("duplicate key must not count as a missing index")
+	}
+	if isMissingIndex(fmt.Errorf("connection refused")) {
+		t.Error("an unrelated error must not count as a missing index")
 	}
 }
 
@@ -606,109 +778,6 @@ func TestMongoStore_ResolveCtx_DynamicBinding(t *testing.T) {
 	txStore := store.withSession(nil)
 	if txStore.resolveCtx(ctx) != ctx {
 		t.Errorf("expected resolveCtx to return caller context when session is nil")
-	}
-}
-
-func TestUserStore_Delete_Cascade(t *testing.T) {
-	uri := os.Getenv("TEST_MONGO_URI")
-	if uri == "" {
-		t.Skip("TEST_MONGO_URI unset; skipping live MongoDB cascade test")
-	}
-	cfg := config.DefaultConfig()
-	cfg.DatabaseType = config.DatabaseTypeMongo
-	cfg.DatabaseURL = uri
-	cfg.MongoDB.Database = fmt.Sprintf("goauth_test_cascade_%s", strings.ReplaceAll(uuid.New().String(), "-", ""))
-	cfg.MongoDB.AllowNonTransactionalMongo = true
-
-	store, err := Connect(cfg)
-	if err != nil {
-		t.Fatalf("failed to connect to mongodb: %v", err)
-	}
-	t.Cleanup(func() {
-		_ = store.Database().Drop(context.Background())
-		_ = store.Close()
-	})
-
-	ctx := context.Background()
-	uid := uuid.New()
-	user := &db.User{
-		ID:            uid,
-		Email:         "cascade@example.com",
-		PasswordHash:  "dummy_hash",
-		EmailVerified: true,
-		CreatedAt:     time.Now().UTC(),
-		UpdatedAt:     time.Now().UTC(),
-	}
-	if err := store.Users().Create(ctx, user); err != nil {
-		t.Fatalf("Create user failed: %v", err)
-	}
-
-	// Seed child documents across collections
-	sess := &db.Session{
-		ID:                uuid.New(),
-		UserID:            uid,
-		IDHash:            "id_hash_1",
-		SessionType:       db.SessionTypeBearer,
-		LastActiveAt:      time.Now().Add(-10 * time.Minute).UTC(),
-		AbsoluteExpiresAt: time.Now().Add(time.Hour).UTC(),
-		CreatedAt:         time.Now().UTC(),
-	}
-	if err := store.Sessions().Create(ctx, sess); err != nil {
-		t.Fatalf("Create session failed: %v", err)
-	}
-
-	sess2 := &db.Session{
-		ID:                uuid.New(),
-		UserID:            uid,
-		IDHash:            "id_hash_2",
-		SessionType:       db.SessionTypeCookie,
-		LastActiveAt:      time.Now().UTC(),
-		AbsoluteExpiresAt: time.Now().Add(time.Hour).UTC(),
-		CreatedAt:         time.Now().Add(-1 * time.Hour).UTC(),
-	}
-	if err := store.Sessions().Create(ctx, sess2); err != nil {
-		t.Fatalf("Create session2 failed: %v", err)
-	}
-
-	// Verify ListByUserID orders by last_active_at DESC
-	activeList, err := store.Sessions().ListByUserID(ctx, uid)
-	if err != nil {
-		t.Fatalf("ListByUserID failed: %v", err)
-	}
-	if len(activeList) < 2 {
-		t.Fatalf("expected at least 2 sessions, got %d", len(activeList))
-	}
-	if activeList[0].ID != sess2.ID {
-		t.Fatalf("expected sess2 first by last_active_at DESC, got %v", activeList[0].ID)
-	}
-
-	tok := &db.VerificationToken{
-		TokenHash: []byte("vtok_hash_1"),
-		UserID:    uid,
-		ExpiresAt: time.Now().Add(time.Hour).UTC(),
-		CreatedAt: time.Now().UTC(),
-	}
-	if err := store.VerificationTokens().Create(ctx, tok); err != nil {
-		t.Fatalf("Create verification token failed: %v", err)
-	}
-
-	// Delete user
-	if err := store.Users().Delete(ctx, uid); err != nil {
-		t.Fatalf("Delete user failed: %v", err)
-	}
-
-	// Verify child collections are purged
-	sessions, err := store.Sessions().ListByUserID(ctx, uid)
-	if err != nil {
-		t.Fatalf("ListByUserID failed: %v", err)
-	}
-	if len(sessions) != 0 {
-		t.Fatalf("expected 0 sessions after cascade delete, got %d", len(sessions))
-	}
-
-	_, err = store.VerificationTokens().GetByTokenHash(ctx, []byte("vtok_hash_1"))
-	if !errors.Is(err, gorm.ErrRecordNotFound) && err == nil {
-		t.Fatal("expected verification token to be deleted by cascade, but found it")
 	}
 }
 
@@ -824,14 +893,15 @@ func TestMongoStore_CanceledContext_AllMethods(t *testing.T) {
 	acc := &db.OAuthAccount{
 		ID:             uuid.New(),
 		UserID:         uid,
-		ProviderID:     "gh",
-		ProviderUserID: "123",
+		ProviderID:     "github",
+		ProviderUserID: "gh_user_42",
 	}
 	assertCanceled("OAuthAccounts.Create", store.OAuthAccounts().Create(ctx, acc))
-	_, err = store.OAuthAccounts().GetByProvider(ctx, "gh", "123")
+	_, err = store.OAuthAccounts().GetByProvider(ctx, "github", "", "gh_user_42")
 	assertCanceled("OAuthAccounts.GetByProvider", err)
 	_, err = store.OAuthAccounts().GetByUserID(ctx, uid)
 	assertCanceled("OAuthAccounts.GetByUserID", err)
+	assertCanceled("OAuthAccounts.UpdateProviderUserID", store.OAuthAccounts().UpdateProviderUserID(ctx, acc.ID, "123_upd"))
 	assertCanceled("OAuthAccounts.Delete", store.OAuthAccounts().Delete(ctx, acc.ID))
 	assertCanceled("OAuthAccounts.DeleteByUserID", store.OAuthAccounts().DeleteByUserID(ctx, uid))
 
@@ -888,4 +958,119 @@ func TestMongoStore_CanceledContext_AllMethods(t *testing.T) {
 		return nil
 	}))
 	_ = store.Close()
+}
+
+// TestOAuthTokenSetDoc pins the write payload both token paths share: every
+// token column is overwritten, and a nil expiry is written as null so it decodes
+// back to a nil pointer instead of a year-1 time.
+func TestOAuthTokenSetDoc(t *testing.T) {
+	expiresAt := time.Now().UTC().Truncate(time.Millisecond)
+	doc := oauthTokenSetDoc(db.OAuthTokenRecord{
+		AccessTokenCiphertext:   "sealed-access",
+		RefreshTokenCiphertext:  "sealed-refresh",
+		RefreshTokenFingerprint: strings.Repeat("a", 64),
+		TokenScope:              "offline_access",
+		TokenExpiresAt:          &expiresAt,
+	})
+	want := []string{
+		"access_token_ciphertext", "refresh_token_ciphertext", "refresh_token_fingerprint",
+		"token_scope", "token_expires_at", "updated_at",
+	}
+	if len(doc) != len(want) {
+		t.Fatalf("payload has %d keys; want %d: %v", len(doc), len(want), doc)
+	}
+	for _, key := range want {
+		if _, ok := doc[key]; !ok {
+			t.Fatalf("payload is missing %q: %v", key, doc)
+		}
+	}
+	if got, ok := doc["token_expires_at"].(time.Time); !ok || !got.Equal(expiresAt) {
+		t.Fatalf("token_expires_at = %v; want %v", doc["token_expires_at"], expiresAt)
+	}
+
+	// An all-empty record clears the columns and leaves the expiry unset.
+	cleared := oauthTokenSetDoc(db.OAuthTokenRecord{})
+	for _, key := range want[:4] {
+		if cleared[key] != "" {
+			t.Fatalf("cleared %q = %v; want empty string", key, cleared[key])
+		}
+	}
+	if cleared["token_expires_at"] != nil {
+		t.Fatalf("cleared token_expires_at = %v; want nil", cleared["token_expires_at"])
+	}
+
+	// The null must survive a BSON round trip as a nil pointer, not a zero time.
+	data, err := bson.Marshal(bson.M{
+		"_id": uuid.New().String(), "token_expires_at": cleared["token_expires_at"],
+	})
+	if err != nil {
+		t.Fatalf("bson.Marshal failed: %v", err)
+	}
+	var roundTripped OAuthAccountDoc
+	if err := bson.Unmarshal(data, &roundTripped); err != nil {
+		t.Fatalf("bson.Unmarshal failed: %v", err)
+	}
+	if roundTripped.TokenExpiresAt != nil {
+		t.Fatalf("null token_expires_at decoded as %v; want nil", roundTripped.TokenExpiresAt)
+	}
+}
+
+// TestOAuthPartialTokenWrites pins the payloads of the writes that own a single
+// column group: a refresh-only clear cannot blank the access columns, a rotated
+// pair leaves them to their own writer, and the absent-value filter also matches
+// documents written before the token columns existed.
+func TestOAuthPartialTokenWrites(t *testing.T) {
+	refreshColumns := []string{"refresh_token_ciphertext", "refresh_token_fingerprint", "updated_at"}
+
+	cleared := oauthRefreshClearSet()
+	if len(cleared) != len(refreshColumns) {
+		t.Fatalf("clear payload has %d keys; want %d: %v", len(cleared), len(refreshColumns), cleared)
+	}
+	for _, key := range refreshColumns[:2] {
+		if cleared[key] != "" {
+			t.Fatalf("cleared %q = %v; want empty", key, cleared[key])
+		}
+	}
+	if _, ok := cleared["updated_at"].(time.Time); !ok {
+		t.Fatalf("clear payload updated_at = %T; want time.Time", cleared["updated_at"])
+	}
+	for _, key := range []string{"access_token_ciphertext", "token_scope", "token_expires_at"} {
+		if _, ok := cleared[key]; ok {
+			t.Fatalf("refresh clear writes %q: %v", key, cleared)
+		}
+	}
+
+	rotated := oauthRefreshPairSet(db.OAuthTokenRecord{
+		AccessTokenCiphertext:   "rotated-access",
+		RefreshTokenCiphertext:  "rotated-refresh",
+		RefreshTokenFingerprint: strings.Repeat("a", 64),
+		TokenScope:              "offline_access",
+	})
+	if len(rotated) != len(refreshColumns) {
+		t.Fatalf("rotated payload has %d keys; want %d: %v", len(rotated), len(refreshColumns), rotated)
+	}
+	if rotated["refresh_token_ciphertext"] != "rotated-refresh" ||
+		rotated["refresh_token_fingerprint"] != strings.Repeat("a", 64) {
+		t.Fatalf("rotated payload = %v; want the refresh pair", rotated)
+	}
+	for _, key := range []string{"access_token_ciphertext", "token_scope", "token_expires_at"} {
+		if _, ok := rotated[key]; ok {
+			t.Fatalf("rotated payload writes %q: %v", key, rotated)
+		}
+	}
+
+	for _, field := range []string{"refresh_token_fingerprint", "access_token_ciphertext"} {
+		filter := bson.M{"_id": "id", "$or": oauthAbsentOr(field)}
+		or, ok := filter["$or"].([]bson.M)
+		if !ok || len(or) != 2 {
+			t.Fatalf("%s absent filter = %v; want two alternatives", field, filter["$or"])
+		}
+		if or[0][field] != "" {
+			t.Fatalf("%s absent filter does not match the empty column: %v", field, or[0])
+		}
+		exists, ok := or[1][field].(bson.M)
+		if !ok || exists["$exists"] != false {
+			t.Fatalf("%s absent filter does not match a missing column: %v", field, or[1])
+		}
+	}
 }

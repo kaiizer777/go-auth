@@ -3,6 +3,7 @@ package oauth
 import (
 	"bytes"
 	"context"
+	stderrors "errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -19,8 +20,11 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 
+	"github.com/kaiizer777/go-auth/auth"
 	"github.com/kaiizer777/go-auth/config"
 	"github.com/kaiizer777/go-auth/db"
+	gormstore "github.com/kaiizer777/go-auth/db/gorm"
+	"github.com/kaiizer777/go-auth/email"
 	"github.com/kaiizer777/go-auth/errors"
 	"github.com/kaiizer777/go-auth/session"
 )
@@ -34,6 +38,8 @@ type stubProvider struct {
 	exchErr    error
 	gotVerifer string
 	calls      int
+	exchanges  int
+	token      *TokenResponse
 	infoFunc   func() *UserInfo
 }
 
@@ -41,6 +47,10 @@ func (f *stubProvider) ID() string { return f.id }
 
 func (f *stubProvider) AuthURL(state, codeChallenge string) string {
 	return "https://provider.example/auth?state=" + state + "&code_challenge=" + codeChallenge
+}
+
+func (f *stubProvider) AuthCodeURL(state, codeChallenge string, _ ...AuthCodeOption) string {
+	return f.AuthURL(state, codeChallenge)
 }
 
 func (f *stubProvider) ExchangeCode(_ context.Context, code, codeVerifier string) (*TokenResponse, error) {
@@ -52,7 +62,11 @@ func (f *stubProvider) ExchangeCode(_ context.Context, code, codeVerifier string
 	if code == "" {
 		return nil, errors.New(errors.CodeOAuthProviderError, "oauth token exchange failed", nil)
 	}
+	f.exchanges++
 	f.gotVerifer = codeVerifier
+	if f.token != nil {
+		return f.token, nil
+	}
 	return &TokenResponse{AccessToken: "stub-access"}, nil
 }
 
@@ -69,12 +83,16 @@ func (f *stubProvider) FetchUserInfo(_ context.Context, _ *TokenResponse) (*User
 	return f.info, nil
 }
 
+// testTokenKEK is a fixed keyring: kid "test-kid" over the 32 bytes 0x00-0x1f.
+const testTokenKEK = "test-kid:AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
+
 func serviceTestConfig() *config.Config {
 	cfg := config.DefaultConfig()
 	cfg.DatabaseURL = "postgres://user:pass@localhost:5432/testdb"
 	cfg.BaseURL = "https://example.com"
 	cfg.SessionCookieSecure = false
 	cfg.OAuth.StateSecret = "test-state-secret-at-least-32-bytes!"
+	cfg.OAuth.TokenKEK = testTokenKEK
 	return &cfg
 }
 
@@ -104,15 +122,29 @@ func serviceTestDB(t *testing.T) *gorm.DB {
 		created_at DATETIME,
 		updated_at DATETIME
 	);
+	CREATE TABLE IF NOT EXISTS claimed_emails (
+		email VARCHAR(255) PRIMARY KEY,
+		owner_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		verified INTEGER NOT NULL DEFAULT 0,
+		created_at DATETIME,
+		updated_at DATETIME
+	);
 	CREATE TABLE IF NOT EXISTS oauth_accounts (
 		id TEXT PRIMARY KEY,
 		user_id TEXT NOT NULL,
 		provider_id VARCHAR(32) NOT NULL,
+		provider_tenant_id VARCHAR(64) NOT NULL,
 		provider_user_id VARCHAR(255) NOT NULL,
 		email VARCHAR(255) NOT NULL,
+		verified INTEGER NOT NULL DEFAULT 0,
+		access_token_ciphertext TEXT NOT NULL DEFAULT '',
+		refresh_token_ciphertext TEXT NOT NULL DEFAULT '',
+		refresh_token_fingerprint CHAR(64) NOT NULL DEFAULT '',
+		token_expires_at DATETIME,
+		token_scope TEXT NOT NULL DEFAULT '',
 		created_at DATETIME,
 		updated_at DATETIME,
-		CONSTRAINT uq_oauth_accounts_provider_uid UNIQUE (provider_id, provider_user_id)
+		CONSTRAINT uq_oauth_accounts_provider_tenant_uid UNIQUE (provider_id, provider_tenant_id, provider_user_id)
 	);
 	CREATE TABLE IF NOT EXISTS sessions (
 		id TEXT PRIMARY KEY,
@@ -124,6 +156,18 @@ func serviceTestDB(t *testing.T) *gorm.DB {
 		credential_version INTEGER NOT NULL DEFAULT 0,
 		last_active_at DATETIME NOT NULL,
 		absolute_expires_at DATETIME NOT NULL,
+		created_at DATETIME
+	);
+	CREATE TABLE IF NOT EXISTS verification_tokens (
+		token_hash BLOB PRIMARY KEY,
+		user_id TEXT NOT NULL,
+		expires_at DATETIME NOT NULL,
+		created_at DATETIME
+	);
+	CREATE TABLE IF NOT EXISTS password_reset_tokens (
+		token_hash BLOB PRIMARY KEY,
+		user_id TEXT NOT NULL,
+		expires_at DATETIME NOT NULL,
 		created_at DATETIME
 	);
 	`
@@ -175,6 +219,41 @@ func callbackRequest(state string, cookie *http.Cookie) (*httptest.ResponseRecor
 	return rec, req
 }
 
+// callbackRequestWithSession extends callbackRequest with the live session
+// cookie. The callback re-resolves the signed-in user and only honours the
+// state's link owner on equality, so link tests must present the session.
+func callbackRequestWithSession(state string, cookie *http.Cookie, cfg *config.Config, rawSession string) (*httptest.ResponseRecorder, *http.Request) {
+	rec, req := callbackRequest(state, cookie)
+	req.AddCookie(&http.Cookie{Name: cfg.SessionCookieName, Value: rawSession})
+	return rec, req
+}
+
+// initiateLinked starts a flow for an authenticated user so the state cookie
+// carries activeUserID exactly as a real account-link request does. The
+// ?link=true intent is required: since the hardening gate, ambient sessions
+// alone never embed a link owner.
+func initiateLinked(t *testing.T, svc Service, cfg *config.Config, providerID, rawSession string) (string, *http.Cookie) {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/auth/oauth/"+providerID+"?link=true", nil)
+	req.AddCookie(&http.Cookie{Name: cfg.SessionCookieName, Value: rawSession})
+	authURL, err := svc.InitiateFlow(rec, req, providerID)
+	if err != nil {
+		t.Fatalf("InitiateFlow = %v", err)
+	}
+	u, err := url.Parse(authURL)
+	if err != nil {
+		t.Fatalf("parse authURL: %v", err)
+	}
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == cfg.OAuth.StateCookieName {
+			return u.Query().Get("state"), c
+		}
+	}
+	t.Fatalf("no %q cookie issued", cfg.OAuth.StateCookieName)
+	return "", nil
+}
+
 func countRows(t *testing.T, database *gorm.DB, model any) int64 {
 	t.Helper()
 	var n int64
@@ -198,6 +277,15 @@ func requireCode(t *testing.T, err error, want errors.Code, status int) {
 	}
 	if appErr.HTTPStatus() != status {
 		t.Fatalf("status = %d; want %d", appErr.HTTPStatus(), status)
+	}
+}
+
+// writeFixture writes an upstream fixture body, failing the test when the
+// response can no longer be written.
+func writeFixture(t *testing.T, w http.ResponseWriter, format string, args ...any) {
+	t.Helper()
+	if _, err := fmt.Fprintf(w, format, args...); err != nil {
+		t.Errorf("write fixture: %v", err)
 	}
 }
 
@@ -252,7 +340,7 @@ func seedLinkedIdentity(t *testing.T, database *gorm.DB, providerID, providerUse
 		t.Fatalf("seed user: %v", err)
 	}
 	link := db.OAuthAccount{ID: uuid.New(), UserID: owner.ID, ProviderID: providerID,
-		ProviderUserID: providerUserID, Email: owner.Email}
+		ProviderUserID: providerUserID, Email: owner.Email, Verified: true}
 	if err := database.Create(&link).Error; err != nil {
 		t.Fatalf("seed link: %v", err)
 	}
@@ -359,23 +447,19 @@ func TestHandleCallbackState(t *testing.T) {
 }
 
 func TestHandleCallbackEmailGate(t *testing.T) {
-	t.Run("unverified email rejected before any DB write", func(t *testing.T) {
+	t.Run("unverified email cannot merge into an existing account", func(t *testing.T) {
 		t.Parallel()
 		database, cfg, _, svc := setupServiceTest(t,
 			&UserInfo{ProviderID: "google", ProviderUserID: "sub-9", Email: "victim@example.com"})
+		owner := db.User{ID: uuid.New(), Email: "victim@example.com", PasswordHash: "hash", EmailVerified: true}
+		if err := database.Create(&owner).Error; err != nil {
+			t.Fatalf("seed user: %v", err)
+		}
 		state, cookie := mustInitiate(t, svc, cfg, "google")
 		rec, req := callbackRequest(state, cookie)
 		_, _, _, err := svc.HandleCallback(req.Context(), rec, req, "google", "code-1", state, db.SessionTypeCookie)
 		requireCode(t, err, errors.CodeOAuthEmailUnverified, http.StatusBadRequest)
-		if n := countRows(t, database, &db.User{}); n != 0 {
-			t.Fatalf("users = %d; want 0", n)
-		}
-		if n := countRows(t, database, &db.OAuthAccount{}); n != 0 {
-			t.Fatalf("oauth_accounts = %d; want 0", n)
-		}
-		if n := countRows(t, database, &db.Session{}); n != 0 {
-			t.Fatalf("sessions = %d; want 0", n)
-		}
+		requireIdentityRows(t, database, 1, 0, 0)
 	})
 
 	t.Run("existing link succeeds with email omitted", func(t *testing.T) {
@@ -433,14 +517,32 @@ func TestHandleCallbackEmailGate(t *testing.T) {
 		requireIdentityRows(t, database, 1, 1, 1)
 	})
 
-	t.Run("no link unverified email writes zero rows", func(t *testing.T) {
+	t.Run("unverified email registers a fresh unverified account", func(t *testing.T) {
 		database, cfg, _, svc := setupServiceTest(t,
 			&UserInfo{ProviderID: "google", ProviderUserID: "sub-9", Email: "victim@example.com"})
 		state, cookie := mustInitiate(t, svc, cfg, "google")
 		rec, req := callbackRequest(state, cookie)
-		_, _, _, err := svc.HandleCallback(req.Context(), rec, req, "google", "code-1", state, db.SessionTypeCookie)
-		requireCode(t, err, errors.CodeOAuthEmailUnverified, http.StatusBadRequest)
-		requireIdentityRows(t, database, 0, 0, 0)
+		sess, _, _, err := svc.HandleCallback(req.Context(), rec, req, "google", "code-1", state, db.SessionTypeCookie)
+		if err != nil {
+			t.Fatalf("HandleCallback = %v; want fresh registration", err)
+		}
+		var user db.User
+		if err := database.Where("id = ?", sess.UserID).First(&user).Error; err != nil {
+			t.Fatalf("load user: %v", err)
+		}
+		if user.EmailVerified {
+			t.Fatal("unverified provider email minted a verified local user")
+		}
+		// The link is persisted unverified: it can sign in this account and
+		// nothing else.
+		requireIdentityRows(t, database, 1, 1, 1)
+		var link db.OAuthAccount
+		if err := database.Where("provider_user_id = ?", "sub-9").First(&link).Error; err != nil {
+			t.Fatalf("load link: %v", err)
+		}
+		if link.Verified {
+			t.Fatal("unverified provider email must persist verified=false")
+		}
 	})
 
 	t.Run("nil userinfo keeps the 400", func(t *testing.T) {
@@ -523,6 +625,264 @@ func TestHandleCallbackEmailGate(t *testing.T) {
 		_, _, _, err := svc.HandleCallback(req.Context(), rec, req, "google", "code-1", state, db.SessionTypeCookie)
 		requireCode(t, err, errors.CodeOAuthProviderError, http.StatusBadGateway)
 		requireIdentityRows(t, database, 0, 0, 0)
+	})
+
+	microsoftCallback := func(t *testing.T, info *UserInfo) (*gorm.DB, error) {
+		t.Helper()
+		database := serviceTestDB(t)
+		cfg := serviceTestConfig()
+		svc := NewService(database, session.NewService(database, cfg),
+			map[string]Provider{"microsoft": &stubProvider{id: "microsoft", info: info}}, cfg)
+		state, cookie := mustInitiate(t, svc, cfg, "microsoft")
+		req := httptest.NewRequest(http.MethodGet, "/auth/oauth/microsoft/callback", nil)
+		req.AddCookie(cookie)
+		_, _, _, err := svc.HandleCallback(req.Context(), httptest.NewRecorder(), req, "microsoft", "code-1", state, db.SessionTypeCookie)
+		return database, err
+	}
+
+	t.Run("microsoft identity without tenant rejected as provider error", func(t *testing.T) {
+		database, err := microsoftCallback(t, &UserInfo{
+			ProviderID: "microsoft", ProviderUserID: "sub-no-tenant",
+			Email: "jane@example.com", EmailVerified: true,
+		})
+		requireCode(t, err, errors.CodeOAuthProviderError, http.StatusBadGateway)
+		requireIdentityRows(t, database, 0, 0, 0)
+	})
+
+	t.Run("oversized microsoft tenant rejected as provider error", func(t *testing.T) {
+		database, err := microsoftCallback(t, &UserInfo{
+			ProviderID: "microsoft", ProviderTenantID: strings.Repeat("t", providerTenantMaxLen+1),
+			ProviderUserID: "sub-long-tenant", Email: "jane@example.com", EmailVerified: true,
+		})
+		requireCode(t, err, errors.CodeOAuthProviderError, http.StatusBadGateway)
+		requireIdentityRows(t, database, 0, 0, 0)
+	})
+}
+
+// TestUnverifiedSignupLinkProvenance pins what an unverified provider claim
+// leaves behind: a link row marked unverified that signs in its own account, and
+// keeps doing so through a password-only recovery signup, because a caller-set
+// password proves nothing about the address. Only local proof (verification or
+// password reset) spends it.
+func TestUnverifiedSignupLinkProvenance(t *testing.T) {
+	const addr = "victim@example.com"
+	unverified := func() *UserInfo {
+		return &UserInfo{ProviderID: "google", ProviderUserID: "sub-unverified-bind", Email: addr}
+	}
+	// passwordSignup runs the real recovery signup, which binds the caller's
+	// password to the pending row and drops its sessions.
+	passwordSignup := func(t *testing.T, database *gorm.DB, cfg *config.Config) {
+		t.Helper()
+		authSvc, err := auth.New(*cfg, database, email.Hooks{})
+		if err != nil {
+			t.Fatalf("auth.New: %v", err)
+		}
+		if _, _, err := authSvc.Signup(context.Background(), db.SignupRequest{
+			Email: addr, Password: "CorrectHorseBattery9!",
+		}); err != nil {
+			t.Fatalf("password signup: %v", err)
+		}
+	}
+	callback := func(t *testing.T, svc Service, cfg *config.Config) (*session.Session, error) {
+		t.Helper()
+		state, cookie := mustInitiate(t, svc, cfg, "google")
+		rec, req := callbackRequest(state, cookie)
+		sess, _, _, err := svc.HandleCallback(req.Context(), rec, req, "google", "code-1", state, db.SessionTypeCookie)
+		return sess, err
+	}
+
+	t.Run("unverified link is purged by password-only recovery signup", func(t *testing.T) {
+		database, cfg, _, svc := setupServiceTest(t, unverified())
+		first, err := callback(t, svc, cfg)
+		if err != nil {
+			t.Fatalf("unverified oauth signup = %v", err)
+		}
+		var link db.OAuthAccount
+		if err := database.First(&link).Error; err != nil {
+			t.Fatalf("load link: %v", err)
+		}
+		if link.UserID != first.UserID || link.Verified {
+			t.Fatalf("link = (%v, verified=%v); want (%v, unverified)", link.UserID, link.Verified, first.UserID)
+		}
+		passwordSignup(t, database, cfg)
+		var owner db.User
+		if err := database.Where("id = ?", first.UserID).First(&owner).Error; err != nil {
+			t.Fatalf("load owner: %v", err)
+		}
+		if owner.PasswordHash == "" {
+			t.Fatal("password signup did not bind a password to the pending row")
+		}
+		if owner.EmailVerified {
+			t.Fatal("password signup must not prove the address")
+		}
+		sess, err := callback(t, svc, cfg)
+		if err == nil || sess != nil {
+			t.Fatalf("login through unverified link should fail after password signup, got sess = %v", sess)
+		}
+		var linkCount int64
+		database.Model(&db.OAuthAccount{}).Where("user_id = ?", first.UserID).Count(&linkCount)
+		if linkCount != 0 {
+			t.Fatalf("expected 0 links after password signup, got %d", linkCount)
+		}
+	})
+
+	t.Run("password then oauth never binds", func(t *testing.T) {
+		database, cfg, _, svc := setupServiceTest(t, unverified())
+		passwordSignup(t, database, cfg)
+		sess, err := callback(t, svc, cfg)
+		if sess != nil {
+			t.Fatalf("session minted for %v; want none", sess.UserID)
+		}
+		requireCode(t, err, errors.CodeOAuthEmailUnverified, http.StatusBadRequest)
+		requireIdentityRows(t, database, 1, 0, 0)
+	})
+
+	t.Run("concurrent unverified signups converge on one link", func(t *testing.T) {
+		database, _, _, rawSvc := setupServiceTest(t, nil)
+		svc := rawSvc.(*service)
+		info := unverified()
+		type outcome struct {
+			user db.User
+			err  error
+		}
+		outs := make([]outcome, 2)
+		var wg sync.WaitGroup
+		for i := range outs {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				u, _, _, err := svc.linkOrCreate(context.Background(), "google", info, "", nil)
+				outs[i] = outcome{user: u, err: err}
+			}(i)
+		}
+		wg.Wait()
+		for i, o := range outs {
+			if o.err != nil {
+				t.Fatalf("goroutine %d: %v; want convergence", i, o.err)
+			}
+		}
+		if outs[0].user.ID != outs[1].user.ID {
+			t.Fatalf("converged users differ: %v vs %v", outs[0].user.ID, outs[1].user.ID)
+		}
+		requireIdentityRows(t, database, 1, 1, 0)
+	})
+
+	// The winner's commit may become visible before the losing goroutine reads
+	// the address at all; that ordering must converge exactly like the raced one.
+	t.Run("visible pending row converges without a duplicate user", func(t *testing.T) {
+		database, _, _, rawSvc := setupServiceTest(t, nil)
+		pending := db.User{ID: uuid.New(), Email: addr, PasswordHash: "", EmailVerified: false}
+		if err := database.Create(&pending).Error; err != nil {
+			t.Fatalf("seed pending user: %v", err)
+		}
+		// Winning unverified signup committed its oauth link alongside the user
+		winnerLink := db.OAuthAccount{
+			ID:             uuid.New(),
+			UserID:         pending.ID,
+			ProviderID:     "google",
+			ProviderUserID: "sub-unverified-bind",
+			Email:          addr,
+			Verified:       false,
+		}
+		if err := database.Create(&winnerLink).Error; err != nil {
+			t.Fatalf("seed winner link: %v", err)
+		}
+		// Calling createUserAndLink exercises the losing create-race path:
+		// attempting to create the user fails on email uniqueness, invoking
+		// linkRacedUser and mergeOrConverge.
+		got, _, created, err := rawSvc.(*service).createUserAndLink(context.Background(), "google", unverified(), nil)
+		if err != nil {
+			t.Fatalf("createUserAndLink over a pending row = %v; want convergence", err)
+		}
+		if got.ID != pending.ID || created {
+			t.Fatalf("converged on %v (created=%v); want %v", got.ID, created, pending.ID)
+		}
+		requireIdentityRows(t, database, 1, 1, 0)
+	})
+
+	t.Run("relinkExisting invalidates unverified link on claimed account", func(t *testing.T) {
+		database, _, _, rawSvc := setupServiceTest(t, nil)
+		claimed := db.User{ID: uuid.New(), Email: "claimed@example.com", EmailVerified: true}
+		if err := database.Create(&claimed).Error; err != nil {
+			t.Fatalf("seed claimed user: %v", err)
+		}
+		unverifiedLink := db.OAuthAccount{
+			ID:             uuid.New(),
+			UserID:         claimed.ID,
+			ProviderID:     "google",
+			ProviderUserID: "sub-unverified-race",
+			Email:          "claimed@example.com",
+			Verified:       false,
+		}
+		if err := database.Create(&unverifiedLink).Error; err != nil {
+			t.Fatalf("seed unverified link: %v", err)
+		}
+		_, _, _, err := rawSvc.(*service).relinkExisting(context.Background(), "google", "", "sub-unverified-race")
+		if !errors.Is(err, errors.ErrOAuthEmailUnverified) {
+			t.Fatalf("relinkExisting on unverified link for claimed account = %v; want ErrOAuthEmailUnverified", err)
+		}
+		var count int64
+		database.Model(&db.OAuthAccount{}).Where("id = ?", unverifiedLink.ID).Count(&count)
+		if count != 0 {
+			t.Fatalf("expected unverified link to be deleted, got count = %d", count)
+		}
+	})
+
+	t.Run("unattested email cannot take over pending unclaimed account", func(t *testing.T) {
+		database, cfg, _, svc := setupServiceTest(t, &UserInfo{
+			ProviderID:     "google",
+			ProviderUserID: "attacker-sub-456",
+			Email:          addr,
+			EmailVerified:  false,
+		})
+		pending := db.User{ID: uuid.New(), Email: addr, PasswordHash: "", EmailVerified: false}
+		if err := database.Create(&pending).Error; err != nil {
+			t.Fatalf("seed pending user: %v", err)
+		}
+		state, cookie := mustInitiate(t, svc, cfg, "google")
+		rec, req := callbackRequest(state, cookie)
+		sess, _, _, err := svc.HandleCallback(req.Context(), rec, req, "google", "code-1", state, db.SessionTypeCookie)
+		if sess != nil {
+			t.Fatalf("session minted for %v; want none", sess.UserID)
+		}
+		requireCode(t, err, errors.CodeOAuthEmailUnverified, http.StatusBadRequest)
+		requireIdentityRows(t, database, 1, 0, 0)
+	})
+}
+
+// TestMergeGateRejectsUnstorableIdentity pins validateProviderIdentity as the
+// live merge gate: no merge may attempt to store an identity the schema cannot
+// hold, and an unverified claim may not pass it at all.
+func TestMergeGateRejectsUnstorableIdentity(t *testing.T) {
+	oversized := func(email string) *UserInfo {
+		return &UserInfo{ProviderID: "google", ProviderUserID: strings.Repeat("s", providerFieldMaxLen+1),
+			Email: email, EmailVerified: true}
+	}
+
+	t.Run("email merge rejects an oversized provider subject", func(t *testing.T) {
+		database, _, _, rawSvc := setupServiceTest(t, nil)
+		existing := db.User{ID: uuid.New(), Email: "gate@example.com", PasswordHash: "hash", EmailVerified: true}
+		if err := database.Create(&existing).Error; err != nil {
+			t.Fatalf("seed user: %v", err)
+		}
+		_, _, _, err := rawSvc.(*service).linkOrCreate(context.Background(), "google", oversized("gate@example.com"), "", nil)
+		requireCode(t, err, errors.CodeOAuthProviderError, http.StatusBadGateway)
+		if n := countRows(t, database, &db.OAuthAccount{}); n != 0 {
+			t.Fatalf("oauth_accounts = %d; want 0", n)
+		}
+	})
+
+	t.Run("raced email merge rejects an oversized provider subject", func(t *testing.T) {
+		database, _, _, rawSvc := setupServiceTest(t, nil)
+		winner := db.User{ID: uuid.New(), Email: "raced-gate@example.com", PasswordHash: "hash", EmailVerified: true}
+		if err := database.Create(&winner).Error; err != nil {
+			t.Fatalf("seed winner: %v", err)
+		}
+		_, _, _, err := rawSvc.(*service).createUserAndLink(context.Background(), "google", oversized("raced-gate@example.com"), nil)
+		requireCode(t, err, errors.CodeOAuthProviderError, http.StatusBadGateway)
+		if n := countRows(t, database, &db.OAuthAccount{}); n != 0 {
+			t.Fatalf("oauth_accounts = %d; want 0", n)
+		}
 	})
 }
 
@@ -649,6 +1009,1136 @@ func TestHandleCallbackLinking(t *testing.T) {
 	})
 }
 
+func TestHandleCallbackActiveSessionLinking(t *testing.T) {
+	// Provider emails in this block all differ from the active user's address:
+	// a shared address would let email matching hide a broken owner lookup.
+	t.Run("vanished owner fails closed instead of linking by provider email", func(t *testing.T) {
+		database, cfg, _, svc := setupServiceTest(t, &UserInfo{
+			ProviderID: "google", ProviderUserID: "sub-orphan",
+			Email: "provider-owner@personal.example", EmailVerified: true,
+		})
+		ctx := context.Background()
+		sessSvc := session.NewService(database, cfg)
+		active := db.User{ID: uuid.New(), Email: "active@work.example", PasswordHash: "hash", EmailVerified: true}
+		other := db.User{ID: uuid.New(), Email: "provider-owner@personal.example", PasswordHash: "hash", EmailVerified: true}
+		for _, u := range []db.User{active, other} {
+			if err := database.Create(&u).Error; err != nil {
+				t.Fatalf("seed user: %v", err)
+			}
+		}
+		_, rawSession, err := sessSvc.CreateSession(ctx, active.ID, active.CredentialVersion, db.SessionTypeCookie, "127.0.0.1", "ua")
+		if err != nil {
+			t.Fatalf("create session: %v", err)
+		}
+		state, stateCookie := initiateLinked(t, svc, cfg, "google", rawSession)
+		// Hard delete between initiate and callback: the linked owner is gone.
+		if err := database.Delete(&db.User{}, "id = ?", active.ID).Error; err != nil {
+			t.Fatalf("delete active user: %v", err)
+		}
+		rec, req := callbackRequestWithSession(state, stateCookie, cfg, rawSession)
+		sess, _, _, err := svc.HandleCallback(ctx, rec, req, "google", "code-1", state, db.SessionTypeCookie)
+		if sess != nil {
+			t.Fatalf("session issued for %v; want none", sess.UserID)
+		}
+		requireCode(t, err, errors.CodeOAuthAccountNotLinked, http.StatusNotFound)
+		// Merge premise (oauth sync): the callback's live-session re-resolution
+		// prunes the dangling pre-created session (missing_user_at_read), so no
+		// session row survives; no session was minted and the provider identity
+		// stayed unlinked.
+		requireIdentityRows(t, database, 1, 0, 0)
+	})
+
+	t.Run("non-uuid active user id fails closed", func(t *testing.T) {
+		database, _, _, rawSvc := setupServiceTest(t, nil)
+		info := &UserInfo{ProviderID: "google", ProviderUserID: "sub-bad-id",
+			Email: "provider-owner@personal.example", EmailVerified: true}
+		_, _, _, err := rawSvc.(*service).linkOrCreate(context.Background(), "google", info, "not-a-uuid", nil)
+		requireCode(t, err, errors.CodeOAuthAccountNotLinked, http.StatusNotFound)
+		requireIdentityRows(t, database, 0, 0, 0)
+	})
+
+	t.Run("store failure stays a domain error", func(t *testing.T) {
+		_, _, _, rawSvc := setupServiceTest(t, nil)
+		base := rawSvc.(*service).store
+		broken := &failingGetByIDStore{
+			Store: base,
+			users: &failingGetByIDUserStore{UserStore: base.Users(), err: stderrors.New("dial tcp: connection refused")},
+		}
+		svc := NewServiceWithStore(broken, nil, nil, serviceTestConfig()).(*service)
+		_, _, _, err := svc.linkOrCreate(context.Background(), "google", verifiedInfo(), uuid.New().String(), nil)
+		requireCode(t, err, errors.CodeInternalError, http.StatusInternalServerError)
+	})
+
+	t.Run("nil user from store fails closed", func(t *testing.T) {
+		_, _, _, rawSvc := setupServiceTest(t, nil)
+		base := rawSvc.(*service).store
+		svc := NewServiceWithStore(&wrappedTxStore{
+			Store: base,
+			users: nilUserStore{UserStore: base.Users()},
+		}, nil, nil, serviceTestConfig()).(*service)
+		_, _, _, err := svc.linkOrCreate(context.Background(), "google", verifiedInfo(), uuid.New().String(), nil)
+		requireCode(t, err, errors.CodeOAuthAccountNotLinked, http.StatusNotFound)
+	})
+
+	t.Run("provider email differing from the active user links to the active user", func(t *testing.T) {
+		database, cfg, _, svc := setupServiceTest(t, &UserInfo{
+			ProviderID: "google", ProviderUserID: "sub-active",
+			Email: "provider-owner@personal.example", EmailVerified: true,
+		})
+		ctx := context.Background()
+		sessSvc := session.NewService(database, cfg)
+		active := db.User{ID: uuid.New(), Email: "active@work.example", PasswordHash: "hash", EmailVerified: true}
+		if err := database.Create(&active).Error; err != nil {
+			t.Fatalf("seed user: %v", err)
+		}
+		_, rawSession, err := sessSvc.CreateSession(ctx, active.ID, active.CredentialVersion, db.SessionTypeCookie, "127.0.0.1", "ua")
+		if err != nil {
+			t.Fatalf("create session: %v", err)
+		}
+		state, stateCookie := initiateLinked(t, svc, cfg, "google", rawSession)
+		rec, req := callbackRequestWithSession(state, stateCookie, cfg, rawSession)
+		sess, _, _, err := svc.HandleCallback(ctx, rec, req, "google", "code-1", state, db.SessionTypeCookie)
+		if err != nil {
+			t.Fatalf("HandleCallback = %v", err)
+		}
+		if sess.UserID != active.ID {
+			t.Fatalf("session user = %v; want active user %v", sess.UserID, active.ID)
+		}
+		var link db.OAuthAccount
+		if err := database.Where("provider_id = ? AND provider_user_id = ?", "google", "sub-active").First(&link).Error; err != nil {
+			t.Fatalf("load link: %v", err)
+		}
+		if link.UserID != active.ID {
+			t.Fatalf("link owner = %v; want %v", link.UserID, active.ID)
+		}
+	})
+}
+
+// TestExplicitLinkRequiresClaimedOwner pins the pre-hijack gate on the explicit
+// ?link=true path: anyone who registered an address can hold a session on its
+// still-unclaimed row, so a verified provider identity may attach only after the
+// user has proved the address locally with an email verification or a password
+// reset. A password is caller-set and therefore never proof.
+func TestExplicitLinkRequiresClaimedOwner(t *testing.T) {
+	linkInfo := func() *UserInfo {
+		return &UserInfo{ProviderID: "google", ProviderUserID: "sub-link-gate",
+			Email: "provider-owner@personal.example", EmailVerified: true}
+	}
+	linkAttempt := func(t *testing.T, svc Service, cfg *config.Config, rawSession string) (*session.Session, error) {
+		t.Helper()
+		state, cookie := initiateLinked(t, svc, cfg, "google", rawSession)
+		rec, req := callbackRequestWithSession(state, cookie, cfg, rawSession)
+		sess, _, _, err := svc.HandleCallback(req.Context(), rec, req, "google", "code-1", state, db.SessionTypeCookie)
+		return sess, err
+	}
+	seedUnclaimed := func(t *testing.T, database *gorm.DB, cfg *config.Config) (db.User, string) {
+		t.Helper()
+		owner := db.User{ID: uuid.New(), Email: "unclaimed@work.example"}
+		if err := database.Create(&owner).Error; err != nil {
+			t.Fatalf("seed owner: %v", err)
+		}
+		_, rawSession, err := session.NewService(database, cfg).
+			CreateSession(context.Background(), owner.ID, owner.CredentialVersion, db.SessionTypeCookie, "127.0.0.1", "ua")
+		if err != nil {
+			t.Fatalf("create session: %v", err)
+		}
+		return owner, rawSession
+	}
+
+	t.Run("unclaimed owner rejects the link", func(t *testing.T) {
+		database, cfg, _, svc := setupServiceTest(t, linkInfo())
+		_, rawSession := seedUnclaimed(t, database, cfg)
+
+		sess, err := linkAttempt(t, svc, cfg, rawSession)
+		if sess != nil {
+			t.Fatalf("session minted for %v; want the link rejected", sess.UserID)
+		}
+		requireCode(t, err, errors.CodeOAuthAccountLinkConflict, http.StatusConflict)
+		requireIdentityRows(t, database, 1, 0, 1)
+	})
+
+	t.Run("password alone does not authorize the link", func(t *testing.T) {
+		database, cfg, _, svc := setupServiceTest(t, linkInfo())
+		owner, _ := seedUnclaimed(t, database, cfg)
+		signupPassword(t, database, cfg, owner.Email, "CorrectHorseBattery9!")
+
+		var claimed db.User
+		if err := database.Where("id = ?", owner.ID).First(&claimed).Error; err != nil {
+			t.Fatalf("load claimed owner: %v", err)
+		}
+		if claimed.PasswordHash == "" {
+			t.Fatal("password signup did not bind a password")
+		}
+		if claimed.EmailVerified {
+			t.Fatal("password signup must not mark the address verified")
+		}
+		_, rawSession, err := session.NewService(database, cfg).
+			CreateSession(context.Background(), claimed.ID, claimed.CredentialVersion, db.SessionTypeCookie, "127.0.0.1", "ua")
+		if err != nil {
+			t.Fatalf("create session: %v", err)
+		}
+
+		sess, err := linkAttempt(t, svc, cfg, rawSession)
+		if sess != nil {
+			t.Fatalf("session minted for %v; a caller-set password must not authorize the link", sess.UserID)
+		}
+		requireCode(t, err, errors.CodeOAuthAccountLinkConflict, http.StatusConflict)
+		requireIdentityRows(t, database, 1, 0, 1)
+	})
+
+	t.Run("locally verified owner links", func(t *testing.T) {
+		database, cfg, _, svc := setupServiceTest(t, linkInfo())
+		owner := db.User{ID: uuid.New(), Email: "verified-owner@example.com", EmailVerified: true}
+		if err := database.Create(&owner).Error; err != nil {
+			t.Fatalf("seed owner: %v", err)
+		}
+		_, rawSession, err := session.NewService(database, cfg).
+			CreateSession(context.Background(), owner.ID, owner.CredentialVersion, db.SessionTypeCookie, "127.0.0.1", "ua")
+		if err != nil {
+			t.Fatalf("create session: %v", err)
+		}
+
+		sess, err := linkAttempt(t, svc, cfg, rawSession)
+		if err != nil {
+			t.Fatalf("link for a verified owner = %v; want success", err)
+		}
+		if sess.UserID != owner.ID {
+			t.Fatalf("session user = %v; want %v", sess.UserID, owner.ID)
+		}
+		var link db.OAuthAccount
+		if err := database.Where("provider_id = ? AND provider_user_id = ?", "google", "sub-link-gate").First(&link).Error; err != nil {
+			t.Fatalf("load link: %v", err)
+		}
+		if link.UserID != owner.ID || !link.Verified {
+			t.Fatalf("link = (%v, verified=%v); want (%v, verified)", link.UserID, link.Verified, owner.ID)
+		}
+	})
+
+	// The full pre-hijack chain: an unverified provider signup mints a session on
+	// the victim's unclaimed row, and the explicit link that would have survived
+	// the later claim is refused, so the refused identity never gets a row. The
+	// owner's own unverified link then dies at the address proof (covered by
+	// TestUnverifiedLinkTakeoverDefense).
+	t.Run("rejected pre-claim link persists nothing for the refused identity", func(t *testing.T) {
+		database := serviceTestDB(t)
+		cfg := serviceTestConfig()
+		const addr = "victim@example.test"
+		google := &stubProvider{id: "google", info: &UserInfo{
+			ProviderID: "google", ProviderUserID: "sub-victim-unverified", Email: addr,
+		}}
+		github := &stubProvider{id: "github", info: &UserInfo{
+			ProviderID: "github", ProviderUserID: "sub-attacker-verified",
+			Email: "attacker@example.test", EmailVerified: true,
+		}}
+		sessSvc := session.NewService(database, cfg)
+		svc := NewService(database, sessSvc, map[string]Provider{"google": google, "github": github}, cfg)
+
+		attacker, err := loginViaGoogle(t, svc, cfg)
+		if err != nil {
+			t.Fatalf("unverified signup = %v", err)
+		}
+		var pending db.User
+		if err := database.Where("id = ?", attacker.UserID).First(&pending).Error; err != nil {
+			t.Fatalf("load pending owner: %v", err)
+		}
+		_, rawSession, err := sessSvc.CreateSession(context.Background(), pending.ID,
+			pending.CredentialVersion, db.SessionTypeCookie, "127.0.0.1", "ua")
+		if err != nil {
+			t.Fatalf("create session: %v", err)
+		}
+
+		state, cookie := initiateLinked(t, svc, cfg, "github", rawSession)
+		rec, req := callbackRequestWithSession(state, cookie, cfg, rawSession)
+		sess, _, _, err := svc.HandleCallback(req.Context(), rec, req, "github", "code-1", state, db.SessionTypeCookie)
+		if sess != nil {
+			t.Fatalf("session minted for %v through the explicit link", sess.UserID)
+		}
+		requireCode(t, err, errors.CodeOAuthAccountLinkConflict, http.StatusConflict)
+		requireIdentityRows(t, database, 1, 1, 2)
+		var link db.OAuthAccount
+		if err := database.First(&link).Error; err != nil {
+			t.Fatalf("load link: %v", err)
+		}
+		if link.ProviderUserID != "sub-victim-unverified" || link.Verified {
+			t.Fatalf("surviving link = (%q, verified=%v); want the owner's own unverified google link",
+				link.ProviderUserID, link.Verified)
+		}
+		var refused int64
+		if err := database.Model(&db.OAuthAccount{}).
+			Where("provider_id = ? AND provider_user_id = ?", "github", "sub-attacker-verified").
+			Count(&refused).Error; err != nil {
+			t.Fatalf("count refused link: %v", err)
+		}
+		if refused != 0 {
+			t.Fatalf("refused identity rows = %d; want 0", refused)
+		}
+	})
+}
+
+// TestInitiateFlowSkipsNonceForNonOIDC pins that a nonce is minted only for
+// providers that can verify an ID token: a plain Provider has no nonce channel
+// and never checks one at callback.
+func TestInitiateFlowSkipsNonceForNonOIDC(t *testing.T) {
+	database := serviceTestDB(t)
+	cfg := serviceTestConfig()
+	stub := &stubProvider{id: "google", info: verifiedInfo()}
+	svc := NewService(database, session.NewService(database, cfg), map[string]Provider{"google": stub}, cfg)
+
+	state, cookie := mustInitiate(t, svc, cfg, "google")
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/auth/oauth/google/callback", nil)
+	req.AddCookie(cookie)
+	payload, err := ValidateState(rec, req, cfg, "google", state)
+	if err != nil {
+		t.Fatalf("ValidateState = %v", err)
+	}
+	if payload.Nonce != "" {
+		t.Fatalf("state nonce = %q for a non-OIDC provider; want empty", payload.Nonce)
+	}
+}
+
+// failingGetByIDStore swaps the user store so GetByID can fail like a dead DB link.
+type failingGetByIDStore struct {
+	db.Store
+	users db.UserStore
+}
+
+func (f *failingGetByIDStore) Users() db.UserStore { return f.users }
+
+type failingGetByIDUserStore struct {
+	db.UserStore
+	err error
+}
+
+func (f *failingGetByIDUserStore) GetByID(context.Context, uuid.UUID) (*db.User, error) {
+	return nil, f.err
+}
+
+// nilUserStore returns (nil, nil) for GetByID: Store is a pluggable interface,
+// so a third-party implementation may violate the miss contract.
+type nilUserStore struct{ db.UserStore }
+
+func (nilUserStore) GetByID(context.Context, uuid.UUID) (*db.User, error) { return nil, nil }
+
+// linkGate is the state shared by every gated store view: the service reads
+// through the root store and through the transaction it opens, and both must
+// agree on the rendezvous and on which probes report a miss.
+type linkGate struct {
+	remaining atomic.Int32
+	conflicts atomic.Int32
+	arrived   chan struct{}
+	release   chan struct{}
+}
+
+// gatedStore rebinds the gate to whichever store view is current, so the
+// transaction-scoped insert is the one that observes the unique violation.
+type gatedStore struct {
+	db.Store
+	gate *linkGate
+}
+
+func (s *gatedStore) OAuthAccounts() db.OAuthAccountStore {
+	return &gatedMissLinkStore{OAuthAccountStore: s.Store.OAuthAccounts(), gate: s.gate}
+}
+
+func (s *gatedStore) Transaction(ctx context.Context, fn func(db.Store) error) error {
+	return s.Store.Transaction(ctx, func(tx db.Store) error {
+		return fn(&gatedStore{Store: tx, gate: s.gate})
+	})
+}
+
+// gatedMissLinkStore reports a miss for its first `remaining` GetByProvider
+// probes, holding each caller until release closes. Both concurrent callbacks
+// therefore clear the already-linked branch before either can insert.
+type gatedMissLinkStore struct {
+	db.OAuthAccountStore
+	gate *linkGate
+}
+
+func (g *gatedMissLinkStore) GetByProvider(ctx context.Context, providerID, providerTenantID, providerUserID string) (*db.OAuthAccount, error) {
+	if g.gate.remaining.Add(-1) < 0 {
+		return g.OAuthAccountStore.GetByProvider(ctx, providerID, providerTenantID, providerUserID)
+	}
+	g.gate.arrived <- struct{}{}
+	<-g.gate.release
+	return nil, gorm.ErrRecordNotFound
+}
+
+func (g *gatedMissLinkStore) Create(ctx context.Context, a *db.OAuthAccount) error {
+	err := g.OAuthAccountStore.Create(ctx, a)
+	if isUniqueViolation(err) {
+		g.gate.conflicts.Add(1)
+	}
+	return err
+}
+
+// hideFirstLinkStore hides an existing link from the first GetByProvider probe,
+// so the callback skips the already-linked branch and loses the insert race.
+type hideFirstLinkStore struct {
+	db.OAuthAccountStore
+	hidden bool
+}
+
+func (h *hideFirstLinkStore) GetByProvider(ctx context.Context, providerID, providerTenantID, providerUserID string) (*db.OAuthAccount, error) {
+	if h.hidden {
+		h.hidden = false
+		return nil, gorm.ErrRecordNotFound
+	}
+	return h.OAuthAccountStore.GetByProvider(ctx, providerID, providerTenantID, providerUserID)
+}
+
+// hidesEmailUserStore reports one miss for a single address, standing in for the
+// read a signup invalidates when it commits between the link's probe and its
+// write. Every other lookup, and every later probe, is served normally.
+type hidesEmailUserStore struct {
+	db.UserStore
+	email  string
+	hidden *atomic.Bool
+}
+
+func (h *hidesEmailUserStore) GetByEmail(ctx context.Context, email string) (*db.User, error) {
+	if db.NormalizeEmail(email) == h.email && h.hidden.CompareAndSwap(true, false) {
+		return nil, gorm.ErrRecordNotFound
+	}
+	return h.UserStore.GetByEmail(ctx, email)
+}
+
+type hidesEmailStore struct {
+	db.Store
+	email  string
+	hidden *atomic.Bool
+}
+
+func (s *hidesEmailStore) Users() db.UserStore {
+	return &hidesEmailUserStore{UserStore: s.Store.Users(), email: s.email, hidden: s.hidden}
+}
+
+func (s *hidesEmailStore) Transaction(ctx context.Context, fn func(db.Store) error) error {
+	return s.Store.Transaction(ctx, func(tx db.Store) error {
+		return fn(&hidesEmailStore{Store: tx, email: s.email, hidden: s.hidden})
+	})
+}
+
+// TestHandleCallbackLinkLosesToSignupThatCommittedMidFlight is #94: a password
+// signup for the provider's address commits after the link's owner probe but
+// before its insert. The link must lose, because the claim insert is the guard a
+// read cannot be; without it both tables end up owning the address.
+func TestHandleCallbackLinkLosesToSignupThatCommittedMidFlight(t *testing.T) {
+	const addr = "midflight@example.test"
+	database, cfg, stub, rawSvc := setupServiceTest(t, &UserInfo{
+		ProviderID: "google", ProviderUserID: "sub-midflight",
+		Email: addr, EmailVerified: true,
+	})
+	ctx := context.Background()
+	base := rawSvc.(*service).store
+
+	// The signup that committed mid-flight: its row exists, its claim is unverified.
+	winner := db.User{ID: uuid.New(), Email: addr, PasswordHash: "hash"}
+	if err := base.Users().Create(ctx, &winner); err != nil {
+		t.Fatalf("seed signup: %v", err)
+	}
+	if err := base.ClaimedEmails().Claim(ctx, addr, winner.ID, false); err != nil {
+		t.Fatalf("seed claim: %v", err)
+	}
+
+	// A verified account linking an address that is not its own.
+	linker := db.User{ID: uuid.New(), Email: "linker@work.example", PasswordHash: "hash", EmailVerified: true}
+	if err := base.Users().Create(ctx, &linker); err != nil {
+		t.Fatalf("seed linker: %v", err)
+	}
+	sessSvc := session.NewService(database, cfg)
+	_, rawSession, err := sessSvc.CreateSession(ctx, linker.ID, linker.CredentialVersion, db.SessionTypeCookie, "127.0.0.1", "ua")
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	hidden := &atomic.Bool{}
+	hidden.Store(true)
+	svc := NewServiceWithStore(&hidesEmailStore{Store: base, email: db.NormalizeEmail(addr), hidden: hidden},
+		sessSvc, map[string]Provider{"google": stub}, cfg)
+
+	state, cookie := initiateLinked(t, svc, cfg, "google", rawSession)
+	rec, req := callbackRequestWithSession(state, cookie, cfg, rawSession)
+	sess, _, _, cerr := svc.HandleCallback(ctx, rec, req, "google", "code-1", state, db.SessionTypeCookie)
+	if sess != nil {
+		t.Fatalf("session minted for %v despite the committed signup", sess.UserID)
+	}
+	requireCode(t, cerr, errors.CodeOAuthAccountLinkConflict, http.StatusConflict)
+
+	// The signup stays the only holder: no link row carries its address.
+	var links int64
+	if err := database.Model(&db.OAuthAccount{}).Where("email = ?", addr).Count(&links).Error; err != nil {
+		t.Fatalf("count links: %v", err)
+	}
+	if links != 0 {
+		t.Fatalf("oauth_accounts holding %q = %d; want 0", addr, links)
+	}
+	claim, gerr := base.ClaimedEmails().Get(ctx, addr)
+	if gerr != nil {
+		t.Fatalf("load claim: %v", gerr)
+	}
+	if claim.OwnerUserID != winner.ID {
+		t.Fatalf("claim owner = %v; want the signup %v", claim.OwnerUserID, winner.ID)
+	}
+}
+
+// TestHandleCallbackLinkRefusesEmailClaimedByAnotherLink pins the 409 for an
+// address reserved by another account's link, which has no users row to converge
+// on and must not become a 500.
+func TestHandleCallbackLinkRefusesEmailClaimedByAnotherLink(t *testing.T) {
+	const addr = "held-by-link@example.test"
+	database, cfg, stub, rawSvc := setupServiceTest(t, &UserInfo{
+		ProviderID: "google", ProviderUserID: "sub-held-by-link",
+		Email: addr, EmailVerified: true,
+	})
+	ctx := context.Background()
+	base := rawSvc.(*service).store
+
+	holder := db.User{ID: uuid.New(), Email: "holder@work.example", PasswordHash: "hash", EmailVerified: true}
+	linker := db.User{ID: uuid.New(), Email: "linker@work.example", PasswordHash: "hash", EmailVerified: true}
+	for _, u := range []db.User{holder, linker} {
+		if err := base.Users().Create(ctx, &u); err != nil {
+			t.Fatalf("seed user: %v", err)
+		}
+	}
+	if err := base.ClaimedEmails().Claim(ctx, addr, holder.ID, true); err != nil {
+		t.Fatalf("seed claim: %v", err)
+	}
+	sessSvc := session.NewService(database, cfg)
+	_, rawSession, err := sessSvc.CreateSession(ctx, linker.ID, linker.CredentialVersion, db.SessionTypeCookie, "127.0.0.1", "ua")
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	svc := NewServiceWithStore(base, sessSvc, map[string]Provider{"google": stub}, cfg)
+
+	state, cookie := initiateLinked(t, svc, cfg, "google", rawSession)
+	rec, req := callbackRequestWithSession(state, cookie, cfg, rawSession)
+	sess, _, _, cerr := svc.HandleCallback(ctx, rec, req, "google", "code-1", state, db.SessionTypeCookie)
+	if sess != nil {
+		t.Fatalf("session minted for %v; the claim belongs to another account", sess.UserID)
+	}
+	requireCode(t, cerr, errors.CodeOAuthAccountLinkConflict, http.StatusConflict)
+	if n := countRows(t, database, &db.OAuthAccount{}); n != 0 {
+		t.Fatalf("oauth_accounts = %d; want 0", n)
+	}
+}
+
+// lockOrderStore records the order of the owner lock and the link delete inside
+// invalidateLink, which must match attachLink's owner-then-link lock order.
+type lockOrderStore struct {
+	db.Store
+	calls *[]string
+}
+
+type lockOrderUserStore struct {
+	db.UserStore
+	calls *[]string
+}
+
+func (s *lockOrderUserStore) GetByIDForUpdate(ctx context.Context, id uuid.UUID) (*db.User, error) {
+	*s.calls = append(*s.calls, "lock")
+	return s.UserStore.GetByIDForUpdate(ctx, id)
+}
+
+type lockOrderLinkStore struct {
+	db.OAuthAccountStore
+	calls *[]string
+}
+
+func (s *lockOrderLinkStore) Delete(ctx context.Context, id uuid.UUID) error {
+	*s.calls = append(*s.calls, "delete")
+	return s.OAuthAccountStore.Delete(ctx, id)
+}
+
+func (s *lockOrderStore) Users() db.UserStore {
+	return &lockOrderUserStore{UserStore: s.Store.Users(), calls: s.calls}
+}
+
+func (s *lockOrderStore) OAuthAccounts() db.OAuthAccountStore {
+	return &lockOrderLinkStore{OAuthAccountStore: s.Store.OAuthAccounts(), calls: s.calls}
+}
+
+func (s *lockOrderStore) Transaction(ctx context.Context, fn func(db.Store) error) error {
+	return s.Store.Transaction(ctx, func(tx db.Store) error {
+		return fn(&lockOrderStore{Store: tx, calls: s.calls})
+	})
+}
+
+// TestInvalidateLinkLocksTheOwnerBeforeDeleting pins the lock order that avoids a
+// deadlock with a concurrent attachLink: the owner row is locked before the link
+// row is deleted, never after.
+func TestInvalidateLinkLocksTheOwnerBeforeDeleting(t *testing.T) {
+	database, cfg, stub, rawSvc := setupServiceTest(t, &UserInfo{
+		ProviderID: "google", ProviderUserID: "sub-lock-order", Email: "", EmailVerified: true,
+	})
+	ctx := context.Background()
+	base := rawSvc.(*service).store
+
+	owner := db.User{ID: uuid.New(), Email: "lock-order-owner@example.com", PasswordHash: "hash", EmailVerified: true}
+	if err := base.Users().Create(ctx, &owner); err != nil {
+		t.Fatalf("seed owner: %v", err)
+	}
+	link := db.OAuthAccount{ID: uuid.New(), UserID: owner.ID, ProviderID: "google",
+		ProviderUserID: "sub-lock-order", Email: "lock-order-link@example.com", Verified: true}
+	if err := database.Create(&link).Error; err != nil {
+		t.Fatalf("seed link: %v", err)
+	}
+
+	calls := make([]string, 0, 4)
+	svc := NewServiceWithStore(&lockOrderStore{Store: base, calls: &calls},
+		session.NewService(database, cfg), map[string]Provider{"google": stub}, cfg)
+
+	svc.(*service).invalidateLink(ctx, link)
+	if len(calls) < 2 || calls[0] != "lock" || calls[1] != "delete" {
+		t.Fatalf("invalidateLink calls = %v; want the owner lock before the link delete", calls)
+	}
+}
+
+// TestRegistrationClaimsTheAddress pins the third account-creating path:
+// createUserAndLink must claim the address it registers, or every OAuth-only
+// account is missing the row the table exists to hold.
+func TestRegistrationClaimsTheAddress(t *testing.T) {
+	const addr = "register-claim@example.test"
+	database, cfg, _, rawSvc := setupServiceTest(t, &UserInfo{
+		ProviderID: "google", ProviderUserID: "sub-register-claim",
+		Email: addr, EmailVerified: true,
+	})
+	ctx := context.Background()
+
+	sess, err := loginViaGoogle(t, rawSvc, cfg)
+	if err != nil || sess == nil {
+		t.Fatalf("registration = %v, %v; want a session", sess, err)
+	}
+	claim, cerr := rawSvc.(*service).store.ClaimedEmails().Get(ctx, addr)
+	if cerr != nil {
+		t.Fatalf("load claim: %v", cerr)
+	}
+	if claim.OwnerUserID != sess.UserID || !claim.Verified {
+		t.Fatalf("claim = %+v; want holder %v, verified", claim, sess.UserID)
+	}
+	if n := countRows(t, database, &db.OAuthAccount{}); n != 1 {
+		t.Fatalf("oauth_accounts = %d; want the registration's single link", n)
+	}
+}
+
+// TestRegistrationRefusesAddressClaimedByAnotherLink drives the claimConflict arm:
+// the address has no users row, so the registration user insert succeeds and only
+// the claim insert can reject it. The rejection must be the 409, and the rolled-back
+// transaction must leave no user or link behind.
+func TestRegistrationRefusesAddressClaimedByAnotherLink(t *testing.T) {
+	const addr = "register-held@example.test"
+	database, cfg, _, rawSvc := setupServiceTest(t, &UserInfo{
+		ProviderID: "google", ProviderUserID: "sub-register-held",
+		Email: addr, EmailVerified: true,
+	})
+	ctx := context.Background()
+	base := rawSvc.(*service).store
+
+	holder := db.User{ID: uuid.New(), Email: "register-holder@work.example", PasswordHash: "hash", EmailVerified: true}
+	if err := base.Users().Create(ctx, &holder); err != nil {
+		t.Fatalf("seed holder: %v", err)
+	}
+	if err := base.ClaimedEmails().Claim(ctx, addr, holder.ID, true); err != nil {
+		t.Fatalf("seed claim: %v", err)
+	}
+
+	sess, err := loginViaGoogle(t, rawSvc, cfg)
+	if sess != nil {
+		t.Fatalf("session minted for %v; the address is claimed by another account", sess.UserID)
+	}
+	requireCode(t, err, errors.CodeOAuthAccountLinkConflict, http.StatusConflict)
+	if n := countRows(t, database, &db.User{}); n != 1 {
+		t.Fatalf("users = %d; want only the holder", n)
+	}
+	if n := countRows(t, database, &db.OAuthAccount{}); n != 0 {
+		t.Fatalf("oauth_accounts = %d; want the registration's link rolled back", n)
+	}
+	claim, cerr := base.ClaimedEmails().Get(ctx, addr)
+	if cerr != nil {
+		t.Fatalf("load claim: %v", cerr)
+	}
+	if claim.OwnerUserID != holder.ID {
+		t.Fatalf("claim owner = %v; want the seeded holder %v", claim.OwnerUserID, holder.ID)
+	}
+}
+
+// createRejectsUserStore makes the registration's user insert look like a lost
+// create race while the address has no users row: the window linkRacedUser runs in
+// when the winner is a link-only claim rather than an account.
+type createRejectsUserStore struct {
+	db.Store
+	email string
+}
+
+type createRejectsUser struct {
+	db.UserStore
+	email string
+}
+
+func (s *createRejectsUser) Create(ctx context.Context, user *db.User) error {
+	if db.NormalizeEmail(user.Email) == s.email {
+		return errors.ErrEmailAlreadyExists
+	}
+	return s.UserStore.Create(ctx, user)
+}
+
+func (s *createRejectsUserStore) Users() db.UserStore {
+	return &createRejectsUser{UserStore: s.Store.Users(), email: s.email}
+}
+
+func (s *createRejectsUserStore) Transaction(ctx context.Context, fn func(db.Store) error) error {
+	return s.Store.Transaction(ctx, func(tx db.Store) error {
+		return fn(&createRejectsUserStore{Store: tx, email: s.email})
+	})
+}
+
+// TestRegistrationRaceRejectsLinkOnlyClaim pins linkRacedUser: losing the user
+// insert to a race whose address is held by another account's link must return the
+// documented 409, not a 500.
+func TestRegistrationRaceRejectsLinkOnlyClaim(t *testing.T) {
+	const addr = "race-link-claim@example.test"
+	database, cfg, stub, rawSvc := setupServiceTest(t, &UserInfo{
+		ProviderID: "google", ProviderUserID: "sub-race-link",
+		Email: addr, EmailVerified: true,
+	})
+	ctx := context.Background()
+	base := rawSvc.(*service).store
+
+	holder := db.User{ID: uuid.New(), Email: "race-holder@work.example", PasswordHash: "hash", EmailVerified: true}
+	if err := base.Users().Create(ctx, &holder); err != nil {
+		t.Fatalf("seed holder: %v", err)
+	}
+	if err := base.ClaimedEmails().Claim(ctx, addr, holder.ID, true); err != nil {
+		t.Fatalf("seed claim: %v", err)
+	}
+	svc := NewServiceWithStore(
+		&createRejectsUserStore{Store: base, email: db.NormalizeEmail(addr)},
+		session.NewService(database, cfg), map[string]Provider{"google": stub}, cfg)
+
+	sess, err := loginViaGoogle(t, svc, cfg)
+	if sess != nil {
+		t.Fatalf("session minted for %v; the address is claimed by another account", sess.UserID)
+	}
+	requireCode(t, err, errors.CodeOAuthAccountLinkConflict, http.StatusConflict)
+	if n := countRows(t, database, &db.OAuthAccount{}); n != 0 {
+		t.Fatalf("oauth_accounts = %d; want 0", n)
+	}
+}
+
+// TestTakeoverRefusedWhenClaimAlreadyVerified pins the guard's hard edge: a claim
+// that is already proved is never handed over, even when the account row itself
+// still looks unverified. The address stays blocked and no credential is touched.
+func TestTakeoverRefusedWhenClaimAlreadyVerified(t *testing.T) {
+	const addr = "proved@example.test"
+	database, cfg, stub, rawSvc := setupServiceTest(t, &UserInfo{
+		ProviderID: "google", ProviderUserID: "sub-proved",
+		Email: addr, EmailVerified: true,
+	})
+	ctx := context.Background()
+	base := rawSvc.(*service).store
+
+	squatter := db.User{ID: uuid.New(), Email: addr, PasswordHash: "hash"}
+	if err := base.Users().Create(ctx, &squatter); err != nil {
+		t.Fatalf("seed squatter: %v", err)
+	}
+	if err := base.ClaimedEmails().Claim(ctx, addr, squatter.ID, true); err != nil {
+		t.Fatalf("seed verified claim: %v", err)
+	}
+	svc := NewServiceWithStore(base, session.NewService(database, cfg), map[string]Provider{"google": stub}, cfg)
+
+	sess, err := loginViaGoogle(t, svc, cfg)
+	if sess != nil {
+		t.Fatalf("session minted for %v; a verified claim must not be taken over", sess.UserID)
+	}
+	requireCode(t, err, errors.CodeOAuthAccountLinkConflict, http.StatusConflict)
+
+	var after db.User
+	if aerr := database.Where("id = ?", squatter.ID).First(&after).Error; aerr != nil {
+		t.Fatalf("reload squatter: %v", aerr)
+	}
+	if after.PasswordHash != squatter.PasswordHash {
+		t.Error("a refused takeover must not touch the password")
+	}
+	if n := countRows(t, database, &db.OAuthAccount{}); n != 0 {
+		t.Fatalf("oauth_accounts = %d; want 0", n)
+	}
+}
+
+// TestTakeoverRefusedForUnverifiedProviderEmail pins that the handover needs the
+// provider's attestation: without it the squatted account keeps its credentials.
+func TestTakeoverRefusedForUnverifiedProviderEmail(t *testing.T) {
+	const addr = "unattested@example.test"
+	database, cfg, stub, rawSvc := setupServiceTest(t, &UserInfo{
+		ProviderID: "google", ProviderUserID: "sub-unattested",
+		Email: addr, EmailVerified: false,
+	})
+	ctx := context.Background()
+	base := rawSvc.(*service).store
+
+	squatter := db.User{ID: uuid.New(), Email: addr, PasswordHash: "hash"}
+	if err := base.Users().Create(ctx, &squatter); err != nil {
+		t.Fatalf("seed squatter: %v", err)
+	}
+	if err := base.ClaimedEmails().Claim(ctx, addr, squatter.ID, false); err != nil {
+		t.Fatalf("seed claim: %v", err)
+	}
+	svc := NewServiceWithStore(base, session.NewService(database, cfg), map[string]Provider{"google": stub}, cfg)
+
+	sess, err := loginViaGoogle(t, svc, cfg)
+	if sess != nil {
+		t.Fatalf("session minted for %v; an unattested address proves nothing", sess.UserID)
+	}
+	requireCode(t, err, errors.CodeOAuthEmailUnverified, http.StatusBadRequest)
+
+	var after db.User
+	if aerr := database.Where("id = ?", squatter.ID).First(&after).Error; aerr != nil {
+		t.Fatalf("reload squatter: %v", aerr)
+	}
+	if after.PasswordHash != squatter.PasswordHash || after.EmailVerified {
+		t.Errorf("squatted account changed (password=%q verified=%v); want it untouched",
+			after.PasswordHash, after.EmailVerified)
+	}
+}
+
+// TestTakeoverRefusedWithoutProviderAttestation drives the guard directly: the
+// public callback rejects an unattested address before it can reach the handover,
+// so this pins the guard's own contract — no credential is touched and nothing is
+// promoted when the provider did not attest the mailbox.
+func TestTakeoverRefusedWithoutProviderAttestation(t *testing.T) {
+	const addr = "direct-unattested@example.test"
+	database, cfg, _, rawSvc := setupServiceTest(t, &UserInfo{
+		ProviderID: "google", ProviderUserID: "sub-direct", Email: addr, EmailVerified: false,
+	})
+	ctx := context.Background()
+	svc := rawSvc.(*service)
+	base := svc.store
+
+	squatter := db.User{ID: uuid.New(), Email: addr, PasswordHash: "hash"}
+	if err := base.Users().Create(ctx, &squatter); err != nil {
+		t.Fatalf("seed squatter: %v", err)
+	}
+	if err := base.ClaimedEmails().Claim(ctx, addr, squatter.ID, false); err != nil {
+		t.Fatalf("seed claim: %v", err)
+	}
+	if _, _, err := session.NewService(database, cfg).
+		CreateSession(ctx, squatter.ID, squatter.CredentialVersion, db.SessionTypeCookie, "127.0.0.1", "ua"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	owner, err := base.Users().GetByID(ctx, squatter.ID)
+	if err != nil {
+		t.Fatalf("load owner: %v", err)
+	}
+	terr := svc.takeoverUnverifiedAccount(ctx, base, owner,
+		&UserInfo{ProviderID: "google", Email: addr, EmailVerified: false})
+	if !errors.Is(terr, errors.ErrOAuthAccountLinkConflict) {
+		t.Fatalf("takeover = %v; want ErrOAuthAccountLinkConflict", terr)
+	}
+
+	after, err := base.Users().GetByID(ctx, squatter.ID)
+	if err != nil {
+		t.Fatalf("reload owner: %v", err)
+	}
+	if after.PasswordHash != squatter.PasswordHash || after.EmailVerified {
+		t.Errorf("account changed (password=%q verified=%v); want it untouched",
+			after.PasswordHash, after.EmailVerified)
+	}
+	if claim, cerr := base.ClaimedEmails().Get(ctx, addr); cerr != nil || claim.Verified {
+		t.Fatalf("claim = %+v, %v; want it left unverified", claim, cerr)
+	}
+	if sessions, serr := base.Sessions().ListByUserID(ctx, squatter.ID); serr != nil || len(sessions) != 1 {
+		t.Fatalf("sessions = %d, %v; want the existing session untouched", len(sessions), serr)
+	}
+}
+
+// TestTakeoverIsRetryable pins that repeating the proving callback is safe: the
+// identity resolves its own link, no second account or link appears, and the
+// account stays proved.
+func TestTakeoverIsRetryable(t *testing.T) {
+	const addr = "retry@example.test"
+	database, cfg, stub, rawSvc := setupServiceTest(t, &UserInfo{
+		ProviderID: "google", ProviderUserID: "sub-retry",
+		Email: addr, EmailVerified: true,
+	})
+	ctx := context.Background()
+	base := rawSvc.(*service).store
+
+	squatter := db.User{ID: uuid.New(), Email: addr, PasswordHash: "hash"}
+	if err := base.Users().Create(ctx, &squatter); err != nil {
+		t.Fatalf("seed squatter: %v", err)
+	}
+	if err := base.ClaimedEmails().Claim(ctx, addr, squatter.ID, false); err != nil {
+		t.Fatalf("seed claim: %v", err)
+	}
+	svc := NewServiceWithStore(base, session.NewService(database, cfg), map[string]Provider{"google": stub}, cfg)
+
+	for i := 0; i < 2; i++ {
+		sess, err := loginViaGoogle(t, svc, cfg)
+		if err != nil {
+			t.Fatalf("callback %d: %v", i, err)
+		}
+		if sess == nil || sess.UserID != squatter.ID {
+			t.Fatalf("callback %d session user = %v; want %v", i, sess, squatter.ID)
+		}
+	}
+	requireIdentityRows(t, database, 1, 1, 2)
+	claim, cerr := base.ClaimedEmails().Get(ctx, addr)
+	if cerr != nil {
+		t.Fatalf("load claim: %v", cerr)
+	}
+	if claim.OwnerUserID != squatter.ID || !claim.Verified {
+		t.Fatalf("claim = %+v; want it proved and held by %v", claim, squatter.ID)
+	}
+}
+
+// TestLinkDeletionReleasesClaimOnlyWhenItWasTheLastHolder pins the release rule:
+// a removed link frees its address only when the owner's account row and its other
+// links no longer hold it, so a released address becomes claimable again.
+func TestLinkDeletionReleasesClaimOnlyWhenItWasTheLastHolder(t *testing.T) {
+	const addr = "released@example.test"
+	database, _, _, rawSvc := setupServiceTest(t, &UserInfo{
+		ProviderID: "google", ProviderUserID: "sub-released", Email: "", EmailVerified: true,
+	})
+	ctx := context.Background()
+	svc := rawSvc.(*service)
+	base := svc.store
+
+	owner := db.User{ID: uuid.New(), Email: "owner@work.example", PasswordHash: "hash", EmailVerified: true}
+	if err := base.Users().Create(ctx, &owner); err != nil {
+		t.Fatalf("seed owner: %v", err)
+	}
+	first := db.OAuthAccount{ID: uuid.New(), UserID: owner.ID, ProviderID: "google",
+		ProviderTenantID: "", ProviderUserID: "sub-released", Email: addr, Verified: true}
+	second := db.OAuthAccount{ID: uuid.New(), UserID: owner.ID, ProviderID: "github",
+		ProviderTenantID: "", ProviderUserID: "gh-released", Email: addr, Verified: true}
+	for _, link := range []db.OAuthAccount{first, second} {
+		if err := database.Create(&link).Error; err != nil {
+			t.Fatalf("seed link: %v", err)
+		}
+	}
+	if err := base.ClaimedEmails().Claim(ctx, addr, owner.ID, true); err != nil {
+		t.Fatalf("seed claim: %v", err)
+	}
+
+	// A second link still holds the address.
+	svc.invalidateLink(ctx, first)
+	if _, err := base.ClaimedEmails().Get(ctx, addr); err != nil {
+		t.Fatalf("claim released while another link still holds the address: %v", err)
+	}
+	// The last holder is removed.
+	svc.invalidateLink(ctx, second)
+	if _, err := base.ClaimedEmails().Get(ctx, addr); !errors.Is(err, gorm.ErrRecordNotFound) {
+		t.Fatalf("claim survived its last holder, err = %v", err)
+	}
+	// The address is claimable again.
+	if err := base.ClaimedEmails().Claim(ctx, addr, owner.ID, false); err != nil {
+		t.Fatalf("re-claim after release: %v", err)
+	}
+
+	// The owner's own account row also holds an address, so deleting such a link
+	// keeps its claim.
+	ownLink := db.OAuthAccount{ID: uuid.New(), UserID: owner.ID, ProviderID: "github",
+		ProviderTenantID: "", ProviderUserID: "gh-own", Email: owner.Email, Verified: true}
+	if err := database.Create(&ownLink).Error; err != nil {
+		t.Fatalf("seed own-address link: %v", err)
+	}
+	if err := base.ClaimedEmails().Claim(ctx, owner.Email, owner.ID, true); err != nil {
+		t.Fatalf("claim own address: %v", err)
+	}
+	svc.invalidateLink(ctx, ownLink)
+	if _, err := base.ClaimedEmails().Get(ctx, owner.Email); err != nil {
+		t.Fatalf("claim for the account's own address was released: %v", err)
+	}
+}
+
+func TestHandleCallbackLinkConflictForeignOwner(t *testing.T) {
+	database, cfg, stub, rawSvc := setupServiceTest(t, &UserInfo{
+		ProviderID: "google", ProviderUserID: "sub-conflict",
+		Email: "provider-owner@personal.example", EmailVerified: true,
+	})
+	ctx := context.Background()
+	sessSvc := session.NewService(database, cfg)
+	active := db.User{ID: uuid.New(), Email: "active@work.example", PasswordHash: "hash", EmailVerified: true}
+	foreign := db.User{ID: uuid.New(), Email: "foreign@personal.example", PasswordHash: "hash", EmailVerified: true}
+	for _, u := range []db.User{active, foreign} {
+		if err := database.Create(&u).Error; err != nil {
+			t.Fatalf("seed user: %v", err)
+		}
+	}
+	won := db.OAuthAccount{ID: uuid.New(), UserID: foreign.ID, ProviderID: "google",
+		ProviderUserID: "sub-conflict", Email: foreign.Email, Verified: true}
+	if err := database.Create(&won).Error; err != nil {
+		t.Fatalf("seed link: %v", err)
+	}
+	_, rawSession, err := sessSvc.CreateSession(ctx, active.ID, active.CredentialVersion, db.SessionTypeCookie, "127.0.0.1", "ua")
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	base := rawSvc.(*service).store
+	svc := NewServiceWithStore(&wrappedTxStore{
+		Store: base,
+		oauth: &hideFirstLinkStore{OAuthAccountStore: base.OAuthAccounts(), hidden: true},
+	}, sessSvc, map[string]Provider{"google": stub}, cfg)
+
+	state, stateCookie := initiateLinked(t, svc, cfg, "google", rawSession)
+	rec, req := callbackRequestWithSession(state, stateCookie, cfg, rawSession)
+	sess, _, _, err := svc.HandleCallback(ctx, rec, req, "google", "code-1", state, db.SessionTypeCookie)
+	if sess != nil {
+		t.Fatalf("session issued for %v; want none for the foreign owner", sess.UserID)
+	}
+	requireCode(t, err, errors.CodeOAuthAccountAlreadyLinked, http.StatusConflict)
+	requireIdentityRows(t, database, 2, 1, 1)
+	var link db.OAuthAccount
+	if err := database.Where("provider_id = ? AND provider_user_id = ?", "google", "sub-conflict").First(&link).Error; err != nil {
+		t.Fatalf("load link: %v", err)
+	}
+	if link.UserID != foreign.ID {
+		t.Fatalf("link owner = %v; want untouched %v", link.UserID, foreign.ID)
+	}
+}
+
+func TestHandleCallbackLinkConflictSameOwnerConverges(t *testing.T) {
+	database, cfg, stub, rawSvc := setupServiceTest(t, &UserInfo{
+		ProviderID: "google", ProviderUserID: "sub-same-owner",
+		Email: "provider-owner@personal.example", EmailVerified: true,
+	})
+	ctx := context.Background()
+	sessSvc := session.NewService(database, cfg)
+	active := db.User{ID: uuid.New(), Email: "active@work.example", PasswordHash: "hash", EmailVerified: true}
+	if err := database.Create(&active).Error; err != nil {
+		t.Fatalf("seed user: %v", err)
+	}
+	_, rawSession, err := sessSvc.CreateSession(ctx, active.ID, active.CredentialVersion, db.SessionTypeCookie, "127.0.0.1", "ua")
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	base := rawSvc.(*service).store
+	gate := &linkGate{
+		arrived: make(chan struct{}, 2),
+		release: make(chan struct{}),
+	}
+	gate.remaining.Store(2)
+	svc := NewServiceWithStore(&gatedStore{Store: base, gate: gate},
+		sessSvc, map[string]Provider{"google": stub}, cfg)
+
+	states := make([]string, 2)
+	cookies := make([]*http.Cookie, 2)
+	for i := range states {
+		states[i], cookies[i] = initiateLinked(t, svc, cfg, "google", rawSession)
+	}
+	type outcome struct {
+		userID uuid.UUID
+		err    error
+	}
+	results := make([]outcome, len(states))
+	var wg sync.WaitGroup
+	for i := range states {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			rec, req := callbackRequestWithSession(states[i], cookies[i], cfg, rawSession)
+			sess, _, _, err := svc.HandleCallback(req.Context(), rec, req, "google", "code-1", states[i], db.SessionTypeCookie)
+			if sess != nil {
+				results[i].userID = sess.UserID
+			}
+			results[i].err = err
+		}(i)
+	}
+	// Hold both callbacks at their first link probe until both have arrived, so
+	// one insert wins and the other takes the conflict-recovery path.
+	<-gate.arrived
+	<-gate.arrived
+	close(gate.release)
+	wg.Wait()
+	if n := gate.conflicts.Load(); n != 1 {
+		t.Fatalf("unique conflicts = %d; want 1 (loser must take the relink path)", n)
+	}
+
+	for i, r := range results {
+		if r.err != nil {
+			t.Fatalf("callback %d: %v; want same-owner convergence", i, r.err)
+		}
+		if r.userID != active.ID {
+			t.Fatalf("callback %d session user = %v; want %v", i, r.userID, active.ID)
+		}
+	}
+	// One active-user session plus one per callback; both linked to the owner.
+	requireIdentityRows(t, database, 1, 1, 3)
+}
+
+// staleOwnerStore hides a revocation that lands after the caller's first read:
+// Users().GetByID returns the verified snapshot the gate would have used, while
+// the locking read observes the current (unverified) row. Transaction rebinds
+// the snapshot to the tx store, so only GetByID is overridden and every other
+// user read, GetByIDForUpdate included, stays on the transaction's connection.
+type staleOwnerStore struct {
+	db.Store
+	stale *db.User
+}
+
+func (s *staleOwnerStore) Users() db.UserStore {
+	return &staleOwnerUserStore{UserStore: s.Store.Users(), stale: s.stale}
+}
+
+func (s *staleOwnerStore) Transaction(ctx context.Context, fn func(db.Store) error) error {
+	return s.Store.Transaction(ctx, func(tx db.Store) error {
+		return fn(&wrappedTxStore{Store: tx, users: &staleOwnerUserStore{UserStore: tx.Users(), stale: s.stale}})
+	})
+}
+
+type staleOwnerUserStore struct {
+	db.UserStore
+	stale *db.User
+}
+
+func (s *staleOwnerUserStore) GetByID(ctx context.Context, id uuid.UUID) (*db.User, error) {
+	if s.stale != nil && s.stale.ID == id {
+		return s.stale, nil
+	}
+	return s.UserStore.GetByID(ctx, id)
+}
+
+// TestExplicitLinkGateReadsLockedOwnerState pins that the claim decision is made
+// on the row-locked owner, not on an earlier read: a revocation that lands
+// between the callback's owner load and the insert must be observed, so the
+// link cannot be committed onto an account that is no longer claimed.
+func TestExplicitLinkGateReadsLockedOwnerState(t *testing.T) {
+	database, cfg, stub, rawSvc := setupServiceTest(t, &UserInfo{
+		ProviderID: "google", ProviderUserID: "sub-locked-gate",
+		Email: "provider-owner@personal.example", EmailVerified: true,
+	})
+	owner := db.User{ID: uuid.New(), Email: "owner@work.example", EmailVerified: true}
+	if err := database.Create(&owner).Error; err != nil {
+		t.Fatalf("seed owner: %v", err)
+	}
+	_, rawSession, err := session.NewService(database, cfg).
+		CreateSession(context.Background(), owner.ID, owner.CredentialVersion, db.SessionTypeCookie, "127.0.0.1", "ua")
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	// The verified snapshot the callback would have gated on, and the revoked row
+	// a concurrent writer commits before the insert.
+	stale := owner
+	if err := database.Model(&db.User{}).Where("id = ?", owner.ID).Update("email_verified", false).Error; err != nil {
+		t.Fatalf("revoke verification: %v", err)
+	}
+
+	base := rawSvc.(*service).store
+	svc := NewServiceWithStore(&staleOwnerStore{Store: base, stale: &stale},
+		session.NewService(database, cfg), map[string]Provider{"google": stub}, cfg)
+
+	state, cookie := initiateLinked(t, svc, cfg, "google", rawSession)
+	rec, req := callbackRequestWithSession(state, cookie, cfg, rawSession)
+	sess, _, _, err := svc.HandleCallback(context.Background(), rec, req, "google", "code-1", state, db.SessionTypeCookie)
+	if sess != nil {
+		t.Fatalf("session minted for %v; the revoked claim must reject the link", sess.UserID)
+	}
+	requireCode(t, err, errors.CodeOAuthAccountLinkConflict, http.StatusConflict)
+	requireIdentityRows(t, database, 1, 0, 1)
+}
+
 func TestHandleCallbackNilGuards(t *testing.T) {
 	t.Run("nil request tolerated on initiate", func(t *testing.T) {
 		t.Parallel()
@@ -707,7 +2197,7 @@ func TestLinkOrCreateConcurrent(t *testing.T) {
 			wg.Add(1)
 			go func(i int) {
 				defer wg.Done()
-				u, _, _, err := svc.linkOrCreate(context.Background(), "google", info)
+				u, _, _, err := svc.linkOrCreate(context.Background(), "google", info, "", nil)
 				outs[i] = outcome{u, err}
 			}(i)
 		}
@@ -857,13 +2347,13 @@ func TestHandleCallbackAuditFlags(t *testing.T) {
 			t.Fatalf("seed user: %v", err)
 		}
 		link := db.OAuthAccount{ID: uuid.New(), UserID: owner.ID, ProviderID: "google",
-			ProviderUserID: "sub-123", Email: owner.Email}
+			ProviderUserID: "sub-123", Email: owner.Email, Verified: true}
 		if err := database.Create(&link).Error; err != nil {
 			t.Fatalf("seed link: %v", err)
 		}
 		// Enter the create step directly: the seeded link is exactly what a
 		// concurrent winner leaves behind, so the insert must lose to it.
-		user, linked, created, err := svc.(*service).createUserAndLink(context.Background(), "google", verifiedInfo())
+		user, linked, created, err := svc.(*service).createUserAndLink(context.Background(), "google", verifiedInfo(), nil)
 		if err != nil {
 			t.Fatalf("createUserAndLink = %v", err)
 		}
@@ -908,7 +2398,7 @@ func TestService_CreateUserEmailRaceRecovery(t *testing.T) {
 			Email:          "raced@example.com",
 			EmailVerified:  true,
 		}
-		user, linked, created, err := svc.(*service).createUserAndLink(ctx, "google", info)
+		user, linked, created, err := svc.(*service).createUserAndLink(ctx, "google", info, nil)
 		if err != nil {
 			t.Fatalf("expected successful race recovery, got err: %v", err)
 		}
@@ -951,9 +2441,37 @@ func TestService_CreateUserEmailRaceRecovery(t *testing.T) {
 			Email:          "unverified@example.com",
 			EmailVerified:  true,
 		}
-		_, _, _, err := svc.(*service).createUserAndLink(ctx, "google", info)
+		_, _, _, err := svc.(*service).createUserAndLink(ctx, "google", info, nil)
 		if !errors.Is(err, errors.ErrOAuthAccountLinkConflict) {
 			t.Fatalf("expected ErrOAuthAccountLinkConflict, got %v", err)
+		}
+	})
+
+	t.Run("race loser with unverified provider email never merges", func(t *testing.T) {
+		database, _, _, svc := setupServiceTest(t, nil)
+		ctx := context.Background()
+
+		winner := db.User{
+			ID:            uuid.New(),
+			Email:         "raced-unverified@example.com",
+			PasswordHash:  "hash",
+			EmailVerified: true,
+		}
+		if err := database.Create(&winner).Error; err != nil {
+			t.Fatalf("seed winner: %v", err)
+		}
+
+		info := &UserInfo{
+			ProviderUserID: "raced-unverified-subject",
+			Email:          "raced-unverified@example.com",
+			EmailVerified:  false,
+		}
+		_, _, _, err := svc.(*service).createUserAndLink(ctx, "facebook", info, nil)
+		if !errors.Is(err, errors.ErrOAuthEmailUnverified) {
+			t.Fatalf("expected ErrOAuthEmailUnverified, got %v", err)
+		}
+		if n := countRows(t, database, &db.OAuthAccount{}); n != 0 {
+			t.Fatalf("oauth_accounts = %d; want 0 (no merge on an unverified claim)", n)
 		}
 	})
 }
@@ -973,12 +2491,12 @@ func TestService_SubjectCaseSensitivity(t *testing.T) {
 		EmailVerified:  true,
 	}
 
-	u1, linked1, created1, err1 := svc.(*service).createUserAndLink(ctx, "google", upperInfo)
+	u1, linked1, created1, err1 := svc.(*service).createUserAndLink(ctx, "google", upperInfo, nil)
 	if err1 != nil || !linked1 || !created1 {
 		t.Fatalf("create upper failed: %v", err1)
 	}
 
-	u2, linked2, created2, err2 := svc.(*service).createUserAndLink(ctx, "google", lowerInfo)
+	u2, linked2, created2, err2 := svc.(*service).createUserAndLink(ctx, "google", lowerInfo, nil)
 	if err2 != nil || !linked2 || !created2 {
 		t.Fatalf("create lower failed: %v", err2)
 	}
@@ -988,12 +2506,12 @@ func TestService_SubjectCaseSensitivity(t *testing.T) {
 	}
 
 	// Verify lookups resolve distinct accounts
-	l1, found1, err := svc.(*service).findLink(ctx, "google", "Subject_CASE_123")
+	l1, found1, err := svc.(*service).findLink(ctx, "google", "", "Subject_CASE_123")
 	if err != nil || !found1 || l1.UserID != u1.ID {
 		t.Fatalf("upper lookup mismatch: found=%v, err=%v, link=%+v", found1, err, l1)
 	}
 
-	l2, found2, err := svc.(*service).findLink(ctx, "google", "subject_case_123")
+	l2, found2, err := svc.(*service).findLink(ctx, "google", "", "subject_case_123")
 	if err != nil || !found2 || l2.UserID != u2.ID {
 		t.Fatalf("lower lookup mismatch: found=%v, err=%v, link=%+v", found2, err, l2)
 	}
@@ -1110,7 +2628,7 @@ func TestService_CreateUserAndLink_RetryIsolation(t *testing.T) {
 			EmailVerified:  true,
 		}
 
-		_, _, _, err := testSvc.createUserAndLink(ctx, "google", info)
+		_, _, _, err := testSvc.createUserAndLink(ctx, "google", info, nil)
 		if err == nil {
 			t.Fatal("expected error, got nil")
 		}
@@ -1176,7 +2694,7 @@ func TestService_CreateUserAndLink_RetryIsolation(t *testing.T) {
 			EmailVerified:  true,
 		}
 
-		_, _, _, err := testSvc.createUserAndLink(ctx, "google", info)
+		_, _, _, err := testSvc.createUserAndLink(ctx, "google", info, nil)
 		if err == nil {
 			t.Fatal("expected error, got nil")
 		}
@@ -1192,6 +2710,878 @@ func TestService_CreateUserAndLink_RetryIsolation(t *testing.T) {
 		}
 		if !strings.Contains(err.Error(), "disk full during oauth link") {
 			t.Fatalf("expected underlying error 'disk full during oauth link', got: %v", err)
+		}
+	})
+}
+
+func TestOAuthService_X_MissingEmail(t *testing.T) {
+	database := serviceTestDB(t)
+	cfg := serviceTestConfig()
+
+	xInfo := &UserInfo{
+		ProviderID:     "x",
+		ProviderUserID: "x-user-999",
+		Email:          "",
+		EmailVerified:  false,
+		Name:           "X User",
+		AvatarURL:      "https://example.com/avatar.png",
+	}
+
+	stub := &stubProvider{id: "x", info: xInfo}
+	svc := NewService(database, session.NewService(database, cfg),
+		map[string]Provider{"x": stub}, cfg)
+
+	t.Run("unauthenticated registration with missing email fails closed", func(t *testing.T) {
+		state, cookie := mustInitiate(t, svc, cfg, "x")
+		req := httptest.NewRequest(http.MethodGet, "/auth/oauth/x/callback", nil)
+		req.AddCookie(cookie)
+		rec := httptest.NewRecorder()
+
+		_, _, _, err := svc.HandleCallback(context.Background(), rec, req, "x", "test-code", state, db.SessionTypeCookie)
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+		if !errors.Is(err, errors.ErrOAuthEmailRequired) {
+			t.Fatalf("expected ErrOAuthEmailRequired, got %v", err)
+		}
+
+		// Invariant: zero synthetic users or link rows created in database
+		var userCount, linkCount int64
+		if err := database.Model(&db.User{}).Count(&userCount).Error; err != nil {
+			t.Fatalf("count users: %v", err)
+		}
+		if err := database.Model(&db.OAuthAccount{}).Count(&linkCount).Error; err != nil {
+			t.Fatalf("count links: %v", err)
+		}
+		if userCount != 0 {
+			t.Fatalf("expected 0 users created, got %d", userCount)
+		}
+		if linkCount != 0 {
+			t.Fatalf("expected 0 links created, got %d", linkCount)
+		}
+	})
+
+	t.Run("returning user with pre-linked account succeeds without email", func(t *testing.T) {
+		owner := seedLinkedIdentity(t, database, "x", "x-user-999")
+
+		state, cookie := mustInitiate(t, svc, cfg, "x")
+		req := httptest.NewRequest(http.MethodGet, "/auth/oauth/x/callback", nil)
+		req.AddCookie(cookie)
+		rec := httptest.NewRecorder()
+
+		sess, rawID, _, err := svc.HandleCallback(context.Background(), rec, req, "x", "test-code", state, db.SessionTypeCookie)
+		if err != nil {
+			t.Fatalf("unexpected callback error: %v", err)
+		}
+		if sess == nil || rawID == "" {
+			t.Fatal("expected valid session and token")
+		}
+		if sess.UserID != owner.ID {
+			t.Fatalf("sess.UserID = %v; want %v", sess.UserID, owner.ID)
+		}
+	})
+
+	t.Run("active session links provider account without email", func(t *testing.T) {
+		sessSvc := session.NewService(database, cfg)
+		user := db.User{
+			ID:            uuid.New(),
+			Email:         "active-session-user@example.com",
+			EmailVerified: true,
+		}
+		if err := database.Create(&user).Error; err != nil {
+			t.Fatalf("create user: %v", err)
+		}
+
+		sess, rawToken, err := sessSvc.CreateSession(context.Background(), user.ID, 0, db.SessionTypeCookie, "127.0.0.1", "ua")
+		if err != nil {
+			t.Fatalf("create session: %v", err)
+		}
+		if sess == nil || rawToken == "" {
+			t.Fatal("session required")
+		}
+
+		initReq := httptest.NewRequest(http.MethodGet, "/auth/oauth/x?link=true", nil)
+		initReq.AddCookie(&http.Cookie{
+			Name:  cfg.SessionCookieName,
+			Value: rawToken,
+		})
+		initRec := httptest.NewRecorder()
+
+		activeStub := &stubProvider{id: "x", info: &UserInfo{ProviderID: "x", ProviderUserID: "x-active-user-123", Email: ""}}
+		activeSvc := NewService(database, sessSvc, map[string]Provider{"x": activeStub}, cfg)
+
+		authURL, err := activeSvc.InitiateFlow(initRec, initReq, "x")
+		if err != nil {
+			t.Fatalf("initiate flow failed: %v", err)
+		}
+		if authURL == "" {
+			t.Fatal("expected non-empty auth url")
+		}
+
+		var stateCookie *http.Cookie
+		for _, c := range initRec.Result().Cookies() {
+			if c.Name == cfg.OAuth.StateCookieName {
+				stateCookie = c
+				break
+			}
+		}
+		if stateCookie == nil {
+			t.Fatal("state cookie required")
+		}
+
+		// Extract state query param from authURL
+		u, err := url.Parse(authURL)
+		if err != nil {
+			t.Fatalf("parse auth url: %v", err)
+		}
+		state := u.Query().Get("state")
+
+		cbReq := httptest.NewRequest(http.MethodGet, "/auth/oauth/x/callback?code=valid-code&state="+state, nil)
+		cbReq.AddCookie(stateCookie)
+		cbReq.AddCookie(&http.Cookie{Name: cfg.SessionCookieName, Value: rawToken})
+		cbRec := httptest.NewRecorder()
+
+		cbSess, _, _, err := activeSvc.HandleCallback(context.Background(), cbRec, cbReq, "x", "valid-code", state, db.SessionTypeCookie)
+		if err != nil {
+			t.Fatalf("callback failed for active user link: %v", err)
+		}
+		if cbSess.UserID != user.ID {
+			t.Fatalf("expected session user %v, got %v", user.ID, cbSess.UserID)
+		}
+
+		// Verify oauth_accounts link was created
+		var count int64
+		if err := database.Model(&db.OAuthAccount{}).Where("provider_id = ? AND user_id = ?", "x", user.ID).Count(&count).Error; err != nil {
+			t.Fatalf("count links: %v", err)
+		}
+		if count != 1 {
+			t.Fatalf("expected 1 link for user, got %d", count)
+		}
+	})
+
+	t.Run("subsequent login with linked subject-only identity succeeds and preserves link", func(t *testing.T) {
+		sessSvc := session.NewService(database, cfg)
+		user := db.User{
+			ID:            uuid.New(),
+			Email:         "active-subseq-user@example.com",
+			EmailVerified: true,
+		}
+		if err := database.Create(&user).Error; err != nil {
+			t.Fatalf("create user: %v", err)
+		}
+
+		_, rawToken, err := sessSvc.CreateSession(context.Background(), user.ID, 0, db.SessionTypeCookie, "127.0.0.1", "ua")
+		if err != nil {
+			t.Fatalf("create session: %v", err)
+		}
+
+		initReq := httptest.NewRequest(http.MethodGet, "/auth/oauth/x?link=true", nil)
+		initReq.AddCookie(&http.Cookie{Name: cfg.SessionCookieName, Value: rawToken})
+		initRec := httptest.NewRecorder()
+
+		stub := &stubProvider{id: "x", info: &UserInfo{ProviderID: "x", ProviderUserID: "x-subseq-user-456", Email: "", EmailVerified: false}}
+		xSvc := NewService(database, sessSvc, map[string]Provider{"x": stub}, cfg)
+
+		authURL, err := xSvc.InitiateFlow(initRec, initReq, "x")
+		if err != nil {
+			t.Fatalf("initiate flow failed: %v", err)
+		}
+		u, _ := url.Parse(authURL)
+		state := u.Query().Get("state")
+
+		var stateCookie *http.Cookie
+		for _, c := range initRec.Result().Cookies() {
+			if c.Name == cfg.OAuth.StateCookieName {
+				stateCookie = c
+				break
+			}
+		}
+
+		// Explicit link
+		cbReq := httptest.NewRequest(http.MethodGet, "/auth/oauth/x/callback?code=valid-code&state="+state, nil)
+		cbReq.AddCookie(stateCookie)
+		cbReq.AddCookie(&http.Cookie{Name: cfg.SessionCookieName, Value: rawToken})
+		cbRec := httptest.NewRecorder()
+
+		cbSess, _, _, err := xSvc.HandleCallback(context.Background(), cbRec, cbReq, "x", "valid-code", state, db.SessionTypeCookie)
+		if err != nil {
+			t.Fatalf("callback failed for active user link: %v", err)
+		}
+		if cbSess.UserID != user.ID {
+			t.Fatalf("expected session user %v, got %v", user.ID, cbSess.UserID)
+		}
+
+		// Subsequent login (unauthenticated, returning user)
+		loginState, loginCookie := mustInitiate(t, xSvc, cfg, "x")
+		loginReq := httptest.NewRequest(http.MethodGet, "/auth/oauth/x/callback", nil)
+		loginReq.AddCookie(loginCookie)
+		loginRec := httptest.NewRecorder()
+
+		loginSess, _, _, err := xSvc.HandleCallback(context.Background(), loginRec, loginReq, "x", "login-code", loginState, db.SessionTypeCookie)
+		if err != nil {
+			t.Fatalf("subsequent login failed: %v; want successful login", err)
+		}
+		if loginSess.UserID != user.ID {
+			t.Fatalf("expected session user %v, got %v", user.ID, loginSess.UserID)
+		}
+
+		// Verify link was not deleted by the unverified-link invalidation rule
+		var link db.OAuthAccount
+		if err := database.Where("provider_id = ? AND provider_user_id = ?", "x", "x-subseq-user-456").First(&link).Error; err != nil {
+			t.Fatalf("expected link to persist, got err: %v", err)
+		}
+		if link.UserID != user.ID {
+			t.Fatalf("expected link user %v, got %v", user.ID, link.UserID)
+		}
+	})
+}
+
+func TestHandleCallbackUntrustedTenant(t *testing.T) {
+	t.Run("untrusted tenant token is rejected with ErrOAuthTenantInvalid", func(t *testing.T) {
+		database := serviceTestDB(t)
+		cfg := serviceTestConfig()
+		sessSvc := session.NewService(database, cfg)
+		// Mock profile carrying untrusted_tenant claim
+		untrustedInfo := &UserInfo{
+			ProviderID:       "microsoft",
+			ProviderTenantID: "tenant-untrusted",
+			ProviderUserID:   "ms-untrusted-sub",
+			Email:            "victim@example.com",
+			EmailVerified:    false,
+			Name:             "Untrusted Tenant User",
+			RawClaims: map[string]any{
+				"untrusted_tenant": true,
+			},
+		}
+		mockMS := &stubProvider{
+			id:   "microsoft",
+			info: untrustedInfo,
+		}
+		msSvc := NewService(database, sessSvc, map[string]Provider{"microsoft": mockMS}, cfg)
+
+		state, cookie := mustInitiate(t, msSvc, cfg, "microsoft")
+		req := httptest.NewRequest(http.MethodGet, "/auth/oauth/microsoft/callback", nil)
+		req.AddCookie(cookie)
+		rec := httptest.NewRecorder()
+
+		_, _, _, err := msSvc.HandleCallback(context.Background(), rec, req, "microsoft", "code", state, db.SessionTypeCookie)
+		if !errors.Is(err, errors.ErrOAuthTenantInvalid) {
+			t.Fatalf("expected ErrOAuthTenantInvalid, got %v", err)
+		}
+	})
+
+	t.Run("untrusted tenant evicts existing oauth link and rejects callback", func(t *testing.T) {
+		database := serviceTestDB(t)
+		cfg := serviceTestConfig()
+		sessSvc := session.NewService(database, cfg)
+		owner := db.User{ID: uuid.New(), Email: "victim@example.com", PasswordHash: "hash", EmailVerified: true}
+		if err := database.Create(&owner).Error; err != nil {
+			t.Fatalf("create owner: %v", err)
+		}
+		link := db.OAuthAccount{
+			ID:               uuid.New(),
+			UserID:           owner.ID,
+			ProviderID:       "microsoft",
+			ProviderTenantID: "tenant-untrusted",
+			ProviderUserID:   "ms-untrusted-returning-sub",
+			Email:            owner.Email,
+			Verified:         true,
+		}
+		if err := database.Create(&link).Error; err != nil {
+			t.Fatalf("create link: %v", err)
+		}
+
+		untrustedInfo := &UserInfo{
+			ProviderID:       "microsoft",
+			ProviderTenantID: "tenant-untrusted",
+			ProviderUserID:   "ms-untrusted-returning-sub",
+			Email:            owner.Email,
+			EmailVerified:    true,
+			Name:             "Untrusted Returning User",
+			RawClaims: map[string]any{
+				"untrusted_tenant": true,
+			},
+		}
+		mockMS := &stubProvider{
+			id:   "microsoft",
+			info: untrustedInfo,
+		}
+		msSvc := NewService(database, sessSvc, map[string]Provider{"microsoft": mockMS}, cfg)
+
+		state, cookie := mustInitiate(t, msSvc, cfg, "microsoft")
+		req := httptest.NewRequest(http.MethodGet, "/auth/oauth/microsoft/callback", nil)
+		req.AddCookie(cookie)
+		rec := httptest.NewRecorder()
+
+		sess, _, _, err := msSvc.HandleCallback(context.Background(), rec, req, "microsoft", "code", state, db.SessionTypeCookie)
+		if !errors.Is(err, errors.ErrOAuthTenantInvalid) {
+			t.Fatalf("expected ErrOAuthTenantInvalid, got %v", err)
+		}
+		if sess != nil {
+			t.Fatalf("expected nil session, got %+v", sess)
+		}
+
+		var count int64
+		if err := database.Model(&db.OAuthAccount{}).Where("provider_id = ? AND provider_user_id = ?", "microsoft", "ms-untrusted-returning-sub").Count(&count).Error; err != nil {
+			t.Fatalf("count oauth links: %v", err)
+		}
+		if count != 0 {
+			t.Fatalf("expected 0 oauth links, got %d", count)
+		}
+	})
+}
+
+func TestHandleCallbackActiveSessionUntrustedTenant(t *testing.T) {
+	t.Run("signed-in link with untrusted tenant fails closed", func(t *testing.T) {
+		t.Parallel()
+		database, cfg, _, _ := setupServiceTest(t, verifiedInfo())
+		sessSvc := session.NewService(database, cfg)
+		user := db.User{ID: uuid.New(), Email: "victim@example.com", PasswordHash: "hash", EmailVerified: true}
+		if err := database.Create(&user).Error; err != nil {
+			t.Fatalf("create user: %v", err)
+		}
+		_, rawToken, err := sessSvc.CreateSession(context.Background(), user.ID, 0, db.SessionTypeCookie, "127.0.0.1", "ua")
+		if err != nil {
+			t.Fatalf("create session: %v", err)
+		}
+		untrusted := &stubProvider{id: "microsoft", info: &UserInfo{
+			ProviderID: "microsoft", ProviderTenantID: "tenant-attacker", ProviderUserID: "ms-attacker-sub",
+			Email: "victim@example.com", EmailVerified: true, Name: "Attacker",
+			RawClaims: map[string]any{"untrusted_tenant": true},
+		}}
+		svc := NewService(database, sessSvc, map[string]Provider{"microsoft": untrusted}, cfg)
+
+		initReq := httptest.NewRequest(http.MethodGet, "/auth/oauth/microsoft?link=true", nil)
+		initReq.AddCookie(&http.Cookie{Name: cfg.SessionCookieName, Value: rawToken})
+		initRec := httptest.NewRecorder()
+		authURL, err := svc.InitiateFlow(initRec, initReq, "microsoft")
+		if err != nil {
+			t.Fatalf("initiate flow failed: %v", err)
+		}
+		u, err := url.Parse(authURL)
+		if err != nil {
+			t.Fatalf("parse auth url: %v", err)
+		}
+		state := u.Query().Get("state")
+		var stateCookie *http.Cookie
+		for _, c := range initRec.Result().Cookies() {
+			if c.Name == cfg.OAuth.StateCookieName {
+				stateCookie = c
+			}
+		}
+		if stateCookie == nil {
+			t.Fatal("state cookie required")
+		}
+		cbReq := httptest.NewRequest(http.MethodGet, "/auth/oauth/microsoft/callback", nil)
+		cbReq.AddCookie(stateCookie)
+		cbReq.AddCookie(&http.Cookie{Name: cfg.SessionCookieName, Value: rawToken})
+		_, _, _, err = svc.HandleCallback(context.Background(), httptest.NewRecorder(), cbReq, "microsoft", "code-1", state, db.SessionTypeCookie)
+		if !errors.Is(err, errors.ErrOAuthTenantInvalid) {
+			t.Fatalf("expected ErrOAuthTenantInvalid, got %v", err)
+		}
+		if n := countRows(t, database, &db.OAuthAccount{}); n != 0 {
+			t.Fatalf("oauth_accounts = %d; want 0", n)
+		}
+	})
+}
+
+func TestHandleCallback_MicrosoftLegacyOIDFallback(t *testing.T) {
+	t.Run("resolves legacy oid link on unattested email and migrates to sub", func(t *testing.T) {
+		t.Parallel()
+		database, cfg, _, _ := setupServiceTest(t, verifiedInfo())
+		sessSvc := session.NewService(database, cfg)
+
+		user := db.User{
+			ID:            uuid.New(),
+			Email:         "ms-user@example.com",
+			EmailVerified: true,
+		}
+		if err := database.Create(&user).Error; err != nil {
+			t.Fatalf("create user: %v", err)
+		}
+		legacyLink := db.OAuthAccount{
+			ID:               uuid.New(),
+			UserID:           user.ID,
+			ProviderID:       "microsoft",
+			ProviderTenantID: "tenant-migration",
+			ProviderUserID:   "legacy-oid-guid-123",
+			Email:            user.Email,
+			Verified:         true,
+		}
+		if err := database.Create(&legacyLink).Error; err != nil {
+			t.Fatalf("create legacy link: %v", err)
+		}
+
+		msInfo := &UserInfo{
+			ProviderID:       "microsoft",
+			ProviderTenantID: "tenant-migration",
+			ProviderUserID:   "new-pairwise-sub-456",
+			Email:            "ms-user@example.com",
+			EmailVerified:    false,
+			Name:             "MS User",
+			RawClaims: map[string]any{
+				"sub": "new-pairwise-sub-456",
+				"oid": "legacy-oid-guid-123",
+			},
+		}
+		mockMS := &stubProvider{id: "microsoft", info: msInfo}
+		svc := NewService(database, sessSvc, map[string]Provider{"microsoft": mockMS}, cfg)
+
+		state, cookie := mustInitiate(t, svc, cfg, "microsoft")
+		req := httptest.NewRequest(http.MethodGet, "/auth/oauth/microsoft/callback", nil)
+		req.AddCookie(cookie)
+		rec := httptest.NewRecorder()
+
+		sess, _, _, err := svc.HandleCallback(context.Background(), rec, req, "microsoft", "code", state, db.SessionTypeCookie)
+		if err != nil {
+			t.Fatalf("HandleCallback failed: %v", err)
+		}
+		if sess == nil || sess.UserID != user.ID {
+			t.Fatalf("expected session for user %s, got %v", user.ID, sess)
+		}
+
+		var updatedLink db.OAuthAccount
+		if err := database.Where("id = ?", legacyLink.ID).First(&updatedLink).Error; err != nil {
+			t.Fatalf("failed to query updated link: %v", err)
+		}
+		if updatedLink.ProviderUserID != "new-pairwise-sub-456" {
+			t.Fatalf("expected link to be migrated to new-pairwise-sub-456, got %s", updatedLink.ProviderUserID)
+		}
+		if n := countRows(t, database, &db.OAuthAccount{}); n != 1 {
+			t.Fatalf("expected exactly 1 oauth_accounts row, found %d", n)
+		}
+	})
+
+	t.Run("resolves link directly by sub when already migrated", func(t *testing.T) {
+		t.Parallel()
+		database, cfg, _, _ := setupServiceTest(t, verifiedInfo())
+		sessSvc := session.NewService(database, cfg)
+
+		user := db.User{
+			ID:            uuid.New(),
+			Email:         "ms-sub@example.com",
+			EmailVerified: true,
+		}
+		if err := database.Create(&user).Error; err != nil {
+			t.Fatalf("create user: %v", err)
+		}
+		link := db.OAuthAccount{
+			ID:               uuid.New(),
+			UserID:           user.ID,
+			ProviderID:       "microsoft",
+			ProviderTenantID: "tenant-direct",
+			ProviderUserID:   "direct-sub-789",
+			Email:            user.Email,
+			Verified:         true,
+		}
+		if err := database.Create(&link).Error; err != nil {
+			t.Fatalf("create link: %v", err)
+		}
+
+		msInfo := &UserInfo{
+			ProviderID:       "microsoft",
+			ProviderTenantID: "tenant-direct",
+			ProviderUserID:   "direct-sub-789",
+			Email:            "ms-sub@example.com",
+			EmailVerified:    true,
+			Name:             "MS Sub User",
+			RawClaims: map[string]any{
+				"sub": "direct-sub-789",
+				"oid": "directory-oid-999",
+			},
+		}
+		mockMS := &stubProvider{id: "microsoft", info: msInfo}
+		svc := NewService(database, sessSvc, map[string]Provider{"microsoft": mockMS}, cfg)
+
+		state, cookie := mustInitiate(t, svc, cfg, "microsoft")
+		req := httptest.NewRequest(http.MethodGet, "/auth/oauth/microsoft/callback", nil)
+		req.AddCookie(cookie)
+		rec := httptest.NewRecorder()
+
+		sess, _, _, err := svc.HandleCallback(context.Background(), rec, req, "microsoft", "code", state, db.SessionTypeCookie)
+		if err != nil {
+			t.Fatalf("HandleCallback failed: %v", err)
+		}
+		if sess == nil || sess.UserID != user.ID {
+			t.Fatalf("expected session for user %s, got %v", user.ID, sess)
+		}
+	})
+
+	t.Run("legacy oid fallback does not insert duplicate when email is attested", func(t *testing.T) {
+		t.Parallel()
+		database, cfg, _, _ := setupServiceTest(t, verifiedInfo())
+		sessSvc := session.NewService(database, cfg)
+
+		user := db.User{
+			ID:            uuid.New(),
+			Email:         "ms-attested@example.com",
+			EmailVerified: true,
+		}
+		if err := database.Create(&user).Error; err != nil {
+			t.Fatalf("create user: %v", err)
+		}
+		legacyLink := db.OAuthAccount{
+			ID:               uuid.New(),
+			UserID:           user.ID,
+			ProviderID:       "microsoft",
+			ProviderTenantID: "tenant-attested",
+			ProviderUserID:   "legacy-oid-attested",
+			Email:            user.Email,
+			Verified:         true,
+		}
+		if err := database.Create(&legacyLink).Error; err != nil {
+			t.Fatalf("create legacy link: %v", err)
+		}
+
+		msInfo := &UserInfo{
+			ProviderID:       "microsoft",
+			ProviderTenantID: "tenant-attested",
+			ProviderUserID:   "sub-attested-new",
+			Email:            "ms-attested@example.com",
+			EmailVerified:    true,
+			Name:             "MS Attested User",
+			RawClaims: map[string]any{
+				"sub": "sub-attested-new",
+				"oid": "legacy-oid-attested",
+			},
+		}
+		mockMS := &stubProvider{id: "microsoft", info: msInfo}
+		svc := NewService(database, sessSvc, map[string]Provider{"microsoft": mockMS}, cfg)
+
+		state, cookie := mustInitiate(t, svc, cfg, "microsoft")
+		req := httptest.NewRequest(http.MethodGet, "/auth/oauth/microsoft/callback", nil)
+		req.AddCookie(cookie)
+		rec := httptest.NewRecorder()
+
+		sess, _, _, err := svc.HandleCallback(context.Background(), rec, req, "microsoft", "code", state, db.SessionTypeCookie)
+		if err != nil {
+			t.Fatalf("HandleCallback failed: %v", err)
+		}
+		if sess == nil || sess.UserID != user.ID {
+			t.Fatalf("expected session for user %s, got %v", user.ID, sess)
+		}
+
+		if n := countRows(t, database, &db.OAuthAccount{}); n != 1 {
+			t.Fatalf("expected 1 row (migrated, not duplicated), got %d", n)
+		}
+	})
+
+	t.Run("propagates 500 when legacy oid lookup fails with database error", func(t *testing.T) {
+		t.Parallel()
+		database, cfg, _, _ := setupServiceTest(t, verifiedInfo())
+		sessSvc := session.NewService(database, cfg)
+
+		user := db.User{
+			ID:            uuid.New(),
+			Email:         "ms-err@example.com",
+			EmailVerified: false,
+		}
+		if err := database.Create(&user).Error; err != nil {
+			t.Fatalf("create user: %v", err)
+		}
+
+		msInfo := &UserInfo{
+			ProviderID:     "microsoft",
+			ProviderUserID: "new-sub-err",
+			Email:          "ms-err@example.com",
+			EmailVerified:  false,
+			Name:           "MS Error User",
+			RawClaims: map[string]any{
+				"sub": "new-sub-err",
+				"oid": "faulty-oid-123",
+			},
+		}
+		mockMS := &stubProvider{id: "microsoft", info: msInfo}
+
+		baseStore := gormstore.New(database)
+		faultyAccounts := &faultyOAuthAccountStore{
+			OAuthAccountStore: baseStore.OAuthAccounts(),
+			errOnUID:          "faulty-oid-123",
+		}
+		faultyStore := &faultyStoreWrapper{
+			Store:    baseStore,
+			accounts: faultyAccounts,
+		}
+
+		svc := NewServiceWithStore(faultyStore, sessSvc, map[string]Provider{"microsoft": mockMS}, cfg)
+
+		state, cookie := mustInitiate(t, svc, cfg, "microsoft")
+		req := httptest.NewRequest(http.MethodGet, "/auth/oauth/microsoft/callback", nil)
+		req.AddCookie(cookie)
+		rec := httptest.NewRecorder()
+
+		_, _, _, err := svc.HandleCallback(context.Background(), rec, req, "microsoft", "code", state, db.SessionTypeCookie)
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+		var appErr *errors.Error
+		if !stderrors.As(err, &appErr) {
+			t.Fatalf("expected *errors.Error, got %T: %v", err, err)
+		}
+		if appErr.Code() != errors.CodeInternalError {
+			t.Fatalf("expected CodeInternalError (500), got %s", appErr.Code())
+		}
+	})
+}
+
+type faultyOAuthAccountStore struct {
+	db.OAuthAccountStore
+	errOnUID string
+}
+
+func (s *faultyOAuthAccountStore) GetByProvider(ctx context.Context, providerID, providerTenantID, providerUserID string) (*db.OAuthAccount, error) {
+	if providerUserID == s.errOnUID {
+		return nil, stderrors.New("simulated database failure")
+	}
+	return s.OAuthAccountStore.GetByProvider(ctx, providerID, providerTenantID, providerUserID)
+}
+
+type faultyStoreWrapper struct {
+	db.Store
+	accounts db.OAuthAccountStore
+}
+
+func (w *faultyStoreWrapper) OAuthAccounts() db.OAuthAccountStore {
+	return w.accounts
+}
+
+// TestFacebookFirstSignup drives the real Facebook adapter through the linking
+// engine: the Graph email decides whether a first-time signup can complete.
+func TestFacebookFirstSignup(t *testing.T) {
+	const appID = "fb-test-app"
+
+	graph := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/oauth/access_token":
+			if err := r.ParseForm(); err != nil {
+				http.Error(w, "bad form", http.StatusBadRequest)
+				return
+			}
+			writeFixture(t, w, `{"access_token":%q,"token_type":"bearer"}`, "token-"+r.PostFormValue("code"))
+		case "/debug_token":
+			if err := r.ParseForm(); err != nil {
+				http.Error(w, "bad form", http.StatusBadRequest)
+				return
+			}
+			if r.PostFormValue("input_token") == "" {
+				http.Error(w, "missing input_token", http.StatusBadRequest)
+				return
+			}
+			writeFixture(t, w, `{"data":{"app_id":%q,"is_valid":true}}`, appID)
+		case "/me":
+			switch strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ") {
+			case "token-code-with-email":
+				writeFixture(t, w, `{"id":"fb-1001","name":"Alice","email":"alice@fb-test.com"}`)
+			case "token-code-without-email":
+				writeFixture(t, w, `{"id":"fb-1002","name":"Bob"}`)
+			default:
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+			}
+		default:
+			http.Error(w, "not found", http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(graph.Close)
+
+	newService := func(t *testing.T) (*gorm.DB, *config.Config, Service) {
+		t.Helper()
+		database := serviceTestDB(t)
+		cfg := serviceTestConfig()
+		p := NewFacebookProvider(config.FacebookConfig{
+			AppID:        appID,
+			AppSecret:    "fb-test-secret",
+			RedirectURI:  "https://example.com/callback",
+			GraphVersion: "v19.0",
+		})
+		p.tokenURL = graph.URL + "/oauth/access_token"
+		p.debugURL = graph.URL + "/debug_token"
+		p.userInfoURL = graph.URL + "/me"
+		return database, cfg, NewService(database, session.NewService(database, cfg),
+			map[string]Provider{"facebook": p}, cfg)
+	}
+
+	t.Run("first signup with an unverified Graph email registers an unverified user", func(t *testing.T) {
+		database, cfg, svc := newService(t)
+		state, cookie := mustInitiate(t, svc, cfg, "facebook")
+		rec, req := callbackRequest(state, cookie)
+		sess, _, _, err := svc.HandleCallback(req.Context(), rec, req, "facebook", "code-with-email", state, db.SessionTypeCookie)
+		if err != nil {
+			t.Fatalf("HandleCallback = %v; want first-time facebook signup", err)
+		}
+		var user db.User
+		if err := database.Where("id = ?", sess.UserID).First(&user).Error; err != nil {
+			t.Fatalf("load user: %v", err)
+		}
+		if user.Email != "alice@fb-test.com" || user.EmailVerified {
+			t.Fatalf("user email=%q verified=%v; want alice@fb-test.com/false", user.Email, user.EmailVerified)
+		}
+		// The row records that Meta did not attest the address, which is what
+		// keeps it out of merge, recovery, and email resolution.
+		requireIdentityRows(t, database, 1, 1, 1)
+		var link db.OAuthAccount
+		if err := database.Where("provider_id = ?", "facebook").First(&link).Error; err != nil {
+			t.Fatalf("load link: %v", err)
+		}
+		if link.Verified {
+			t.Fatal("facebook graph email must persist verified=false")
+		}
+	})
+
+	t.Run("first signup without a Graph email is rejected", func(t *testing.T) {
+		database, cfg, svc := newService(t)
+		state, cookie := mustInitiate(t, svc, cfg, "facebook")
+		rec, req := callbackRequest(state, cookie)
+		_, _, _, err := svc.HandleCallback(req.Context(), rec, req, "facebook", "code-without-email", state, db.SessionTypeCookie)
+		requireCode(t, err, errors.CodeOAuthEmailRequired, http.StatusBadRequest)
+		requireIdentityRows(t, database, 0, 0, 0)
+	})
+}
+
+// TestProviderLookupCanonicalSlug pins the dynamic registry path: a registered
+// provider must resolve under any casing, and the canonical slug is what reaches
+// the store.
+func TestProviderLookupCanonicalSlug(t *testing.T) {
+	database := serviceTestDB(t)
+	cfg := serviceTestConfig()
+	info := &UserInfo{ProviderID: "custom-idp", ProviderUserID: "custom-sub-1",
+		Email: "custom@example.com", EmailVerified: true}
+	reg := NewRegistry()
+	if err := reg.Register(&stubProvider{id: "custom-idp", info: info}); err != nil {
+		t.Fatalf("register dynamic provider: %v", err)
+	}
+	svc := NewServiceWithRegistry(gormstore.New(database), session.NewService(database, cfg), reg, cfg)
+	inner := svc.(*service)
+
+	p, err := inner.providerFor("  Custom-IDP ")
+	if err != nil || p == nil || p.ID() != "custom-idp" {
+		t.Fatalf("providerFor(non-canonical) = %v, err = %v; want custom-idp", p, err)
+	}
+
+	_, err = inner.providerFor("missing")
+	requireCode(t, err, errors.CodeOAuthProviderNotFound, http.StatusNotFound)
+
+	state, cookie := mustInitiate(t, svc, cfg, "Custom-IDP")
+	rec, req := callbackRequest(state, cookie)
+	sess, _, _, err := svc.HandleCallback(req.Context(), rec, req, "Custom-IDP", "code-1", state, db.SessionTypeCookie)
+	if err != nil {
+		t.Fatalf("HandleCallback(non-canonical) = %v", err)
+	}
+
+	var link db.OAuthAccount
+	if err := database.Where("provider_user_id = ?", "custom-sub-1").First(&link).Error; err != nil {
+		t.Fatalf("load link: %v", err)
+	}
+	if link.ProviderID != "custom-idp" {
+		t.Fatalf("stored provider_id = %q; want canonical custom-idp", link.ProviderID)
+	}
+
+	// A later login through the canonical slug must resolve the same identity.
+	state, cookie = mustInitiate(t, svc, cfg, "custom-idp")
+	rec, req = callbackRequest(state, cookie)
+	again, _, _, err := svc.HandleCallback(req.Context(), rec, req, "custom-idp", "code-1", state, db.SessionTypeCookie)
+	if err != nil {
+		t.Fatalf("HandleCallback(canonical) = %v", err)
+	}
+	if again.UserID != sess.UserID || link.UserID != sess.UserID {
+		t.Fatalf("second login user = %v; want %v", again.UserID, sess.UserID)
+	}
+	requireIdentityRows(t, database, 1, 1, 2)
+}
+
+// TestCallbackStateReplayAcrossSessions pins the state-to-session binding: a
+// completed state value can never be replayed against another live session.
+func TestCallbackStateReplayAcrossSessions(t *testing.T) {
+	database, cfg, _, svc := setupServiceTest(t, &UserInfo{
+		ProviderID: "google", ProviderUserID: "sub-replay-state",
+		Email: "replay-state@example.com", EmailVerified: true,
+	})
+	sessSvc := session.NewService(database, cfg)
+	seedSession := func(t *testing.T, email string) string {
+		t.Helper()
+		user := db.User{ID: uuid.New(), Email: email, PasswordHash: "hash", EmailVerified: true}
+		if err := database.Create(&user).Error; err != nil {
+			t.Fatalf("seed user: %v", err)
+		}
+		_, raw, err := sessSvc.CreateSession(context.Background(), user.ID, 0, db.SessionTypeCookie, "127.0.0.1", "ua")
+		if err != nil {
+			t.Fatalf("create session: %v", err)
+		}
+		return raw
+	}
+	tokA := seedSession(t, "replay-a@example.com")
+	tokB := seedSession(t, "replay-b@example.com")
+
+	state, cookie := initiateLinked(t, svc, cfg, "google", tokA)
+	rec, req := callbackRequestWithSession(state, cookie, cfg, tokA)
+	if _, _, _, err := svc.HandleCallback(req.Context(), rec, req, "google", "code-1", state, db.SessionTypeCookie); err != nil {
+		t.Fatalf("first callback = %v", err)
+	}
+
+	rec, req = callbackRequestWithSession(state, cookie, cfg, tokB)
+	_, _, _, err := svc.HandleCallback(req.Context(), rec, req, "google", "code-1", state, db.SessionTypeCookie)
+	requireCode(t, err, errors.CodeOAuthStateInvalid, http.StatusForbidden)
+	requireIdentityRows(t, database, 2, 1, 3)
+}
+
+// TestResolveLinkUserID pins the guards that keep a broken session store loud
+// and an absent context owner from becoming a link target.
+func TestResolveLinkUserID(t *testing.T) {
+	cfg := serviceTestConfig()
+	newSvc := func(sessSvc session.Service) *service {
+		return NewServiceWithStore(nil, sessSvc, nil, cfg).(*service)
+	}
+	sessionRequest := func() *http.Request {
+		req := httptest.NewRequest(http.MethodGet, "/auth/oauth/google?link=true", nil)
+		req.AddCookie(&http.Cookie{Name: cfg.SessionCookieName, Value: "0123456789abcdef0123456789abcdef"})
+		return req
+	}
+	contextRequest := func(v any) *http.Request {
+		req := httptest.NewRequest(http.MethodGet, "/auth/oauth/google?link=true", nil)
+		return req.WithContext(context.WithValue(context.Background(), ctxUserIDKey{}, v))
+	}
+
+	t.Run("store failure stays a 500", func(t *testing.T) {
+		svc := newSvc(&failGetSessionSvc{err: errors.New(errors.CodeInternalError, "db down", nil)})
+		_, err := svc.resolveLinkUserID(sessionRequest())
+		requireCode(t, err, errors.CodeInternalError, http.StatusInternalServerError)
+	})
+
+	t.Run("lapsed session degrades to login", func(t *testing.T) {
+		svc := newSvc(&failGetSessionSvc{err: errors.ErrSessionInvalid})
+		uid, err := svc.resolveLinkUserID(sessionRequest())
+		if err != nil || uid != "" {
+			t.Fatalf("resolveLinkUserID = %q, %v; want empty owner and nil error", uid, err)
+		}
+	})
+
+	t.Run("missing session service fails closed", func(t *testing.T) {
+		_, err := newSvc(nil).resolveLinkUserID(sessionRequest())
+		requireCode(t, err, errors.CodeInternalError, http.StatusInternalServerError)
+	})
+
+	t.Run("nil uuid context owner degrades to login", func(t *testing.T) {
+		svc := newSvc(&failGetSessionSvc{err: errors.ErrSessionInvalid})
+		uid, err := svc.resolveLinkUserID(contextRequest(uuid.Nil))
+		if err != nil || uid != "" {
+			t.Fatalf("resolveLinkUserID(nil uuid) = %q, %v; want empty owner and nil error", uid, err)
+		}
+	})
+
+	t.Run("valid uuid context owner resolves", func(t *testing.T) {
+		want := uuid.New()
+		svc := newSvc(&failGetSessionSvc{err: errors.ErrSessionInvalid})
+		uid, err := svc.resolveLinkUserID(contextRequest(want))
+		if err != nil || uid != want.String() {
+			t.Fatalf("resolveLinkUserID = %q, %v; want %q", uid, err, want)
+		}
+	})
+
+	t.Run("empty context owner degrades to login", func(t *testing.T) {
+		svc := newSvc(&failGetSessionSvc{err: errors.ErrSessionInvalid})
+		uid, err := svc.resolveLinkUserID(contextRequest(""))
+		if err != nil || uid != "" {
+			t.Fatalf("resolveLinkUserID(empty) = %q, %v; want empty owner and nil error", uid, err)
 		}
 	})
 }

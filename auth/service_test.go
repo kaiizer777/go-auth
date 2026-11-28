@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -17,8 +18,10 @@ import (
 	"github.com/kaiizer777/go-auth/config"
 	"github.com/kaiizer777/go-auth/crypto"
 	"github.com/kaiizer777/go-auth/db"
+	gormstore "github.com/kaiizer777/go-auth/db/gorm"
 	"github.com/kaiizer777/go-auth/email"
 	"github.com/kaiizer777/go-auth/errors"
+	"github.com/kaiizer777/go-auth/session"
 )
 
 func testConfig() config.Config {
@@ -80,6 +83,30 @@ func setupTestDB(t testing.TB) *gorm.DB {
 		last_active_at DATETIME NOT NULL,
 		absolute_expires_at DATETIME NOT NULL,
 		created_at DATETIME
+	);
+	CREATE TABLE IF NOT EXISTS claimed_emails (
+		email VARCHAR(255) PRIMARY KEY,
+		owner_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		verified INTEGER NOT NULL DEFAULT 0,
+		created_at DATETIME,
+		updated_at DATETIME
+	);
+	CREATE TABLE IF NOT EXISTS oauth_accounts (
+		id TEXT PRIMARY KEY,
+		user_id TEXT NOT NULL,
+		provider_id VARCHAR(50) NOT NULL,
+		provider_tenant_id VARCHAR(64) NOT NULL,
+		provider_user_id VARCHAR(255) NOT NULL,
+		email VARCHAR(255) NOT NULL,
+		verified INTEGER NOT NULL DEFAULT 0,
+		access_token_ciphertext TEXT NOT NULL DEFAULT '',
+		refresh_token_ciphertext TEXT NOT NULL DEFAULT '',
+		refresh_token_fingerprint CHAR(64) NOT NULL DEFAULT '',
+		token_expires_at DATETIME,
+		token_scope TEXT NOT NULL DEFAULT '',
+		created_at DATETIME,
+		updated_at DATETIME,
+		CONSTRAINT uq_oauth_accounts_provider_tenant_uid UNIQUE (provider_id, provider_tenant_id, provider_user_id)
 	);
 	`
 	if err := database.Exec(ddl).Error; err != nil {
@@ -602,6 +629,79 @@ func TestService_VerifyEmail(t *testing.T) {
 		var appErr *errors.Error
 		if !errors.As(err, &appErr) || appErr.Code() != errors.CodeInvalidToken {
 			t.Fatalf("expected CodeInvalidToken on replay, got %v", err)
+		}
+	})
+
+	t.Run("verifying email revokes sessions, increments credential version, and purges unverified links", func(t *testing.T) {
+		user, rawToken, err := svc.Signup(ctx, db.SignupRequest{Email: "revoke-on-verify@example.com", Password: "SecurePassword#2026!"})
+		if err != nil {
+			t.Fatalf("signup failed: %v", err)
+		}
+
+		sess := db.Session{
+			ID:                uuid.New(),
+			UserID:            user.ID,
+			IDHash:            "session_hash_verify_revocation_test_123456789012345678901234567890",
+			SessionType:       db.SessionTypeCookie,
+			CredentialVersion: user.CredentialVersion,
+			LastActiveAt:      time.Now().UTC(),
+			AbsoluteExpiresAt: time.Now().UTC().Add(24 * time.Hour),
+			CreatedAt:         time.Now().UTC(),
+		}
+		if err := database.Create(&sess).Error; err != nil {
+			t.Fatalf("failed to create session: %v", err)
+		}
+
+		unverifiedLink := db.OAuthAccount{
+			ID:             uuid.New(),
+			UserID:         user.ID,
+			ProviderID:     "google",
+			ProviderUserID: "unv-verify-uid",
+			Email:          "revoke-on-verify@example.com",
+			Verified:       false,
+			CreatedAt:      time.Now().UTC(),
+		}
+		if err := database.Create(&unverifiedLink).Error; err != nil {
+			t.Fatalf("failed to create unverified oauth account: %v", err)
+		}
+
+		verifiedLink := db.OAuthAccount{
+			ID:             uuid.New(),
+			UserID:         user.ID,
+			ProviderID:     "github",
+			ProviderUserID: "ver-verify-uid",
+			Email:          "revoke-on-verify@example.com",
+			Verified:       true,
+			CreatedAt:      time.Now().UTC(),
+		}
+		if err := database.Create(&verifiedLink).Error; err != nil {
+			t.Fatalf("failed to create verified oauth account: %v", err)
+		}
+
+		verified, err := svc.VerifyEmail(ctx, db.VerifyEmailRequest{Token: rawToken})
+		if err != nil {
+			t.Fatalf("unexpected verification error: %v", err)
+		}
+		if verified.CredentialVersion != user.CredentialVersion+1 {
+			t.Fatalf("credential version = %d; want %d", verified.CredentialVersion, user.CredentialVersion+1)
+		}
+
+		var sessCount int64
+		database.Model(&db.Session{}).Where("id = ?", sess.ID).Count(&sessCount)
+		if sessCount != 0 {
+			t.Fatalf("expected session to be deleted on email verification, count = %d", sessCount)
+		}
+
+		var unvCount int64
+		database.Model(&db.OAuthAccount{}).Where("id = ?", unverifiedLink.ID).Count(&unvCount)
+		if unvCount != 0 {
+			t.Fatalf("expected unverified oauth account to be deleted on email verification, count = %d", unvCount)
+		}
+
+		var verCount int64
+		database.Model(&db.OAuthAccount{}).Where("id = ?", verifiedLink.ID).Count(&verCount)
+		if verCount != 1 {
+			t.Fatalf("expected verified oauth account to survive email verification, count = %d", verCount)
 		}
 	})
 }
@@ -1413,6 +1513,19 @@ func TestService_Signup_UnverifiedAccountRecovery(t *testing.T) {
 		t.Fatalf("failed to seed session before recovery: %v", err)
 	}
 
+	unverifiedLink := db.OAuthAccount{
+		ID:             uuid.New(),
+		UserID:         user.ID,
+		ProviderID:     "google",
+		ProviderUserID: "unv-rec-uid",
+		Email:          "recover@example.com",
+		Verified:       false,
+		CreatedAt:      time.Now().UTC(),
+	}
+	if err := database.Create(&unverifiedLink).Error; err != nil {
+		t.Fatalf("failed to seed oauth account: %v", err)
+	}
+
 	newPass := "RecoveredPass#67890"
 	recUser, recToken, err := svc.Signup(ctx, db.SignupRequest{Email: "recover@example.com", Password: newPass})
 	if err != nil {
@@ -1470,6 +1583,12 @@ func TestService_Signup_UnverifiedAccountRecovery(t *testing.T) {
 	database.Model(&db.Session{}).Where("user_id = ?", user.ID).Count(&sessAfter)
 	if sessAfter != 0 {
 		t.Fatalf("expected 0 sessions after unverified recovery, got %d", sessAfter)
+	}
+
+	var linkCount int64
+	database.Model(&db.OAuthAccount{}).Where("id = ?", unverifiedLink.ID).Count(&linkCount)
+	if linkCount != 0 {
+		t.Fatalf("expected unverified oauth link to be deleted after recovery signup, count = %d", linkCount)
 	}
 
 	if _, err := svc.VerifyEmail(ctx, db.VerifyEmailRequest{Token: origToken}); err == nil {
@@ -1879,6 +1998,383 @@ func TestService_Signup_UnverifiedRecovery_AttackerCredentialBinding_ConcurrentR
 	})
 	if err == nil {
 		t.Fatal("expected attacker login to fail")
+	}
+}
+
+func TestService_Signup_SilentSuccessWhenAddressClaimedElsewhere(t *testing.T) {
+	database := setupTestDB(t)
+	cfg := testConfig()
+	store := gormstore.New(database)
+	dispatched := make(chan string, 4)
+	hooks := email.Hooks{
+		SendVerificationEmail: func(_ context.Context, recipient, _ string) error {
+			dispatched <- recipient
+			return nil
+		},
+	}
+	svc, err := NewWithStore(cfg, store, hooks)
+	if err != nil {
+		t.Fatalf("NewWithStore: %v", err)
+	}
+	ctx := context.Background()
+
+	holder := db.User{ID: uuid.New(), Email: "holder@work.example", PasswordHash: "hash"}
+	if err := store.Users().Create(ctx, &holder); err != nil {
+		t.Fatalf("seed holder: %v", err)
+	}
+	// The address is reserved by that account's provider link, so no users row
+	// carries it: the signup loser has nothing to converge on.
+	const addr = "taken@example.com"
+	if err := store.ClaimedEmails().Claim(ctx, addr, holder.ID, true); err != nil {
+		t.Fatalf("seed claim: %v", err)
+	}
+
+	user, token, err := svc.Signup(ctx, db.SignupRequest{Email: "Taken@Example.com", Password: "SignupPass#2026!"})
+	if err != nil {
+		t.Fatalf("signup = %v; a lost claim must stay silent", err)
+	}
+	if user != nil || token != "" {
+		t.Fatalf("signup returned user=%v token=%q; want the silent-success shape", user, token)
+	}
+	if _, gerr := store.Users().GetByEmail(ctx, addr); !errors.Is(gerr, gorm.ErrRecordNotFound) {
+		t.Fatalf("account created for a claimed address, err = %v", gerr)
+	}
+	select {
+	case recipient := <-dispatched:
+		t.Fatalf("verification email dispatched to %q for a lost claim", recipient)
+	case <-time.After(100 * time.Millisecond):
+	}
+	claim, cerr := store.ClaimedEmails().Get(ctx, addr)
+	if cerr != nil {
+		t.Fatalf("load claim: %v", cerr)
+	}
+	if claim.OwnerUserID != holder.ID {
+		t.Fatalf("claim owner = %v; want the seeded holder %v", claim.OwnerUserID, holder.ID)
+	}
+}
+
+func TestService_VerifyEmail_FailsWhenAddressClaimedByAnotherAccount(t *testing.T) {
+	database := setupTestDB(t)
+	cfg := testConfig()
+	store := gormstore.New(database)
+	tokens := make(chan string, 1)
+	hooks := email.Hooks{
+		SendVerificationEmail: func(_ context.Context, _ string, token string) error {
+			tokens <- token
+			return nil
+		},
+	}
+	svc, err := NewWithStore(cfg, store, hooks)
+	if err != nil {
+		t.Fatalf("NewWithStore: %v", err)
+	}
+	ctx := context.Background()
+
+	const addr = "verify@example.com"
+	user, _, err := svc.Signup(ctx, db.SignupRequest{Email: addr, Password: "VerifyPass#2026!"})
+	if err != nil || user == nil {
+		t.Fatalf("signup = %v, %v", user, err)
+	}
+	var raw string
+	select {
+	case raw = <-tokens:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the verification email")
+	}
+
+	// The claim moves to another account before verification runs.
+	rival := db.User{ID: uuid.New(), Email: "rival@work.example", PasswordHash: "hash"}
+	if err := store.Users().Create(ctx, &rival); err != nil {
+		t.Fatalf("seed rival: %v", err)
+	}
+	if err := store.ClaimedEmails().Release(ctx, addr, user.ID); err != nil {
+		t.Fatalf("release claim: %v", err)
+	}
+	if err := store.ClaimedEmails().Claim(ctx, addr, rival.ID, false); err != nil {
+		t.Fatalf("re-claim: %v", err)
+	}
+
+	if _, verr := svc.VerifyEmail(ctx, db.VerifyEmailRequest{Token: raw}); !errors.Is(verr, errors.ErrEmailClaimed) {
+		t.Fatalf("VerifyEmail = %v; want ErrEmailClaimed", verr)
+	}
+	reloaded, rerr := store.Users().GetByID(ctx, user.ID)
+	if rerr != nil {
+		t.Fatalf("reload account: %v", rerr)
+	}
+	if reloaded.EmailVerified {
+		t.Fatal("verification reported a conflict but the account was marked verified")
+	}
+	claim, cerr := store.ClaimedEmails().Get(ctx, addr)
+	if cerr != nil {
+		t.Fatalf("load claim: %v", cerr)
+	}
+	if claim.OwnerUserID != rival.ID || claim.Verified {
+		t.Fatalf("claim = %+v; the conflicting claim must be left untouched", claim)
+	}
+}
+
+func TestService_VerifyEmail_PromotesClaimToVerified(t *testing.T) {
+	database := setupTestDB(t)
+	cfg := testConfig()
+	store := gormstore.New(database)
+	tokens := make(chan string, 1)
+	hooks := email.Hooks{
+		SendVerificationEmail: func(_ context.Context, _ string, token string) error {
+			tokens <- token
+			return nil
+		},
+	}
+	svc, err := NewWithStore(cfg, store, hooks)
+	if err != nil {
+		t.Fatalf("NewWithStore: %v", err)
+	}
+	ctx := context.Background()
+
+	const addr = "verify-promote@example.com"
+	if _, _, serr := svc.Signup(ctx, db.SignupRequest{Email: addr, Password: "VerifyPass#2026!"}); serr != nil {
+		t.Fatalf("signup: %v", serr)
+	}
+	var raw string
+	select {
+	case raw = <-tokens:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the verification email")
+	}
+	if _, err := svc.VerifyEmail(ctx, db.VerifyEmailRequest{Token: raw}); err != nil {
+		t.Fatalf("VerifyEmail: %v", err)
+	}
+
+	// Mailbox proof must promote the claim: leaving it unverified would let a
+	// provider that attests the same address take over the freshly verified
+	// account.
+	claim, cerr := store.ClaimedEmails().Get(ctx, addr)
+	if cerr != nil {
+		t.Fatalf("load claim: %v", cerr)
+	}
+	if !claim.Verified {
+		t.Fatal("a verified mailbox left its claim unverified")
+	}
+}
+
+func TestService_ResetPassword_PromotesClaimToVerified(t *testing.T) {
+	database := setupTestDB(t)
+	cfg := testConfig()
+	store := gormstore.New(database)
+	svc, err := NewWithStore(cfg, store, email.Hooks{})
+	if err != nil {
+		t.Fatalf("NewWithStore: %v", err)
+	}
+	ctx := context.Background()
+
+	const addr = "reset-claim@example.com"
+	if _, _, serr := svc.Signup(ctx, db.SignupRequest{Email: addr, Password: "SignupPass#2026!"}); serr != nil {
+		t.Fatalf("signup: %v", serr)
+	}
+	if claim, gerr := store.ClaimedEmails().Get(ctx, addr); gerr != nil || claim.Verified {
+		t.Fatalf("claim before reset = %+v, %v; want an unverified reservation", claim, gerr)
+	}
+
+	raw, err := svc.RequestPasswordReset(ctx, db.PasswordResetRequest{Email: addr})
+	if err != nil {
+		t.Fatalf("RequestPasswordReset: %v", err)
+	}
+	if _, err := svc.ResetPassword(ctx, db.PasswordResetConfirmRequest{Token: raw, NewPassword: "ResetClaim#2026!"}); err != nil {
+		t.Fatalf("ResetPassword: %v", err)
+	}
+
+	// A consumed reset token proves the mailbox, so the claim must be verified:
+	// an unverified claim would leave the account open to a provider takeover.
+	claim, err := store.ClaimedEmails().Get(ctx, addr)
+	if err != nil {
+		t.Fatalf("load claim: %v", err)
+	}
+	if !claim.Verified {
+		t.Fatal("a reset-proved mailbox left its claim unverified")
+	}
+}
+
+func TestService_ResetPassword_ReleasesClaimOfPurgedLink(t *testing.T) {
+	database := setupTestDB(t)
+	cfg := testConfig()
+	store := gormstore.New(database)
+	svc, err := NewWithStore(cfg, store, email.Hooks{})
+	if err != nil {
+		t.Fatalf("NewWithStore: %v", err)
+	}
+	ctx := context.Background()
+
+	const addr = "purge-owner@example.com"
+	const legacyAddr = "purge-legacy@example.com"
+	user, _, serr := svc.Signup(ctx, db.SignupRequest{Email: addr, Password: "SignupPass#2026!"})
+	if serr != nil || user == nil {
+		t.Fatalf("signup = %v, %v", user, serr)
+	}
+	// A pre-#92-era row: the account's unverified link carries an address that is
+	// not its own, and the account claims that address.
+	link := db.OAuthAccount{ID: uuid.New(), UserID: user.ID, ProviderID: "github",
+		ProviderUserID: "sub-legacy-purge", Email: legacyAddr}
+	if err := database.Create(&link).Error; err != nil {
+		t.Fatalf("seed legacy link: %v", err)
+	}
+	if err := store.ClaimedEmails().Claim(ctx, legacyAddr, user.ID, false); err != nil {
+		t.Fatalf("seed claim: %v", err)
+	}
+
+	raw, rerr := svc.RequestPasswordReset(ctx, db.PasswordResetRequest{Email: addr})
+	if rerr != nil {
+		t.Fatalf("RequestPasswordReset: %v", rerr)
+	}
+	if _, err := svc.ResetPassword(ctx, db.PasswordResetConfirmRequest{Token: raw, NewPassword: "ResetClaim#2026!"}); err != nil {
+		t.Fatalf("ResetPassword: %v", err)
+	}
+
+	// The purge removed the untrusted link and released the address it held, so the
+	// address is not permanently blocked.
+	var links int64
+	if err := database.Model(&db.OAuthAccount{}).Where("user_id = ?", user.ID).Count(&links).Error; err != nil {
+		t.Fatalf("count links: %v", err)
+	}
+	if links != 0 {
+		t.Fatalf("unverified links surviving the purge = %d; want 0", links)
+	}
+	if _, gerr := store.ClaimedEmails().Get(ctx, legacyAddr); !errors.Is(gerr, gorm.ErrRecordNotFound) {
+		t.Fatalf("claim for the purged link survived, err = %v", gerr)
+	}
+	rival := db.User{ID: uuid.New(), Email: "purge-rival@work.example", PasswordHash: "hash"}
+	if err := store.Users().Create(ctx, &rival); err != nil {
+		t.Fatalf("seed rival: %v", err)
+	}
+	if err := store.ClaimedEmails().Claim(ctx, legacyAddr, rival.ID, false); err != nil {
+		t.Fatalf("re-claim after release: %v", err)
+	}
+}
+
+// TestService_VerifyEmail_UnclaimableStoredAddressIsClientError covers a legacy
+// row whose stored address no longer produces a claim key: verification must fail
+// with the validation code, not a database 500.
+func TestService_VerifyEmail_UnclaimableStoredAddressIsClientError(t *testing.T) {
+	database := setupTestDB(t)
+	cfg := testConfig()
+	store := gormstore.New(database)
+	tokens := make(chan string, 1)
+	hooks := email.Hooks{
+		SendVerificationEmail: func(_ context.Context, _ string, token string) error {
+			tokens <- token
+			return nil
+		},
+	}
+	svc, err := NewWithStore(cfg, store, hooks)
+	if err != nil {
+		t.Fatalf("NewWithStore: %v", err)
+	}
+	ctx := context.Background()
+
+	const addr = "legacy-verify@example.com"
+	user, _, serr := svc.Signup(ctx, db.SignupRequest{Email: addr, Password: "VerifyPass#2026!"})
+	if serr != nil || user == nil {
+		t.Fatalf("signup = %v, %v", user, serr)
+	}
+	var raw string
+	select {
+	case raw = <-tokens:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the verification email")
+	}
+	// The row predates the current key rule: its stored address is not an address.
+	if err := database.Model(&db.User{}).Where("id = ?", user.ID).Update("email", "not-an-address").Error; err != nil {
+		t.Fatalf("corrupt stored address: %v", err)
+	}
+
+	_, verr := svc.VerifyEmail(ctx, db.VerifyEmailRequest{Token: raw})
+	if !errors.Is(verr, errors.ErrInvalidEmail) {
+		t.Fatalf("VerifyEmail = %v; want ErrInvalidEmail", verr)
+	}
+	var appErr *errors.Error
+	if !errors.As(verr, &appErr) || appErr.Code() != errors.CodeInvalidEmail {
+		t.Fatalf("VerifyEmail code = %v; want %v (a 4xx, not a database 500)", verr, errors.CodeInvalidEmail)
+	}
+}
+
+// TestService_ResetPassword_UnclaimableStoredAddressIsClientError is the reset
+// twin: the claim promotion runs inside the reset transaction, so its validation
+// failure must surface as a 4xx rather than being wrapped as a database error.
+func TestService_ResetPassword_UnclaimableStoredAddressIsClientError(t *testing.T) {
+	database := setupTestDB(t)
+	cfg := testConfig()
+	store := gormstore.New(database)
+	svc, err := NewWithStore(cfg, store, email.Hooks{})
+	if err != nil {
+		t.Fatalf("NewWithStore: %v", err)
+	}
+	ctx := context.Background()
+
+	const addr = "legacy-reset@example.com"
+	user, _, serr := svc.Signup(ctx, db.SignupRequest{Email: addr, Password: "SignupPass#2026!"})
+	if serr != nil || user == nil {
+		t.Fatalf("signup = %v, %v", user, serr)
+	}
+	raw, rerr := svc.RequestPasswordReset(ctx, db.PasswordResetRequest{Email: addr})
+	if rerr != nil {
+		t.Fatalf("RequestPasswordReset: %v", rerr)
+	}
+	if err := database.Model(&db.User{}).Where("id = ?", user.ID).Update("email", "not-an-address").Error; err != nil {
+		t.Fatalf("corrupt stored address: %v", err)
+	}
+
+	_, rerr = svc.ResetPassword(ctx, db.PasswordResetConfirmRequest{Token: raw, NewPassword: "ResetClaim#2026!"})
+	if !errors.Is(rerr, errors.ErrInvalidEmail) {
+		t.Fatalf("ResetPassword = %v; want ErrInvalidEmail", rerr)
+	}
+	var appErr *errors.Error
+	if !errors.As(rerr, &appErr) || appErr.Code() != errors.CodeInvalidEmail {
+		t.Fatalf("ResetPassword code = %v; want %v (a 4xx, not a database 500)", rerr, errors.CodeInvalidEmail)
+	}
+}
+
+// authOverlongFoldedAddress is 255 bytes raw and 256 after case folding.
+func authOverlongFoldedAddress() string {
+	const domain = "@example.com"
+	return strings.Repeat("a", 255-len(domain)-len("Ⱥ")) + "Ⱥ" + domain
+}
+
+// TestService_LegacyFoldedAddressStillAuthenticates pins the scope of the
+// folded-length rule: it guards claim creation, never authentication. An account
+// stored with an address that no longer fits a new claim key must still log in,
+// refresh its session, and request a password reset.
+func TestService_LegacyFoldedAddressStillAuthenticates(t *testing.T) {
+	database := setupTestDB(t)
+	cfg := testConfig()
+	svc, err := New(cfg, database, email.Hooks{})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ctx := context.Background()
+
+	const password = "LegacyPass#2026!"
+	user, _, serr := svc.Signup(ctx, db.SignupRequest{Email: "legacy-login@example.com", Password: password})
+	if serr != nil || user == nil {
+		t.Fatalf("signup = %v, %v", user, serr)
+	}
+	long := authOverlongFoldedAddress()
+	if err := database.Model(&db.User{}).Where("id = ?", user.ID).
+		Updates(map[string]any{"email": long, "email_verified": true}).Error; err != nil {
+		t.Fatalf("store legacy address: %v", err)
+	}
+
+	if _, lerr := svc.Login(ctx, db.LoginRequest{Email: long, Password: password}); lerr != nil {
+		t.Fatalf("legacy account cannot log in: %v", lerr)
+	}
+	if _, rerr := svc.RequestPasswordReset(ctx, db.PasswordResetRequest{Email: long}); rerr != nil {
+		t.Fatalf("legacy account cannot request a password reset: %v", rerr)
+	}
+
+	sessSvc := session.NewService(database, &cfg)
+	_, raw, cerr := sessSvc.CreateSession(ctx, user.ID, user.CredentialVersion, db.SessionTypeCookie, "127.0.0.1", "ua")
+	if cerr != nil {
+		t.Fatalf("create session: %v", cerr)
+	}
+	if _, _, rerr := sessSvc.RotateSession(ctx, raw, "127.0.0.1", "ua"); rerr != nil {
+		t.Fatalf("legacy account cannot refresh its session: %v", rerr)
 	}
 }
 
