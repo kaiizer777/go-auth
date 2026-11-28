@@ -1373,9 +1373,6 @@ func (s *service) takeoverUnverifiedAccount(ctx context.Context, txStore db.Stor
 			return errors.New(errors.CodeInternalError, "failed to revoke takeover grant", err)
 		}
 	}
-	if err := txStore.ClaimedEmails().Claim(ctx, info.Email, owner.ID, true); err != nil {
-		return err
-	}
 	if err := txStore.Users().SetEmailVerified(ctx, owner.ID, true); err != nil {
 		return errors.New(errors.CodeInternalError, "failed to mark takeover account verified", err)
 	}
