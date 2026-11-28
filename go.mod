@@ -8,7 +8,7 @@ require (
 	github.com/golang-migrate/migrate/v4 v4.20.1
 	github.com/google/uuid v1.6.0
 	github.com/jackc/pgx/v5 v5.13.0
-	github.com/pquerna/otp v1.4.0
+	github.com/pquerna/otp v1.5.0
 	go.mongodb.org/mongo-driver/v2 v2.10.1
 	gorm.io/driver/mysql v1.6.0
 	gorm.io/driver/postgres v1.6.3
