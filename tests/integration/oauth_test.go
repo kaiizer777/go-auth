@@ -49,6 +49,7 @@ func setupOAuthFlow(t *testing.T, mocks map[string]*oauthmock.Mock, modifyCfg ..
 		created_at DATETIME,
 		updated_at DATETIME
 	);
+	CREATE INDEX IF NOT EXISTS idx_claimed_emails_owner_user_id ON claimed_emails(owner_user_id);
 	CREATE TABLE IF NOT EXISTS oauth_accounts (
 		id TEXT PRIMARY KEY, user_id TEXT NOT NULL, provider_id VARCHAR(32) NOT NULL,
 		provider_tenant_id VARCHAR(64) NOT NULL,
