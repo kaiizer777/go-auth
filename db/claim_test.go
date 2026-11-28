@@ -14,6 +14,13 @@ func TestClaimKey_NormalisesValidAddresses(t *testing.T) {
 		{"first.last@example.co", "first.last@example.co"},
 		{"USER_NAME@EXAMPLE.COM", "user_name@example.com"},
 		{`"jane"@example.com`, `"jane"@example.com`},
+		// RFC 5322 atext the rest of the system accepts via ValidateEmail: the claim
+		// key must accept it too, or those addresses can never be claimed.
+		{"o'brien@example.com", "o'brien@example.com"},
+		{"admin$@example.com", "admin$@example.com"},
+		{"a{b@example.com", "a{b@example.com"},
+		// 255 bytes after normalisation is the boundary the column holds.
+		{strings.Repeat("a", 243) + "@example.com", strings.Repeat("a", 243) + "@example.com"},
 	} {
 		key, err := ClaimKey(tc.in)
 		if err != nil {
@@ -32,22 +39,17 @@ func TestClaimKey_NormalisesValidAddresses(t *testing.T) {
 
 func TestClaimKey_RejectsNonAddressValues(t *testing.T) {
 	for _, bad := range []string{
-		"admin$@example.com",
-		"admin{@example.com",
-		"admin}@example.com",
-		"a|b@example.com",
-		"o'brien@example.com",
-		"user@exam ple.com",
-		"user@exa\tmple.com",
 		"user@@example.com",
 		"no-at.example.com",
 		"@example.com",
+		"user@",
 		"user@example",
 		"user@.example.com",
+		"user@example..com",
 		"user@example.com.",
-		"user@-example.com",
-		"üser@example.com",
-		strings.Repeat("a", 250) + "@example.com",
+		"user name@example.com",
+		"user@exa\tmple.com",
+		strings.Repeat("a", 244) + "@example.com", // 256 bytes
 	} {
 		if _, err := ClaimKey(bad); !errors.Is(err, errors.ErrInvalidEmail) {
 			t.Errorf("ClaimKey(%q) err = %v; want ErrInvalidEmail", bad, err)

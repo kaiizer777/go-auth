@@ -6,10 +6,13 @@
 -- address, inserted inside the writer's transaction, is the lock: the second
 -- insert blocks on the unique key and its whole transaction loses.
 --
--- The key is db.NormalizeEmail output and is compared byte for byte, so the claim
--- never depends on a database collation: the column carries utf8mb4_bin while the
--- table default stays utf8mb4_unicode_ci. Empty and whitespace-only addresses are
--- never claimed: subject-only provider links store ''.
+-- The key is db.NormalizeEmail output, so the claim never depends on case folding
+-- by collation: the column carries utf8mb4_bin while the table default stays
+-- utf8mb4_unicode_ci. utf8mb4_bin is PAD SPACE, so the primary key ignores
+-- trailing spaces and uniqueness relies on NormalizeEmail trimming them. Empty and
+-- whitespace-only addresses are never claimed: subject-only provider links store ''.
+-- MySQL's collation is not involved in producing the key: the value written is
+-- always the Go-normalised string.
 --
 -- verified records that the holder proved the mailbox. An unverified claim is a
 -- reservation by an unproved credential, so a provider that attests the address

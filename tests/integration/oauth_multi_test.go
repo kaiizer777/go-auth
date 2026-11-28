@@ -44,7 +44,7 @@ func setupMultiOAuthDB(t *testing.T) (*gorm.DB, db.Store) {
 	);
 	CREATE TABLE IF NOT EXISTS claimed_emails (
 		email VARCHAR(255) PRIMARY KEY,
-		owner_user_id TEXT NOT NULL,
+		owner_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
 		verified INTEGER NOT NULL DEFAULT 0,
 		created_at DATETIME,
 		updated_at DATETIME
@@ -111,6 +111,9 @@ func TestIntegration_MultiProviderLinkageAndHardDeleteCascade(t *testing.T) {
 	if err := store.Users().Create(ctx, user); err != nil {
 		t.Fatalf("create user failed: %v", err)
 	}
+	if err := store.ClaimedEmails().Claim(ctx, user.Email, user.ID, true); err != nil {
+		t.Fatalf("claim user email: %v", err)
+	}
 
 	providers := []string{"google", "github", "apple", "microsoft", "facebook", "discord", "x"}
 
@@ -169,6 +172,16 @@ func TestIntegration_MultiProviderLinkageAndHardDeleteCascade(t *testing.T) {
 	}
 	if totalLinks != 0 {
 		t.Fatalf("expected 0 linked accounts after cascade delete, got %d", totalLinks)
+	}
+
+	// The explicit claim release must fire too: this schema has no foreign key on
+	// claimed_emails, so only the store's sweep removes them.
+	var claims int64
+	if err := database.Model(&db.ClaimedEmail{}).Where("owner_user_id = ?", user.ID).Count(&claims).Error; err != nil {
+		t.Fatalf("count claims after delete: %v", err)
+	}
+	if claims != 0 {
+		t.Fatalf("expected 0 claims after user delete, got %d", claims)
 	}
 }
 

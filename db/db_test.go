@@ -710,10 +710,10 @@ func TestMigration000014_ClaimsEmailAddresses(t *testing.T) {
 			}
 		}
 	}
-	if !strings.Contains(postgresUp, "email          VARCHAR(255) NOT NULL") {
-		t.Error("postgres migration 14 must store the claim key as a plain NOT NULL VARCHAR(255)")
+	if !strings.Contains(postgresUp, "email          VARCHAR(255) PRIMARY KEY") {
+		t.Error("postgres migration 14 must store the claim key as a plain VARCHAR(255) primary key")
 	}
-	if !strings.Contains(postgresUp, "CREATE UNIQUE INDEX IF NOT EXISTS uq_claimed_emails_email") {
+	if !strings.Contains(postgresUp, "email          VARCHAR(255) PRIMARY KEY") {
 		t.Error("postgres migration 14 must enforce one claim per address")
 	}
 	if !strings.Contains(mysqlUp, "CHARACTER SET utf8mb4 COLLATE utf8mb4_bin") {

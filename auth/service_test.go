@@ -84,7 +84,7 @@ func setupTestDB(t testing.TB) *gorm.DB {
 	);
 	CREATE TABLE IF NOT EXISTS claimed_emails (
 		email VARCHAR(255) PRIMARY KEY,
-		owner_user_id TEXT NOT NULL,
+		owner_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
 		verified INTEGER NOT NULL DEFAULT 0,
 		created_at DATETIME,
 		updated_at DATETIME
@@ -2040,7 +2040,7 @@ func TestService_Signup_SilentSuccessWhenAddressClaimedElsewhere(t *testing.T) {
 	select {
 	case recipient := <-dispatched:
 		t.Fatalf("verification email dispatched to %q for a lost claim", recipient)
-	default:
+	case <-time.After(100 * time.Millisecond):
 	}
 	claim, cerr := store.ClaimedEmails().Get(ctx, addr)
 	if cerr != nil {

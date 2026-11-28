@@ -5,6 +5,8 @@ import (
 	stderrors "errors"
 	"fmt"
 	"log/slog"
+	"sort"
+	"strings"
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
@@ -191,7 +193,17 @@ func BackfillClaimedEmails(ctx context.Context, database *mongo.Database) error 
 		{collection: "users", ownerField: "_id"},
 		{collection: "oauth_accounts", ownerField: "user_id"},
 	}
-	holders := int64(0)
+	conflicts := make(map[string]map[string]struct{})
+	addConflict := func(key, owner string) {
+		owners, ok := conflicts[key]
+		if !ok {
+			owners = make(map[string]struct{})
+			conflicts[key] = owners
+		}
+		owners[owner] = struct{}{}
+	}
+	holders, skipped := 0, 0
+	created := make(map[string]string)
 	for _, src := range sources {
 		cursor, cerr := database.Collection(src.collection).Find(ctx,
 			bson.M{"email": bson.M{"$ne": ""}},
@@ -210,7 +222,13 @@ func BackfillClaimedEmails(ctx context.Context, database *mongo.Database) error 
 				_ = cursor.Close(ctx)
 				return derr
 			}
-			key := db.NormalizeEmail(row.Email)
+			key, kerr := db.ClaimKey(row.Email)
+			if kerr != nil {
+				// Not an address: it can never be claimed, so report it and move on
+				// instead of aborting the import on junk data.
+				skipped++
+				continue
+			}
 			if key == "" {
 				continue
 			}
@@ -218,30 +236,47 @@ func BackfillClaimedEmails(ctx context.Context, database *mongo.Database) error 
 			if src.ownerField == "_id" {
 				ownerID = row.ID
 			}
-			// Idempotent: a re-run after an aborted pass converges on the rows the
-			// first pass already wrote.
-			_, ierr := claims.UpdateOne(ctx,
-				bson.M{"_id": key},
-				bson.M{"$setOnInsert": bson.M{
-					"owner_user_id": ownerID,
-					"verified":      false,
-					"created_at":    time.Now().UTC(),
-					"updated_at":    time.Now().UTC(),
-				}},
-				options.UpdateOne().SetUpsert(true),
-			)
-			if ierr != nil && !mongo.IsDuplicateKeyError(ierr) {
-				_ = cursor.Close(ctx)
-				return ierr
-			}
+			// Check the holder before writing: a key already held by another account
+			// is recorded as a conflict and never overwritten.
 			var existing ClaimedEmailDoc
-			if derr := claims.FindOne(ctx, bson.M{"_id": key}).Decode(&existing); derr != nil {
+			derr := claims.FindOne(ctx, bson.M{"_id": key}).Decode(&existing)
+			switch {
+			case derr == nil && existing.OwnerUserID != ownerID:
+				addConflict(key, existing.OwnerUserID)
+				addConflict(key, ownerID)
+				continue
+			case derr != nil && !stderrors.Is(derr, mongo.ErrNoDocuments):
 				_ = cursor.Close(ctx)
 				return derr
-			}
-			if existing.OwnerUserID != ownerID {
-				_ = cursor.Close(ctx)
-				return fmt.Errorf("claimed_emails backfill aborted: %q is held by accounts %s and %s", key, existing.OwnerUserID, ownerID)
+			case derr != nil:
+				// Idempotent: a re-run after an aborted pass converges on the rows
+				// the first pass already wrote.
+				_, ierr := claims.UpdateOne(ctx,
+					bson.M{"_id": key},
+					bson.M{"$setOnInsert": bson.M{
+						"owner_user_id": ownerID,
+						"verified":      false,
+						"created_at":    time.Now().UTC(),
+						"updated_at":    time.Now().UTC(),
+					}},
+					options.UpdateOne().SetUpsert(true),
+				)
+				if ierr != nil && !mongo.IsDuplicateKeyError(ierr) {
+					_ = cursor.Close(ctx)
+					return ierr
+				}
+				// A concurrent run can win the upsert with a different owner; the
+				// re-read resolves it instead of assuming our write landed.
+				if derr := claims.FindOne(ctx, bson.M{"_id": key}).Decode(&existing); derr != nil {
+					_ = cursor.Close(ctx)
+					return derr
+				}
+				if existing.OwnerUserID != ownerID {
+					addConflict(key, existing.OwnerUserID)
+					addConflict(key, ownerID)
+					continue
+				}
+				created[key] = ownerID
 			}
 			holders++
 		}
@@ -250,6 +285,22 @@ func BackfillClaimedEmails(ctx context.Context, database *mongo.Database) error 
 			return cerr
 		}
 		_ = cursor.Close(ctx)
+	}
+
+	if len(conflicts) > 0 {
+		// Roll back the claims this run wrote for a conflicting address: leaving the
+		// first-seen owner behind would make the operator resolve the conflict and
+		// then hit it again as a pre-existing claim on the next run.
+		for key := range conflicts {
+			ownerID, ok := created[key]
+			if !ok {
+				continue
+			}
+			if _, derr := claims.DeleteOne(ctx, bson.M{"_id": key, "owner_user_id": ownerID}); derr != nil {
+				return derr
+			}
+		}
+		return mongoClaimConflictError(conflicts)
 	}
 
 	// Promote exactly the keys a trusted holder already proved: a verified user
@@ -281,8 +332,8 @@ func BackfillClaimedEmails(ctx context.Context, database *mongo.Database) error 
 				_ = proofs.Close(ctx)
 				return derr
 			}
-			key := db.NormalizeEmail(row.Email)
-			if key == "" {
+			key, kerr := db.ClaimKey(row.Email)
+			if kerr != nil || key == "" {
 				continue
 			}
 			ownerID := row.OwnerID
@@ -317,8 +368,30 @@ func BackfillClaimedEmails(ctx context.Context, database *mongo.Database) error 
 		"migration", claimedEmailsBackfillID,
 		"claims_held", holders,
 		"claims_promoted", promoted,
+		"claims_skipped", skipped,
 	)
 	return nil
+}
+
+// mongoClaimConflictError lists every conflicting address with all owners seen
+// during the pass, matching the SQL import's aggregated conflict error.
+func mongoClaimConflictError(conflicts map[string]map[string]struct{}) error {
+	keys := make([]string, 0, len(conflicts))
+	for key := range conflicts {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, key := range keys {
+		owners := make([]string, 0, len(conflicts[key]))
+		for owner := range conflicts[key] {
+			owners = append(owners, owner)
+		}
+		sort.Strings(owners)
+		parts = append(parts, fmt.Sprintf("%s held by %s", key, strings.Join(owners, ", ")))
+	}
+	return fmt.Errorf("claimed_emails backfill aborted: %d address(es) held by more than one account: %s",
+		len(keys), strings.Join(parts, "; "))
 }
 
 // microsoftOIDBackfillID is the schema_migrations marker of the data migration

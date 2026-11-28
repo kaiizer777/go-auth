@@ -342,6 +342,16 @@ func TestNormalizeMySQLError(t *testing.T) {
 			wantErr: errors.ErrEmailClaimed,
 		},
 		{
+			name:    "claimed email primary key via postgres string",
+			err:     stderrors.New("ERROR: duplicate key value violates unique constraint \"claimed_emails_pkey\" (SQLSTATE 23505)"),
+			wantErr: errors.ErrEmailClaimed,
+		},
+		{
+			name:    "users duplicate whose value contains the claim table name",
+			err:     stderrors.New("Error 1062 (23000): Duplicate entry 'claimed_emails@example.com' for key 'users.idx_users_email_lower'"),
+			wantErr: errors.ErrEmailAlreadyExists,
+		},
+		{
 			name:    "claimed email foreign key is not a claim conflict",
 			err:     stderrors.New("ERROR: insert or update on table \"claimed_emails\" violates foreign key constraint \"fk_claimed_emails_owner_user_id\" (SQLSTATE 23503)"),
 			wantErr: errors.ErrUserNotFound,

@@ -19,10 +19,12 @@ func NormalizeMongoError(err error) error {
 	}
 	msg := strings.ToLower(err.Error())
 	switch {
-	case strings.Contains(msg, "claimed_emails"):
-		// Explicit and first: the claim key must never normalise to
-		// ErrEmailAlreadyExists, which the signup and link paths classify
-		// differently.
+	case strings.Contains(msg, ".claimed_emails index:"):
+		// Match the claim collection's index namespace, not the whole message: a
+		// users.email duplicate whose value happens to contain "claimed_emails"
+		// must still normalise to ErrEmailAlreadyExists. The claim key must never
+		// collapse into that sentinel either, because the signup and link paths
+		// classify the two differently.
 		return errors.ErrEmailClaimed
 	case strings.Contains(msg, "uq_users_email") || strings.Contains(msg, "email_1"):
 		return errors.ErrEmailAlreadyExists

@@ -314,13 +314,15 @@ func NormalizeMySQLError(err error) error {
 	}
 
 	switch {
-	case strings.Contains(msg, "claimed_emails") &&
-		(strings.Contains(msg, "unique") || strings.Contains(msg, "duplicate") || strings.Contains(msg, "primary")):
-		// Explicit and before the table cases below: the claim key must never
-		// normalise to ErrEmailAlreadyExists, which the signup and link paths
-		// classify differently. Requiring the key wording keeps
-		// fk_claimed_emails_owner_user_id out: a foreign-key failure is a bug, not
-		// a lost claim race, and signup would swallow it as silent success.
+	case strings.Contains(msg, "for key 'claimed_emails.") ||
+		strings.Contains(msg, "uq_claimed_emails_email") ||
+		strings.Contains(msg, "claimed_emails_pkey") ||
+		strings.Contains(msg, "unique constraint failed: claimed_emails"):
+		// Match the claim key's constraint name, not the whole message: a users or
+		// oauth_accounts duplicate whose value happens to contain "claimed_emails"
+		// must still fall through to its own case, and a foreign-key failure on the
+		// claim table is not a lost claim race (signup would swallow it as silent
+		// success). The claim key must never normalise to ErrEmailAlreadyExists.
 		return errors.ErrEmailClaimed
 	case strings.Contains(msg, "idx_users_email") || strings.Contains(msg, "users"):
 		return errors.ErrEmailAlreadyExists

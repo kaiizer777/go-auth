@@ -324,8 +324,12 @@ func (s *authService) VerifyEmail(ctx context.Context, req db.VerifyEmailRequest
 			return err
 		}
 
-		if _, err := txStore.Users().GetByIDForUpdate(ctx, tok.UserID); err != nil {
+		owner, err := txStore.Users().GetByIDForUpdate(ctx, tok.UserID)
+		if err != nil {
 			return err
+		}
+		if owner == nil {
+			return errors.ErrUserNotFound
 		}
 
 		rows, err := txStore.VerificationTokens().Delete(ctx, tokenHash[:])
@@ -342,10 +346,6 @@ func (s *authService) VerifyEmail(ctx context.Context, req db.VerifyEmailRequest
 		// Promotion, never takeover: the claim is this account's, and a claim a
 		// different account already proved fails the whole verification instead of
 		// being moved.
-		owner, oerr := txStore.Users().GetByID(ctx, tok.UserID)
-		if oerr != nil {
-			return oerr
-		}
 		if cerr := txStore.ClaimedEmails().Claim(ctx, owner.Email, tok.UserID, true); cerr != nil {
 			return cerr
 		}

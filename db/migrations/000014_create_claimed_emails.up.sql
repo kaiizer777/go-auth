@@ -30,12 +30,11 @@
 -- before writing, naming every conflicting address and account ID instead of
 -- picking a winner; resolve those rows and re-run. See docs/email-claims.md.
 CREATE TABLE IF NOT EXISTS claimed_emails (
-    email          VARCHAR(255) NOT NULL,
+    email          VARCHAR(255) PRIMARY KEY,
     owner_user_id  UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     verified       BOOLEAN NOT NULL DEFAULT FALSE,
     created_at     TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at     TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS uq_claimed_emails_email ON claimed_emails (email);
 CREATE INDEX IF NOT EXISTS idx_claimed_emails_owner_user_id ON claimed_emails (owner_user_id);

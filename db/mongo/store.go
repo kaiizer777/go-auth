@@ -1312,7 +1312,8 @@ func (s *claimedEmailStore) Claim(ctx context.Context, email string, ownerID uui
 		return nil
 	}
 	now := time.Now().UTC()
-	_, err := s.collection().UpdateOne(s.store.resolveCtx(ctx),
+	readCtx := s.store.resolveCtx(ctx)
+	_, err := s.collection().UpdateOne(readCtx,
 		claimFilter{ID: key},
 		bson.M{"$setOnInsert": bson.M{
 			"owner_user_id": ownerID.String(),
@@ -1322,13 +1323,17 @@ func (s *claimedEmailStore) Claim(ctx context.Context, email string, ownerID uui
 		}},
 		options.UpdateOne().SetUpsert(true),
 	)
-	// A concurrent upsert of the same _id can lose with a duplicate key; the read
-	// below resolves the winner, which is the answer this call needs.
-	if err != nil && !mongo.IsDuplicateKeyError(err) {
-		return NormalizeMongoError(err)
+	// A concurrent upsert of the same _id can lose with a duplicate key. MongoDB
+	// aborts the enclosing transaction on that error, so the ownership read (and any
+	// promotion) must run outside it: the winner committed the row this call needs.
+	if err != nil {
+		if !mongo.IsDuplicateKeyError(err) {
+			return NormalizeMongoError(err)
+		}
+		readCtx = ctx
 	}
 	var doc ClaimedEmailDoc
-	if derr := s.collection().FindOne(s.store.resolveCtx(ctx), claimFilter{ID: key}).Decode(&doc); derr != nil {
+	if derr := s.collection().FindOne(readCtx, claimFilter{ID: key}).Decode(&doc); derr != nil {
 		if errors.Is(derr, mongo.ErrNoDocuments) {
 			return errors.ErrEmailClaimed
 		}
@@ -1339,7 +1344,7 @@ func (s *claimedEmailStore) Claim(ctx context.Context, email string, ownerID uui
 		return errors.ErrEmailClaimed
 	}
 	if verified && !claim.Verified {
-		_, uerr := s.collection().UpdateOne(s.store.resolveCtx(ctx),
+		_, uerr := s.collection().UpdateOne(readCtx,
 			claimOwnerFilter{ID: key, OwnerID: ownerID.String()},
 			bson.M{"$set": bson.M{"verified": true, "updated_at": now}},
 		)
@@ -1363,6 +1368,9 @@ func (s *claimedEmailStore) Get(ctx context.Context, email string) (*db.ClaimedE
 	return doc.toDomain(), nil
 }
 
+// Release deletes the holder's claim. A key ClaimKey rejects cannot exist in the
+// table: every write path and the explicit import skip such addresses, so an
+// invalid key is a no-op rather than a missed row.
 func (s *claimedEmailStore) Release(ctx context.Context, email string, ownerID uuid.UUID) error {
 	key, kerr := db.ClaimKey(email)
 	if kerr != nil || key == "" {

@@ -77,8 +77,9 @@ func signupPasswordVerified(t *testing.T, database *gorm.DB, cfg *config.Config,
 
 // TestPasswordSquatLosesAccountToProviderProof is the pre-hijacking handover end
 // to end: an attacker binds a password to an address it does not own, and the
-// identity that proves the mailbox takes the account back. Nothing is deleted and
-// no second account appears; every credential the squatter held stops working.
+// identity that proves the mailbox takes the account back. The account and its
+// rows stay, while the squatter's sessions are deleted and its provider grants are
+// revoked in place; no second account appears.
 func TestPasswordSquatLosesAccountToProviderProof(t *testing.T) {
 	const addr = "squatted@example.test"
 	const squatterPassword = "CorrectHorseBattery9!"
@@ -168,7 +169,8 @@ func TestPasswordSquatLosesAccountToProviderProof(t *testing.T) {
 	if claim.OwnerUserID != squatter.ID || !claim.Verified {
 		t.Fatalf("claim = %+v; want it proved and held by %v", claim, squatter.ID)
 	}
-	// One account and the identity that proved it; nothing was merged or deleted.
+	// One account and the identity that proved it; the squatter's session and
+	// grants are revoked, but no account or link row is removed.
 	requireIdentityRows(t, database, 1, 2, 1)
 }
 

@@ -124,7 +124,7 @@ func serviceTestDB(t *testing.T) *gorm.DB {
 	);
 	CREATE TABLE IF NOT EXISTS claimed_emails (
 		email VARCHAR(255) PRIMARY KEY,
-		owner_user_id TEXT NOT NULL,
+		owner_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
 		verified INTEGER NOT NULL DEFAULT 0,
 		created_at DATETIME,
 		updated_at DATETIME
@@ -1397,7 +1397,7 @@ type hidesEmailUserStore struct {
 }
 
 func (h *hidesEmailUserStore) GetByEmail(ctx context.Context, email string) (*db.User, error) {
-	if h.hidden.CompareAndSwap(true, false) && db.NormalizeEmail(email) == h.email {
+	if db.NormalizeEmail(email) == h.email && h.hidden.CompareAndSwap(true, false) {
 		return nil, gorm.ErrRecordNotFound
 	}
 	return h.UserStore.GetByEmail(ctx, email)

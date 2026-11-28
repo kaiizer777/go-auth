@@ -727,6 +727,9 @@ func (s *claimedEmailStore) Get(ctx context.Context, email string) (*db.ClaimedE
 	return &claim, nil
 }
 
+// Release deletes the holder's claim. A key ClaimKey rejects cannot exist in the
+// table: every write path and the explicit import skip such addresses, so an
+// invalid key is a no-op rather than a missed row.
 func (s *claimedEmailStore) Release(ctx context.Context, email string, ownerID uuid.UUID) error {
 	key, kerr := db.ClaimKey(email)
 	if kerr != nil || key == "" {

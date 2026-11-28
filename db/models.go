@@ -49,6 +49,12 @@ func (User) TableName() string { return "users" }
 // transaction. Email is db.NormalizeEmail output and is compared byte for byte:
 // the key never depends on a database collation.
 //
+// The byte comparison is a property of the deployed column, not of this tag: the
+// migrations define a binary-collation key (PostgreSQL PRIMARY KEY on a plain
+// varchar, MySQL utf8mb4_bin). A schema built by AutoMigrate alone on MySQL takes
+// the server default collation and can fold accents, so migration 000014 must be
+// applied there.
+//
 // A claim does not imply users.email. A provider-attested address is claimed by
 // the account that linked it even when that is not the account's own address.
 //

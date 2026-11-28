@@ -19,6 +19,9 @@ const claimBackfillBatchSize = 500
 type ClaimBackfillResult struct {
 	Claims   int
 	Promoted int
+	// Skipped counts source rows whose address ClaimKey rejects. They are not
+	// claimable anywhere, so they are reported rather than aborting the import.
+	Skipped int
 }
 
 // claimHolder is one account's reservation of one normalised address.
@@ -77,6 +80,7 @@ func BackfillClaimedEmails(ctx context.Context, database *gorm.DB) (ClaimBackfil
 		result, err := backfillClaimSource(ctx, database, load)
 		total.Claims += result.Claims
 		total.Promoted += result.Promoted
+		total.Skipped += result.Skipped
 		if err != nil {
 			return total, err
 		}
@@ -93,6 +97,9 @@ type claimRow struct {
 	owner    uuid.UUID
 	key      string
 	verified bool
+	// invalid marks a row whose address ClaimKey rejects: it is counted and
+	// skipped, never written.
+	invalid bool
 }
 
 func loadUserClaimRows(tx *gorm.DB, cursor uuid.UUID, limit int) ([]claimRow, error) {
@@ -103,11 +110,13 @@ func loadUserClaimRows(tx *gorm.DB, cursor uuid.UUID, limit int) ([]claimRow, er
 	}
 	rows := make([]claimRow, 0, len(users))
 	for _, user := range users {
+		key, kerr := ClaimKey(user.Email)
 		rows = append(rows, claimRow{
 			id:       user.ID,
 			owner:    user.ID,
-			key:      NormalizeEmail(user.Email),
+			key:      key,
 			verified: user.EmailVerified,
+			invalid:  kerr != nil,
 		})
 	}
 	return rows, nil
@@ -121,11 +130,13 @@ func loadLinkClaimRows(tx *gorm.DB, cursor uuid.UUID, limit int) ([]claimRow, er
 	}
 	rows := make([]claimRow, 0, len(links))
 	for _, link := range links {
+		key, kerr := ClaimKey(link.Email)
 		rows = append(rows, claimRow{
 			id:       link.ID,
 			owner:    link.UserID,
-			key:      NormalizeEmail(link.Email),
+			key:      key,
 			verified: link.Verified,
+			invalid:  kerr != nil,
 		})
 	}
 	return rows, nil
@@ -165,6 +176,7 @@ func backfillClaimSource(ctx context.Context, database *gorm.DB, load claimPageL
 		}
 		total.Claims += batchResult.Claims
 		total.Promoted += batchResult.Promoted
+		total.Skipped += batchResult.Skipped
 		if pageSize < claimBackfillBatchSize {
 			return total, nil
 		}
@@ -179,7 +191,12 @@ func applyClaimPage(ctx context.Context, tx *gorm.DB, page []claimRow) (ClaimBac
 	holders := make(map[string]claimHolder, len(page))
 	conflicts := make(map[string][]uuid.UUID)
 	keys := make([]string, 0, len(page))
+	var skipped int
 	for _, row := range page {
+		if row.invalid {
+			skipped++
+			continue
+		}
 		if row.key == "" {
 			continue
 		}
@@ -197,7 +214,7 @@ func applyClaimPage(ctx context.Context, tx *gorm.DB, page []claimRow) (ClaimBac
 		}
 	}
 	if len(keys) == 0 {
-		return ClaimBackfillResult{}, nil
+		return ClaimBackfillResult{Skipped: skipped}, nil
 	}
 
 	// One read for the page, so every conflict is reported and nothing is written
@@ -219,7 +236,7 @@ func applyClaimPage(ctx context.Context, tx *gorm.DB, page []claimRow) (ClaimBac
 	}
 
 	sort.Strings(keys)
-	var result ClaimBackfillResult
+	result := ClaimBackfillResult{Skipped: skipped}
 	for _, key := range keys {
 		holder := holders[key]
 		if claim, ok := existingByKey[key]; !ok {

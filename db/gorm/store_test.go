@@ -1960,12 +1960,74 @@ func TestUserStore_DeleteReleasesEveryClaim(t *testing.T) {
 		t.Fatalf("delete user: %v", err)
 	}
 	for _, email := range []string{"gone@example.com", "provider-only@example.com"} {
-		if _, err := store.ClaimedEmails().Get(ctx, email); err == nil {
-			t.Errorf("claim for %s survived its owner's deletion", email)
+		if _, err := store.ClaimedEmails().Get(ctx, email); !errors.Is(err, gormdriver.ErrRecordNotFound) {
+			t.Errorf("claim for %s survived its owner's deletion (err = %v)", email, err)
 		}
 	}
 	if _, err := store.ClaimedEmails().Get(ctx, "kept@example.com"); err != nil {
 		t.Errorf("claim for a surviving account was released: %v", err)
+	}
+}
+
+// lockingUserStore records whether the owner row was read with the row lock.
+type lockingUserStore struct {
+	db.UserStore
+	locked *bool
+}
+
+func (s *lockingUserStore) GetByIDForUpdate(ctx context.Context, id uuid.UUID) (*db.User, error) {
+	*s.locked = true
+	return s.UserStore.GetByIDForUpdate(ctx, id)
+}
+
+// lockingStore propagates the recorder through Transaction, so a release that runs
+// inside a transaction still reports which read it used.
+type lockingStore struct {
+	db.Store
+	locked *bool
+}
+
+func (s *lockingStore) Users() db.UserStore {
+	return &lockingUserStore{UserStore: s.Store.Users(), locked: s.locked}
+}
+
+func (s *lockingStore) Transaction(ctx context.Context, fn func(db.Store) error) error {
+	return s.Store.Transaction(ctx, func(tx db.Store) error {
+		return fn(&lockingStore{Store: tx, locked: s.locked})
+	})
+}
+
+// TestReleaseLinkClaimLocksTheOwnerRow pins the serialisation that stops a
+// concurrent attachLink from inserting a link between the scan and the release: the
+// claim release takes the owner row lock first.
+func TestReleaseLinkClaimLocksTheOwnerRow(t *testing.T) {
+	database, store := setupTestDB(t)
+	ctx := context.Background()
+	owner := seedClaimUsers(t, store, "lock-owner@example.com")[0]
+	link := db.OAuthAccount{ID: uuid.New(), UserID: owner.ID, ProviderID: "google",
+		ProviderUserID: "sub-lock-probe", Email: "lock-link@example.com"}
+	if err := database.Create(&link).Error; err != nil {
+		t.Fatalf("seed link: %v", err)
+	}
+	if err := store.ClaimedEmails().Claim(ctx, link.Email, owner.ID, true); err != nil {
+		t.Fatalf("seed claim: %v", err)
+	}
+
+	locked := false
+	wrapped := &lockingStore{Store: store, locked: &locked}
+	if err := wrapped.Transaction(ctx, func(tx db.Store) error {
+		if derr := tx.OAuthAccounts().Delete(ctx, link.ID); derr != nil {
+			return derr
+		}
+		return db.ReleaseLinkClaim(ctx, tx, link)
+	}); err != nil {
+		t.Fatalf("release in transaction: %v", err)
+	}
+	if !locked {
+		t.Fatal("ReleaseLinkClaim read the owner without the row lock; a concurrent link insert can be lost")
+	}
+	if _, err := store.ClaimedEmails().Get(ctx, link.Email); !errors.Is(err, gormdriver.ErrRecordNotFound) {
+		t.Fatalf("claim after its last holder was deleted: %v; want not found", err)
 	}
 }
 
@@ -1977,7 +2039,7 @@ func TestClaimedEmailStore_RejectsInvalidAddress(t *testing.T) {
 	ctx := context.Background()
 	owner := seedClaimUsers(t, store, "invalid-probe@example.com")[0]
 
-	for _, addr := range []string{"bad$@example.com", "bad{@example.com", "bad|@example.com"} {
+	for _, addr := range []string{"user@@example.com", "no-at.example.com", "user@example"} {
 		if err := store.ClaimedEmails().Claim(ctx, addr, owner.ID, true); !errors.Is(err, apperrors.ErrInvalidEmail) {
 			t.Errorf("Claim(%q) err = %v; want ErrInvalidEmail", addr, err)
 		}

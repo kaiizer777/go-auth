@@ -211,8 +211,9 @@ func TestMigrations_Claim000014IsDDLOnly(t *testing.T) {
 	if _, err := migrateDB.Exec(`INSERT INTO claimed_emails (email, owner_user_id, verified) VALUES ($1, $2, FALSE)`, key, ownerID); err != nil {
 		t.Fatalf("insert app-keyed claim: %v", err)
 	}
-	if _, err := migrateDB.Exec(`INSERT INTO claimed_emails (email, owner_user_id, verified) VALUES ($1, $2, TRUE)`, key, ownerID); err == nil {
-		t.Fatal("a second claim row for the same key was accepted; the unique key is missing")
+	var pgErr *pgconn.PgError
+	if _, err := migrateDB.Exec(`INSERT INTO claimed_emails (email, owner_user_id, verified) VALUES ($1, $2, TRUE)`, key, ownerID); !stderrors.As(err, &pgErr) || pgErr.Code != "23505" {
+		t.Fatalf("second claim row for the same key: want unique violation 23505, got: %v", err)
 	}
 
 	if _, err := migrateDB.Exec(`DELETE FROM oauth_accounts WHERE user_id = $1`, ownerID); err != nil {

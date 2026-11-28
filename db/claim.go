@@ -19,13 +19,18 @@ import (
 // another account.
 //
 // Callers invoke it in the same transaction as the link delete, after the row is
-// gone, so a stale claim cannot outlive the row that justified it.
+// gone, so a stale claim cannot outlive the row that justified it. The owner row
+// is read FOR UPDATE first: a concurrent attachLink of the same owner holds that
+// same lock, so either it commits before this scan (and its link is seen, blocking
+// the release) or it waits until after the release (and re-claims the address
+// itself). Without the lock, a link inserted between the scan and the release
+// would keep the address without its claim.
 func ReleaseLinkClaim(ctx context.Context, store Store, link OAuthAccount) error {
 	key := NormalizeEmail(link.Email)
 	if key == "" {
 		return nil
 	}
-	owner, err := store.Users().GetByID(ctx, link.UserID)
+	owner, err := store.Users().GetByIDForUpdate(ctx, link.UserID)
 	switch {
 	case err == nil && owner != nil:
 		if NormalizeEmail(owner.Email) == key {
@@ -69,54 +74,26 @@ func claimInsertStatement(tx *gorm.DB) string {
 	return "INSERT INTO claimed_emails " + columns + " ON CONFLICT (email) DO NOTHING"
 }
 
-// ClaimKey normalises email and validates the result against the claim key
-// grammar. It is the only way a claim key may be produced: the key is a primary
-// key (SQL) or a collection _id (MongoDB), so the value must be a real address and
-// not an arbitrary string.
+// ClaimKey normalises email and validates the result against the same address
+// rule the rest of the system enforces (ValidateEmail). It is the only way a
+// claim key may be produced: the key is a primary key (SQL) or a collection _id
+// (MongoDB), so the value must be an address and not an arbitrary string.
 //
 // An empty or whitespace-only address yields ("", nil): such an address is never
-// claimable and callers keep their existing no-op behaviour. Anything else that is
-// not a normalised ASCII address of at most 255 bytes yields ErrInvalidEmail.
+// claimable and callers keep their existing no-op behaviour. Anything ValidateEmail
+// rejects yields ErrInvalidEmail.
 func ClaimKey(email string) (string, error) {
 	key := NormalizeEmail(email)
 	if key == "" {
 		return "", nil
 	}
-	if len(key) > claimKeyMaxLength || !validClaimKey(key) {
+	if len(key) > claimKeyMaxLength || ValidateEmail(key) != nil {
 		return "", errors.ErrInvalidEmail
 	}
 	return key, nil
 }
 
 const claimKeyMaxLength = 255
-
-// validClaimKey accepts lowercase ASCII addresses built only from letters,
-// digits, '.', '-', '_', '+' and the double quote used by quoted local parts,
-// with exactly one '@', a non-empty local part and a dotted domain. Everything
-// else is rejected: control characters, Mongo operators ('$'), braces, non-ASCII,
-// and multiple '@'.
-func validClaimKey(key string) bool {
-	at := strings.IndexByte(key, '@')
-	if at <= 0 || at != strings.LastIndexByte(key, '@') || at == len(key)-1 {
-		return false
-	}
-	domain := key[at+1:]
-	if !strings.Contains(domain, ".") ||
-		domain[0] == '.' || domain[0] == '-' ||
-		domain[len(domain)-1] == '.' || domain[len(domain)-1] == '-' {
-		return false
-	}
-	for i := 0; i < len(key); i++ {
-		c := key[i]
-		switch {
-		case c >= 'a' && c <= 'z', c >= '0' && c <= '9':
-		case c == '@' || c == '.' || c == '-' || c == '_' || c == '+' || c == '"':
-		default:
-			return false
-		}
-	}
-	return true
-}
 
 // ClaimWithin takes the claim for email on behalf of ownerID inside the caller's
 // transaction. It is the single arbiter both the store and the explicit import use:

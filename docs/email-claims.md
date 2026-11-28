@@ -41,9 +41,12 @@ if _, err := db.BackfillClaimedEmails(ctx, gormDB); err != nil {
 - SQL: `db.BackfillClaimedEmails` pages `users` and `oauth_accounts` by primary
   key (500 rows per page), reads the page's existing claims in one statement, and
   writes each page inside one short transaction. A failed page commits nothing.
+  Rows whose address `ClaimKey` rejects are counted in `Skipped`, not imported.
 - MongoDB: `mongostore.BackfillClaimedEmails(ctx, database)` is the equivalent
-  explicit call. It records the `000014_create_claimed_emails` marker when a run
-  completes.
+  explicit call. It streams one cursor per collection (memory stays bounded) and
+  makes two round trips per account, so it is not keyset-paged like the SQL one;
+  rows whose address `ClaimKey` rejects are skipped. It records the
+  `000014_create_claimed_emails` marker when a run completes.
 
 Both key with `db.NormalizeEmail`, use the same claim write the runtime uses, and
 are idempotent: re-running after success changes nothing, and a re-run picks up

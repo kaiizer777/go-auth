@@ -127,7 +127,7 @@ func setupTestDB(t *testing.T) *gorm.DB {
 	);
 	CREATE TABLE IF NOT EXISTS claimed_emails (
 		email VARCHAR(255) PRIMARY KEY,
-		owner_user_id TEXT NOT NULL,
+		owner_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
 		verified INTEGER NOT NULL DEFAULT 0,
 		created_at DATETIME,
 		updated_at DATETIME
