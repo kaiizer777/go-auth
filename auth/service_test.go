@@ -2111,6 +2111,49 @@ func TestService_VerifyEmail_FailsWhenAddressClaimedByAnotherAccount(t *testing.
 	}
 }
 
+func TestService_VerifyEmail_PromotesClaimToVerified(t *testing.T) {
+	database := setupTestDB(t)
+	cfg := testConfig()
+	store := gormstore.New(database)
+	tokens := make(chan string, 1)
+	hooks := email.Hooks{
+		SendVerificationEmail: func(_ context.Context, _ string, token string) error {
+			tokens <- token
+			return nil
+		},
+	}
+	svc, err := NewWithStore(cfg, store, hooks)
+	if err != nil {
+		t.Fatalf("NewWithStore: %v", err)
+	}
+	ctx := context.Background()
+
+	const addr = "verify-promote@example.com"
+	if _, _, serr := svc.Signup(ctx, db.SignupRequest{Email: addr, Password: "VerifyPass#2026!"}); serr != nil {
+		t.Fatalf("signup: %v", serr)
+	}
+	var raw string
+	select {
+	case raw = <-tokens:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the verification email")
+	}
+	if _, err := svc.VerifyEmail(ctx, db.VerifyEmailRequest{Token: raw}); err != nil {
+		t.Fatalf("VerifyEmail: %v", err)
+	}
+
+	// Mailbox proof must promote the claim: leaving it unverified would let a
+	// provider that attests the same address take over the freshly verified
+	// account.
+	claim, cerr := store.ClaimedEmails().Get(ctx, addr)
+	if cerr != nil {
+		t.Fatalf("load claim: %v", cerr)
+	}
+	if !claim.Verified {
+		t.Fatal("a verified mailbox left its claim unverified")
+	}
+}
+
 func TestService_ResetPassword_PromotesClaimToVerified(t *testing.T) {
 	database := setupTestDB(t)
 	cfg := testConfig()

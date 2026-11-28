@@ -245,6 +245,100 @@ func TestMigrations_Claim000014BackfillAndDown(t *testing.T) {
 	}
 }
 
+// TestMigrations_Claim000014AbortsOnCrossAccountCollision proves the backfill
+// refuses to elect a winner: when a link of one account carries an address owned
+// by another, deploying 000014 fails and names both accounts instead of silently
+// stripping one of them.
+func TestMigrations_Claim000014AbortsOnCrossAccountCollision(t *testing.T) {
+	dbURL := resolveDatabaseURL()
+	sqlDB, err := sql.Open("pgx", dbURL)
+	if err != nil {
+		if os.Getenv("CI") != "" {
+			t.Fatalf("CI: failed to open postgres connection: %v", err)
+		}
+		t.Skipf("Postgres not available, skipping: %v", err)
+	}
+	defer func() { _ = sqlDB.Close() }()
+	pingCtx, pingCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer pingCancel()
+	if err := sqlDB.PingContext(pingCtx); err != nil {
+		if os.Getenv("CI") != "" {
+			t.Fatalf("CI: PostgreSQL connection failed: %v", err)
+		}
+		t.Skipf("Postgres not available, skipping: %v", err)
+	}
+
+	m, migrateDB := newMigrator(t, dbURL)
+	if err := m.Up(); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("m.Up() failed: %v", err)
+	}
+	_, _ = migrateDB.Exec("TRUNCATE TABLE sessions, verification_tokens, password_reset_tokens, oauth_accounts, totp_secrets, totp_used_codes, two_factor_tokens, claimed_emails, users CASCADE")
+	if err := m.Steps(-1); err != nil {
+		t.Fatalf("000014 down failed: %v", err)
+	}
+	_, _ = m.Close()
+	_ = migrateDB.Close()
+
+	// Two accounts disagree about who owns one address: users.email says owner,
+	// another account's link says holder.
+	ownerID, holderID := uuid.New(), uuid.New()
+	seedDB, err := sql.Open("pgx", dbURL)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	if _, err := seedDB.Exec(`INSERT INTO users (id, email, password_hash, email_verified) VALUES ($1, 'collision@example.test', 'hash', TRUE)`, ownerID); err != nil {
+		t.Fatalf("seed owner: %v", err)
+	}
+	if _, err := seedDB.Exec(`INSERT INTO users (id, email, password_hash, email_verified) VALUES ($1, 'collision-holder@example.test', 'hash', TRUE)`, holderID); err != nil {
+		t.Fatalf("seed holder: %v", err)
+	}
+	if _, err := seedDB.Exec(`INSERT INTO oauth_accounts (id, user_id, provider_id, provider_tenant_id, provider_user_id, email, verified)
+		VALUES ($1, $2, 'google', '', 'sub-collision', 'collision@example.test', TRUE)`, uuid.New(), holderID); err != nil {
+		t.Fatalf("seed colliding link: %v", err)
+	}
+	_ = seedDB.Close()
+
+	m2, migrateDB2 := newMigrator(t, dbURL)
+	upErr := m2.Up()
+	if upErr == nil {
+		t.Fatal("000014 applied over a cross-account collision; the backfill must abort")
+	}
+	msg := upErr.Error()
+	if !strings.Contains(msg, "claimed_emails backfill aborted") {
+		t.Fatalf("abort message = %q; want it to name the backfill", msg)
+	}
+	if !strings.Contains(msg, ownerID.String()) || !strings.Contains(msg, holderID.String()) {
+		t.Fatalf("abort message = %q; want both competing accounts named", msg)
+	}
+
+	// Recovery: the aborted migration is a rolled-back transaction, so the table
+	// is absent; re-pin 13, remove the offending link, and deploy cleanly.
+	_, _ = m2.Close()
+	_ = migrateDB2.Close()
+	m3, migrateDB3 := newMigrator(t, dbURL)
+	if ferr := m3.Force(13); ferr != nil {
+		t.Fatalf("m3.Force(13) failed: %v", ferr)
+	}
+	if _, err := migrateDB3.Exec(`DELETE FROM oauth_accounts WHERE provider_user_id = 'sub-collision'`); err != nil {
+		t.Fatalf("remove colliding link: %v", err)
+	}
+	if err := m3.Up(); err != nil {
+		t.Fatalf("re-applying 000014 after the collision was resolved failed: %v", err)
+	}
+	var gotHolder uuid.UUID
+	if err := migrateDB3.QueryRow(`SELECT owner_user_id FROM claimed_emails WHERE email = 'collision@example.test'`).Scan(&gotHolder); err != nil {
+		t.Fatalf("claim after recovery: %v", err)
+	}
+	if gotHolder != ownerID {
+		t.Fatalf("claim owner = %v; want the surviving account %v", gotHolder, ownerID)
+	}
+	if _, err := migrateDB3.Exec(`DELETE FROM users WHERE id IN ($1, $2)`, ownerID, holderID); err != nil {
+		t.Fatalf("remove seeded users: %v", err)
+	}
+	_, _ = m3.Close()
+	_ = migrateDB3.Close()
+}
+
 func TestMigrations_DownRefusedOnSeededDB(t *testing.T) {
 	dbURL := resolveDatabaseURL()
 

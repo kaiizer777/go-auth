@@ -141,6 +141,15 @@ func TestPasswordSquatLosesAccountToProviderProof(t *testing.T) {
 	if _, lerr := authSvc.Login(ctx, db.LoginRequest{Email: addr, Password: squatterPassword}); lerr == nil {
 		t.Fatal("the squatter's password still authenticates")
 	}
+	// Row level, not just usability: the only session left belongs to the callback
+	// that proved the mailbox; the squatter's rows are gone, not merely stale.
+	var liveSessions int64
+	if err := database.Model(&db.Session{}).Where("user_id = ?", squatter.ID).Count(&liveSessions).Error; err != nil {
+		t.Fatalf("count sessions: %v", err)
+	}
+	if liveSessions != 1 {
+		t.Errorf("session rows = %d; want only the proving callback's", liveSessions)
+	}
 	if _, serr := sessSvc.GetSession(ctx, squatterSession); serr == nil {
 		t.Fatal("the squatter's session survived the handover")
 	}
