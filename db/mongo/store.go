@@ -1301,8 +1301,9 @@ type claimOwnerFilter struct {
 }
 
 // Claim mirrors the SQL implementation: an upsert that cannot fail the call on a
-// duplicate, followed by a read of the holder. Mongo does not abort a transaction
-// on a duplicate key, but the same order keeps both backends observably equal.
+// duplicate, followed by a read of the holder. A duplicate-key error aborts a
+// MongoDB transaction, so the losing call resolves the winner with a read outside
+// it and does not promote: promotion belongs to the winner's own transaction.
 func (s *claimedEmailStore) Claim(ctx context.Context, email string, ownerID uuid.UUID, verified bool) error {
 	key, kerr := db.ClaimKey(email)
 	if kerr != nil {
@@ -1312,8 +1313,8 @@ func (s *claimedEmailStore) Claim(ctx context.Context, email string, ownerID uui
 		return nil
 	}
 	now := time.Now().UTC()
-	readCtx := s.store.resolveCtx(ctx)
-	_, err := s.collection().UpdateOne(readCtx,
+	sessionCtx := s.store.resolveCtx(ctx)
+	_, err := s.collection().UpdateOne(sessionCtx,
 		claimFilter{ID: key},
 		bson.M{"$setOnInsert": bson.M{
 			"owner_user_id": ownerID.String(),
@@ -1323,17 +1324,27 @@ func (s *claimedEmailStore) Claim(ctx context.Context, email string, ownerID uui
 		}},
 		options.UpdateOne().SetUpsert(true),
 	)
-	// A concurrent upsert of the same _id can lose with a duplicate key. MongoDB
-	// aborts the enclosing transaction on that error, so the ownership read (and any
-	// promotion) must run outside it: the winner committed the row this call needs.
 	if err != nil {
 		if !mongo.IsDuplicateKeyError(err) {
 			return NormalizeMongoError(err)
 		}
-		readCtx = ctx
+		// The concurrent winner committed the row this call needs. Read it outside
+		// the aborted transaction and do not promote: a write made outside the
+		// caller's transaction would survive its rollback.
+		var winner ClaimedEmailDoc
+		if derr := s.collection().FindOne(ctx, claimFilter{ID: key}).Decode(&winner); derr != nil {
+			if errors.Is(derr, mongo.ErrNoDocuments) {
+				return errors.ErrEmailClaimed
+			}
+			return derr
+		}
+		if winner.toDomain().OwnerUserID != ownerID {
+			return errors.ErrEmailClaimed
+		}
+		return nil
 	}
 	var doc ClaimedEmailDoc
-	if derr := s.collection().FindOne(readCtx, claimFilter{ID: key}).Decode(&doc); derr != nil {
+	if derr := s.collection().FindOne(sessionCtx, claimFilter{ID: key}).Decode(&doc); derr != nil {
 		if errors.Is(derr, mongo.ErrNoDocuments) {
 			return errors.ErrEmailClaimed
 		}
@@ -1344,7 +1355,7 @@ func (s *claimedEmailStore) Claim(ctx context.Context, email string, ownerID uui
 		return errors.ErrEmailClaimed
 	}
 	if verified && !claim.Verified {
-		_, uerr := s.collection().UpdateOne(readCtx,
+		_, uerr := s.collection().UpdateOne(sessionCtx,
 			claimOwnerFilter{ID: key, OwnerID: ownerID.String()},
 			bson.M{"$set": bson.M{"verified": true, "updated_at": now}},
 		)

@@ -15,12 +15,20 @@ import (
 // ValidateEmail validates an email address according to Phase 3 requirements.
 // It enforces non-empty, max 255 length, no spaces, RFC 5322 compliance via net/mail,
 // and domain structure (at least one dot, no empty labels, no trailing/leading dots).
+//
+// The length limit applies to the normalised claim key as well as the raw input:
+// Go's unicode case folding can expand a character (U+023A is 2 bytes and folds to
+// U+2C65, 3 bytes), so an address that fits raw can exceed the claim key limit once
+// folded. Rejecting it here keeps "accepted" and "claimable" the same predicate.
 func ValidateEmail(email string) error {
 	if email == "" || strings.TrimSpace(email) == "" {
 		return errors.New(errors.CodeInvalidEmail, "email is required", nil)
 	}
 	if len(email) > 255 {
 		return errors.New(errors.CodeInvalidEmail, "email exceeds maximum length of 255 characters", nil)
+	}
+	if key := NormalizeEmail(email); len(key) > claimKeyMaxLength {
+		return errors.New(errors.CodeInvalidEmail, "email exceeds maximum length of 255 characters after case folding", nil)
 	}
 	if strings.IndexFunc(email, unicode.IsSpace) >= 0 {
 		return errors.New(errors.CodeInvalidEmail, "email cannot contain spaces", nil)

@@ -251,7 +251,7 @@ func BackfillClaimedEmails(ctx context.Context, database *mongo.Database) error 
 			case derr != nil:
 				// Idempotent: a re-run after an aborted pass converges on the rows
 				// the first pass already wrote.
-				_, ierr := claims.UpdateOne(ctx,
+				res, ierr := claims.UpdateOne(ctx,
 					bson.M{"_id": key},
 					bson.M{"$setOnInsert": bson.M{
 						"owner_user_id": ownerID,
@@ -265,8 +265,8 @@ func BackfillClaimedEmails(ctx context.Context, database *mongo.Database) error 
 					_ = cursor.Close(ctx)
 					return ierr
 				}
-				// A concurrent run can win the upsert with a different owner; the
-				// re-read resolves it instead of assuming our write landed.
+				// A concurrent run can win the upsert; the re-read resolves it instead
+				// of assuming our write landed.
 				if derr := claims.FindOne(ctx, bson.M{"_id": key}).Decode(&existing); derr != nil {
 					_ = cursor.Close(ctx)
 					return derr
@@ -276,7 +276,12 @@ func BackfillClaimedEmails(ctx context.Context, database *mongo.Database) error 
 					addConflict(key, ownerID)
 					continue
 				}
-				created[key] = ownerID
+				// Only a row this run actually inserted may be rolled back during
+				// conflict cleanup: a same-owner row created by another writer is a
+				// live reservation and must survive.
+				if res.UpsertedCount > 0 {
+					created[key] = ownerID
+				}
 			}
 			holders++
 		}

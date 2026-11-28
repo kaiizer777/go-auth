@@ -376,6 +376,11 @@ func (s *authService) VerifyEmail(ctx context.Context, req db.VerifyEmailRequest
 		if errors.Is(err, errors.ErrEmailClaimed) {
 			return nil, errors.ErrEmailClaimed
 		}
+		// A stored address that stopped being claimable (a legacy row) is a data
+		// problem the caller can see, not a database outage.
+		if errors.Is(err, errors.ErrInvalidEmail) {
+			return nil, err
+		}
 		return nil, errors.Wrap(err, errors.CodeDatabaseError, "failed to verify email")
 	}
 	if isExpired {
@@ -536,6 +541,11 @@ func (s *authService) ResetPassword(ctx context.Context, req db.PasswordResetCon
 			return nil, err
 		}
 		if errors.Is(err, errors.ErrEmailClaimed) {
+			return nil, err
+		}
+		// A stored address that stopped being claimable (a legacy row) is a data
+		// problem the caller can see, not a database outage.
+		if errors.Is(err, errors.ErrInvalidEmail) {
 			return nil, err
 		}
 		return nil, errors.Wrap(err, errors.CodeDatabaseError, "failed to reset password")

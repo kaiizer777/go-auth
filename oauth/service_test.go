@@ -1523,6 +1523,77 @@ func TestHandleCallbackLinkRefusesEmailClaimedByAnotherLink(t *testing.T) {
 	}
 }
 
+// lockOrderStore records the order of the owner lock and the link delete inside
+// invalidateLink, which must match attachLink's owner-then-link lock order.
+type lockOrderStore struct {
+	db.Store
+	calls *[]string
+}
+
+type lockOrderUserStore struct {
+	db.UserStore
+	calls *[]string
+}
+
+func (s *lockOrderUserStore) GetByIDForUpdate(ctx context.Context, id uuid.UUID) (*db.User, error) {
+	*s.calls = append(*s.calls, "lock")
+	return s.UserStore.GetByIDForUpdate(ctx, id)
+}
+
+type lockOrderLinkStore struct {
+	db.OAuthAccountStore
+	calls *[]string
+}
+
+func (s *lockOrderLinkStore) Delete(ctx context.Context, id uuid.UUID) error {
+	*s.calls = append(*s.calls, "delete")
+	return s.OAuthAccountStore.Delete(ctx, id)
+}
+
+func (s *lockOrderStore) Users() db.UserStore {
+	return &lockOrderUserStore{UserStore: s.Store.Users(), calls: s.calls}
+}
+
+func (s *lockOrderStore) OAuthAccounts() db.OAuthAccountStore {
+	return &lockOrderLinkStore{OAuthAccountStore: s.Store.OAuthAccounts(), calls: s.calls}
+}
+
+func (s *lockOrderStore) Transaction(ctx context.Context, fn func(db.Store) error) error {
+	return s.Store.Transaction(ctx, func(tx db.Store) error {
+		return fn(&lockOrderStore{Store: tx, calls: s.calls})
+	})
+}
+
+// TestInvalidateLinkLocksTheOwnerBeforeDeleting pins the lock order that avoids a
+// deadlock with a concurrent attachLink: the owner row is locked before the link
+// row is deleted, never after.
+func TestInvalidateLinkLocksTheOwnerBeforeDeleting(t *testing.T) {
+	database, cfg, stub, rawSvc := setupServiceTest(t, &UserInfo{
+		ProviderID: "google", ProviderUserID: "sub-lock-order", Email: "", EmailVerified: true,
+	})
+	ctx := context.Background()
+	base := rawSvc.(*service).store
+
+	owner := db.User{ID: uuid.New(), Email: "lock-order-owner@example.com", PasswordHash: "hash", EmailVerified: true}
+	if err := base.Users().Create(ctx, &owner); err != nil {
+		t.Fatalf("seed owner: %v", err)
+	}
+	link := db.OAuthAccount{ID: uuid.New(), UserID: owner.ID, ProviderID: "google",
+		ProviderUserID: "sub-lock-order", Email: "lock-order-link@example.com", Verified: true}
+	if err := database.Create(&link).Error; err != nil {
+		t.Fatalf("seed link: %v", err)
+	}
+
+	calls := make([]string, 0, 4)
+	svc := NewServiceWithStore(&lockOrderStore{Store: base, calls: &calls},
+		session.NewService(database, cfg), map[string]Provider{"google": stub}, cfg)
+
+	svc.(*service).invalidateLink(ctx, link)
+	if len(calls) < 2 || calls[0] != "lock" || calls[1] != "delete" {
+		t.Fatalf("invalidateLink calls = %v; want the owner lock before the link delete", calls)
+	}
+}
+
 // TestRegistrationClaimsTheAddress pins the third account-creating path:
 // createUserAndLink must claim the address it registers, or every OAuth-only
 // account is missing the row the table exists to hold.

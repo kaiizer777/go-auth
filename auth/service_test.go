@@ -2247,6 +2247,88 @@ func TestService_ResetPassword_ReleasesClaimOfPurgedLink(t *testing.T) {
 	}
 }
 
+// TestService_VerifyEmail_UnclaimableStoredAddressIsClientError covers a legacy
+// row whose stored address no longer produces a claim key: verification must fail
+// with the validation code, not a database 500.
+func TestService_VerifyEmail_UnclaimableStoredAddressIsClientError(t *testing.T) {
+	database := setupTestDB(t)
+	cfg := testConfig()
+	store := gormstore.New(database)
+	tokens := make(chan string, 1)
+	hooks := email.Hooks{
+		SendVerificationEmail: func(_ context.Context, _ string, token string) error {
+			tokens <- token
+			return nil
+		},
+	}
+	svc, err := NewWithStore(cfg, store, hooks)
+	if err != nil {
+		t.Fatalf("NewWithStore: %v", err)
+	}
+	ctx := context.Background()
+
+	const addr = "legacy-verify@example.com"
+	user, _, serr := svc.Signup(ctx, db.SignupRequest{Email: addr, Password: "VerifyPass#2026!"})
+	if serr != nil || user == nil {
+		t.Fatalf("signup = %v, %v", user, serr)
+	}
+	var raw string
+	select {
+	case raw = <-tokens:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the verification email")
+	}
+	// The row predates the current key rule: its stored address is not an address.
+	if err := database.Model(&db.User{}).Where("id = ?", user.ID).Update("email", "not-an-address").Error; err != nil {
+		t.Fatalf("corrupt stored address: %v", err)
+	}
+
+	_, verr := svc.VerifyEmail(ctx, db.VerifyEmailRequest{Token: raw})
+	if !errors.Is(verr, errors.ErrInvalidEmail) {
+		t.Fatalf("VerifyEmail = %v; want ErrInvalidEmail", verr)
+	}
+	var appErr *errors.Error
+	if !errors.As(verr, &appErr) || appErr.Code() != errors.CodeInvalidEmail {
+		t.Fatalf("VerifyEmail code = %v; want %v (a 4xx, not a database 500)", verr, errors.CodeInvalidEmail)
+	}
+}
+
+// TestService_ResetPassword_UnclaimableStoredAddressIsClientError is the reset
+// twin: the claim promotion runs inside the reset transaction, so its validation
+// failure must surface as a 4xx rather than being wrapped as a database error.
+func TestService_ResetPassword_UnclaimableStoredAddressIsClientError(t *testing.T) {
+	database := setupTestDB(t)
+	cfg := testConfig()
+	store := gormstore.New(database)
+	svc, err := NewWithStore(cfg, store, email.Hooks{})
+	if err != nil {
+		t.Fatalf("NewWithStore: %v", err)
+	}
+	ctx := context.Background()
+
+	const addr = "legacy-reset@example.com"
+	user, _, serr := svc.Signup(ctx, db.SignupRequest{Email: addr, Password: "SignupPass#2026!"})
+	if serr != nil || user == nil {
+		t.Fatalf("signup = %v, %v", user, serr)
+	}
+	raw, rerr := svc.RequestPasswordReset(ctx, db.PasswordResetRequest{Email: addr})
+	if rerr != nil {
+		t.Fatalf("RequestPasswordReset: %v", rerr)
+	}
+	if err := database.Model(&db.User{}).Where("id = ?", user.ID).Update("email", "not-an-address").Error; err != nil {
+		t.Fatalf("corrupt stored address: %v", err)
+	}
+
+	_, rerr = svc.ResetPassword(ctx, db.PasswordResetConfirmRequest{Token: raw, NewPassword: "ResetClaim#2026!"})
+	if !errors.Is(rerr, errors.ErrInvalidEmail) {
+		t.Fatalf("ResetPassword = %v; want ErrInvalidEmail", rerr)
+	}
+	var appErr *errors.Error
+	if !errors.As(rerr, &appErr) || appErr.Code() != errors.CodeInvalidEmail {
+		t.Fatalf("ResetPassword code = %v; want %v (a 4xx, not a database 500)", rerr, errors.CodeInvalidEmail)
+	}
+}
+
 func TestService_DispatchEmailAsync_SaturationOverflowAndPendingRelease(t *testing.T) {
 	database := setupTestDB(t)
 	cfg := testConfig()

@@ -78,7 +78,7 @@ func setupAntiHijackingDB(t *testing.T) (*gorm.DB, db.Store) {
 	return database, gormstore.New(database)
 }
 
-func TestSecurity_PreHijackingAccountLinkConflict(t *testing.T) {
+func TestSecurity_PreHijackingUnverifiedClaimTakeover(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	database, store := setupAntiHijackingDB(t)
@@ -107,6 +107,12 @@ func TestSecurity_PreHijackingAccountLinkConflict(t *testing.T) {
 		t.Fatalf("seed claim: %v", err)
 	}
 
+	// The squatter also holds a session; the takeover must revoke it.
+	_, squatterSession, err := sessSvc.CreateSession(ctx, attackerUser.ID, attackerUser.CredentialVersion, db.SessionTypeCookie, "127.0.0.1", "ua")
+	if err != nil {
+		t.Fatalf("create squatter session: %v", err)
+	}
+
 	// 2. Legitimate victim logs in via Microsoft OAuth with verified email
 	mockMS := oauthmock.New("microsoft", "victim-ms-oid-999", victimEmail, true)
 	defer mockMS.Close()
@@ -132,8 +138,8 @@ func TestSecurity_PreHijackingAccountLinkConflict(t *testing.T) {
 	sess, _, _, err := svc.HandleCallback(ctx, cbRec, cbReq, "microsoft", "code-1", state, db.SessionTypeCookie)
 
 	// Invariant: provider proof over an unverified claim hands the account over.
-	// The identity that proves the mailbox wins, the squatter's session and grants
-	// are revoked, and no second account appears.
+	// The identity that proves the mailbox wins, the squatter's session is revoked,
+	// and no second account appears.
 	if err != nil {
 		t.Fatalf("expected the proving identity to take over the unverified account, got %v", err)
 	}
@@ -146,6 +152,9 @@ func TestSecurity_PreHijackingAccountLinkConflict(t *testing.T) {
 	}
 	if claim.OwnerUserID != attackerUser.ID || !claim.Verified {
 		t.Fatalf("claim = %+v; want holder %v, verified", claim, attackerUser.ID)
+	}
+	if _, serr := sessSvc.GetSession(ctx, squatterSession); serr == nil {
+		t.Fatal("the squatter's session survived the takeover")
 	}
 	var users, links int64
 	database.Model(&db.User{}).Count(&users)

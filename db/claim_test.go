@@ -37,6 +37,52 @@ func TestClaimKey_NormalisesValidAddresses(t *testing.T) {
 	}
 }
 
+// foldExpander is U+023A (2 bytes) whose lowercase form U+2C65 is 3 bytes, so
+// NormalizeEmail can make an address longer than its stored form.
+const foldExpander = "Ⱥ"
+
+// TestValidateEmailAndClaimKeyAgree pins the predicate: an address the system
+// accepts is always claimable, and a key ClaimKey rejects was already rejected by
+// ValidateEmail. Folding expansion is the case that used to diverge.
+func TestValidateEmailAndClaimKeyAgree(t *testing.T) {
+	const domain = "@example.com"
+	cases := []struct {
+		name     string
+		addr     string
+		accepted bool
+	}{
+		{name: "plain", addr: "user@example.com", accepted: true},
+		{name: "ascii max length", addr: strings.Repeat("a", 255-len(domain)) + domain, accepted: true},
+		{name: "ascii over length", addr: strings.Repeat("a", 256-len(domain)) + domain, accepted: false},
+		{name: "folding expansion fits", addr: strings.Repeat("a", 254-len(domain)-len(foldExpander)) + foldExpander + domain, accepted: true},
+		{name: "folding expansion crosses the limit", addr: strings.Repeat("a", 255-len(domain)-len(foldExpander)) + foldExpander + domain, accepted: false},
+		{name: "combining characters", addr: "e\u0301milie@example.com", accepted: true},
+		{name: "quoted local part", addr: `"jane"@example.com`, accepted: true},
+		{name: "plus addressing", addr: "user+tag@example.com", accepted: true},
+		{name: "uppercase", addr: "USER@EXAMPLE.COM", accepted: true},
+		{name: "surrounding whitespace", addr: " user@example.com ", accepted: false},
+		{name: "not an address", addr: "no-at.example.com", accepted: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			verr := ValidateEmail(tc.addr)
+			if (verr == nil) != tc.accepted {
+				t.Fatalf("ValidateEmail(%q) = %v; want accepted=%v", tc.addr, verr, tc.accepted)
+			}
+			key, kerr := ClaimKey(tc.addr)
+			if verr == nil && kerr != nil {
+				t.Fatalf("accepted address %q is not claimable: %v", tc.addr, kerr)
+			}
+			if kerr != nil && verr == nil {
+				t.Fatalf("ClaimKey(%q) failed but ValidateEmail accepted it", tc.addr)
+			}
+			if kerr == nil && len(key) > claimKeyMaxLength {
+				t.Fatalf("claim key for %q is %d bytes; limit is %d", tc.addr, len(key), claimKeyMaxLength)
+			}
+		})
+	}
+}
+
 func TestClaimKey_RejectsNonAddressValues(t *testing.T) {
 	for _, bad := range []string{
 		"user@@example.com",

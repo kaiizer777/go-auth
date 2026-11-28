@@ -400,6 +400,36 @@ func TestBackfillClaimedEmails_ReportsEveryConflictInThePage(t *testing.T) {
 	}
 }
 
+// TestBackfillClaimedEmails_CountsUnclaimableAddresses pins the report for legacy
+// rows that are not addresses: they are counted, not silently dropped, and never
+// written as a claim key.
+func TestBackfillClaimedEmails_CountsUnclaimableAddresses(t *testing.T) {
+	database := setupClaimBackfillDB(t)
+	ctx := context.Background()
+
+	good := seedLegacyUser(t, database, claimTestID(0), "good-legacy@example.com", false)
+	seedLegacyUser(t, database, claimTestID(1), "not-an-address", false)
+
+	result, err := BackfillClaimedEmails(ctx, database)
+	if err != nil {
+		t.Fatalf("backfill: %v", err)
+	}
+	if result.Claims != 1 {
+		t.Fatalf("claims written = %d; want 1", result.Claims)
+	}
+	if result.Skipped != 1 {
+		t.Fatalf("skipped = %d; want 1 (the operator must see the unclaimable row)", result.Skipped)
+	}
+	loadClaim(t, database, good.Email)
+	var bad int64
+	if err := database.Model(&ClaimedEmail{}).Where("email = ?", "not-an-address").Count(&bad).Error; err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if bad != 0 {
+		t.Fatal("an unclaimable legacy address was written as a claim key")
+	}
+}
+
 // TestBackfillClaimedEmails_ImportsAddressesAddedAfterASuccessfulRun pins why the
 // utility is safe to re-run: a row written after an import completed is picked up
 // by the next run instead of staying unclaimed.

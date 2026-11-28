@@ -1577,8 +1577,18 @@ func isClaimedAccount(u db.User) bool {
 // best-effort by design: the refusal does not depend on it because link trust is
 // re-derived from the owner and the tenant on every callback, so a store failure
 // is logged rather than turning a rejected login into a 500.
+//
+// The owner row is locked before the link delete, matching attachLink's
+// owner-then-link order. Deleting first and locking afterwards would let a
+// concurrent attachLink (owner lock held, waiting on this link's unique index)
+// and this transaction (link lock held, waiting on the owner) deadlock.
 func (s *service) invalidateLink(ctx context.Context, link db.OAuthAccount) {
 	err := s.store.Transaction(ctx, func(txStore db.Store) error {
+		if _, lerr := txStore.Users().GetByIDForUpdate(ctx, link.UserID); lerr != nil {
+			if !errors.Is(lerr, gorm.ErrRecordNotFound) && !errors.Is(lerr, errors.ErrUserNotFound) {
+				return lerr
+			}
+		}
 		if derr := txStore.OAuthAccounts().Delete(ctx, link.ID); derr != nil {
 			return derr
 		}
