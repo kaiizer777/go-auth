@@ -1,14 +1,18 @@
 # TOTP secret key management
 
-TOTP secrets are stored as keyring envelopes: `{"v":1,"alg":"A256GCM","kid":"…","n":"…","ct":"…"}`
-sealed with AES-256-GCM under the active key, bound by additional data to the
-owning user id and the fixed field label `encrypted_secret`. A row sealed for
-one user cannot be opened for another, and an envelope written for a different
-domain (an OAuth token, say) never authenticates here.
+New TOTP secrets are stored as keyring envelopes:
+`{"v":1,"alg":"A256GCM","kid":"…","n":"…","ct":"…"}` sealed with AES-256-GCM
+under the active key, bound by additional data to the owning user id and the
+fixed field label `encrypted_secret`. An envelope sealed for one user cannot be
+opened for another, only the ring entry named by its kid opens it, and an
+envelope written for a different domain (an OAuth token, say) never authenticates
+here. Rows still in the pre-envelope layout are covered below.
 
 ## Configuration
 
-Both fields live under `TOTP` and either one enables two-factor authentication:
+Both fields live under `TOTP`, and either one wires two-factor authentication up.
+A surface that is configured but unusable fails closed instead of silently
+serving 2FA-less logins (see below).
 
 | Field | Meaning |
 |---|---|
@@ -21,36 +25,51 @@ a `Keyring` precedes it; with no `Keyring`, it is the ring head and encrypts as
 well. Consequences:
 
 - `EncryptionKey` only — the hex key is the ring head, so it encrypts new rows
-  and still reads every existing one.
+  and reads every existing row that key sealed.
 - `Keyring` + `EncryptionKey` — new writes use the ring head, the old key still
-  opens every legacy row and every row sealed under `legacy`. This is the
-  rotation path.
-- `Keyring` only - the ring head encrypts. Legacy rows open only if the old key
-  is included in the ring; the sweep below aborts loudly on a row it cannot
-  open instead of leaving it behind.
+  opens every legacy row it sealed and every row sealed under `legacy`. This is
+  the rotation path.
+- `Keyring` only - the ring head encrypts. Legacy rows open only while the key
+  that sealed them is somewhere in the ring; the sweep below aborts loudly on a
+  row it cannot open instead of leaving it behind.
 
 `legacy` is a reserved kid. A `Keyring` that already defines it, combined with a
 non-empty `EncryptionKey`, fails configuration validation
 (`ErrTOTPKeyringInvalid`) at startup instead of passing and leaving every TOTP
 operation unusable. Give the pre-existing key a different kid and list it in
-`Keyring` instead.
+`Keyring` instead. A `Keyring` that defines `legacy` with no `EncryptionKey` set
+composes no duplicate and is accepted.
 
 A configured-but-unusable key surface is never a silent "2FA off": the service
-is wired, startup logs `totp_crypto_config_invalid`, and every TOTP operation
-fails closed. A composed ring that does not parse, or that defines `legacy`
-while a non-empty `EncryptionKey` also joins the ring under that kid, fails
-`Validate` (`ErrTOTPKeyringInvalid`) before a config-built service starts.
+is wired, startup logs `totp_crypto_config_invalid`, and every operation that
+seals or opens a secret fails closed (status reads need no key). A composed ring
+that does not parse, or that defines `legacy` while a non-empty `EncryptionKey`
+also joins the ring under that kid, fails `Validate` (`ErrTOTPKeyringInvalid`)
+before a config-built service starts.
 
 ## Stored format and the legacy read path
 
-Rows written before the envelope existed are `nonce || ciphertext || tag` with
-no key id and no additional data. The read path detects the format by parsing,
-never by length or first byte, and opens legacy rows under every ring entry. That
-legacy read stays in place until a field deployment has drained its rows with the
-sweep; removing it is a follow-up change.
+Rows written before the envelope existed are `nonce || ciphertext || tag` with no
+key id and no additional data. The read path detects the format by parsing, never
+by length or first byte: a legacy nonce is random, so roughly 1 in 256 such rows
+begins with `{` and is still attempted as a legacy blob once envelope parsing
+fails. A blob larger than the 64 KiB parsing budget is refused before either
+attempt, so no legacy row that size is readable.
 
-Legacy rows are unbound: because they carry no additional data, a legacy row
-still opens for any user id. Rewrapping them is what closes that gap.
+Two gaps follow, and the rewrap closes both:
+
+- **Not bound.** A legacy row carries no additional data, so it opens for any
+  user id and any field label.
+- **Not kid-authenticated.** No kid records which key sealed a legacy row, so the
+  read path cannot check a claimed key id; it tries every ring entry instead.
+
+A legacy row therefore stays readable only while the key that sealed it is still
+an entry in the composed ring. Drop that key before the sweep has drained the row
+and the row is unrecoverable — which is why the rewrap exists, and why the old key
+must stay in the ring until the sweep has rewritten every row only it can open.
+
+That legacy read stays in place until a field deployment has drained its rows with
+the sweep; removing it is a follow-up change.
 
 ## Rewrapping (key rotation / first rollout of the envelope format)
 
@@ -81,8 +100,12 @@ path.
 ## Schema
 
 Migration `000013` adds `totp_secrets.secret_kid VARCHAR(32) NOT NULL DEFAULT ''`
-in both dialects. The column is a hint and an audit trail, never a format tag and
-never read on the read path; `''` means unknown. It is deliberately not part of
-`db.TotpSecret`, so a down-migrated database (column dropped) keeps serving every
-read and write — only the sweep needs the column, and it fails loudly without it.
-`000013` contains no key material, no ciphertext and no data `UPDATE`.
+in both dialects. The column is a non-authoritative hint, never a format tag and
+never consulted on the read path: `''` means unknown, which covers every row
+written before the column existed and every row an enrolment writes. The sweep
+writes the kid it sealed under in the same statement as the ciphertext, and it
+decides whether a row still needs rewriting from the kid inside the envelope, not
+from this column. It is deliberately not part of `db.TotpSecret`, so a
+down-migrated database (column dropped) keeps serving every read and write; only
+the sweep selects the column and fails loudly without it. `000013` contains no
+key material, no ciphertext and no data `UPDATE`.
