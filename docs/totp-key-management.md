@@ -48,11 +48,16 @@ guard it differently:
   ring (one that does not parse, or that collides with the reserved `legacy` kid)
   returns `ErrTOTPKeyringInvalid` before any service exists. Nothing logs
   `totp_crypto_config_invalid` on this path, because the constructor never runs.
-- `totp.NewServiceWithStore` (or `totp.New`) called directly with a
+- `totp.NewServiceWithStore` — or its `NewTotpServiceWithStore` alias, or
+  `totp.NewService`/`NewTotpService`, which wrap it — called directly with a
   `config.TOTPConfig` performs no validation. The service is constructed with the
-  construction error recorded, the constructor logs a warning with event
-  `totp_crypto_config_invalid`, and every operation that seals or opens a secret
-  returns that error. Status reads need no key and keep working.
+  construction error recorded, and the constructor logs a warning with event
+  `totp_crypto_config_invalid`. Operations that must seal or open a secret then
+  fail closed instead of proceeding, but not with a uniform error: `Enroll`,
+  `ConfirmEnrollment` and `VerifyCode` return the recorded construction error,
+  while `DisableTOTP` with a code swallows it and reports
+  `ErrInvalidCredentials`. Disabling with the password needs no key, and
+  `Status`/`IsTotpEnabled` need none either.
 
 ## Stored format and the legacy read path
 
@@ -94,9 +99,10 @@ explicit call — there is no startup hook and no config flag.
   data is the progress. Opening before skipping is what keeps a corrupt blob
   that merely claims the active kid from being counted as migrated.
 - Per-row compare-and-swap: the ciphertext and the `secret_kid` hint are written
-  by one `UPDATE … WHERE id = ? AND encrypted_secret = ?`. A concurrent
-  enrolment that replaces the row makes the swap miss, and the sweep skips that
-  row rather than overwriting a newer secret.
+  by one conditional statement — `UPDATE … WHERE id = ? AND encrypted_secret = ?`
+  on the SQL stores, a single filtered update on MongoDB. A concurrent enrolment
+  that replaces the row makes the swap miss, and the sweep skips that row rather
+  than overwriting a newer secret.
 - A row no ring key can open aborts the run. That row is a future lockout, so it
   surfaces immediately, together with the number of rows already rewritten and
   the failing owner. Rows the run already migrated stay migrated and readable.
