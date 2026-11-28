@@ -235,6 +235,14 @@ func TestMigrations_Claim000014BackfillAndDown(t *testing.T) {
 	if claimsFromUnverifiedAccount != 1 {
 		t.Fatalf("unverified account claims = %d; want 1", claimsFromUnverifiedAccount)
 	}
+	// Leave the shared database as this test found it: the next migration test
+	// only rolls back to 000007 cleanly when oauth_accounts is empty.
+	if _, err := migrateDB.Exec(`DELETE FROM oauth_accounts WHERE user_id IN ($1, $2)`, ownerID, linkerID); err != nil {
+		t.Fatalf("remove seeded links: %v", err)
+	}
+	if _, err := migrateDB.Exec(`DELETE FROM users WHERE id IN ($1, $2)`, ownerID, linkerID); err != nil {
+		t.Fatalf("remove seeded users: %v", err)
+	}
 }
 
 func TestMigrations_DownRefusedOnSeededDB(t *testing.T) {
@@ -342,8 +350,8 @@ func TestMigrations_DownRefusedOnSeededDB(t *testing.T) {
 	if _, err := sqlDB2.Exec(`DELETE FROM users WHERE email = 'down-rollback@example.com'`); err != nil {
 		t.Fatalf("failed to remove seed row: %v", err)
 	}
-	if verr, ddirty, verr2 := m2.Version(); verr2 != nil || verr != 13 || ddirty {
-		t.Fatalf("expected version 13 clean after re-up, got version=%d dirty=%v err=%v", verr, ddirty, verr2)
+	if verr, ddirty, verr2 := m2.Version(); verr2 != nil || verr != 14 || ddirty {
+		t.Fatalf("expected version 14 clean after re-up, got version=%d dirty=%v err=%v", verr, ddirty, verr2)
 	}
 }
 
