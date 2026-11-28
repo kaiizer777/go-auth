@@ -558,6 +558,109 @@ func TestBackfillMicrosoftOIDLinks(t *testing.T) {
 	}
 }
 
+// TestBackfillClaimedEmails pins the MongoDB mirror of the claim import: keys are
+// db.NormalizeEmail output (not the raw column), the verified flag follows the
+// holders, the run is idempotent, and a cross-account collision aborts naming both
+// accounts instead of picking a winner.
+func TestBackfillClaimedEmails(t *testing.T) {
+	uri := requireMongoURI(t)
+	client, err := mongo.Connect(options.Client().ApplyURI(uri))
+	if err != nil {
+		t.Fatalf("mongo.Connect failed: %v", err)
+	}
+	database := client.Database(fmt.Sprintf("goauth_test_claim_bf_%s", strings.ReplaceAll(uuid.New().String(), "-", "")))
+	t.Cleanup(func() {
+		_ = database.Drop(context.Background())
+		_ = client.Disconnect(context.Background())
+	})
+	ctx := context.Background()
+
+	alice, bob := uuid.New(), uuid.New()
+	if _, err := database.Collection("users").InsertMany(ctx, []any{
+		bson.M{"_id": alice.String(), "email": "  Alice@Example.COM\t", "email_verified": false},
+		bson.M{"_id": bob.String(), "email": "bob@example.com", "email_verified": true},
+	}); err != nil {
+		t.Fatalf("seed users: %v", err)
+	}
+	if _, err := database.Collection("oauth_accounts").InsertMany(ctx, []any{
+		bson.M{"_id": uuid.New().String(), "user_id": alice.String(), "provider_id": "google",
+			"provider_user_id": "sub-alice", "email": "ALICE@example.com", "verified": false},
+		bson.M{"_id": uuid.New().String(), "user_id": bob.String(), "provider_id": "google",
+			"provider_user_id": "sub-bob", "email": " BOB@Example.com ", "verified": true},
+	}); err != nil {
+		t.Fatalf("seed links: %v", err)
+	}
+
+	for run := 1; run <= 2; run++ {
+		if err := BackfillClaimedEmails(ctx, database); err != nil {
+			t.Fatalf("run %d: %v", run, err)
+		}
+	}
+	for _, tc := range []struct {
+		raw      string
+		owner    uuid.UUID
+		verified bool
+	}{
+		{raw: "  Alice@Example.COM\t", owner: alice, verified: false},
+		{raw: " BOB@Example.com ", owner: bob, verified: true},
+	} {
+		var doc ClaimedEmailDoc
+		key := db.NormalizeEmail(tc.raw)
+		if err := database.Collection("claimed_emails").FindOne(ctx, bson.M{"_id": key}).Decode(&doc); err != nil {
+			t.Fatalf("claim %q: %v", key, err)
+		}
+		if doc.OwnerUserID != tc.owner.String() || doc.Verified != tc.verified {
+			t.Errorf("claim %q = (%s, %v); want (%v, %v)", key, doc.OwnerUserID, doc.Verified, tc.owner, tc.verified)
+		}
+	}
+	if n, err := database.Collection("schema_migrations").CountDocuments(ctx, bson.M{"_id": claimedEmailsBackfillID}); err != nil || n != 1 {
+		t.Fatalf("migration marker rows = %d (err %v); want 1", n, err)
+	}
+}
+
+// TestBackfillClaimedEmails_AbortsOnCrossAccountCollision proves the import refuses
+// two owners for one address and names both.
+func TestBackfillClaimedEmails_AbortsOnCrossAccountCollision(t *testing.T) {
+	uri := requireMongoURI(t)
+	client, err := mongo.Connect(options.Client().ApplyURI(uri))
+	if err != nil {
+		t.Fatalf("mongo.Connect failed: %v", err)
+	}
+	database := client.Database(fmt.Sprintf("goauth_test_claim_bf_conflict_%s", strings.ReplaceAll(uuid.New().String(), "-", "")))
+	t.Cleanup(func() {
+		_ = database.Drop(context.Background())
+		_ = client.Disconnect(context.Background())
+	})
+	ctx := context.Background()
+
+	owner, rival := uuid.New(), uuid.New()
+	if _, err := database.Collection("users").InsertMany(ctx, []any{
+		bson.M{"_id": owner.String(), "email": "collision@example.com", "email_verified": true},
+		bson.M{"_id": rival.String(), "email": "rival@example.com", "email_verified": true},
+	}); err != nil {
+		t.Fatalf("seed users: %v", err)
+	}
+	if _, err := database.Collection("oauth_accounts").InsertOne(ctx, bson.M{
+		"_id": uuid.New().String(), "user_id": rival.String(), "provider_id": "google",
+		"provider_user_id": "sub-collision", "email": "COLLISION@example.com", "verified": true,
+	}); err != nil {
+		t.Fatalf("seed colliding link: %v", err)
+	}
+
+	err = BackfillClaimedEmails(ctx, database)
+	if err == nil {
+		t.Fatal("backfill accepted an address held by two accounts")
+	}
+	for _, want := range []string{"backfill aborted", "collision@example.com", owner.String(), rival.String()} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %q", err.Error(), want)
+		}
+	}
+	if n, cerr := database.Collection("schema_migrations").CountDocuments(ctx, bson.M{"_id": claimedEmailsBackfillID}); cerr != nil || n != 0 {
+		t.Fatalf("migration marker rows = %d; want 0 after an aborted run", n)
+	}
+}
+
 func TestUserStore_Delete_Cascade(t *testing.T) {
 	uri := requireMongoURI(t)
 	cfg := config.DefaultConfig()
@@ -638,6 +741,12 @@ func TestUserStore_Delete_Cascade(t *testing.T) {
 		t.Fatalf("Create verification token failed: %v", err)
 	}
 
+	// A claim whose address is not the account's own: the sweep names its owner
+	// column owner_user_id, so the user_id child list cannot cover it.
+	if err := store.ClaimedEmails().Claim(ctx, "link-only@example.com", uid, true); err != nil {
+		t.Fatalf("seed claim: %v", err)
+	}
+
 	// Delete user
 	if err := store.Users().Delete(ctx, uid); err != nil {
 		t.Fatalf("Delete user failed: %v", err)
@@ -655,6 +764,10 @@ func TestUserStore_Delete_Cascade(t *testing.T) {
 	_, err = store.VerificationTokens().GetByTokenHash(ctx, []byte("vtok_hash_1"))
 	if !stderrors.Is(err, gorm.ErrRecordNotFound) && err == nil {
 		t.Fatal("expected verification token to be deleted by cascade, but found it")
+	}
+
+	if _, err := store.ClaimedEmails().Get(ctx, "link-only@example.com"); !stderrors.Is(err, gorm.ErrRecordNotFound) {
+		t.Fatalf("claim survived its owner's deletion, err = %v", err)
 	}
 }
 
