@@ -51,11 +51,12 @@ guard it differently:
 - `totp.NewServiceWithStore` — or its `NewTotpServiceWithStore` alias, or
   `totp.NewService`/`NewTotpService`, which wrap it — called directly with a
   `config.TOTPConfig` performs no validation. The service is constructed with the
-  construction error recorded, and the constructor logs a warning with event
-  `totp_crypto_config_invalid`. Operations that must seal or open a secret then
-  fail closed instead of proceeding, but not with a uniform error: `Enroll`,
-  `ConfirmEnrollment` and `VerifyCode` return the recorded construction error,
-  while `DisableTOTP` with a code swallows it and reports
+  construction error recorded; when a key surface is configured but unusable, the
+  constructor also logs a warning with event `totp_crypto_config_invalid`, while
+  no key surface at all is recorded silently. Operations that must seal or open a
+  secret then fail closed instead of proceeding, but not with a uniform error:
+  `Enroll`, `ConfirmEnrollment` and `VerifyCode` return the recorded construction
+  error, while `DisableTOTP` with a code swallows it and reports
   `ErrInvalidCredentials`. Disabling with the password needs no key, and
   `Status`/`IsTotpEnabled` need none either.
 
@@ -75,9 +76,11 @@ Two gaps follow, and the rewrap closes both:
 - **Not kid-authenticated.** No kid records which key sealed a legacy row, so the
   read path cannot check a claimed key id; it tries every ring entry instead.
 
-A legacy row therefore stays readable only while the key that sealed it is still
-an entry in the composed ring. Drop that key before the sweep has drained the row
-and the row is unrecoverable — which is why the rewrap exists, and why the old key
+A legacy row therefore stays readable only while the key that sealed it is an
+entry in the composed ring. Remove that entry and the row cannot be opened;
+restore it and the row opens again, because readability depends only on the
+current ring, not on any stored state. The row is lost for good only if the key
+material itself is destroyed — which is why the rewrap exists, and why the old key
 must stay in the ring until the sweep has rewritten every row only it can open.
 
 That legacy read stays in place until a field deployment has drained its rows with
