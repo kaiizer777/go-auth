@@ -157,7 +157,7 @@ func TestBackfillClaimedEmails_WritesTheApplicationKey(t *testing.T) {
 	}
 	got := make([]string, 0, len(rows))
 	for _, row := range rows {
-		got = append(got, row.Email)
+		got = append(got, string(row.Email))
 	}
 	want := []string{"alice@example.com", "bob@example.com", "carol@example.com"}
 	if strings.Join(got, ",") != strings.Join(want, ",") {

@@ -226,9 +226,10 @@ func applyClaimPage(ctx context.Context, tx *gorm.DB, page []claimRow) (ClaimBac
 	}
 	existingByKey := make(map[string]ClaimedEmail, len(existing))
 	for _, claim := range existing {
-		existingByKey[claim.Email] = claim
-		if claim.OwnerUserID != holders[claim.Email].owner {
-			conflicts[claim.Email] = appendUnique(appendUnique(conflicts[claim.Email], holders[claim.Email].owner), claim.OwnerUserID)
+		key := string(claim.Email)
+		existingByKey[key] = claim
+		if claim.OwnerUserID != holders[key].owner {
+			conflicts[key] = appendUnique(appendUnique(conflicts[key], holders[key].owner), claim.OwnerUserID)
 		}
 	}
 	if len(conflicts) > 0 {

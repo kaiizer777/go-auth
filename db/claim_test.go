@@ -1,12 +1,15 @@
 package db
 
 import (
+	"reflect"
 	"strings"
+	"sync"
 	"testing"
 
 	gormsqlite "github.com/glebarez/sqlite"
 	gormmysql "gorm.io/driver/mysql"
 	"gorm.io/gorm"
+	"gorm.io/gorm/schema"
 
 	"github.com/kaiizer777/go-auth/errors"
 )
@@ -138,16 +141,33 @@ func TestValidateClaimableEmailScopesTheFoldLimit(t *testing.T) {
 	}
 }
 
-// TestClaimedEmailMySQLKeyUsesBinaryCollation pins the AutoMigrate type: MySQL's
-// default collation folds case and accents, so the claim key needs an explicit
-// binary collation there. PostgreSQL and SQLite compare the varchar byte for byte.
-func TestClaimedEmailMySQLKeyUsesBinaryCollation(t *testing.T) {
+// TestClaimedEmailFieldTypeDrivesTheCollation pins the hook to the field GORM
+// actually migrates. GORM calls GormDBDataType on the field's type, not on the
+// model struct, so a plain string field would silently fall back to the server
+// default collation. MySQL then folds case and accents, while PostgreSQL and
+// SQLite compare the varchar byte for byte.
+func TestClaimedEmailFieldTypeDrivesTheCollation(t *testing.T) {
+	parsed, err := schema.Parse(&ClaimedEmail{}, &sync.Map{}, schema.NamingStrategy{})
+	if err != nil {
+		t.Fatalf("parse schema: %v", err)
+	}
+	field := parsed.LookUpField("Email")
+	if field == nil {
+		t.Fatal("ClaimedEmail has no Email field")
+	}
+	hook, ok := reflect.New(field.IndirectFieldType).Interface().(interface {
+		GormDBDataType(*gorm.DB, *schema.Field) string
+	})
+	if !ok {
+		t.Fatalf("field type %v does not implement GormDBDataType: AutoMigrate would use the default collation", field.IndirectFieldType)
+	}
+
 	mysqlDB := &gorm.DB{Config: &gorm.Config{Dialector: gormmysql.New(gormmysql.Config{DSN: "user:pass@tcp(127.0.0.1:3306)/x"})}}
-	if got := (ClaimedEmail{}).GormDBDataType(mysqlDB, nil); !strings.Contains(got, "COLLATE utf8mb4_bin") {
+	if got := hook.GormDBDataType(mysqlDB, field); got != "varchar(255) COLLATE utf8mb4_bin" {
 		t.Errorf("mysql claim key type = %q; want an explicit utf8mb4_bin collation", got)
 	}
 	sqliteDB := &gorm.DB{Config: &gorm.Config{Dialector: gormsqlite.Open(":memory:")}}
-	if got := (ClaimedEmail{}).GormDBDataType(sqliteDB, nil); strings.Contains(got, "COLLATE") {
+	if got := hook.GormDBDataType(sqliteDB, field); got != "varchar(255)" {
 		t.Errorf("sqlite claim key type = %q; want the plain varchar type", got)
 	}
 }

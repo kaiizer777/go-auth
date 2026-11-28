@@ -463,7 +463,7 @@ func (d *ClaimedEmailDoc) toDomain() *db.ClaimedEmail {
 	}
 	ownerID, _ := uuid.Parse(d.OwnerUserID)
 	return &db.ClaimedEmail{
-		Email:       d.Email,
+		Email:       db.ClaimKeyValue(d.Email),
 		OwnerUserID: ownerID,
 		Verified:    d.Verified,
 		CreatedAt:   d.CreatedAt.UTC(),
