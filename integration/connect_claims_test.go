@@ -100,6 +100,71 @@ func TestConnect_ImportsLegacyClaimsOnUpgrade(t *testing.T) {
 	}
 }
 
+// TestConnect_ImportsRowsAddedAfterTheFirstImport pins the absence of an
+// "already imported" gate: an address written after a successful import must be
+// picked up on the next connect, or it stays unclaimed with no way to notice.
+func TestConnect_ImportsRowsAddedAfterTheFirstImport(t *testing.T) {
+	dbURL := resolveDatabaseURL()
+
+	initial, err := db.Connect(testConfig(dbURL))
+	if err != nil {
+		if os.Getenv("CI") != "" {
+			t.Fatalf("CI: initial connect failed: %v", err)
+		}
+		t.Skipf("Postgres not available, skipping: %v", err)
+	}
+	_ = initial.Exec("TRUNCATE TABLE sessions, verification_tokens, password_reset_tokens, oauth_accounts, totp_secrets, totp_used_codes, two_factor_tokens, claimed_emails, users CASCADE")
+	if rawDB, derr := initial.DB(); derr == nil {
+		_ = rawDB.Close()
+	}
+
+	earlyID, lateID := uuid.New(), uuid.New()
+	seedUser := func(id uuid.UUID, email string) {
+		t.Helper()
+		conn, cerr := sql.Open("pgx", dbURL)
+		if cerr != nil {
+			t.Fatalf("open seed connection: %v", cerr)
+		}
+		defer func() { _ = conn.Close() }()
+		if _, ierr := conn.Exec(`INSERT INTO users (id, email, password_hash, email_verified) VALUES ($1, $2, 'hash', TRUE)`, id, email); ierr != nil {
+			t.Fatalf("seed user %q: %v", email, ierr)
+		}
+	}
+	seedUser(earlyID, "early-connect@example.test")
+
+	first, err := db.Connect(testConfig(dbURL))
+	if err != nil {
+		t.Fatalf("first import connect failed: %v", err)
+	}
+	if rawDB, derr := first.DB(); derr == nil {
+		_ = rawDB.Close()
+	}
+
+	seedUser(lateID, " Late.Connect@Example.Test ")
+
+	second, err := db.Connect(testConfig(dbURL))
+	if err != nil {
+		t.Fatalf("second connect failed: %v", err)
+	}
+	t.Cleanup(func() {
+		if rawDB, derr := second.DB(); derr == nil {
+			_ = rawDB.Close()
+		}
+	})
+
+	var late db.ClaimedEmail
+	if err := second.Where("email = ?", db.NormalizeEmail(" Late.Connect@Example.Test ")).First(&late).Error; err != nil {
+		t.Fatalf("address written after the first import stayed unclaimed: %v", err)
+	}
+	if late.OwnerUserID != lateID || !late.Verified {
+		t.Errorf("late claim = %+v; want holder %v, verified", late, lateID)
+	}
+
+	if err := second.Exec(`DELETE FROM users WHERE id IN ($1, $2)`, earlyID, lateID).Error; err != nil {
+		t.Fatalf("remove seeded users: %v", err)
+	}
+}
+
 // TestConnect_FailsOnConflictingLegacyClaims pins the failure contract: when the
 // import cannot resolve who owns an address, the connection fails instead of
 // returning a store that silently lost the protection.

@@ -115,13 +115,17 @@ func Connect(cfg config.Config) (*gorm.DB, error) {
 	}
 
 	// 4. Import addresses written before 000014 into the claim table. The table
-	// ships empty and no SQL migration backfills it, so skipping this would leave
-	// an upgraded database unprotected while looking healthy. A conflict fails the
-	// connection on purpose: running with an empty or partially imported claim
-	// table is the silent state this import exists to remove.
+	// ships empty and no SQL migration backfills it. This runs on every connect
+	// inside one transaction, with no "already imported" gate: any gate keyed on a
+	// non-empty table or a marker can silently skip rows written after it, and this
+	// project cannot tell a completed import from an out-of-band row. A conflict or
+	// any write failure rolls the whole import back, so the next boot retries from
+	// the same empty state instead of inheriting a half-imported table. A conflict
+	// fails the connection on purpose: starting without the claims is the silent
+	// unprotected state this import exists to remove.
 	importCtx, importCancel := context.WithTimeout(context.Background(), defaultMigrationTimeout)
 	defer importCancel()
-	if _, err := importClaimsAtConnect(importCtx, db); err != nil {
+	if _, err := BackfillClaimedEmails(importCtx, db); err != nil {
 		return nil, errors.New(errors.CodeDatabaseError, "failed to backfill claimed emails", err)
 	}
 

@@ -171,19 +171,15 @@ const claimedEmailsBackfillID = "000014_create_claimed_emails"
 // attribution while leaving its rows pointing at an address it does not claim.
 // The insert is an idempotent $setOnInsert, so a run that aborted on the operator's
 // data converges when re-run after the offending links are removed.
+//
+// It runs on every connect, with no completed-marker gate: a marker would silently
+// skip addresses written after it, and a failed run would inherit partial reads.
+// The marker below records that a run completed; it is not used to skip.
 func BackfillClaimedEmails(ctx context.Context, database *mongo.Database) error {
 	if database == nil {
 		return nil
 	}
 	markers := database.Collection("schema_migrations")
-	var marker bson.M
-	err := markers.FindOne(ctx, bson.M{"_id": claimedEmailsBackfillID}).Decode(&marker)
-	if err == nil {
-		return nil
-	}
-	if !stderrors.Is(err, mongo.ErrNoDocuments) {
-		return err
-	}
 
 	claims := database.Collection("claimed_emails")
 	sources := []struct {

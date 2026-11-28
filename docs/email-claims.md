@@ -26,18 +26,25 @@ SQL is not guaranteed to equal the Go key the application looks up.
 ## Claim import at connect
 
 `000014` ships the table empty and contains no data backfill. The import runs from
-the connection path instead, identically for both stores, on the first connection
-to a database whose claim table is empty:
+the connection path instead, on **every** connection, identically for both stores:
 
-- SQL: `db.Connect` calls `db.BackfillClaimedEmails` after migrations.
-- MongoDB: `mongostore.Connect` runs the equivalent backfill as an init step,
-  gated by the `000014_create_claimed_emails` marker in `schema_migrations`.
+- SQL: `db.Connect` calls `db.BackfillClaimedEmails` after migrations, inside one
+  transaction. Validation runs first; then every claim is written; any error rolls
+  the whole run back, so the table contains either none or all of the import and
+  the next boot retries from a known state.
+- MongoDB: `mongostore.Connect` runs the equivalent backfill as an init step. It
+  records the `000014_create_claimed_emails` marker when a run completes, but the
+  marker is not a gate: MongoDB cannot make the multi-document write atomic on a
+  standalone deployment, so a partial run must be retried, and every connect does.
 
 Both read `users.email` and `oauth_accounts.email`, key with `db.NormalizeEmail`,
-and use the same claim write the runtime uses. Running twice is a no-op. SQL has
-no per-data-migration marker, so an empty table is the gate: the table is created
-empty and only becomes non-empty through a completed import or a write from this
-version.
+and use the same claim write the runtime uses. Running twice is a no-op.
+
+There is deliberately no "already imported" gate. A marker or a non-empty table
+cannot distinguish "the import completed" from "someone wrote a claim", so it would
+silently skip addresses added afterwards — a restore, or a row written by an older
+instance still serving during a rolling rollout. Re-running at connect is
+idempotent and bounded by one scan of the account tables.
 
 ## Conflicts
 

@@ -23,12 +23,16 @@
 -- closes for the addresses meant to be migrated.
 --
 -- The import runs from the connection path instead: db.Connect calls
--- db.BackfillClaimedEmails on the first connection to a database whose claim table
--- is empty. It keys with db.NormalizeEmail, is idempotent, and aborts naming every
--- address held by more than one account instead of picking a winner. A conflict
--- fails the connection on purpose: running with an unimported claim table is the
--- unprotected state this migration exists to remove. Remedy: resolve the links the
--- error names, then reconnect. See docs/email-claims.md.
+-- db.BackfillClaimedEmails on every connection. It keys with db.NormalizeEmail, is
+-- idempotent, and runs all-or-nothing inside one transaction, so a failure commits
+-- nothing and the next boot retries. When an address is held by more than one
+-- account it aborts before writing, naming every such address instead of picking a
+-- winner; the connection then fails on purpose, because starting with an
+-- unimported claim table is the unprotected state this migration exists to remove.
+-- There is no "already imported" gate: an address written after a run (a restore,
+-- or an older instance still serving during a rollout) is picked up by the next
+-- connect instead of staying unclaimed forever. Remedy: resolve the links the error
+-- names, then reconnect. See docs/email-claims.md.
 CREATE TABLE IF NOT EXISTS claimed_emails (
     email          VARCHAR(255) NOT NULL,
     owner_user_id  UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,

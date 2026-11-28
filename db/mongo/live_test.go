@@ -616,6 +616,25 @@ func TestBackfillClaimedEmails(t *testing.T) {
 	if n, err := database.Collection("schema_migrations").CountDocuments(ctx, bson.M{"_id": claimedEmailsBackfillID}); err != nil || n != 1 {
 		t.Fatalf("migration marker rows = %d (err %v); want 1", n, err)
 	}
+
+	// No completed-marker gate: an account written after the import must still be
+	// picked up, or its address stays unclaimed forever.
+	late := uuid.New()
+	if _, err := database.Collection("users").InsertOne(ctx, bson.M{
+		"_id": late.String(), "email": "Late@Example.com ", "email_verified": true,
+	}); err != nil {
+		t.Fatalf("seed late user: %v", err)
+	}
+	if err := BackfillClaimedEmails(ctx, database); err != nil {
+		t.Fatalf("run after a late row: %v", err)
+	}
+	var lateDoc ClaimedEmailDoc
+	if err := database.Collection("claimed_emails").FindOne(ctx, bson.M{"_id": "late@example.com"}).Decode(&lateDoc); err != nil {
+		t.Fatalf("address added after the import stayed unclaimed: %v", err)
+	}
+	if lateDoc.OwnerUserID != late.String() || !lateDoc.Verified {
+		t.Errorf("late claim = %+v; want holder %v, verified", lateDoc, late)
+	}
 }
 
 // TestBackfillClaimedEmails_AbortsOnCrossAccountCollision proves the import refuses

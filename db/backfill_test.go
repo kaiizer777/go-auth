@@ -171,31 +171,77 @@ func TestBackfillClaimedEmails_AbortsOnForeignExistingClaim(t *testing.T) {
 	}
 }
 
-// TestImportClaimsAtConnect_SkipsWhenClaimsExist pins the connect gate: a
-// non-empty claim table means the import already ran (or this version wrote it),
-// so the connect path must not re-scan.
-func TestImportClaimsAtConnect_SkipsWhenClaimsExist(t *testing.T) {
+// TestBackfillClaimedEmails_MidRunFailureWritesNothing pins the transaction
+// boundary: when a write is rejected after earlier rows were inserted, the run
+// commits nothing, so the table stays empty and the next attempt starts clean
+// instead of inheriting a partial import.
+func TestBackfillClaimedEmails_MidRunFailureWritesNothing(t *testing.T) {
 	database := setupClaimBackfillDB(t)
 	ctx := context.Background()
 
-	owner := seedLegacyUser(t, database, "present@example.com", true)
-	if err := ClaimWithin(ctx, database, "present@example.com", owner.ID, true); err != nil {
-		t.Fatalf("seed claim: %v", err)
+	// Sorted order puts alpha before boom, so the rejected write happens after a
+	// successful one and would be visible without the transaction.
+	seedLegacyUser(t, database, "alpha@example.com", false)
+	seedLegacyUser(t, database, "boom@example.com", false)
+	seedLegacyUser(t, database, "zulu@example.com", false)
+	if err := database.Exec(`CREATE TRIGGER claim_insert_boom BEFORE INSERT ON claimed_emails
+		WHEN NEW.email = 'boom@example.com'
+		BEGIN
+			SELECT RAISE(ABORT, 'injected claim failure');
+		END`).Error; err != nil {
+		t.Fatalf("install trigger: %v", err)
 	}
-	legacy := seedLegacyUser(t, database, "legacy@example.com", false)
 
-	result, err := importClaimsAtConnect(ctx, database)
-	if err != nil {
-		t.Fatalf("import: %v", err)
-	}
-	if result.Claims != 0 {
-		t.Fatalf("import ran on a non-empty table and wrote %d claims", result.Claims)
+	if _, err := BackfillClaimedEmails(ctx, database); err == nil {
+		t.Fatal("backfill reported success while a claim insert was rejected")
 	}
 	var claims int64
-	if err := database.Model(&ClaimedEmail{}).Where("email = ?", legacy.Email).Count(&claims).Error; err != nil {
+	if err := database.Model(&ClaimedEmail{}).Count(&claims).Error; err != nil {
 		t.Fatalf("count claims: %v", err)
 	}
 	if claims != 0 {
-		t.Fatal("connect gate imported a row into a table that was already populated")
+		t.Fatalf("failed run committed %d claims; want none", claims)
+	}
+
+	// The next attempt after the failure is fixed completes the import.
+	if err := database.Exec(`DROP TRIGGER claim_insert_boom`).Error; err != nil {
+		t.Fatalf("drop trigger: %v", err)
+	}
+	result, err := BackfillClaimedEmails(ctx, database)
+	if err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	if result.Claims != 3 {
+		t.Fatalf("retry claimed %d addresses; want 3", result.Claims)
+	}
+	for _, email := range []string{"alpha@example.com", "boom@example.com", "zulu@example.com"} {
+		if _, gerr := readClaim(ctx, database, email); gerr != nil {
+			t.Errorf("claim %q missing after the retry: %v", email, gerr)
+		}
+	}
+}
+
+// TestBackfillClaimedEmails_ImportsAddressesAddedAfterASuccessfulRun pins the
+// reason there is no "already imported" gate: a row written after an import
+// completed must still be picked up, or the address stays unclaimed forever.
+func TestBackfillClaimedEmails_ImportsAddressesAddedAfterASuccessfulRun(t *testing.T) {
+	database := setupClaimBackfillDB(t)
+	ctx := context.Background()
+
+	seedLegacyUser(t, database, "early@example.com", false)
+	if _, err := BackfillClaimedEmails(ctx, database); err != nil {
+		t.Fatalf("first run: %v", err)
+	}
+	late := seedLegacyUser(t, database, "late@example.com", true)
+
+	if _, err := BackfillClaimedEmails(ctx, database); err != nil {
+		t.Fatalf("second run: %v", err)
+	}
+	claim, err := readClaim(ctx, database, late.Email)
+	if err != nil {
+		t.Fatalf("address added after the first import stayed unclaimed: %v", err)
+	}
+	if claim.OwnerUserID != late.ID || !claim.Verified {
+		t.Fatalf("claim = %+v; want holder %v, verified", claim, late.ID)
 	}
 }

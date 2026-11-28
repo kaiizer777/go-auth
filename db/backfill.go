@@ -29,74 +29,72 @@ type claimHolder struct {
 // NormalizeEmail (lower() folds by collation, trim() strips only spaces).
 //
 // Keys are NormalizeEmail output, so the rows are reachable by the same
-// ClaimedEmails().Claim/Get the write paths use. The run is idempotent. When an
-// address is held by more than one account it aborts before writing anything,
-// listing every such address and its competing accounts, instead of choosing a
-// winner: electing one strips the other account's address attribution while its
-// rows keep pointing at an address it no longer claims.
+// ClaimedEmails().Claim/Get the write paths use. The run is idempotent and
+// all-or-nothing: it validates every address, then writes inside one transaction,
+// so a failure commits nothing. When an address is held by more than one account
+// it aborts before writing anything, listing every such address and its competing
+// accounts, instead of choosing a winner: electing one strips the other account's
+// address attribution while its rows keep pointing at an address it no longer
+// claims.
 func BackfillClaimedEmails(ctx context.Context, database *gorm.DB) (ClaimBackfillResult, error) {
 	if database == nil {
 		return ClaimBackfillResult{}, fmt.Errorf("claimed_emails backfill: nil database")
 	}
-	holders, sourceConflicts, err := collectClaimHolders(ctx, database)
+	var (
+		result      ClaimBackfillResult
+		conflictErr error
+	)
+	err := database.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		holders, sourceConflicts, err := collectClaimHolders(ctx, tx)
+		if err != nil {
+			return err
+		}
+
+		conflicts := make(map[string][]uuid.UUID, len(sourceConflicts))
+		for key, owners := range sourceConflicts {
+			conflicts[key] = owners
+		}
+		keys := make([]string, 0, len(holders))
+		for key, holder := range holders {
+			keys = append(keys, key)
+			claim, gerr := readClaim(ctx, tx, key)
+			switch {
+			case gerr == nil && claim.OwnerUserID != holder.owner:
+				conflicts[key] = appendUnique(appendUnique(conflicts[key], holder.owner), claim.OwnerUserID)
+			case gerr != nil && !stderrors.Is(gerr, gorm.ErrRecordNotFound):
+				return fmt.Errorf("read %q: %w", key, gerr)
+			}
+		}
+		if len(conflicts) > 0 {
+			conflictErr = conflictError(conflicts)
+			return conflictErr
+		}
+
+		sort.Strings(keys)
+		for _, key := range keys {
+			holder := holders[key]
+			claim, gerr := readClaim(ctx, tx, key)
+			switch {
+			case gerr != nil && !stderrors.Is(gerr, gorm.ErrRecordNotFound):
+				return fmt.Errorf("read %q: %w", key, gerr)
+			case gerr != nil:
+				result.Claims++
+			case holder.verified && !claim.Verified:
+				result.Promoted++
+			}
+			if cerr := ClaimWithin(ctx, tx, key, holder.owner, holder.verified); cerr != nil {
+				return fmt.Errorf("claim %q: %w", key, cerr)
+			}
+		}
+		return nil
+	})
+	if conflictErr != nil {
+		return ClaimBackfillResult{}, conflictErr
+	}
 	if err != nil {
 		return ClaimBackfillResult{}, fmt.Errorf("claimed_emails backfill: %w", err)
 	}
-
-	conflicts := make(map[string][]uuid.UUID, len(sourceConflicts))
-	for key, owners := range sourceConflicts {
-		conflicts[key] = owners
-	}
-	keys := make([]string, 0, len(holders))
-	for key, holder := range holders {
-		keys = append(keys, key)
-		claim, gerr := readClaim(ctx, database, key)
-		switch {
-		case gerr == nil && claim.OwnerUserID != holder.owner:
-			conflicts[key] = appendUnique(appendUnique(conflicts[key], holder.owner), claim.OwnerUserID)
-		case gerr != nil && !stderrors.Is(gerr, gorm.ErrRecordNotFound):
-			return ClaimBackfillResult{}, fmt.Errorf("claimed_emails backfill: read %q: %w", key, gerr)
-		}
-	}
-	if len(conflicts) > 0 {
-		return ClaimBackfillResult{}, conflictError(conflicts)
-	}
-
-	sort.Strings(keys)
-	var result ClaimBackfillResult
-	for _, key := range keys {
-		holder := holders[key]
-		claim, gerr := readClaim(ctx, database, key)
-		switch {
-		case gerr != nil && !stderrors.Is(gerr, gorm.ErrRecordNotFound):
-			return result, fmt.Errorf("claimed_emails backfill: read %q: %w", key, gerr)
-		case gerr != nil:
-			result.Claims++
-		case holder.verified && !claim.Verified:
-			result.Promoted++
-		}
-		if cerr := ClaimWithin(ctx, database, key, holder.owner, holder.verified); cerr != nil {
-			return result, fmt.Errorf("claimed_emails backfill: claim %q: %w", key, cerr)
-		}
-	}
 	return result, nil
-}
-
-// importClaimsAtConnect runs the import on the first connection to a database
-// whose claim table is still empty. MongoDB gates its equivalent with a
-// schema_migrations marker; SQL has no per-data-migration marker, and an empty
-// table is the same signal: the table is created empty and only becomes non-empty
-// through a completed import or a write from this version, so a non-empty table
-// means nothing is left to import.
-func importClaimsAtConnect(ctx context.Context, database *gorm.DB) (ClaimBackfillResult, error) {
-	var existing int64
-	if err := database.WithContext(ctx).Model(&ClaimedEmail{}).Count(&existing).Error; err != nil {
-		return ClaimBackfillResult{}, err
-	}
-	if existing > 0 {
-		return ClaimBackfillResult{}, nil
-	}
-	return BackfillClaimedEmails(ctx, database)
 }
 
 // readClaim returns the claim for key, or gorm.ErrRecordNotFound.
